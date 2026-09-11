@@ -124,20 +124,37 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     trap 'rc=$?; cleanup3; exit $rc' EXIT
 
     echo "booting with -cpu max to exercise the XSAVE/AVX path..."
-    timeout -s KILL 150 "$QEMU" -cpu max -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
-        -append "lxfaulttest" \
+    # nonetdemo: -cpu max under TCG has to EMULATE AVX and is far slower, and the
+    # boot network self-test does a real TLS handshake (bignum RSA/ECDSA) on top
+    # of that. Skipping it keeps this boot to the part being tested.
+    timeout -s KILL 300 "$QEMU" -cpu max -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+        -append "lxfaulttest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
         -netdev user,id=net0 -device e1000,netdev=net0 \
         -display none -serial file:"$SLOG3" >/dev/null 2>&1 &
     QPID3=$!
+    # Wait for the OUTCOME being asserted, not for an unrelated later marker.
+    # The first version waited on "boot network self-test finished" -- which
+    # happens long AFTER the libc launch -- so under full-suite load the loop
+    # expired before the boot even got there and the test failed with glibc
+    # having neither reached brk nor faulted. Waiting on either real outcome
+    # makes it terminate as soon as the answer exists, pass or fail.
     i=0
-    while [ $i -lt 280 ]; do
-        grep -aq "boot network self-test finished" "$SLOG3" 2>/dev/null && break
+    while [ $i -lt 560 ]; do
+        grep -aqE "unimplemented Linux syscall 12|Invalid Opcode|KERNEL PANIC" "$SLOG3" 2>/dev/null && break
         sleep 0.5; i=$((i+1))
     done
 
     f3=0
+    # A kernel panic must be called out as such. The swapgs-pairing bug (M1943)
+    # first showed up here as "glibc never reached brk", which was true but
+    # buried the real event: a DOUBLE FAULT in the syscall entry stub.
+    if grep -aq "KERNEL PANIC" "$SLOG3"; then
+        echo "  FAIL: KERNEL PANIC during a Linux syscall:"
+        grep -a -A2 "KERNEL PANIC" "$SLOG3" | head -3
+        f3=1
+    fi
     if grep -aq "XSAVE+AVX enabled" "$SLOG3"; then
         echo "  ok: XSAVE+AVX armed on a CPU that has it ($(grep -ao 'state area [0-9]* bytes' "$SLOG3" | head -1))"
     else

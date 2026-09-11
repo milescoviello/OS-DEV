@@ -75,7 +75,30 @@ static struct lx_percpu lx_pc[LX_MAXCPUS];
  * finds the CURRENT task's kernel stack — exactly the value the CPU would have
  * loaded from the TSS had this been an interrupt gate. */
 void linux_abi_set_kernel_rsp(int cpu, uint64_t rsp) {
-    lx_pc[cpu & (LX_MAXCPUS - 1)].kernel_rsp = rsp;
+    int i = cpu & (LX_MAXCPUS - 1);
+    lx_pc[i].kernel_rsp = rsp;
+
+    /* Re-assert KERNEL_GS_BASE too (M1943).
+     *
+     * `swapgs` is only self-restoring when every entry is PAIRED with an exit,
+     * and a syscall that never returns breaks the pair: exit_group calls
+     * task_exit(), so the closing swapgs in the entry stub never executes.
+     * KERNEL_GS_BASE is then left holding the USER's base (0, since
+     * iret_to_user's `mov gs, ax` zeroes it), and the NEXT Linux syscall on
+     * this core swaps that 0 into GS -- so `mov %gs:0, %rsp` reads absolute
+     * address 0 and loads garbage.
+     *
+     * Measured, not hypothesised: that produced a DOUBLE FAULT at
+     * linux_syscall_entry+0x15 with rsp=0xf000ff53f000ff53 -- the real-mode
+     * IVT, read from address 0 -- on glibc's first syscall (brk), immediately
+     * after the freestanding binary had exited. It was ORDER-DEPENDENT, which
+     * is exactly why it showed up as a flaky test rather than a hard failure.
+     *
+     * Re-asserting here makes the invariant self-healing: a task can only reach
+     * a syscall after being switched to, and this runs on every switch. The
+     * rdmsr guard keeps the common case to a read rather than a write. */
+    if (rdmsr(MSR_KERNEL_GS_BASE) != (uint64_t)&lx_pc[i])
+        wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)&lx_pc[i]);
 }
 
 extern void linux_syscall_entry(void);
