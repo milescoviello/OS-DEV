@@ -3591,6 +3591,36 @@ static int run_command(char *line, char *cwd) {
             print(ok ? "fsync/fdatasync/sync_file_range: 0 on a real file fd (write-through already durable), -1 on a memfd; sync() returns -- OK\n"
                      : "fsynctest: VERIFY FAILED\n");
             if (!ok) g_status = 1;
+        } else if (streq(line, "lxabitest")) {
+            /* M1938: execute the `syscall` INSTRUCTION from ring 3 and prove it
+             * lands in the Linux ABI dispatcher, not the native int 0x80 one.
+             *
+             * Before this the instruction was unarmed (EFER.SCE clear), so it
+             * raised #UD and killed the task -- which is also the failure mode
+             * if any part of the entry path is wrong, since a bad stack switch
+             * cannot return. Reaching the next line at all is most of the test.
+             *
+             * The write() output goes through the kernel console, so unlike
+             * ring-3 print() it reaches COM1 and a headless run can grep it. */
+            long pid = -1, nosys = 0, wrote = -1;
+            static const char msg[] = "[lxabi] hello from a LINUX syscall in ring 3\n";
+
+            __asm__ volatile("syscall" : "=a"(pid)   : "a"(39L)   : "rcx", "r11", "memory");   /* Linux getpid */
+            __asm__ volatile("syscall" : "=a"(nosys) : "a"(9999L) : "rcx", "r11", "memory");   /* unimplemented */
+            __asm__ volatile("syscall"
+                             : "=a"(wrote)
+                             : "a"(1L), "D"(1L), "S"(msg), "d"((long)sizeof msg - 1)
+                             : "rcx", "r11", "memory");                                        /* Linux write */
+
+            int ok = 1;
+            if (pid <= 0)                       { print("lxabitest: getpid via syscall returned nothing sane\n"); ok = 0; }
+            if (nosys != -38)                   { print("lxabitest: an unimplemented call did not return -ENOSYS\n"); ok = 0; }
+            if (wrote != (long)sizeof msg - 1)  { print("lxabitest: write returned the wrong byte count\n"); ok = 0; }
+            if (ok) {
+                char pb[24]; ltoa_simple(pid, pb);
+                print("lxabitest: `syscall` reached the Linux dispatcher -- getpid="); print(pb);
+                print(", unknown call -> -ENOSYS, write echoed to the kernel console -- OK\n");
+            } else print("lxabitest: VERIFY FAILED\n");
         } else if (startswith(line, "ext2caps")) {
             /* M1937: the Phase-1 completion bar for the self-hosting campaign --
              * everything a borrowed userland needs from a filesystem and the

@@ -8,6 +8,7 @@
 #include "console.h"
 #include "vga.h"
 #include "gdt.h"
+#include "linuxabi.h"
 #include "interrupts.h"
 #include "timer.h"
 #include "keyboard.h"
@@ -483,6 +484,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
 
     gdt_init();
     interrupts_init();
+    linux_abi_init_this_cpu();   /* arm the `syscall` instruction on the BSP (M1938) */
     fpu_init();                    /* enable x87 + SSE so userspace can use floating point */
     cpu_harden();                  /* SMEP + UMIP: kernel can't run ring-3 pages; ring-3 can't SGDT/etc (M1269) */
     timer_init(100);

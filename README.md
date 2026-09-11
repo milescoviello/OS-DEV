@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1937-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1938-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-102%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -436,7 +436,11 @@ Landed so far, all on the from-scratch ext2 driver:
   names a *different file*, and that was measurably happening: `openat()` on a
   105-char path used to succeed and then read the wrong file.
 
-Still ahead: the `syscall`-instruction entry path and a static-PIE hello world,
+- **M1938** — the **`syscall` instruction now works and speaks Linux**: a second,
+  independent entry path on an instruction that was previously unused here, so
+  it cannot collide with the native `int 0x80` ABI. Proven from ring 3.
+
+Still ahead: static-PIE ELF loading with a real auxv, then a hello world,
 then busybox, then the toolchain. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be

@@ -19,6 +19,7 @@
 #include "gdt.h"
 #include "string.h"
 #include "smp.h"
+#include "linuxabi.h"
 #include <stdint.h>
 
 /* 64-bit TSS, packed exactly as the CPU expects (104 bytes). */
@@ -109,7 +110,14 @@ void gdt_init(void) {
 }
 
 void tss_set_rsp0(uint64_t rsp0) {
-    tss[this_core()].rsp[0] = rsp0;   /* always targets the CORE CALLING THIS, not a fixed one (M1531) */
+    int c = this_core();
+    tss[c].rsp[0] = rsp0;             /* always targets the CORE CALLING THIS, not a fixed one (M1531) */
+    /* The `syscall` instruction does NOT consult the TSS -- it hands the kernel
+     * no stack at all -- so the Linux ABI entry path keeps its own per-core
+     * mirror of exactly this value, reached through KERNEL_GS_BASE. Updated
+     * here so the two can never drift: a stale mirror would run a Linux
+     * syscall on some other task's kernel stack. (M1938) */
+    linux_abi_set_kernel_rsp(c, rsp0);
 }
 
 /* Load the shared kernel GDT on an application processor, reload its segment

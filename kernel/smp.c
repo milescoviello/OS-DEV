@@ -19,6 +19,7 @@
  * [smp] lines in the boot log).
  */
 #include "smp.h"
+#include "linuxabi.h"
 #include "smpthread.h"  /* smpthread_ap_tick — real kernel threads pinned per-core (M1530) */
 #include "task.h"       /* task_register_ap_core/schedule — the general scheduler on every core (M1531) */
 #include "acpi.h"
@@ -233,6 +234,7 @@ void smp_parallel_for(int n, smp_fn fn, void *ctx) {
 void ap_main(void) {
     lapic_enable_this_cpu();
     gdt_load_ap();                       /* kernel GDT + THIS core's own TSS (M1531) */
+    linux_abi_init_this_cpu();           /* EFER.SCE/LSTAR/STAR/SFMASK/KERNEL_GS_BASE are PER-CORE (M1938) */
     idt_load();                          /* kernel IDT: the wake/tick IPIs + exceptions */
     extern void fpu_init_ap(void);        /* CR0/CR4 are per-core: enable FXSAVE/FXRSTOR HERE too (M1531) */
     fpu_init_ap();
