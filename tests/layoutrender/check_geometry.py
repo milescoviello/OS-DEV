@@ -67,6 +67,8 @@ COL = {
     "ruleref":   (0xfe, 0x22, 0x22),   # no width -> spans the column (reference)
     "rulew":     (0xfe, 0x20, 0x20),   # width:300px; margin:0 auto -- from a RULE
     "rulevw":    (0xfe, 0x21, 0x21),   # width:40vw -- from a RULE
+    "rulepad":   (0xfe, 0x24, 0x24),   # width:200px + padding:25px -- from a RULE
+    "ruleht":    (0xfe, 0x25, 0x25),   # width:200px + height:70px -- from a RULE
 }
 
 
@@ -333,6 +335,13 @@ def main():
        "margin:0 auto from a stylesheet rule centres it (gaps %d vs %d)" % (gl, gr))
     ck(abs(width("rulevw") - colw * 40 / 100) <= 8,
        "width:40vw resolves against the viewport (got %d, column %d)" % (width("rulevw"), colw))
+
+    # Padding and height from a rule too (M1930): padding is part of the 10.3.3
+    # width constraint, so 200 content + 2x25 padding is a 250px box.
+    ck(abs(width("rulepad") - 250) <= TOL,
+       "padding:25px from a stylesheet rule widens the box to 250px (got %d)" % width("rulepad"))
+    ck(abs(height("ruleht") - 70) <= 4,
+       "height:70px from a stylesheet rule is honoured (got %d)" % height("ruleht"))
 
     # --- a nested background stays inside its padded parent ------------------
     il, it, ir, ib = boxes["wide_in"]

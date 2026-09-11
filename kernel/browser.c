@@ -170,6 +170,10 @@ struct browser {
      * `body{width:60vw;margin:15vh auto}` -- exactly how real pages, example.com
      * included, centre their content -- did nothing at all. */
     uint16_t css_w[CSS_MAX]; uint8_t css_mauto[CSS_MAX];
+    /* Padding + height from a rule too (M1930): `.card{padding:20px}` is one of
+     * the most common declarations there is, and it was inline-only. */
+    uint8_t css_padl[CSS_MAX], css_padr[CSS_MAX], css_padt[CSS_MAX], css_padb[CSS_MAX];
+    uint16_t css_h[CSS_MAX];
     int n_css;  /* <style> rules: selector -> color / text-style / underline / text-transform / background / text-align / font-size / line-height / display:none / border / list-style-type / specificity */
     char    in_id[IN_MAX][32]; char in_val[IN_MAX][IN_VLEN]; int in_n;   /* <input> field values, by id (the typed/scripted text) */
     char    in_name[IN_MAX][32];                                /* each field's name= attr (parallel to in_id), for GET submit */
@@ -1114,7 +1118,8 @@ static void capture_css(browser_t *b, const char *s, int n);
 static int  css_match(browser_t *b, const char *tag, const char *attrs, int attrlen,
                       uint32_t *color, int *textstyle, int *underline, int *transform, uint32_t *bg,
                       int *align, int *size, int *hidden, int *margin, int *indent, uint32_t *border, int *flex,
-                      int *lineheight, int *ws, int *cwidth, int *cmauto);
+                      int *lineheight, int *ws, int *cwidth, int *cmauto,
+                      int *cpl, int *cpr, int *cpt, int *cpb, int *cheight);
 static int  css_match_list(browser_t *b, const char *tag, const char *attrs, int attrlen);
 
 /* Resolve the best URL for an <img> tag with "fallback only" semantics:
@@ -1207,9 +1212,10 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
         }
     } else if (!is_void_tag(tag)) {
         uint32_t c = 0; int ts = -1, ul = 0, tr = 0; uint32_t bg = 0; int al = 0, fs = 0, hide = 0, mv = 0, ml = 0; uint32_t bd = 0; int flex = 0, fgap = 0, fjust = 0, mw = 0; int lh_css = 0; int prews = 0; int bwpx = 0, bmauto = 0, bpadl = 0, bpadr = 0, bpadt = 0, bpadb = 0, bmargb = 0, bbordbox = 0, bhpx = 0, bminh = 0, bmaxh = 0, bovh = 0, bclear = 0;   /* width (M1896) / padding (M1897, M1900) / margin-bottom + box-sizing (M1903) / min+max-height (M1905, M1910) */
-        int csw = 0, csma = 0;   /* box geometry from a stylesheet rule (M1929) */
-        if (b->n_css > 0) css_match(b, tag, attrs, attrlen, &c, &ts, &ul, &tr, &bg, &al, &fs, &hide, &mv, &ml, &bd, &flex, &lh_css, &prews, &csw, &csma);   /* <style> rules first (lower priority) */
+        int csw = 0, csma = 0, cspl = 0, cspr = 0, cspt = 0, cspb = 0, csh = 0;   /* box geometry from a stylesheet rule (M1929/M1930) */
+        if (b->n_css > 0) css_match(b, tag, attrs, attrlen, &c, &ts, &ul, &tr, &bg, &al, &fs, &hide, &mv, &ml, &bd, &flex, &lh_css, &prews, &csw, &csma, &cspl, &cspr, &cspt, &cspb, &csh);   /* <style> rules first (lower priority) */
         bwpx = csw; bmauto = csma;   /* an inline style= below overrides these */
+        bpadl = cspl; bpadr = cspr; bpadt = cspt; bpadb = cspb; bhpx = csh;
         if (mv) b->pending_vmargin = (uint16_t)mv;   /* CSS-rule vertical margin (an inline style= margin below overrides it) */
         const char *st; int stl;
         if (find_attr(attrs, attrlen, "style", &st, &stl)) {           /* inline style overrides per-property (cascade) */
@@ -2440,7 +2446,11 @@ static void capture_css(browser_t *b, const char *s, int n) {
         int wsv = parse_style_whitespace(s + ds, de - ds);           /* white-space from a stylesheet rule (M1819) */
         int wv  = parse_style_width_px(s + ds, de - ds);             /* width from a stylesheet rule (M1929) */
         int mav = parse_style_auto_margins(s + ds, de - ds);         /* margin:auto from a stylesheet rule (M1929) */
-        if (!(col || tsv >= 0 || ulv || trv || bgv || alv || szv || dnv || mgv || hsv || bdv || lsv || lhv || wsv || wv || mav)) continue;   /* nothing we render */
+        int pl = 0, pr = 0, pt = 0, pb = 0;                          /* padding from a rule (M1930) */
+        parse_style_padding_lr(s + ds, de - ds, &pl, &pr);
+        parse_style_padding_tb(s + ds, de - ds, &pt, &pb);
+        int hv  = parse_style_height_px(s + ds, de - ds);            /* height from a rule (M1930) */
+        if (!(col || tsv >= 0 || ulv || trv || bgv || alv || szv || dnv || mgv || hsv || bdv || lsv || lhv || wsv || wv || mav || pl || pr || pt || pb || hv)) continue;   /* nothing we render */
         const char *D = s + ds; int dn = de - ds;                    /* M1788: per-property !important bitmask, so an !important decl outranks a higher-specificity normal one */
         uint16_t imp = 0;
         if (prop_imp(D,dn,"color"))                                  imp |= 1u<<0;
@@ -2490,6 +2500,11 @@ static void capture_css(browser_t *b, const char *s, int n) {
             b->css_ws[b->n_css] = (uint8_t)wsv;
             b->css_w[b->n_css] = (uint16_t)(wv > 65535 ? 65535 : wv);
             b->css_mauto[b->n_css] = (uint8_t)mav;
+            b->css_padl[b->n_css] = (uint8_t)(pl > 255 ? 255 : pl);
+            b->css_padr[b->n_css] = (uint8_t)(pr > 255 ? 255 : pr);
+            b->css_padt[b->n_css] = (uint8_t)(pt > 255 ? 255 : pt);
+            b->css_padb[b->n_css] = (uint8_t)(pb > 255 ? 255 : pb);
+            b->css_h[b->n_css] = (uint16_t)(hv > 65535 ? 65535 : hv);
             b->n_css++;
         }
     }
@@ -2542,7 +2557,8 @@ static int css_rule_matches(browser_t *b, int r, const char *tag, const char *at
 static int css_match(browser_t *b, const char *tag, const char *attrs, int attrlen,
                      uint32_t *color, int *textstyle, int *underline, int *transform, uint32_t *bg,
                      int *align, int *size, int *hidden, int *margin, int *indent, uint32_t *border, int *flex,
-                     int *lineheight, int *ws, int *cwidth, int *cmauto) {
+                     int *lineheight, int *ws, int *cwidth, int *cmauto,
+                     int *cpl, int *cpr, int *cpt, int *cpb, int *cheight) {
     int hit = 0;
     /* per-property specificity watermarks: each output property is set only when the rule's
      * specificity >= the watermark for that property (ties go to source order = later wins). */
@@ -2572,6 +2588,11 @@ static int css_match(browser_t *b, const char *tag, const char *attrs, int attrl
         /* Box geometry rides the margin/padding priority slots (M1929). */
         if (b->css_w[r]       && PRI(8) >= sp_mg)       { *cwidth     = b->css_w[r]; }
         if (b->css_mauto[r]   && PRI(9) >= sp_in)       { *cmauto     = b->css_mauto[r]; }
+        if (b->css_padl[r]    && PRI(9) >= sp_in)       { *cpl        = b->css_padl[r]; }
+        if (b->css_padr[r]    && PRI(9) >= sp_in)       { *cpr        = b->css_padr[r]; }
+        if (b->css_padt[r]    && PRI(8) >= sp_mg)       { *cpt        = b->css_padt[r]; }
+        if (b->css_padb[r]    && PRI(8) >= sp_mg)       { *cpb        = b->css_padb[r]; }
+        if (b->css_h[r]       && PRI(8) >= sp_mg)       { *cheight    = b->css_h[r]; }
         #undef PRI
         hit = 1;
     }
