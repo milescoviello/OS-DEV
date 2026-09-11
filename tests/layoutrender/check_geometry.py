@@ -59,6 +59,10 @@ COL = {
     "clipdeep":  (0xfe, 0x17, 0x17),   # a span INSIDE it, past the cap -> must be ABSENT
     "afterclip": (0xfe, 0x18, 0x18),   # the follower
     "tail":      (0xfe, 0x15, 0x15),   # page-3 sentinel
+    # --- page 4: float + clear (M1928) ------------------------------------------
+    "floatimg":  (0x33, 0x66, 0xcc),   # LOGO.SVG's blue rect = the floated image
+    "wraptext":  (0xfe, 0x19, 0x19),   # span bg = where the wrapping text actually sits
+    "cleared":   (0xfe, 0x1a, 0x1a),   # a block with clear:both after the float
 }
 
 
@@ -293,6 +297,23 @@ def main():
         ck(boxes[nxt][1] >= boxes[prev][1],
            "%s starts at or below %s's top, source order preserved (%d vs %d)"
            % (nxt, prev, boxes[nxt][1], boxes[prev][1]))
+
+    # --- float + clear (M1928) -----------------------------------------------
+    # The decisive pair: text beside a left float must start to the RIGHT of the
+    # image AND overlap it vertically. Either alone is weak -- text below the
+    # image also "starts to the right" of nothing, and text that merely overlaps
+    # vertically could still be painted through the picture.
+    fi, wt = boxes["floatimg"], boxes["wraptext"]
+    ck(wt[0] > fi[2],
+       "text beside a left float starts to the RIGHT of the image (text x=%d, image right=%d)"
+       % (wt[0], fi[2]))
+    ck(wt[1] < fi[3],
+       "...and overlaps it vertically, i.e. it wraps ALONGSIDE rather than below "
+       "(text top=%d, image bottom=%d)" % (wt[1], fi[3]))
+    # clear:both must drop the following block past the float entirely.
+    ck(boxes["cleared"][1] >= fi[3],
+       "clear:both drops the next block below the float (cleared top=%d, image bottom=%d)"
+       % (boxes["cleared"][1], fi[3]))
 
     # --- a nested background stays inside its padded parent ------------------
     il, it, ir, ib = boxes["wide_in"]

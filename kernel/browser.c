@@ -869,6 +869,36 @@ static int parse_style_minheight_px(const char *s, int n) {
     return num > 4000 ? 4000 : num;
 }
 
+/* `float: left | right` (M1928). Returns 1 for left, 2 for right, else 0.
+ *
+ * This renderer has no out-of-flow boxes, so a floated BLOCK CONTAINER (whose
+ * children would have to be laid out inside a narrowed sub-column) is still out
+ * of reach. A floated IMAGE is not: it is a single rectangle, so it can be
+ * placed at the column edge, registered as an obstacle for the lines it spans,
+ * and skipped in the vertical flow — which is the case real pages overwhelmingly
+ * use floats for (text wrapping around a picture). */
+static int parse_style_float(const char *st, int n) {
+    int vs, ve;
+    if (!style_prop(st, n, "float", 5, &vs, &ve)) return 0;
+    const char *v = st + vs; int vl = ve - vs, i = 0;
+    while (i < vl && v[i] == ' ') i++;
+    if (i + 4 <= vl && (v[i]|32)=='l' && (v[i+1]|32)=='e' && (v[i+2]|32)=='f' && (v[i+3]|32)=='t') return 1;
+    if (i + 5 <= vl && (v[i]|32)=='r' && (v[i+1]|32)=='i' && (v[i+2]|32)=='g' && (v[i+3]|32)=='h' && (v[i+4]|32)=='t') return 2;
+    return 0;
+}
+
+/* `clear: left | right | both` — bit0 = clear left floats, bit1 = right. (M1928) */
+static int parse_style_clear(const char *st, int n) {
+    int vs, ve;
+    if (!style_prop(st, n, "clear", 5, &vs, &ve)) return 0;
+    const char *v = st + vs; int vl = ve - vs, i = 0;
+    while (i < vl && v[i] == ' ') i++;
+    if (i + 4 <= vl && (v[i]|32)=='l' && (v[i+1]|32)=='e' && (v[i+2]|32)=='f' && (v[i+3]|32)=='t') return 1;
+    if (i + 5 <= vl && (v[i]|32)=='r' && (v[i+1]|32)=='i' && (v[i+2]|32)=='g' && (v[i+3]|32)=='h' && (v[i+4]|32)=='t') return 2;
+    if (i + 4 <= vl && (v[i]|32)=='b' && (v[i+1]|32)=='o' && (v[i+2]|32)=='t' && (v[i+3]|32)=='h') return 3;
+    return 0;
+}
+
 /* `overflow: hidden` (or `clip`) on a block (M1917). Only these two values are
  * honoured: they clip with no interaction affordance, so clipping IS the whole
  * behaviour. `auto` and `scroll` also clip in CSS, but they clip WITH a scrollbar
@@ -1140,7 +1170,7 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
             }
         }
     } else if (!is_void_tag(tag)) {
-        uint32_t c = 0; int ts = -1, ul = 0, tr = 0; uint32_t bg = 0; int al = 0, fs = 0, hide = 0, mv = 0, ml = 0; uint32_t bd = 0; int flex = 0, fgap = 0, fjust = 0, mw = 0; int lh_css = 0; int prews = 0; int bwpx = 0, bmauto = 0, bpadl = 0, bpadr = 0, bpadt = 0, bpadb = 0, bmargb = 0, bbordbox = 0, bhpx = 0, bminh = 0, bmaxh = 0, bovh = 0;   /* width (M1896) / padding (M1897, M1900) / margin-bottom + box-sizing (M1903) / min+max-height (M1905, M1910) */
+        uint32_t c = 0; int ts = -1, ul = 0, tr = 0; uint32_t bg = 0; int al = 0, fs = 0, hide = 0, mv = 0, ml = 0; uint32_t bd = 0; int flex = 0, fgap = 0, fjust = 0, mw = 0; int lh_css = 0; int prews = 0; int bwpx = 0, bmauto = 0, bpadl = 0, bpadr = 0, bpadt = 0, bpadb = 0, bmargb = 0, bbordbox = 0, bhpx = 0, bminh = 0, bmaxh = 0, bovh = 0, bclear = 0;   /* width (M1896) / padding (M1897, M1900) / margin-bottom + box-sizing (M1903) / min+max-height (M1905, M1910) */
         if (b->n_css > 0) css_match(b, tag, attrs, attrlen, &c, &ts, &ul, &tr, &bg, &al, &fs, &hide, &mv, &ml, &bd, &flex, &lh_css, &prews);   /* <style> rules first (lower priority) */
         if (mv) b->pending_vmargin = (uint16_t)mv;   /* CSS-rule vertical margin (an inline style= margin below overrides it) */
         const char *st; int stl;
@@ -1165,6 +1195,7 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
             bminh    = parse_style_minheight_px(st, stl);                      /* min-height (px) (M1905) */
             bmaxh    = parse_style_maxheight_px(st, stl);                       /* max-height (px) — caps the box, content spills (M1910) */
             bovh     = parse_style_overflow_hidden(st, stl);                   /* overflow:hidden/clip — clip content to the box (M1917) */
+            bclear   = parse_style_clear(st, stl);                             /* clear: left/right/both (M1928) */
 
             int ial = parse_style_align(st, stl);      if (ial) al = ial;   /* text-align */
             int ifs = parse_style_fontsize(st, stl);   if (ifs) fs = ifs;   /* font-size (enlarge) */
@@ -1213,7 +1244,7 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
                  * so the border, the box itself and the background all agree. */
                 int box_owner = (mw > 0 || bwpx > 0 || bmauto || bpadl > 0 || bpadr > 0
                                  || bpadt > 0 || bpadb > 0 || bbordbox || bhpx > 0
-                                 || bminh > 0 || bmaxh > 0);
+                                 || bminh > 0 || bmaxh > 0 || bclear > 0);
                 b->sc[sp].hasborder = 0;
                 if (bd && is_block_tag(tag) && b->ntok < TOK_MAX && b->n_hidden == 0) {   /* bracket the block's tokens with a border marker, drawn as one rect at render */
                     /* Bit 24 of `off` (above the 24-bit colour) marks that this element
@@ -1250,7 +1281,8 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
                                 | ((uint32_t)(bpadt & 0xFF) << 16)
                                 | ((uint32_t)(bpadb & 0xFF) << 24);
                     b->toks[b->ntok++] = (tok_t){ ow, (uint16_t)bwpx, pk,
-                                                  (uint8_t)(bmauto | (bbordbox ? 4 : 0)), TK_MAXW_OPEN };
+                                                  (uint8_t)(bmauto | (bbordbox ? 4 : 0)
+                                                            | ((bclear & 3) << 3)), TK_MAXW_OPEN };
                     b->sc[sp].hasmaxw = 1;
                     b->sc[sp].padb    = (uint8_t)(bpadb & 0xFF);
                 }
@@ -1454,6 +1486,13 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
             { const char *st; int stl; int ih = has_attr(attrs, attrlen, "hidden");   /* a hidden image (its own display:none/visibility:hidden/hidden) shows nothing */
               if (find_attr(attrs, attrlen, "style", &st, &stl) && parse_style_display(st, stl)) ih = 1;
               if (ih) return; }
+            /* float side for this image, read once and carried on the token's
+             * `style` field (unused for TK_IMG). A floated image must NOT get the
+             * emit_break() bracket the others do — those are what force an image
+             * onto its own line, which is precisely what floating undoes. (M1928) */
+            int imgflt = 0;
+            { const char *st; int stl;
+              if (find_attr(attrs, attrlen, "style", &st, &stl)) imgflt = parse_style_float(st, stl); }
             const char *v; int vl;
             char label[40]; int p = 0; label[p++] = '[';
             if (find_attr(attrs, attrlen, "alt", &v, &vl) && vl > 0)
@@ -1474,10 +1513,10 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
                         /* honour explicit width/height (off=w, len=h; 0 = natural) */
                         int aw = attr_int(attrs, attrlen, "width");
                         int ah = attr_int(attrs, attrlen, "height");
-                        emit_break(b, TK_BREAK);
+                        if (!imgflt) emit_break(b, TK_BREAK);
                         b->tokalign[b->ntok] = (uint8_t)b->curalign;   /* honour enclosing text-align when centred/right */
-                        b->toks[b->ntok++] = (tok_t){ (uint16_t)aw, (uint16_t)ah, (uint16_t)slot, STY_NORMAL, TK_IMG };
-                        emit_break(b, TK_BREAK);
+                        b->toks[b->ntok++] = (tok_t){ (uint16_t)aw, (uint16_t)ah, (uint16_t)slot, (uint8_t)imgflt, TK_IMG };
+                        if (!imgflt) emit_break(b, TK_BREAK);
                         shown = 1;
                     }
                 }
@@ -1501,10 +1540,10 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
                             if (slot >= 0 && b->ntok + 2 < TOK_MAX) {
                                 int aw = attr_int(attrs, attrlen, "width");
                                 int ah = attr_int(attrs, attrlen, "height");
-                                emit_break(b, TK_BREAK);
+                                if (!imgflt) emit_break(b, TK_BREAK);
                                 b->tokalign[b->ntok] = (uint8_t)b->curalign;   /* honour enclosing text-align when centred/right */
-                                b->toks[b->ntok++] = (tok_t){ (uint16_t)aw, (uint16_t)ah, (uint16_t)slot, STY_NORMAL, TK_IMG };
-                                emit_break(b, TK_BREAK);
+                                b->toks[b->ntok++] = (tok_t){ (uint16_t)aw, (uint16_t)ah, (uint16_t)slot, (uint8_t)imgflt, TK_IMG };
+                                if (!imgflt) emit_break(b, TK_BREAK);
                                 shown = 1;
                             }
                         }
@@ -1527,10 +1566,10 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
                         if (slot >= 0 && b->ntok + 2 < TOK_MAX) {
                             int aw = attr_int(attrs, attrlen, "width");
                             int ah = attr_int(attrs, attrlen, "height");
-                            emit_break(b, TK_BREAK);
+                            if (!imgflt) emit_break(b, TK_BREAK);
                             b->tokalign[b->ntok] = (uint8_t)b->curalign;   /* honour enclosing text-align when centred/right */
-                            b->toks[b->ntok++] = (tok_t){ (uint16_t)aw, (uint16_t)ah, (uint16_t)slot, STY_NORMAL, TK_IMG };
-                            emit_break(b, TK_BREAK);
+                            b->toks[b->ntok++] = (tok_t){ (uint16_t)aw, (uint16_t)ah, (uint16_t)slot, (uint8_t)imgflt, TK_IMG };
+                            if (!imgflt) emit_break(b, TK_BREAK);
                             shown = 1;
                         }
                     }
@@ -4430,6 +4469,35 @@ static void box(int x, int y, int w, int h, uint32_t c) {
 #define IMG_ROWBUF_MAX 4096
 static uint32_t img_rowbuf[IMG_ROWBUF_MAX];
 
+/* ---- float bands (M1928) ----------------------------------------------------
+ * A floated image is an OBSTACLE: for the vertical range it occupies, the line
+ * box is narrowed on its side, which is what makes text wrap around it. That is
+ * the whole trick this renderer needs — it has no out-of-flow boxes, but it does
+ * not need them for a float, only a per-line left/right inset.
+ *
+ * Bands are kept for the whole page (a page has very few floats), so the cost is
+ * a walk over at most FBND_MAX entries per line. A line [y, y+lh) is obstructed
+ * by a band [y0, y1) when they overlap at all. */
+#define FBND_MAX 8
+typedef struct { int y0, y1, edge, side; } fbnd_t;   /* side: 1 = left, 2 = right */
+
+static int flt_left(const fbnd_t *f, int n, int cl, int y, int lh) {
+    for (int i = 0; i < n; i++)
+        if (f[i].side == 1 && y < f[i].y1 && y + lh > f[i].y0 && f[i].edge > cl) cl = f[i].edge;
+    return cl;
+}
+static int flt_right(const fbnd_t *f, int n, int cr, int y, int lh) {
+    for (int i = 0; i < n; i++)
+        if (f[i].side == 2 && y < f[i].y1 && y + lh > f[i].y0 && f[i].edge < cr) cr = f[i].edge;
+    return cr;
+}
+/* `clear`: drop below every float on the named side(s). mask bit0 = left, bit1 = right. */
+static int flt_clearto(const fbnd_t *f, int n, int y, int mask) {
+    for (int i = 0; i < n; i++)
+        if ((mask & f[i].side) && f[i].y1 > y) y = f[i].y1;
+    return y;
+}
+
 /* The `off` payload of the TK_MAXW_CLOSE matching the TK_MAXW_OPEN at index `i`,
  * or 0 if unmatched (M1910).
  *
@@ -4568,6 +4636,7 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
     int mxy[16];              /* content-top y per open block box, for `height` (M1904) */
     int mxcap[16];            /* absolute y where this box's max-height cap ends; 0x7FFFFFFF = uncapped (M1910) */
     int mxclip[16];           /* absolute y to CLIP content at (overflow:hidden); 0x7FFFFFFF = no clip (M1917) */
+    fbnd_t fbnd[FBND_MAX]; int nfbnd = 0;   /* active float obstacles (M1928) */
     int bgsp = 0;   /* block-bg nesting depth: counted so a nested TK_BG_OPEN's forward-scan stops at ITS matching close (M993) */
     for (int t = 0; t < b->ntok && t < TOK_MAX; t++) {   /* t < TOK_MAX: provably in-bounds for the per-token arrays */
         tok_t *tk = &b->toks[t];
@@ -4640,6 +4709,12 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
         }
         if (tk->type == TK_FLEX_CLOSE) { if (flex_depth > 0) flex_depth--; cy += curlh; cx = cl; curlh = 18; continue; }   /* end the row */
         if (tk->type == TK_MAXW_OPEN)  {   /* narrow + centre the content column for this block */
+            /* `clear` drops the cursor below every float on the named side(s)
+             * before the box is placed, which is the whole point of the property:
+             * it is how a page ends a float's text-wrap region. (M1928) */
+            { int cmask = (tk->style >> 3) & 3;
+              if (cmask) { int ny = flt_clearto(fbnd, nfbnd, cy, cmask);
+                           if (ny > cy) { cy = ny; cx = cl; curlh = 18; } } }
             if (cx > cl) { cy += curlh; curlh = 18; }
             if (mxsp < 16) { mxcl[mxsp] = cl; mxcr[mxsp] = cr; mxpl[mxsp] = pbl; mxpr[mxsp] = pbr;
                              mxpt[mxsp] = pbtop; mxsp++;
@@ -4830,7 +4905,13 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
                 int tlh2 = (u < TOK_MAX) ? b->toklh[u] : 0;
                 int lh2 = tlh2 ? (tlh2 * zm2) : ((tsc2 ? (16 * tsc2 + 2) : lineh_for(tu->style)) * zm2);
                 int wpx2 = tu->len * GW * sc2; if (wpx2 > scr - scl) wpx2 = scr - scl;
-                if (scx + wpx2 > scr - srp && scx > scl) { scy += slh; scx = scl; slh = 18; }
+                { int s_cr = flt_right(fbnd, nfbnd, scr, scy, slh);
+                  int s_cl = flt_left(fbnd, nfbnd, scl, scy, slh);
+                  if (scx < s_cl) scx = s_cl;
+                  if (scx + wpx2 > s_cr - srp && scx > s_cl) {
+                      scy += slh; slh = 18;
+                      scx = flt_left(fbnd, nfbnd, scl, scy, slh);
+                  } }
                 if (lh2 > slh) slh = lh2;
                 scx += wpx2 + GW * sc2;
             }
@@ -4849,8 +4930,8 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
             continue;
         }
         if (tk->type == TK_BG_CLOSE) { if (bgsp > 0) bgsp--; continue; }
-        if (tk->type == TK_BREAK) { if (flex_depth > 0) { if (cx > cl) cx += flex_gap; continue; } cy += curlh + tk->off; cx = cl; curlh = 18; continue; }   /* in flex: break -> horizontal gap between items */
-        if (tk->type == TK_PARA)  { if (flex_depth > 0) { if (cx > cl) cx += flex_gap; continue; } cy += curlh + 8 + tk->off; cx = cl; curlh = 18; continue; }
+        if (tk->type == TK_BREAK) { if (flex_depth > 0) { if (cx > cl) cx += flex_gap; continue; } cy += curlh + tk->off; curlh = 18; cx = flt_left(fbnd, nfbnd, cl, cy, curlh); continue; }   /* in flex: break -> horizontal gap between items */
+        if (tk->type == TK_PARA)  { if (flex_depth > 0) { if (cx > cl) cx += flex_gap; continue; } cy += curlh + 8 + tk->off; curlh = 18; cx = flt_left(fbnd, nfbnd, cl, cy, curlh); continue; }
         if (tk->type == TK_HR) {
             cy += curlh;
             if (cy + 4 >= ct && cy + 4 <= cb) fb_fill_rect(cl, cy + 4, cr - cl, 1, 0xC8CED8);
@@ -4868,14 +4949,31 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
                 } else { destw = iw; desth = ih; }
                 if (destw > maxw && destw > 0) { desth = (int)((long)desth * maxw / destw); destw = maxw; }
                 if (desth > IMG_MAX_H && desth > 0) { destw = (int)((long)destw * IMG_MAX_H / desth); desth = IMG_MAX_H; }
-                if (cx > cl) { cy += curlh; cx = cl; }   /* drop to a fresh line */
+                int flt = tk->style;                     /* 1 = float:left, 2 = float:right (M1928) */
+                if (!flt && cx > cl) { cy += curlh; cx = cl; }   /* drop to a fresh line */
                 /* block image honours the enclosing text-align: centre/right shift the
                  * blit x within [cl, cr] (same offset math as the word path). align 0
                  * (left, the default) -> x0 == cl, so existing pages are byte-identical;
                  * clamped >= cl so a too-wide image stays pinned left. */
                 int x0 = cl;
+                if (flt) {
+                    /* Place against the current line's left/right edge, already
+                     * inset by any earlier float, then register the obstacle. The
+                     * vertical cursor is deliberately NOT advanced: a float is out
+                     * of flow, so the text that follows keeps its own line and is
+                     * merely narrowed by the band below. */
+                    int lcl = flt_left(fbnd, nfbnd, cl, cy, desth);
+                    int lcr = flt_right(fbnd, nfbnd, cr, cy, desth);
+                    x0 = (flt == 1) ? lcl : lcr - destw;
+                    if (x0 < cl) x0 = cl;
+                    if (nfbnd < FBND_MAX) {
+                        fbnd[nfbnd].y0 = cy; fbnd[nfbnd].y1 = cy + desth + 4;   /* +4: a little gutter */
+                        fbnd[nfbnd].edge = (flt == 1) ? x0 + destw + 6 : x0 - 6;
+                        fbnd[nfbnd].side = flt; nfbnd++;
+                    }
+                }
                 int ialn = (t < TOK_MAX) ? b->tokalign[t] : 0;
-                if (ialn) {
+                if (!flt && ialn) {
                     int ioff = (ialn == 1) ? (cr - cl - destw) / 2 : (cr - cl - destw);
                     if (ioff < 0) ioff = 0;
                     x0 = cl + ioff;
@@ -4898,7 +4996,8 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
                     }
                     fb_row(x0, py, rw, img_rowbuf);
                 }
-                cy += desth + 6; cx = cl; curlh = 18;
+                if (flt) { cx = flt_left(fbnd, nfbnd, cl, cy, curlh); }   /* out of flow: cy unchanged */
+                else { cy += desth + 6; cx = cl; curlh = 18; }
             }
             continue;
         }
@@ -4909,7 +5008,18 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
         int tlh = (t < TOK_MAX) ? b->toklh[t] : 0;          /* CSS line-height override in px (0 = use style default) */
         int lh = tlh ? (tlh * zm) : ((tsc ? (16 * tsc + 2) : lineh_for(tk->style)) * zm);
         int wpx = tk->len * GW * sc; if (wpx > cr - cl) wpx = cr - cl;
-        if (cx + wpx > cr - render_rpad && cx > cl) { cy += curlh; cx = cl; curlh = 18; }
+        /* Float-aware line box (M1928): the right edge is pulled in by any
+         * right float covering this line, and a wrapped line restarts at the
+         * left edge a left float allows — which is what makes text flow around
+         * a floated image instead of through it. Both collapse to plain cl/cr
+         * when nothing is floated, so unfloated pages render byte-identically. */
+        { int lcr = flt_right(fbnd, nfbnd, cr, cy, curlh);
+          int lcl = flt_left(fbnd, nfbnd, cl, cy, curlh);
+          if (cx < lcl) cx = lcl;                       /* start clear of a left float */
+          if (cx + wpx > lcr - render_rpad && cx > lcl) {
+              cy += curlh; curlh = 18;
+              cx = flt_left(fbnd, nfbnd, cl, cy, curlh);
+          } }
         if (lh > curlh) curlh = lh;
         /* at a line start (cx==cl): apply the line's left-indent (<blockquote>) and, for
          * center/right text-align, look ahead over the words that fit on the line
