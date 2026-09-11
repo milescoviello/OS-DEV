@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1946-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1947-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -471,14 +471,15 @@ Landed so far, all on the from-scratch ext2 driver:
   handler and *calls* it) and an **information leak** that affected OS-DEV's
   own apps too. glibc now returns from `main` normally.
 
-- **M1946** — **real file I/O from a glibc program**: `openat`/`read`/`lseek`/
-  `newfstatat`, with glibc stdio writing and re-reading a 200-line file on
-  ext2. `opendir` is the known remaining gap (`vfs_stat` does not treat a
-  `/diskN` mount root as a directory).
+- **M1946/M1947** — **a glibc program does real file I/O and lists a
+  directory** on ext2: `openat`/`read`/`lseek`/`newfstatat`/`fstat`/
+  `getdents64`. It writes and re-reads a 200-line file, stats it, lists the
+  directory, and exits 0. `opendir` needed three chained fixes, each of which
+  had been failing *silently* with zero entries.
 
-Still ahead: directory listing, then a toolchain. busybox itself is not
-obtainable on this host, so the ABI surface is driven by purpose-built glibc
-programs that exercise the same syscalls. The honest scale is months, and the memory
+Still ahead: a toolchain. busybox itself is not obtainable on this host, so
+the ABI surface is driven by purpose-built glibc programs exercising the same
+syscalls. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be
 expressed).

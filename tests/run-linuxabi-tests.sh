@@ -86,8 +86,12 @@ timeout -s KILL 120 "$QEMU" -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KER
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -display none -serial file:"$SLOG2" >/dev/null 2>&1 &
 QPID2=$!
+# 280s, not 110s. This boot now launches TWO glibc binaries that both fault
+# under the default (no-AVX) CPU, and each fault dumps its registers over the
+# serial console, which is slow. At the old budget the loop expired under
+# full-suite load and the test reported a wedge that had not happened.
 i=0
-while [ $i -lt 220 ]; do
+while [ $i -lt 560 ]; do
     grep -aq "boot network self-test finished" "$SLOG2" 2>/dev/null && break
     sleep 0.5; i=$((i+1))
 done
@@ -103,7 +107,9 @@ fi
 if grep -aq "boot network self-test finished" "$SLOG2"; then
     echo "  ok: the boot ran to completion despite the fault (no deadlock)"
 else
-    echo "  FAIL: the boot never completed -- wedged after the fault ($(wc -l < "$SLOG2") log lines)"; f2=1
+    # Say what was OBSERVED, not what it means. The previous wording asserted
+    # "wedged", and the one time it fired the boot had merely been slow.
+    echo "  FAIL: the boot did not reach its end marker within the budget ($(wc -l < "$SLOG2") log lines; a full boot is ~306)"; f2=1
 fi
 [ $f2 -eq 0 ] || { echo "FAIL: console-lock/fault-reporting regression"; exit 1; }
 echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console"
@@ -175,8 +181,11 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # Real file I/O through glibc stdio onto the ext2 volume: openat, write,
     # read, lseek, close and newfstatat, all exercised by fopen/fprintf/fgets/
     # stat rather than by calling the syscalls directly.
-    if grep -aq "LXIO: wrote+read 200 lines / 1690 bytes, stat size=1690" "$SLOG3"; then
-        echo "  ok: glibc stdio wrote and re-read a 200-line file on ext2, stat size matches"
+    # dir entries>0 matters: opendir() needs openat on a directory, fstat on
+    # that fd, AND getdents64 -- three separate things, and a failure in any of
+    # them silently yields zero entries rather than an error.
+    if grep -aqE "LXIO: wrote\+read 200 lines / 1690 bytes, stat size=1690, dir entries=[1-9]" "$SLOG3"; then
+        echo "  ok: glibc stdio wrote+re-read a 200-line file on ext2 AND listed the directory"
     else
         echo "  FAIL: glibc file I/O wrong:"; grep -a "LXIO:" "$SLOG3" | head -1; f3=1
     fi

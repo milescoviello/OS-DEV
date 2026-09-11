@@ -563,6 +563,17 @@ int vfs_stat(const char *path, struct statx *st) {
        * FAT32-only resolve() has no notion of a mount name as a path component. */
         int midx; char fpath[VFS_PATH_MAX];
         if (mount_path(path, &midx, fpath, sizeof fpath)) {
+            /* The mount ROOT itself -- "/disk2" with no subpath -- is a
+             * directory by definition, and there is no entry for
+             * blockdev_mount_stat to look up, so it failed. That made
+             * stat("/disk2") report not-found, which made app_open refuse to
+             * hand out a directory fd, which is why opendir() on a mount
+             * returned nothing at all. mount_path() leaves fpath empty in
+             * exactly this case. (M1947) */
+            if (!fpath[0] || (fpath[0] == '/' && !fpath[1])) {
+                st->stx_mode = S_IFDIR | 0755u;
+                return 0;
+            }
             uint32_t fsize; int fisdir;
             if (blockdev_mount_stat(midx, fpath, &fsize, &fisdir) != 0) return -1;
             st->stx_mode = (unsigned)(fisdir ? S_IFDIR : S_IFREG) | (fisdir ? 0755u : 0644u);

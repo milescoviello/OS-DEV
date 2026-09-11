@@ -411,7 +411,22 @@ void linux_syscall_dispatch(struct registers *r) {
             *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
             r->rax = 0;
         } else {
-            r->rax = (uint64_t)-(long)LX_EBADF;
+            /* A REAL fd. opendir() fstat()s the fd it just opened to confirm it
+             * is a directory before it will call getdents64 -- so returning
+             * EBADF here made every opendir() fail silently, with the directory
+             * fd already successfully created. The fd table remembers each
+             * FILE fd's path, so stat that. */
+            const char *fp = app_fd_path((int)a1);
+            struct statx sx;
+            if (!fp || vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            int isdir = (sx.stx_mode & 0170000u) == 0040000u;
+            *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
+            *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+            *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
+            *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+            *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
+            *(uint64_t *)(st + LXST_O_INO)     = 1;
+            r->rax = 0;
         }
         break;
     }
