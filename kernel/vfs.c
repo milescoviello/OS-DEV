@@ -424,9 +424,36 @@ int vfs_list(vfs_dirent *out, int max) {
  * disturbing any shell/app's current directory (M1761). Boot FS only; the
  * synthetic (/proc /dev /tmp) and secondary-mount (/diskN) directories keep
  * using the cwd-based vfs_list(). Returns the entry count, or -1. */
+/* List a directory by path. Unlike every sibling here this went STRAIGHT to
+ * the boot filesystem with no routing, so a /diskN mount could not be listed at
+ * all -- `opendir("/disk2")` returned zero entries with no error (M1946). It
+ * now dispatches like vfs_read/vfs_stat do. */
 int vfs_list_path(const char *path, vfs_dirent *out, int max) {
+    if (!out || max <= 0) return -1;
+    const char *p = (path && path[0]) ? path : "/";
+    char rb[VFS_PATH_MAX];
+    p = bind_resolve(p, rb, sizeof rb);
+    if (!p) return -1;                             /* path too long to represent (M1937) */
+
+    int midx; char fpath[VFS_PATH_MAX];
+    if (mount_path(p, &midx, fpath, sizeof fpath)) {
+        /* fatvol_dirent carries is_dir, vfs_dirent does not, so the two are
+         * NOT layout-compatible -- copy field by field rather than casting. */
+        static fatvol_dirent fe[64];
+        int cap = max < 64 ? max : 64;
+        int n = blockdev_mount_list(midx, fpath, fe, cap);
+        if (n < 0) return -1;
+        for (int i = 0; i < n; i++) {
+            int k = 0;
+            while (fe[i].name[k] && k < (int)sizeof out[i].name - 1) { out[i].name[k] = fe[i].name[k]; k++; }
+            out[i].name[k] = 0;
+            out[i].size = fe[i].size;
+            out[i].date = out[i].time = 0;
+        }
+        return n;
+    }
     if (!fs || !fs->list_path) return -1;
-    return fs->list_path(path && path[0] ? path : "/", out, max);
+    return fs->list_path(p, out, max);
 }
 
 /* Positioned read: up to `max` bytes of `name` starting at byte `off`. Backs

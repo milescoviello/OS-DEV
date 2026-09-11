@@ -718,6 +718,10 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");
+            /* A demanding one: real file I/O + a directory listing, i.e. what a
+             * `cat` and an `ls` need. Drives the next ENOSYS batch. */
+            kprintf("[lxabi] launching a glibc file-I/O binary...\n");
+            app_spawn_linux_from_file("/disk2/lxfileio");
         }
     }
 

@@ -172,6 +172,14 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     else
         echo "  FAIL: the glibc binary did not print its argc/argv:"; grep -a "static-PIE LIBC" "$SLOG3" | head -1; f3=1
     fi
+    # Real file I/O through glibc stdio onto the ext2 volume: openat, write,
+    # read, lseek, close and newfstatat, all exercised by fopen/fprintf/fgets/
+    # stat rather than by calling the syscalls directly.
+    if grep -aq "LXIO: wrote+read 200 lines / 1690 bytes, stat size=1690" "$SLOG3"; then
+        echo "  ok: glibc stdio wrote and re-read a 200-line file on ext2, stat size matches"
+    else
+        echo "  FAIL: glibc file I/O wrong:"; grep -a "LXIO:" "$SLOG3" | head -1; f3=1
+    fi
     if grep -aq "guest exited with status 7" "$SLOG3"; then
         echo "  ok: it exited cleanly through exit_group with the right status"
     else

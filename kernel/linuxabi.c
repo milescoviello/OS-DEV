@@ -38,7 +38,8 @@
 #include "vmm.h"
 #include "app.h"
 #include "rtc.h"
-#include "random.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
+#include "random.h"
+#include "vfs.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
 #include "timer.h"
 #include "syscall.h"   /* AT_PAGESZ/AT_ENTRY/AT_UID/... -- the auxv types we share with /proc/<pid>/auxv */
 #include <stdint.h>
@@ -178,6 +179,24 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_rseq         334
 #define LXS_fstat          5
 #define LXS_getrandom_    318
+#define LXS_openat_      257
+#define LXS_read_          0
+#define LXS_close_         3
+#define LXS_lseek_         8
+#define LXS_getdents64   217
+#define LXS_newfstatat   262
+#define LXS_unlink_       87
+#define LXS_unlinkat_    263
+
+/* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
+ * 8 here, O_TRUNC 01000 (512) vs 4. Passing them through unmapped would silently
+ * mean something else entirely (Linux's O_CREAT=64 would land on nothing we
+ * define, so a create would quietly become an open-existing and fail). */
+#define LXO_WRONLY   01
+#define LXO_RDWR     02
+#define LXO_CREAT   0100
+#define LXO_TRUNC  01000
+#define LXO_APPEND 02000
 
 /* Linux's x86-64 `struct stat` -- 144 bytes, and the field OFFSETS are the ABI.
  * Writing our own struct layout here would compile fine and hand glibc
@@ -228,7 +247,13 @@ void linux_syscall_dispatch(struct registers *r) {
 
     switch (r->rax) {
     case LXS_write: {                       /* (fd, buf, count) */
-        if (a1 != 1 && a1 != 2) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        if (a1 != 1 && a1 != 2) {           /* a real file fd: straight to the fd table */
+            if (a3 < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            if (a3 && !vmm_user_ok(r->rsi, (uint64_t)a3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            long w = app_fd_write((int)a1, (const void *)r->rsi, (unsigned long)a3);
+            r->rax = (w < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)w;
+            break;
+        }
         /* Validate before dereferencing -- the native path routes every ring-3
          * pointer through vmm_user_ok (a PTE_USER page-table walk) and this
          * path must not be the hole in that. An unvalidated buf here would let
@@ -397,6 +422,91 @@ void linux_syscall_dispatch(struct registers *r) {
          * the M1940 stack supplies. */
         r->rax = (uint64_t)-(long)LX_ENOENT;
         break;
+    case LXS_openat_: {                     /* (dirfd, path, flags, mode) */
+        const char *path = (const char *)r->rsi;
+        if (!path || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        long lf = (long)r->rdx, nf = 0;
+        if (lf & (LXO_WRONLY | LXO_RDWR)) nf |= O_WRONLY;   /* we have no separate RDWR */
+        if (lf & LXO_CREAT)  nf |= O_CREAT;
+        if (lf & LXO_TRUNC)  nf |= O_TRUNC;
+        if (lf & LXO_APPEND) nf |= O_APPEND;
+        int fd = app_open(path, (int)nf);
+        r->rax = (fd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)fd;
+        break;
+    }
+    case LXS_read_: {                       /* (fd, buf, count) */
+        long n = (long)r->rdx;
+        if (n < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (n && !vmm_user_ok(r->rsi, (uint64_t)n)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        long got = app_fd_read((int)a1, (void *)r->rsi, (unsigned long)n);
+        r->rax = (got < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)got;
+        break;
+    }
+    case LXS_close_:
+        r->rax = (uint64_t)(app_fd_close((int)a1) == 0 ? 0 : -(long)LX_EBADF);
+        break;
+    case LXS_lseek_: {                      /* (fd, offset, whence) -- SET/CUR/END match */
+        long off = app_lseek((int)a1, (long)r->rsi, (int)r->rdx);
+        r->rax = (off < 0) ? (uint64_t)-(long)LX_EINVAL : (uint64_t)off;
+        break;
+    }
+    case LXS_newfstatat: {                  /* (dirfd, path, statbuf, flags) */
+        const char *path = (const char *)r->rsi;
+        if (!path || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!vmm_user_ok(r->rdx, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        struct statx sx;
+        if (vfs_stat(path, &sx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        uint8_t *st = (uint8_t *)r->rdx;
+        for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
+        int isdir = (sx.stx_mode & 0170000u) == 0040000u;
+        *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
+        *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+        *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
+        *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+        *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);  /* 512-byte units, as Linux defines it */
+        *(uint64_t *)(st + LXST_O_INO)     = 1;
+        r->rax = 0;
+        break;
+    }
+    case LXS_getdents64: {                  /* (fd, dirp, count) */
+        long cap = (long)r->rdx;
+        if (cap <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (!vmm_user_ok(r->rsi, (uint64_t)cap)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* Our native app_getdents64 walks the CWD, not an fd, so it cannot
+         * serve this. The fd table already remembers each FILE fd's path
+         * (app_fd_path), so list THAT directory instead -- which is what the
+         * caller actually opened. */
+        const char *dp = app_fd_path((int)a1);
+        if (!dp) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        static vfs_dirent ents[64];         /* static: 64 * sizeof(vfs_dirent) is far too much stack */
+        int n = vfs_list_path(dp, ents, 64);
+        if (n < 0) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+        /* The offset is carried in the fd's own cursor, so a second call
+         * returns 0 and readdir() terminates instead of looping forever. */
+        long start = app_lseek((int)a1, 0, 1 /*SEEK_CUR*/);
+        if (start < 0) start = 0;
+        uint8_t *out = (uint8_t *)r->rsi;
+        long used = 0; int emitted = 0;
+        for (int i = (int)start; i < n; i++) {
+            int nl = 0; while (ents[i].name[nl]) nl++;
+            long rec = (19 + nl + 1 + 7) & ~7L;        /* dirent64 header is 19 bytes, 8-byte aligned */
+            if (used + rec > cap) break;
+            uint8_t *e = out + used;
+            *(uint64_t *)(e + 0)  = (uint64_t)(i + 2);            /* d_ino (nonzero) */
+            *(int64_t  *)(e + 8)  = (int64_t)(i + 1);             /* d_off = next index */
+            *(uint16_t *)(e + 16) = (uint16_t)rec;                /* d_reclen */
+            /* DT_UNKNOWN: vfs_dirent carries no type field, and guessing wrong
+             * is worse than admitting it -- DT_UNKNOWN is explicitly legal and
+             * makes readdir() fall back to stat() when the caller needs a type. */
+            e[18] = 0 /*DT_UNKNOWN*/;
+            for (int k = 0; k < nl; k++) e[19 + k] = (uint8_t)ents[i].name[k];
+            e[19 + nl] = 0;
+            used += rec; emitted++;
+        }
+        app_lseek((int)a1, start + emitted, 0 /*SEEK_SET*/);
+        r->rax = (uint64_t)used;            /* 0 = end of directory */
+        break;
+    }
     case LXS_exit:
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);
