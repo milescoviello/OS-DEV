@@ -466,9 +466,95 @@ static int write_inode(ext2_t *v, uint32_t ino, const uint8_t *in) {
     return wrblk(v, tblk, b);
 }
 
+static int free_block(ext2_t *v, uint32_t blk);        /* defined below; bmap_alloc unwinds with it */
+
+/* ---- bmap_alloc: the ALLOCATING counterpart of map_block (M1933) -----------
+ *
+ * map_block() is read-only — it returns 0 for a hole. Growing a file needs the
+ * inverse: walk the same direct / single / double-indirect tree, but CREATE
+ * each missing level on the way down. This is the primitive that turns ext2
+ * from "can rewrite a small file" into "can grow a large one", and both
+ * dir_add (growing a directory) and streaming writes are built on it.
+ *
+ * `*charged` accumulates EVERY block allocated — data and indirect metablocks
+ * alike — because i_blocks counts both. Forgetting the metablocks is the
+ * classic way to leave a filesystem that mounts fine but fails fsck.
+ *
+ * Triple-indirect is deliberately NOT allocated: double-indirect already
+ * reaches 4 GiB at a 4 KiB block size (12 + 1024 + 1024*1024 blocks), which is
+ * also FAT32's per-file ceiling, and free_inode_blocks() only frees through
+ * double — allocating a level it cannot free would leak blocks on unlink. */
+
+/* Allocate a ZERO-FILLED block. Indirect metablocks must be zeroed: a recycled
+ * block still full of its previous contents reads back as a page of bogus
+ * block pointers, which map_block would happily follow. */
+static uint32_t alloc_zeroed(ext2_t *v, uint32_t *charged) {
+    uint32_t b = alloc_block(v);
+    if (!b) return 0;
+    uint8_t z[4096];
+    memset(z, 0, v->block_size);
+    if (wrblk(v, b, z) < 0) { free_block(v, b); return 0; }
+    if (charged) (*charged)++;
+    return b;
+}
+
+/* Slot `idx` of indirect block `tbl`, allocating the block it points at if
+ * absent. `zero` is set when the target is itself an indirect level (see
+ * alloc_zeroed); a leaf data block needs no pre-zeroing because the caller
+ * overwrites it in full. */
+static uint32_t ind_slot(ext2_t *v, uint32_t tbl, uint32_t idx, int zero, uint32_t *charged) {
+    uint8_t b[4096];
+    if (rdblk(v, tbl, b) < 0) return 0;
+    uint32_t got = e_rd32(b + idx * 4);
+    if (got) return got;
+    if (zero) { got = alloc_zeroed(v, charged); }
+    else      { got = alloc_block(v); if (got && charged) (*charged)++; }
+    if (!got) return 0;
+    e_wr32(b + idx * 4, got);
+    if (wrblk(v, tbl, b) < 0) { free_block(v, got); return 0; }
+    return got;
+}
+
+/* Physical block backing logical block `fblk`, allocating as needed. Updates
+ * i_block[] in the caller's in-memory `inode` — the caller must write_inode(). */
+static uint32_t bmap_alloc(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged) {
+    if (e_rd32(inode + 32) & EXT4_EXTENTS_FL) return 0;    /* extent-mapped: not ours to grow */
+    uint8_t *ib = inode + 40;                              /* i_block[15] */
+    uint32_t ppb = v->block_size / 4;
+
+    if (fblk < 12) {                                       /* direct */
+        uint32_t b = e_rd32(ib + fblk * 4);
+        if (!b) {
+            b = alloc_block(v);
+            if (!b) return 0;
+            if (charged) (*charged)++;
+            e_wr32(ib + fblk * 4, b);
+        }
+        return b;
+    }
+    fblk -= 12;
+
+    if (fblk < ppb) {                                      /* single-indirect */
+        uint32_t ind = e_rd32(ib + 12 * 4);
+        if (!ind) { ind = alloc_zeroed(v, charged); if (!ind) return 0; e_wr32(ib + 12 * 4, ind); }
+        return ind_slot(v, ind, fblk, 0, charged);
+    }
+    fblk -= ppb;
+
+    if (fblk < ppb * ppb) {                                /* double-indirect */
+        uint32_t dind = e_rd32(ib + 13 * 4);
+        if (!dind) { dind = alloc_zeroed(v, charged); if (!dind) return 0; e_wr32(ib + 13 * 4, dind); }
+        uint32_t ind = ind_slot(v, dind, fblk / ppb, 1, charged);
+        if (!ind) return 0;
+        return ind_slot(v, ind, fblk % ppb, 0, charged);
+    }
+    return 0;                                              /* triple-indirect: see the note above */
+}
+
 /* Add a directory record {child_ino, name, ftype} to directory inode `parent_ino`
- * by splitting an existing record's slack. Returns 0, or -1 if no block has room
- * (growing the directory is unsupported). */
+ * by splitting an existing record's slack, APPENDING A BLOCK if none has room
+ * (M1933 — before that a directory was permanently stuck at its first block,
+ * i.e. roughly 30-50 entries, which no real source tree fits in). Returns 0. */
 static int dir_add(ext2_t *v, uint32_t parent_ino, const char *name, uint32_t child_ino, uint8_t ftype) {
     uint8_t pin[256], blk[4096];
     if (read_inode(v, parent_ino, pin) < 0) return -1;
@@ -500,7 +586,27 @@ static int dir_add(ext2_t *v, uint32_t parent_ino, const char *name, uint32_t ch
             bo += rl;
         }
     }
-    return -1;
+
+    /* Every existing block is full -> APPEND one. A directory's i_size is always
+     * a whole number of blocks, so the new block's logical index is exactly
+     * size/block_size, and the fresh block holds a single record spanning it. */
+    if (need > v->block_size) return -1;
+    uint32_t charged = 0;
+    uint32_t nb = bmap_alloc(v, pin, size / v->block_size, &charged);
+    if (!nb) return -1;                                    /* out of space, or an extent-mapped dir */
+    memset(blk, 0, v->block_size);
+    e_wr32(blk + 0, child_ino);
+    e_wr16(blk + 4, (uint16_t)v->block_size);              /* this record owns the whole block */
+    blk[6] = (uint8_t)nl;
+    blk[7] = ftype;
+    for (int k = 0; k < nl; k++) blk[8 + k] = (uint8_t)name[k];
+    /* Commit the data block BEFORE the inode: a crash between the two leaves an
+     * allocated-but-unreferenced block (which fsck reclaims), whereas the
+     * reverse order would publish a directory block full of stale garbage. */
+    if (wrblk(v, nb, blk) < 0) { free_block(v, nb); return -1; }
+    e_wr32(pin + 4,  size + v->block_size);                               /* i_size  */
+    e_wr32(pin + 28, e_rd32(pin + 28) + charged * (v->block_size / 512)); /* i_blocks, 512-byte units */
+    return write_inode(v, parent_ino, pin);
 }
 
 /* ----- freeing, for overwrite + unlink (M1135) ----- *

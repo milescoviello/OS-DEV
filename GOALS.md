@@ -12,6 +12,54 @@ below are what comes *after* it, and each adds large subsystems.
 
 ---
 
+## Update (2026-09-10): goal 3 is now an active campaign, with a route
+
+"Run Claude Code" has stopped being a distant north star and become the thing
+being built, with a concrete target: **Claude Code running inside OS-DEV,
+developing OS-DEV inside OS-DEV** — full self-hosting, not just compiling a
+C program in-guest.
+
+**The route:** Claude Code is a Node application, and Node is V8 + libuv.
+Writing a from-scratch GCC and a from-scratch Node is not credible. So instead
+OS-DEV gains a **Linux ABI compatibility layer** and *runs* unmodified static
+Linux binaries — busybox, then a real GCC toolchain, then Node. We never port
+GCC; we run it.
+
+**Why this is tractable, and it genuinely is:** the `syscall`/`sysret`
+instruction is *entirely unused* here (the native ABI is `int 0x80`), so a
+Linux ABI can be added on a second entry path that cannot collide with the 345
+native syscalls. The register convention is already Linux-identical. `fork`
+(real COW), `exec`, `waitpid`, `epoll`, `eventfd`, `timerfd`, `futex`, `clone`,
+demand paging and RW→RX `mprotect` — the JIT primitive — all already exist.
+The kernel is much further along than the userspace.
+
+**The phases:** 1 ext2 root filesystem → 2 Linux syscall entry + a static-PIE
+hello world → 3 busybox → 4 static GCC toolchain → 5 self-host → 6 Node →
+7 Claude Code. Each is the next one's foundation.
+
+**Two decisions that avoid rewrites.** Everything is built `-static-pie`,
+because boot maps the low 1 GiB as *supervisor* pages shared into every address
+space, so no user page can exist below 1 GiB and a normal non-PIE static binary
+(linked at `0x400000`) cannot load — fixing that properly means a higher-half
+kernel, whereas the loader already handles `ET_DYN`. And **ext2 becomes the root
+filesystem**, because the boot FAT32 has no long filenames at all, no symlinks
+and no permissions, which is a categorical blocker for an npm tree rather than
+a tuning problem.
+
+**This does not dilute the from-scratch claim.** The kernel, drivers, TLS
+stack, JS engine, browser and ~31k lines of userspace apps remain entirely
+self-made. The compatibility layer is a bolt-on whose whole purpose is to run
+*other people's* binaries — which is what every real operating system does, and
+is precisely the point of having an ABI.
+
+**Honest scale:** this is a multi-month campaign, not a milestone. Phases 1-3
+are substantial kernel work and phase 6 is a memory-subsystem rewrite (the
+mmap ABI today has no `addr`, `prot` or `flags` argument at all, so V8's cage
+cannot even be expressed). Phases 1-5 are independently valuable: self-hosting
+is a real milestone even if Node never runs.
+
+---
+
 ## Update (2026-06-02): where we actually landed
 
 - **🌐 Web browser — achieved, far beyond the original bar** (updated ~M215).

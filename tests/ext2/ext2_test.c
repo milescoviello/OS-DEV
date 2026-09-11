@@ -417,6 +417,72 @@ int main(int argc, char **argv) {
         printf("longname (M1746): ext2 listing returns '%s' (22 chars) untruncated\n", lname);
     }
 
+    /* --- M1933: a directory must GROW past its first block ------------------
+     * Before this, dir_add could only split slack inside blocks the directory
+     * ALREADY had, so a directory was permanently capped at roughly 30-50
+     * entries. No real source tree fits in that, let alone a node_modules.
+     *
+     * The check is deliberately end-to-end rather than a unit test of dir_add:
+     * create far more entries than one block can hold, list them ALL back, and
+     * confirm i_size actually grew. The runner then runs e2fsck over the
+     * result, which is the real proof that the appended blocks are
+     * spec-correct and not merely readable by the code that wrote them. */
+    if (argc > 4) {
+        FILE *df = fopen(argv[4], "rb");
+        if (df) {
+            g_img_bytes = (long)fread(g_img, 1, sizeof g_img, df);
+            fclose(df);
+            uint8_t d[8]; for (int k = 0; k < 8; k++) d[k] = (uint8_t)(k + 1);
+            char p[40];
+            int made = 0;
+            for (int i = 0; i < 600; i++) {
+                snprintf(p, sizeof p, "/grow%03d.txt", i);
+                if (ext2_write_path(bd_read, bd_write, 0, 0, p, d, 8) != 8) break;
+                made++;
+            }
+            /* ~24 bytes/record at a 1 KiB block => ~42 entries per block, so
+             * 200 is already several blocks deep. Without the fix this loop
+             * stops in the 30s and the assert below fires. */
+            if (made < 200) {
+                fprintf(stderr, "FAIL dirgrow: only %d files created; a directory still cannot grow past one block\n", made);
+                return 1;
+            }
+
+            ext2_t vv; uint8_t rin[256];
+            if (ext2_open(bd_read, 0, 0, &vv) < 0)  { fprintf(stderr, "FAIL dirgrow: reopen\n"); return 1; }
+            if (read_inode(&vv, 2, rin) < 0)        { fprintf(stderr, "FAIL dirgrow: root inode unreadable\n"); return 1; }
+            uint32_t dsz = e_rd32(rin + 4);
+            if (dsz <= vv.block_size) {
+                fprintf(stderr, "FAIL dirgrow: root dir is still %u bytes (one block) after %d creates\n", dsz, made);
+                return 1;
+            }
+
+            /* every name must come back from a listing... */
+            static fatvol_dirent le[1024];
+            int ln = ext2_list_path(bd_read, 0, 0, "/", le, 1024), found = 0;
+            for (int i = 0; i < made; i++) {
+                snprintf(p, sizeof p, "grow%03d.txt", i);
+                for (int j = 0; j < ln; j++) if (!strcmp(le[j].name, p)) { found++; break; }
+            }
+            if (found != made) {
+                fprintf(stderr, "FAIL dirgrow: created %d files but only %d listed back (listing returned %d)\n", made, found, ln);
+                return 1;
+            }
+            /* ...and an entry in a LATER block must still resolve by path, which
+             * is what actually exercises map_block past the first block. */
+            uint8_t rb2[16];
+            snprintf(p, sizeof p, "/grow%03d.txt", made - 1);
+            if (ext2_read_path(bd_read, 0, 0, p, rb2, sizeof rb2) != 8) {
+                fprintf(stderr, "FAIL dirgrow: the last-created file is not readable by path\n");
+                return 1;
+            }
+
+            if (argc > 5) { FILE *wf = fopen(argv[5], "wb"); if (wf) { fwrite(g_img, 1, (size_t)g_img_bytes, wf); fclose(wf); } }
+            printf("dirgrow (M1933): %d files in ONE directory -- i_size grew to %u bytes (%u blocks), all %d listed back\n",
+                   made, dsz, dsz / vv.block_size, found);
+        }
+    }
+
     printf("PASS\n");
     return 0;
 }
