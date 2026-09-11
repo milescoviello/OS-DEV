@@ -1663,7 +1663,26 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
             int numbered = (lvl >= 0 && b->listtype[lvl] == 'o' && mark != 'N'
                             && mark != '-' && mark != '*' && mark != '+')   /* an <ol>, unless an explicit bullet/none overrides */
                            || mark == '1';                                  /* or a list told to use decimal */
-            if (mark == 'N') {
+            /* `display` is ONE property: setting it to flex replaces `list-item`, so
+             * a flex <li> generates no marker at all. Real pages rely on this —
+             * danluu.com styles `li{display:flex}` to put a date and a title side by
+             * side, and a bullet in front of every row is simply wrong. Checked
+             * against both the inline style= and the stylesheet. (M1931) */
+            int liflex = 0;
+            { const char *lst; int lstl;
+              if (find_attr(attrs, attrlen, "style", &lst, &lstl) && parse_style_flex(lst, lstl))
+                  liflex = 1;
+              if (!liflex && b->n_css > 0) {
+                  uint32_t c2 = 0, bg2 = 0, bd2 = 0;
+                  int ts2 = -1, ul2 = 0, tr2 = 0, al2 = 0, fs2 = 0, hd2 = 0, mv2 = 0, ml2 = 0,
+                      fx2 = 0, lh2 = 0, pw2 = 0, w2 = 0, ma2 = 0, pl2 = 0, pr2 = 0, pt2 = 0,
+                      pb2 = 0, h2 = 0;
+                  css_match(b, tag, attrs, attrlen, &c2, &ts2, &ul2, &tr2, &bg2, &al2, &fs2,
+                            &hd2, &mv2, &ml2, &bd2, &fx2, &lh2, &pw2, &w2, &ma2,
+                            &pl2, &pr2, &pt2, &pb2, &h2);
+                  liflex = fx2;
+              } }
+            if (mark == 'N' || liflex) {
                 /* list-style:none — suppress the marker entirely (keep the indent so nested
                  * lists still step in). The bullet is the only thing dropped. */
             } else if (numbered) {

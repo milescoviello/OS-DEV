@@ -69,6 +69,8 @@ COL = {
     "rulevw":    (0xfe, 0x21, 0x21),   # width:40vw -- from a RULE
     "rulepad":   (0xfe, 0x24, 0x24),   # width:200px + padding:25px -- from a RULE
     "ruleht":    (0xfe, 0x25, 0x25),   # width:200px + height:70px -- from a RULE
+    "liplain":   (0xfe, 0x26, 0x26),   # text in a normal <li> (has a bullet marker)
+    "liflex":    (0xfe, 0x27, 0x27),   # text in a display:flex <li> (must have NONE)
 }
 
 
@@ -342,6 +344,13 @@ def main():
        "padding:25px from a stylesheet rule widens the box to 250px (got %d)" % width("rulepad"))
     ck(abs(height("ruleht") - 70) <= 4,
        "height:70px from a stylesheet rule is honoured (got %d)" % height("ruleht"))
+
+    # display:flex REPLACES display:list-item, so a flex <li> generates no marker
+    # (M1931). Measured as a position: with the bullet gone its text starts further
+    # left than the same text in a plain <li>, at the same indent.
+    ck(boxes["liflex"][0] < boxes["liplain"][0],
+       "a display:flex <li> has no bullet marker, so its text starts further left "
+       "(flex x=%d vs plain x=%d)" % (boxes["liflex"][0], boxes["liplain"][0]))
 
     # --- a nested background stays inside its padded parent ------------------
     il, it, ir, ib = boxes["wide_in"]
