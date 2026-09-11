@@ -71,6 +71,8 @@ COL = {
     "ruleht":    (0xfe, 0x25, 0x25),   # width:200px + height:70px -- from a RULE
     "liplain":   (0xfe, 0x26, 0x26),   # text in a normal <li> (has a bullet marker)
     "liflex":    (0xfe, 0x27, 0x27),   # text in a display:flex <li> (must have NONE)
+    "liflexcss": (0xfe, 0x28, 0x28),   # same, but display:flex from the STYLESHEET
+    "padonly":   (0xfe, 0x29, 0x29),   # a rule with ONLY padding -- no other property
 }
 
 
@@ -351,6 +353,21 @@ def main():
     ck(boxes["liflex"][0] < boxes["liplain"][0],
        "a display:flex <li> has no bullet marker, so its text starts further left "
        "(flex x=%d vs plain x=%d)" % (boxes["liflex"][0], boxes["liplain"][0]))
+
+    # The stylesheet path, not just the inline one (M1932). The inline check above
+    # short-circuits before the css_match branch ever runs, so deleting that whole
+    # branch -- the part danluu.com actually needs -- left the suite green.
+    ck(boxes["liflexcss"][0] < boxes["liplain"][0],
+       "a <li> given display:flex by a STYLESHEET also has no marker "
+       "(x=%d vs plain %d)" % (boxes["liflexcss"][0], boxes["liplain"][0]))
+    # A rule carrying ONLY geometry must still produce a box. Every other rule in
+    # this fixture also sets a background, which is what pushed the scope frame --
+    # so this case was silently dropped and the suite could not see it (M1932).
+    # Referenced against the COLUMN (the full-width reference block), not against
+    # the <li> above, which carries its own list indent.
+    ck(abs(boxes["padonly"][0] - (boxes["ruleref"][0] + 25)) <= TOL + 2,
+       "a rule with ONLY padding still insets its content by 25px "
+       "(text x=%d, column x=%d)" % (boxes["padonly"][0], boxes["ruleref"][0]))
 
     # --- a nested background stays inside its padded parent ------------------
     il, it, ir, ib = boxes["wide_in"]

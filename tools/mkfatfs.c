@@ -257,6 +257,8 @@ static const struct {
       "div.v{width:40vw;background:#fe2121}"
       "div.pad{width:200px;padding:25px;background:#fe2424}"
       "div.ht{width:200px;height:70px;background:#fe2525}"
+      "li.fx{display:flex}"
+      "div.padonly{padding:25px}"
       "</style>"
       "<div class=\"f\">full width reference</div>"
       "<div class=\"w\">width + margin auto from a rule</div>"
@@ -264,7 +266,9 @@ static const struct {
       "<div class=\"pad\">padding from a rule</div>"
       "<div class=\"ht\">height from a rule</div>"
       "<ul><li><span style=\"background:#fe2626\">plain li</span></li></ul>"
-      "<ul><li style=\"display:flex\"><span style=\"background:#fe2727\">flex li</span></li></ul>" },
+      "<ul><li style=\"display:flex\"><span style=\"background:#fe2727\">flex li</span></li></ul>"
+      "<ul><li class=\"fx\"><span style=\"background:#fe2828\">flex li by rule</span></li></ul>"
+      "<div class=\"padonly\"><span style=\"background:#fe2929\">padding-only rule</span></div>" },
     { "LOGO    SVG", "<svg width=\"64\" height=\"64\" viewBox=\"0 0 64 64\"><rect x=\"2\" y=\"2\" width=\"60\" height=\"60\" fill=\"#3366cc\"/><circle cx=\"32\" cy=\"32\" r=\"20\" fill=\"#ffcc00\"/><polygon points=\"32,12 52,52 12,52\" fill=\"#cc3333\"/></svg>" },
     { "XFORM   SVG", "<svg width=\"120\" height=\"120\" viewBox=\"0 0 120 120\"><rect width=\"120\" height=\"120\" fill=\"#eef\"/><g transform=\"translate(60,60)\"><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#e33\"/><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#3a3\" transform=\"rotate(90)\"/><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#36c\" transform=\"rotate(180)\"/><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#ec0\" transform=\"rotate(270)\"/></g><g transform=\"translate(22,98) scale(1.6)\"><circle cx=\"0\" cy=\"0\" r=\"7\" fill=\"#909\"/></g></svg>" },
     { "ICON    SVG", "<svg width=\"80\" height=\"80\" viewBox=\"0 0 24 24\" fill=\"#22aa77\"><path d=\"M12 2 L2 7 L2 17 L12 22 L22 17 L22 7 Z\"/><circle cx=\"12\" cy=\"12\" r=\"3.5\" fill=\"#ffffff\"/></svg>" },

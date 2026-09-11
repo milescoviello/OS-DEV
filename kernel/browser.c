@@ -846,7 +846,7 @@ static int parse_style_maxwidth(const char *s, int n) {
     const char *v = s + vs; int vl = ve - vs, i = 0, num = 0;   /* own parse: parse_px_val caps at 120, too small for a column width */
     while (i < vl && v[i] == ' ') i++;
     while (i < vl && v[i] >= '0' && v[i] <= '9') { num = num*10 + (v[i]-'0'); i++; }
-    if (i + 1 < vl && (v[i]|32) == 'e' && (v[i+1]|32) == 'm') num *= 16;   /* em -> ~16px */
+    num = css_unit_px(num, v + i, vl - i);                   /* em / vw / vh (M1932) */   /* em -> ~16px */
     return num > 4000 ? 4000 : num;                                       /* sane upper cap */
 }
 
@@ -876,7 +876,7 @@ static int parse_style_height_px(const char *s, int n) {
     while (i < vl && v[i] >= '0' && v[i] <= '9') { num = num*10 + (v[i]-'0'); i++; digits++; }
     if (!digits) return 0;
     if (i < vl && v[i] == '%') return 0;
-    if (i + 1 < vl && (v[i]|32) == 'e' && (v[i+1]|32) == 'm') num *= 16;
+    num = css_unit_px(num, v + i, vl - i);                   /* em / vw / vh (M1932) */
     return num > 4000 ? 4000 : num;
 }
 
@@ -901,7 +901,7 @@ static int parse_style_minheight_px(const char *s, int n) {
     while (i < vl && v[i] >= '0' && v[i] <= '9') { num = num*10 + (v[i]-'0'); i++; digits++; }
     if (!digits) return 0;
     if (i < vl && v[i] == '%') return 0;
-    if (i + 1 < vl && (v[i]|32) == 'e' && (v[i+1]|32) == 'm') num *= 16;
+    num = css_unit_px(num, v + i, vl - i);                   /* em / vw / vh (M1932) */
     return num > 4000 ? 4000 : num;
 }
 
@@ -965,7 +965,7 @@ static int parse_style_maxheight_px(const char *s, int n) {
     while (i < vl && v[i] >= '0' && v[i] <= '9') { num = num*10 + (v[i]-'0'); i++; digits++; }
     if (!digits) return 0;                      /* `none` (the initial value) included */
     if (i < vl && v[i] == '%') return 0;        /* percentages need a resolved containing block */
-    if (i + 1 < vl && (v[i]|32) == 'e' && (v[i+1]|32) == 'm') num *= 16;
+    num = css_unit_px(num, v + i, vl - i);                   /* em / vw / vh (M1932) */
     return num > 4000 ? 4000 : num;
 }
 
@@ -1099,11 +1099,10 @@ static int is_void_tag(const char *t) {
 /* HTML block-level elements: a background-color on one fills the whole line band
  * (an inline element's bg only highlights behind its text). */
 static int is_block_tag(const char *t) {
-    /* `body` counts (M1929): it is a block box in CSS, and leaving it out meant a
-     * rule like `body{width:60vw;margin:15vh auto}` -- how real pages centre their
-     * content -- could never take effect, because only a block tag is given a box
-     * token to carry the geometry. */
-    return tageq(t,"body")||tageq(t,"div")||tageq(t,"p")||tageq(t,"section")||tageq(t,"article")||
+    /* NOT `body`: it never reaches handle_tag (a terminal else-if in the parse loop
+     * consumes it), so listing it here would be dead code. body's box is applied to
+     * the page's content column in browser_render instead -- see root_w/root_ma. */
+    return tageq(t,"div")||tageq(t,"p")||tageq(t,"section")||tageq(t,"article")||
            tageq(t,"header")||tageq(t,"footer")||tageq(t,"nav")||tageq(t,"main")||
            tageq(t,"aside")||tageq(t,"blockquote")||tageq(t,"ul")||tageq(t,"ol")||
            tageq(t,"li")||tageq(t,"dl")||tageq(t,"dd")||tageq(t,"dt")||tageq(t,"table")||
@@ -1229,13 +1228,20 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
             fgap = parse_style_gap(st, stl);                                  /* flex gap (px) */
             fjust = parse_style_justify(st, stl);                             /* justify-content: 1 center, 2 end */
             mw = parse_style_maxwidth(st, stl);                               /* max-width (px) -> centred column */
-            bwpx = parse_style_width_px(st, stl);                             /* width (px) — real §10.3.3 column (M1896) */
-            bmauto = parse_style_auto_margins(st, stl);                        /* margin-left/right:auto bits (M1896) */
-            parse_style_padding_lr(st, stl, &bpadl, &bpadr);                  /* h-padding -> real box inset (M1897) */
-            parse_style_padding_tb(st, stl, &bpadt, &bpadb);                  /* v-padding -> inside the background (M1900) */
+            /* GUARDED, like every other property in this block (M1932). These used to
+             * assign unconditionally, so `<style>.hero{width:600px;margin:0 auto}</style>`
+             * plus any unrelated inline declaration -- `style="color:#333"` -- reset the
+             * width and the centring to zero. Mixing a stylesheet with a small inline
+             * tweak is about the most common thing a real page does. */
+            { int iw = parse_style_width_px(st, stl);      if (iw) bwpx = iw; }
+            { int ima = parse_style_auto_margins(st, stl); if (ima) bmauto = ima; }
+            { int ipl = 0, ipr = 0; parse_style_padding_lr(st, stl, &ipl, &ipr);
+              if (ipl) bpadl = ipl; if (ipr) bpadr = ipr; }
+            { int ipt = 0, ipb = 0; parse_style_padding_tb(st, stl, &ipt, &ipb);
+              if (ipt) bpadt = ipt; if (ipb) bpadb = ipb; }
             bmargb   = parse_style_margin_bottom(st, stl);                    /* trailing margin, outside the bg (M1903) */
             bbordbox = parse_style_border_box(st, stl);                       /* box-sizing:border-box (M1903) */
-            bhpx     = parse_style_height_px(st, stl);                         /* height (px) on a block (M1904) */
+            { int ih = parse_style_height_px(st, stl); if (ih) bhpx = ih; }    /* height (px) on a block (M1904) */
             bminh    = parse_style_minheight_px(st, stl);                      /* min-height (px) (M1905) */
             bmaxh    = parse_style_maxheight_px(st, stl);                       /* max-height (px) — caps the box, content spills (M1910) */
             bovh     = parse_style_overflow_hidden(st, stl);                   /* overflow:hidden/clip — clip content to the box (M1917) */
@@ -1264,7 +1270,16 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
               if (attr_eq(av, avl, "center")) al = 1; else if (attr_eq(av, avl, "right")) al = 2; } }
         if (tageq(tag, "u") || tageq(tag, "ins")) ul = 1;   /* the <u>/<ins> tags also underline */
         int apply_ts = (ts >= 0 && *style == STY_NORMAL);   /* like <b>/<i>: only over normal-flow text */
-        if (c || apply_ts || ul || tr || bg || al || fs || hide || ml || bd || flex || mw || lh_css || prews) {  /* styled/hidden/indented/bordered/flex/max-width/line-height/white-space element -> push a frame */
+        /* Box geometry counts too (M1932). This guard decides whether the element
+         * gets a scope frame at all, and box_owner -- which emits TK_MAXW_OPEN -- is
+         * computed INSIDE it. Omitting the box properties meant a rule carrying only
+         * geometry (`.card{padding:20px}`) pushed no frame and was silently dropped:
+         * the exact case M1930's own commit message advertised. The M1929/M1930
+         * fixture hid it because every rule in it also set a background, which is
+         * what actually pushed the frame. */
+        if (c || apply_ts || ul || tr || bg || al || fs || hide || ml || bd || flex || mw || lh_css || prews
+            || bwpx || bmauto || bpadl || bpadr || bpadt || bpadb || bhpx || bminh || bmaxh
+            || bbordbox || bclear || bovh) {  /* styled/hidden/indented/bordered/flex/box-geometry element -> push a frame */
             if (b->sc_sp < SC_MAX) {
                 int sp = b->sc_sp;
                 b->sc[sp].hidden = hide; if (hide) b->n_hidden++;   /* enter a display:none subtree */
@@ -2486,6 +2501,8 @@ static void capture_css(browser_t *b, const char *s, int n) {
         if (prop_imp(D,dn,"list-style-type")||prop_imp(D,dn,"list-style")) imp |= 1u<<11;
         if (prop_imp(D,dn,"line-height"))                           imp |= 1u<<12;
         if (prop_imp(D,dn,"white-space"))                           imp |= 1u<<13;
+        if (prop_imp(D,dn,"width"))                                 imp |= 1u<<14;   /* M1932 */
+        if (prop_imp(D,dn,"height"))                                imp |= 1u<<15;   /* M1932 */
         /* a selector list "a, b, c" -> one rule per simple sub-selector that parses */
         int p = ss;
         while (p < se && b->n_css < CSS_MAX) {
@@ -2582,7 +2599,14 @@ static int css_match(browser_t *b, const char *tag, const char *attrs, int attrl
     /* per-property specificity watermarks: each output property is set only when the rule's
      * specificity >= the watermark for that property (ties go to source order = later wins). */
     uint32_t sp_color=0, sp_style=0, sp_ul=0, sp_tr=0, sp_bg=0, sp_al=0, sp_sz=0,
-             sp_dn=0, sp_mg=0, sp_in=0, sp_bd=0, sp_lh=0, sp_ws=0;
+             sp_dn=0, sp_mg=0, sp_in=0, sp_bd=0, sp_lh=0, sp_ws=0,
+             /* Box geometry needs its OWN watermarks (M1932). Sharing sp_mg/sp_in and
+              * never updating them broke the cascade both ways: a later low-specificity
+              * `div{width:200px}` overwrote `#hero{width:800px}`, and an unrelated
+              * `.box{margin-top:10px}` raised sp_mg enough to silently DROP a `div`
+              * width rule. All four padding sides share one watermark and one
+              * importance bit, because `padding:` is a single shorthand. */
+             sp_w=0, sp_ma=0, sp_pad=0, sp_h=0;
     for (int r = 0; r < b->n_css; r++) {
         if (!css_rule_matches(b, r, tag, attrs, attrlen)) continue;
         uint32_t sp = b->css_spec[r]; uint16_t imp = b->css_imp[r];   /* M1788: priority = (this property is !important)<<16 | specificity, so any !important decl beats any normal one */
@@ -2604,14 +2628,16 @@ static int css_match(browser_t *b, const char *tag, const char *attrs, int attrl
         if (b->css_border[r]  && PRI(10) >= sp_bd)      { *border     = b->css_border[r];     sp_bd    = PRI(10); }
         if (b->css_lineheight[r] && PRI(12) >= sp_lh)   { *lineheight = b->css_lineheight[r]; sp_lh    = PRI(12); }
         if (b->css_ws[r]      && PRI(13) >= sp_ws)      { *ws         = b->css_ws[r];         sp_ws    = PRI(13); }
-        /* Box geometry rides the margin/padding priority slots (M1929). */
-        if (b->css_w[r]       && PRI(8) >= sp_mg)       { *cwidth     = b->css_w[r]; }
-        if (b->css_mauto[r]   && PRI(9) >= sp_in)       { *cmauto     = b->css_mauto[r]; }
-        if (b->css_padl[r]    && PRI(9) >= sp_in)       { *cpl        = b->css_padl[r]; }
-        if (b->css_padr[r]    && PRI(9) >= sp_in)       { *cpr        = b->css_padr[r]; }
-        if (b->css_padt[r]    && PRI(8) >= sp_mg)       { *cpt        = b->css_padt[r]; }
-        if (b->css_padb[r]    && PRI(8) >= sp_mg)       { *cpb        = b->css_padb[r]; }
-        if (b->css_h[r]       && PRI(8) >= sp_mg)       { *cheight    = b->css_h[r]; }
+        /* Box geometry: own watermarks, own importance bits (M1932). */
+        if (b->css_w[r]       && PRI(14) >= sp_w)       { *cwidth     = b->css_w[r];     sp_w   = PRI(14); }
+        if (b->css_mauto[r]   && PRI(9)  >= sp_ma)      { *cmauto     = b->css_mauto[r]; sp_ma  = PRI(9); }
+        if (b->css_h[r]       && PRI(15) >= sp_h)       { *cheight    = b->css_h[r];     sp_h   = PRI(15); }
+        if ((b->css_padl[r] || b->css_padr[r] || b->css_padt[r] || b->css_padb[r])
+            && PRI(8) >= sp_pad) {                       /* one shorthand -> one watermark */
+            *cpl = b->css_padl[r]; *cpr = b->css_padr[r];
+            *cpt = b->css_padt[r]; *cpb = b->css_padb[r];
+            sp_pad = PRI(8);
+        }
         #undef PRI
         hit = 1;
     }
@@ -4654,6 +4680,11 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
 
     /* content */
     int cl = x + 10, cr = x + w - 14, ct = y + ADDR_H + 6, cb = y + h - 8;
+    /* Captured BEFORE the root box narrows the column (M1932): vw/vh are defined
+     * against the VIEWPORT, not against body's used width. Capturing after meant
+     * each navigation to a `body{width:60vw}` page re-based vw on the previous
+     * page's narrowed column -- 980 -> 588 -> 352 -> 211, shrinking monotonically. */
+    g_vp_w = cr - cl; g_vp_h = cb - ct;
     /* Apply the root box to the content column (M1929): a narrower width, centred
      * when both horizontal margins are auto (bits 0|1), plus any top margin. */
     if (root_w > 0 && root_w < cr - cl) {
@@ -4664,7 +4695,7 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
     }
     if (root_mt > 0) ct += root_mt;
     b->view_h = cb - ct;
-    g_vp_w = cr - cl; g_vp_h = cb - ct;      /* vw/vh resolve against this (M1929) */
+
     int cx = cl, cy = ct - b->scroll, curlh = 18;
     b->nlrec = 0;
     b->nwrec = 0;
