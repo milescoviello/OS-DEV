@@ -60,7 +60,9 @@ DW=/tmp/osdev_ext2_dirgrow_written.img
 # Args are POSITIONAL, so pass every slot quoted even when empty — an unquoted
 # empty would shift the later images into the wrong argv index. The test opens
 # each by name and skips the block when fopen fails, so "" == "not supplied".
-if timeout 180 /tmp/osdev_ext2_test "$G" "$EXTOK" "$WARG" "$DIRGROW" "$DWARG"; then
+PW=/tmp/osdev_ext2_pwrite_written.img
+[ -n "$DIRGROW" ] && PWARG="$PW" || PWARG=
+if timeout 300 /tmp/osdev_ext2_test "$G" "$EXTOK" "$WARG" "$DIRGROW" "$DWARG" "$PWARG"; then
     echo "PASS: ext2.c read path (ASan/UBSan clean on corrupt-metadata fuzz + extent reads)"
 else
     echo "FAIL: ext2.c test aborted (ASan/UBSan caught a memory error, or it hung)"; exit 1
@@ -87,4 +89,13 @@ if [ -n "$DIRGROW" ] && [ -f "$DW" ]; then
         echo "FAIL: e2fsck found errors in the grown-directory image:"; cat /tmp/osdev_ext2_dirgrow_fsck.log; exit 1
     fi
     echo "PASS: grown multi-block directory is e2fsck-clean"
+fi
+
+# M1934: the streamed file must be spec-correct too -- e2fsck validates the
+# double-indirect chain, the sparse hole and i_blocks against what we wrote.
+if [ -n "$DIRGROW" ] && [ -f "$PW" ]; then
+    if ! e2fsck -fn "$PW" >/tmp/osdev_ext2_pwrite_fsck.log 2>&1; then
+        echo "FAIL: e2fsck found errors in the streamed-write image:"; cat /tmp/osdev_ext2_pwrite_fsck.log; exit 1
+    fi
+    echo "PASS: streamed 400 KB double-indirect + sparse file is e2fsck-clean"
 fi

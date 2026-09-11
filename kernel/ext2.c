@@ -485,9 +485,15 @@ static int free_block(ext2_t *v, uint32_t blk);        /* defined below; bmap_al
  * also FAT32's per-file ceiling, and free_inode_blocks() only frees through
  * double — allocating a level it cannot free would leak blocks on unlink. */
 
-/* Allocate a ZERO-FILLED block. Indirect metablocks must be zeroed: a recycled
- * block still full of its previous contents reads back as a page of bogus
- * block pointers, which map_block would happily follow. */
+/* These helpers are deliberately written to hold AT MOST ONE 4 KiB block buffer
+ * live at a time, and never to nest two of them. ext2_write_path already spends
+ * ~9 KiB of frame on blk[]+ind[], dir_add another ~4.3 KiB, and the default
+ * KERNEL task stack is 16 KiB (task.c:27) — an allocator that nested two block
+ * buffers under that chain would overflow it. Only app tasks get 256 KiB. */
+
+/* Allocate a ZERO-FILLED block, for use as an indirect metablock: a recycled
+ * block still holding its previous contents reads back as a page of bogus
+ * block pointers, which map_block would follow straight off the rails. */
 static uint32_t alloc_zeroed(ext2_t *v, uint32_t *charged) {
     uint32_t b = alloc_block(v);
     if (!b) return 0;
@@ -498,57 +504,92 @@ static uint32_t alloc_zeroed(ext2_t *v, uint32_t *charged) {
     return b;
 }
 
-/* Slot `idx` of indirect block `tbl`, allocating the block it points at if
- * absent. `zero` is set when the target is itself an indirect level (see
- * alloc_zeroed); a leaf data block needs no pre-zeroing because the caller
- * overwrites it in full. */
-static uint32_t ind_slot(ext2_t *v, uint32_t tbl, uint32_t idx, int zero, uint32_t *charged) {
+/* Get-or-create the intermediate indirect level at slot `idx` of block `tbl`.
+ * Zeroes the new level BEFORE linking it, reusing the one buffer for both (at
+ * the cost of re-reading `tbl`) — link-then-zero would leave a window where a
+ * crash publishes a garbage indirect block. */
+static uint32_t ind_level(ext2_t *v, uint32_t tbl, uint32_t idx, uint32_t *charged) {
     uint8_t b[4096];
     if (rdblk(v, tbl, b) < 0) return 0;
     uint32_t got = e_rd32(b + idx * 4);
     if (got) return got;
-    if (zero) { got = alloc_zeroed(v, charged); }
-    else      { got = alloc_block(v); if (got && charged) (*charged)++; }
-    if (!got) return 0;
+    if (!(got = alloc_block(v))) return 0;
+    if (charged) (*charged)++;
+    memset(b, 0, v->block_size);                           /* b's contents no longer needed */
+    if (wrblk(v, got, b) < 0)      { free_block(v, got); return 0; }
+    if (rdblk(v, tbl, b) < 0)      { free_block(v, got); return 0; }
     e_wr32(b + idx * 4, got);
-    if (wrblk(v, tbl, b) < 0) { free_block(v, got); return 0; }
+    if (wrblk(v, tbl, b) < 0)      { free_block(v, got); return 0; }
     return got;
 }
 
-/* Physical block backing logical block `fblk`, allocating as needed. Updates
- * i_block[] in the caller's in-memory `inode` — the caller must write_inode(). */
-static uint32_t bmap_alloc(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged) {
+/* Where a logical block's pointer lives. tblk==0 means "in i_block[idx]". */
+typedef struct { uint32_t tblk, idx; } bslot_t;
+
+/* Locate logical block `fblk`'s pointer slot, CREATING any missing indirect
+ * levels on the way down. Declares no block buffer of its own, so the helpers
+ * it calls never stack. Returns 1, or 0 on failure. */
+static int bmap_slot(ext2_t *v, uint8_t *inode, uint32_t fblk, bslot_t *s, uint32_t *charged) {
     if (e_rd32(inode + 32) & EXT4_EXTENTS_FL) return 0;    /* extent-mapped: not ours to grow */
     uint8_t *ib = inode + 40;                              /* i_block[15] */
     uint32_t ppb = v->block_size / 4;
 
-    if (fblk < 12) {                                       /* direct */
-        uint32_t b = e_rd32(ib + fblk * 4);
-        if (!b) {
-            b = alloc_block(v);
-            if (!b) return 0;
-            if (charged) (*charged)++;
-            e_wr32(ib + fblk * 4, b);
-        }
-        return b;
-    }
+    if (fblk < 12) { s->tblk = 0; s->idx = fblk; return 1; }   /* direct */
     fblk -= 12;
 
     if (fblk < ppb) {                                      /* single-indirect */
         uint32_t ind = e_rd32(ib + 12 * 4);
-        if (!ind) { ind = alloc_zeroed(v, charged); if (!ind) return 0; e_wr32(ib + 12 * 4, ind); }
-        return ind_slot(v, ind, fblk, 0, charged);
+        if (!ind) { if (!(ind = alloc_zeroed(v, charged))) return 0; e_wr32(ib + 12 * 4, ind); }
+        s->tblk = ind; s->idx = fblk; return 1;
     }
     fblk -= ppb;
 
     if (fblk < ppb * ppb) {                                /* double-indirect */
         uint32_t dind = e_rd32(ib + 13 * 4);
-        if (!dind) { dind = alloc_zeroed(v, charged); if (!dind) return 0; e_wr32(ib + 13 * 4, dind); }
-        uint32_t ind = ind_slot(v, dind, fblk / ppb, 1, charged);
+        if (!dind) { if (!(dind = alloc_zeroed(v, charged))) return 0; e_wr32(ib + 13 * 4, dind); }
+        uint32_t ind = ind_level(v, dind, fblk / ppb, charged);
         if (!ind) return 0;
-        return ind_slot(v, ind, fblk % ppb, 0, charged);
+        s->tblk = ind; s->idx = fblk % ppb; return 1;
     }
     return 0;                                              /* triple-indirect: see the note above */
+}
+
+static uint32_t bslot_get(ext2_t *v, const uint8_t *inode, bslot_t s) {
+    if (!s.tblk) return e_rd32(inode + 40 + s.idx * 4);
+    uint8_t b[4096];
+    if (rdblk(v, s.tblk, b) < 0) return 0;
+    return e_rd32(b + s.idx * 4);
+}
+
+static int bslot_set(ext2_t *v, uint8_t *inode, bslot_t s, uint32_t phys) {
+    if (!s.tblk) { e_wr32(inode + 40 + s.idx * 4, phys); return 0; }  /* caller write_inode()s */
+    uint8_t b[4096];
+    if (rdblk(v, s.tblk, b) < 0) return -1;
+    e_wr32(b + s.idx * 4, phys);
+    return wrblk(v, s.tblk, b);
+}
+
+/* Physical block backing logical block `fblk`, allocating it (and any indirect
+ * level above it) if absent. Updates i_block[] in the caller's in-memory
+ * `inode`, so the caller must write_inode() to commit. 0 on failure. */
+static uint32_t bmap_alloc(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged) {
+    bslot_t s;
+    if (!bmap_slot(v, inode, fblk, &s, charged)) return 0;
+    uint32_t b = bslot_get(v, inode, s);
+    if (b) return b;                                       /* already mapped */
+    if (!(b = alloc_block(v))) return 0;
+    if (charged) (*charged)++;
+    if (bslot_set(v, inode, s, b) < 0) { free_block(v, b); return 0; }
+    return b;
+}
+
+/* Point logical block `fblk` at an ALREADY-ALLOCATED physical block — used to
+ * rebuild an extent-mapped file's mapping as an indirect tree without moving
+ * any data. Charges only the indirect metablocks; `phys` is already counted. */
+static int bmap_install(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t phys, uint32_t *charged) {
+    bslot_t s;
+    if (!bmap_slot(v, inode, fblk, &s, charged)) return -1;
+    return bslot_set(v, inode, s, phys);
 }
 
 /* Add a directory record {child_ino, name, ftype} to directory inode `parent_ino`
@@ -1413,6 +1454,132 @@ long ext2_chown_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
     if (gid >= 0) e_wr16(inode + 24, (uint16_t)gid);   /* i_gid (low 16) */
     e_wr32(inode + 12, ext2_clock ? ext2_clock() : 0); /* i_ctime */
     return write_inode(&v, ino, inode);
+}
+
+/* Rebuild an extent-mapped file's mapping as an indirect tree, IN PLACE and
+ * without moving a single data block: snapshot the extent root out of
+ * i_block[], clear it, then re-point every logical block at the same physical
+ * block through bmap_install. Needed because bmap_alloc cannot grow an extent
+ * tree, and appending to a file this driver created (which takes the
+ * single-extent fast path) is an entirely ordinary thing to do. (M1934)
+ *
+ * Only depth-0 trees are converted. A deeper tree keeps its index blocks on
+ * disk, and those would be orphaned by the rewrite — refusing is honest;
+ * leaking them silently is not. */
+static int extent_to_indirect(ext2_t *v, uint8_t *inode, uint32_t *charged) {
+    uint8_t eh[60];
+    memcpy(eh, inode + 40, 60);                            /* snapshot before we clobber i_block[] */
+    if (e_rd16(eh + 0) != EXT4_EXT_MAGIC) return -1;
+    if (e_rd16(eh + 6) != 0) return -1;                    /* eh_depth > 0: see above */
+    uint32_t size = e_rd32(inode + 4);
+    uint32_t nb = (uint32_t)((size + v->block_size - 1) / v->block_size);
+
+    for (int i = 0; i < 15; i++) e_wr32(inode + 40 + i * 4, 0);
+    e_wr32(inode + 32, e_rd32(inode + 32) & ~EXT4_EXTENTS_FL);
+    for (uint32_t fb = 0; fb < nb; fb++) {
+        uint32_t phys = extent_map(v, eh, fb);
+        if (!phys) continue;                               /* sparse: leave the hole a hole */
+        if (bmap_install(v, inode, fb, phys, charged) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Positional write: put `len` bytes at byte offset `off` in `path`, creating
+ * the file if absent and extending it as needed. Returns `len`, or -1.
+ *
+ * This is the STREAMING counterpart of ext2_write_path below, which takes the
+ * whole file as one in-memory buffer — fine for a config file, impossible for
+ * a 200 MB toolchain binary. Only the blocks the write actually touches are
+ * read, modified and written back, so cost is proportional to `len` rather
+ * than to the file size, and a caller can build an arbitrarily large file from
+ * a small buffer. (M1934)
+ *
+ * A write starting past EOF leaves a genuine sparse hole: unmapped blocks read
+ * back as zeroes via map_block, which is what ext2 semantics call for. */
+long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                      const char *path, uint64_t off, const void *buf, unsigned long len) {
+    ext2_t v;
+    if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
+    v.write = write;
+    if (len == 0) return 0;
+    if (off + len > 0xFFFFFFFFull) return -1;              /* i_size is 32-bit here */
+
+    /* split `path` into parent directory + base filename (as ext2_write_path) */
+    char parent[256], base[256];
+    int last = -1, n = 0;
+    for (int i = 0; path[i]; i++) { if (path[i] == '/') last = i; n = i + 1; }
+    if (last < 0) { parent[0] = 0; }
+    else { int j = 0; for (; j < last && j < 255; j++) parent[j] = path[j]; parent[j] = 0; }
+    { int j = 0, s = last + 1; for (; s < n && j < 255; s++, j++) base[j] = path[s]; base[j] = 0; }
+    if (base[0] == 0) return -1;
+
+    uint8_t pin[256]; int pdir = 0;
+    uint32_t parent_ino = walk(&v, parent, pin, &pdir);
+    if (!parent_ino || !pdir) return -1;
+    int cd = 0;
+    uint32_t existing = dir_lookup(&v, pin, base, &cd);
+    if (existing && cd) return -1;                         /* it's a directory */
+
+    uint8_t inode[256]; uint32_t ino; uint32_t charged = 0;
+    if (existing) {
+        ino = existing;
+        if (read_inode(&v, ino, inode) < 0) return -1;
+        if ((e_rd32(inode + 32) & EXT4_EXTENTS_FL) &&
+            extent_to_indirect(&v, inode, &charged) < 0) return -1;
+    } else {
+        if (!(ino = alloc_inode(&v))) return -1;
+        for (uint32_t i = 0; i < v.inode_size; i++) inode[i] = 0;
+        e_wr16(inode + 0, 0x8000 | 0x1A4);                 /* regular file, rw-r--r-- */
+        e_wr16(inode + 26, 1);                             /* i_links_count */
+    }
+
+    uint32_t size = e_rd32(inode + 4);
+    uint32_t first = (uint32_t)(off / v.block_size), last_b = (uint32_t)((off + len - 1) / v.block_size);
+    uint8_t blk[4096];
+
+    for (uint32_t fb = first; fb <= last_b; fb++) {
+        uint32_t bstart = fb * v.block_size;               /* this block's byte range */
+        uint32_t lo = (off > bstart) ? (uint32_t)(off - bstart) : 0;
+        uint32_t hi = ((off + len) < (uint64_t)bstart + v.block_size)
+                        ? (uint32_t)(off + len - bstart) : v.block_size;
+        uint32_t db = bmap_alloc(&v, inode, fb, &charged);
+        if (!db) goto fail;
+
+        if (lo == 0 && hi == v.block_size) {               /* full block: no read needed */
+            memcpy(blk, (const uint8_t *)buf + (bstart - off), v.block_size);
+        } else {                                           /* partial: read-modify-write */
+            /* A block inside the old file must be preserved around the edit;
+             * one past EOF (or a hole) has no contents to preserve and must
+             * read as zeroes, not as whatever the recycled block held. */
+            if (bstart < size) { if (rdblk(&v, db, blk) < 0) goto fail; }
+            else               { memset(blk, 0, v.block_size); }
+            const uint8_t *src = (const uint8_t *)buf + (bstart + lo - off);
+            memcpy(blk + lo, src, hi - lo);
+        }
+        if (wrblk(&v, db, blk) < 0) goto fail;
+    }
+
+    if ((uint32_t)(off + len) > size) e_wr32(inode + 4, (uint32_t)(off + len));   /* i_size grows only */
+    e_wr32(inode + 28, e_rd32(inode + 28) + charged * (v.block_size / 512));      /* i_blocks */
+    e_stamp(inode);
+    if (write_inode(&v, ino, inode) < 0) goto fail;
+    if (!existing && dir_add(&v, parent_ino, base, ino, 1) < 0) goto fail;
+    return (long)len;
+
+fail:
+    /* Blocks allocated by THIS call are already recorded in the in-memory inode
+     * (and in any indirect block, which bslot_set wrote through). For a CREATE
+     * nothing is reachable yet, so freeing the inode number is enough and
+     * free_inode_blocks cleans the tree. For an EXTEND of an existing file we
+     * deliberately commit what did land: the inode's old contents are still
+     * intact and the extra mapped blocks are real, so writing i_blocks back
+     * keeps the accounting honest rather than leaving them unaccounted. */
+    if (!existing) { free_inode_blocks(&v, inode); free_inode_num(&v, ino); }
+    else {
+        e_wr32(inode + 28, e_rd32(inode + 28) + charged * (v.block_size / 512));
+        write_inode(&v, ino, inode);
+    }
+    return -1;
 }
 
 long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,

@@ -483,6 +483,126 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* --- M1934: STREAMING (positional) writes + double-indirect -------------
+     * ext2_write_path takes the whole file as one in-memory buffer and refuses
+     * anything past direct + single-indirect. Neither is survivable for a
+     * toolchain: a 200 MB binary cannot be held in a kernel buffer, and 268 KB
+     * (at a 1 KiB block) is not a meaningful file-size ceiling. */
+    if (argc > 4) {
+        FILE *df = fopen(argv[4], "rb");
+        if (df) {
+            g_img_bytes = (long)fread(g_img, 1, sizeof g_img, df);
+            fclose(df);
+#define PW_CHUNK 4096
+#define PW_TOTAL (400 * 1024)
+            static uint8_t chunk[PW_CHUNK];
+            static uint8_t whole[PW_TOTAL];
+
+            /* (a) build 400 KB from a 4 KB buffer, one pwrite per chunk. At a
+             * 1 KiB block that is 400 blocks > 12 + 256, so it also proves
+             * double-indirect -- which ext2_write_path rejects outright. */
+            for (uint64_t o = 0; o < PW_TOTAL; o += PW_CHUNK) {
+                for (int k = 0; k < PW_CHUNK; k++) chunk[k] = (uint8_t)((o + (uint64_t)k) * 31 + 7);
+                long w = ext2_pwrite_path(bd_read, bd_write, 0, 0, "/stream.bin", o, chunk, PW_CHUNK);
+                if (w != PW_CHUNK) { fprintf(stderr, "FAIL pwrite: chunk at %llu wrote %ld\n", (unsigned long long)o, w); return 1; }
+            }
+            long rr = ext2_read_path(bd_read, 0, 0, "/stream.bin", whole, PW_TOTAL);
+            if (rr != PW_TOTAL) { fprintf(stderr, "FAIL pwrite: read back %ld of %d bytes\n", rr, PW_TOTAL); return 1; }
+            for (int k = 0; k < PW_TOTAL; k++)
+                if (whole[k] != (uint8_t)((uint64_t)k * 31 + 7)) {
+                    fprintf(stderr, "FAIL pwrite: byte %d is %02x, expected %02x\n", k, whole[k], (uint8_t)((uint64_t)k * 31 + 7));
+                    return 1;
+                }
+            /* the old whole-buffer API genuinely cannot express this file */
+            if (ext2_write_path(bd_read, bd_write, 0, 0, "/toobig.bin", whole, PW_TOTAL) >= 0) {
+                fprintf(stderr, "FAIL pwrite: ext2_write_path unexpectedly accepted %d bytes\n", PW_TOTAL); return 1;
+            }
+
+            /* (b) a partial-block edit mid-file must preserve both neighbours
+             * and must NOT shrink the file */
+            uint8_t patch[5] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x42 };
+            if (ext2_pwrite_path(bd_read, bd_write, 0, 0, "/stream.bin", 100003, patch, 5) != 5) {
+                fprintf(stderr, "FAIL pwrite: mid-file patch failed\n"); return 1;
+            }
+            rr = ext2_read_path(bd_read, 0, 0, "/stream.bin", whole, PW_TOTAL);
+            if (rr != PW_TOTAL) { fprintf(stderr, "FAIL pwrite: mid-file patch changed size to %ld\n", rr); return 1; }
+            if (whole[100002] != (uint8_t)(100002ull * 31 + 7) || whole[100008] != (uint8_t)(100008ull * 31 + 7)) {
+                fprintf(stderr, "FAIL pwrite: mid-file patch clobbered a neighbouring byte\n"); return 1;
+            }
+            for (int k = 0; k < 5; k++)
+                if (whole[100003 + k] != patch[k]) { fprintf(stderr, "FAIL pwrite: patch byte %d wrong\n", k); return 1; }
+
+            /* (c) a write far past EOF leaves a real sparse hole reading as zeroes.
+             *
+             * The obvious version of this check is WORTHLESS: mke2fs leaves free
+             * blocks zeroed, so a block recycled into the sparse file reads as
+             * zeroes whether or not the code zero-fills it, and a mutation that
+             * removed the zero-fill passed cleanly. So dirty a swathe of blocks
+             * with 0xAA and free them FIRST — alloc_block hands out the lowest
+             * free block, so the sparse file lands on one of them and the
+             * partial tail block genuinely contains garbage to begin with. */
+            memset(chunk, 0xAA, PW_CHUNK);
+            for (uint64_t o = 0; o < 200 * 1024; o += PW_CHUNK)
+                if (ext2_pwrite_path(bd_read, bd_write, 0, 0, "/dirty.bin", o, chunk, PW_CHUNK) != PW_CHUNK) {
+                    fprintf(stderr, "FAIL pwrite: dirty-fill failed at %llu\n", (unsigned long long)o); return 1;
+                }
+            if (ext2_unlink_path(bd_read, bd_write, 0, 0, "/dirty.bin") != 0) {
+                fprintf(stderr, "FAIL pwrite: could not free the dirty blocks\n"); return 1;
+            }
+
+            uint8_t tail[4] = { 1, 2, 3, 4 };
+            if (ext2_pwrite_path(bd_read, bd_write, 0, 0, "/sparse.bin", 60000, tail, 4) != 4) {
+                fprintf(stderr, "FAIL pwrite: sparse create failed\n"); return 1;
+            }
+            static uint8_t sp[60004];
+            long sr = ext2_read_path(bd_read, 0, 0, "/sparse.bin", sp, sizeof sp);
+            if (sr != 60004) { fprintf(stderr, "FAIL pwrite: sparse file is %ld bytes, expected 60004\n", sr); return 1; }
+            for (int k = 0; k < 60000; k++)
+                if (sp[k] != 0) { fprintf(stderr, "FAIL pwrite: sparse hole byte %d is %02x, not zero\n", k, sp[k]); return 1; }
+            if (memcmp(sp + 60000, tail, 4)) { fprintf(stderr, "FAIL pwrite: sparse tail wrong\n"); return 1; }
+
+            if (argc > 6) { FILE *wf = fopen(argv[6], "wb"); if (wf) { fwrite(g_img, 1, (size_t)g_img_bytes, wf); fclose(wf); } }
+            printf("pwrite (M1934): 400 KB streamed in 4 KB chunks (double-indirect; whole-buffer API refuses it), "
+                   "mid-file patch preserves neighbours, 60 KB sparse hole reads as zeroes\n");
+        }
+    }
+
+    /* --- M1934: appending to an EXTENT file converts it to indirect ---------
+     * Files this driver creates take the single-extent fast path, so appending
+     * to one is completely ordinary -- and bmap_alloc cannot grow an extent
+     * tree. The conversion must preserve every existing byte. */
+    if (argc > 2) {
+        FILE *xf2 = fopen(argv[2], "rb");
+        if (xf2) {
+            g_img_bytes = (long)fread(g_img, 1, sizeof g_img, xf2);
+            fclose(xf2);
+            static uint8_t orig[20000];
+            for (int k = 0; k < (int)sizeof orig; k++) orig[k] = (uint8_t)(k * 13 + 5);
+            if (ext2_write_path(bd_read, bd_write, 0, 0, "/CONV.BIN", orig, sizeof orig) != (long)sizeof orig) {
+                fprintf(stderr, "FAIL convert: extent create failed\n"); return 1;
+            }
+            {   /* it must really be extent-mapped, or the test proves nothing */
+                ext2_t cv; uint8_t cin[256]; int isd = 0;
+                if (ext2_open(bd_read, 0, 0, &cv) < 0) { fprintf(stderr, "FAIL convert: reopen\n"); return 1; }
+                uint32_t cino = walk(&cv, "/CONV.BIN", cin, &isd);
+                if (!cino || !(e_rd32(cin + 32) & EXT4_EXTENTS_FL)) {
+                    fprintf(stderr, "FAIL convert: /CONV.BIN is not extent-mapped to begin with\n"); return 1;
+                }
+            }
+            uint8_t add[1000];
+            for (int k = 0; k < 1000; k++) add[k] = (uint8_t)(k * 7 + 3);
+            if (ext2_pwrite_path(bd_read, bd_write, 0, 0, "/CONV.BIN", sizeof orig, add, sizeof add) != (long)sizeof add) {
+                fprintf(stderr, "FAIL convert: append to an extent file failed\n"); return 1;
+            }
+            static uint8_t back[21000];
+            long cr = ext2_read_path(bd_read, 0, 0, "/CONV.BIN", back, sizeof back);
+            if (cr != 21000) { fprintf(stderr, "FAIL convert: read back %ld, expected 21000\n", cr); return 1; }
+            if (memcmp(back, orig, sizeof orig)) { fprintf(stderr, "FAIL convert: the original 20000 bytes did not survive conversion\n"); return 1; }
+            if (memcmp(back + sizeof orig, add, sizeof add)) { fprintf(stderr, "FAIL convert: appended bytes wrong\n"); return 1; }
+            printf("pwrite convert (M1934): appended to an extent-mapped file -- rebuilt as indirect, all 20000 original bytes intact\n");
+        }
+    }
+
     printf("PASS\n");
     return 0;
 }

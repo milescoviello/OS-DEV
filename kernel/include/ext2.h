@@ -26,6 +26,14 @@ int  ext2_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char 
  * missing/full, or there's no space. Direct + single-indirect extents only. M1132. */
 long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, const void *buf, unsigned long len);   /* create OR overwrite (M1132/M1135) */
+/* STREAMING write: place len bytes at byte offset `off`, creating the file if
+ * absent and extending it as needed. Unlike ext2_write_path this never needs
+ * the whole file in memory — only the touched blocks are read/modified/written,
+ * so an arbitrarily large file can be built from a small buffer. Writing past
+ * EOF leaves a real sparse hole (unmapped blocks read as zeroes). Reaches
+ * double-indirect = 4 GiB at a 4 KiB block size. Bytes written, or -1. M1934. */
+long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                      const char *path, uint64_t off, const void *buf, unsigned long len);
 long ext2_unlink_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path);                                      /* delete a regular file; 0/-1 (M1135) */
 long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
