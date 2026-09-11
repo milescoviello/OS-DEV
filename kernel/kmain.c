@@ -722,6 +722,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * `cat` and an `ls` need. Drives the next ENOSYS batch. */
             kprintf("[lxabi] launching a glibc file-I/O binary...\n");
             app_spawn_linux_from_file("/disk2/lxfileio");
+            /* Phase 3's real deliverable: a busybox-shaped multi-call binary
+             * that FORKS, re-EXECVEs ITSELF twice with different argv, wires
+             * the two together with a real PIPE, and wait4()s both. */
+            kprintf("[lxabi] launching the fork/execve/pipe demo...\n");
+            app_spawn_linux_from_file_arg("/disk2/lxbox", "pipe");
         }
     }
 

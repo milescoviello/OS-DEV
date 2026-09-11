@@ -21,7 +21,10 @@
 extern linux_syscall_dispatch
 global linux_syscall_entry
 linux_syscall_entry:
-    swapgs                          ; GS base -> this core's per-CPU block
+    ; No swapgs (M1949). GS_BASE permanently holds this core's per-CPU block,
+    ; because swapgs required an entry/exit PAIR and GS_BASE is a per-core MSR
+    ; that nothing saves across a context switch -- a syscall that blocked had
+    ; its GS_BASE changed underneath it by another task's exit swapgs.
     mov [gs:8], rsp                 ; stash the user RSP in the scratch slot
     mov rsp, [gs:0]                 ; ... and take this core's kernel stack
 
@@ -74,6 +77,5 @@ linux_syscall_entry:
     pop rbx
     pop rax
     add rsp, 16                     ; discard int_no + err_code
-    swapgs                          ; user GS base back
     iretq                           ; rip/cs/rflags/rsp/ss -- honours any frame
                                     ; edit the dispatcher made (signals, exec)

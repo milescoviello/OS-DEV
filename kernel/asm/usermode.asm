@@ -31,8 +31,25 @@ enter_user:
     mov ax, 0x23                     ; USER_DS (ring 3 data) into the data segs
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
+    ; FS is deliberately NOT reloaded (M1949): loading any FS selector ZEROES
+    ; FS_BASE, which is the thread's TLS pointer. The context switch has just
+    ; restored it (load_fs_base), so reloading the selector here wiped it
+    ; microseconds later -- a forked child inherited its parent's TLS base and
+    ; then entered ring 3 with FS_BASE = 0, so its first %fs access read a
+    ; small absolute address. glibc's _Fork does exactly that (`mov %fs:0x10`)
+    ; and page faulted with err=0x5: a ring-3 read of address 0x10, present in
+    ; the low identity map but with no PTE_USER.
+    ;
+    ; Worse, loaded_fs_base[core] still believed the MSR held the right value,
+    ; so a later load_fs_base() would SKIP the write and leave it zeroed.
+    ; In long mode the DS/ES/FS/GS selectors are not used for access checks --
+    ; only FS/GS BASE matters -- so leaving FS alone is correct, and
+    ; load_fs_base() on every context switch is the single authority.
+    ; GS is deliberately NOT reloaded (M1949): loading any GS selector ZEROES
+    ; GS_BASE, and GS_BASE permanently holds this core's Linux-ABI per-CPU
+    ; pointer. In long mode the DS/ES/FS/GS selectors are not used for access
+    ; checks anyway -- only FS/GS BASE matters -- so leaving it is harmless,
+    ; and ring 3 cannot read through it (the block has no PTE_USER).
 
     pushfq                           ; take current RFLAGS...
     pop rax

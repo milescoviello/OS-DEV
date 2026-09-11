@@ -209,6 +209,25 @@ static void load_fs_base(uint64_t b) {
 /* Set the CURRENT thread's TLS base (live + saved for restore). M1140. */
 void task_set_fs_base(uint64_t b) { current->fs_base = b; load_fs_base(b); }
 
+/* Inherit the TLS base (and robust-futex list) from `src` into `dst` -- for
+ * fork(), whose child MUST see the parent's %fs base (M1949).
+ *
+ * fork copies the address space, so the child's thread-control block sits at
+ * the SAME address; but the base lives in a per-task MSR shadow, and
+ * task_create_stack kzallocs a fresh task_t, so the child got fs_base = 0.
+ * Any TLS access in the child then dereferences a small absolute address:
+ * glibc's _Fork reads %fs:0x10 immediately after clone returns 0 and page
+ * faulted with err=0x5 -- a ring-3 read of address 0x10, which is present in
+ * the low identity map but has no PTE_USER. This affects ANY task that uses
+ * TLS and forks, not only Linux ones. */
+uint64_t task_fs_base(void) { return current ? current->fs_base : 0; }
+
+void task_copy_tls(task_t *dst, task_t *src) {
+    if (!dst || !src) return;
+    dst->fs_base = src->fs_base;
+    dst->robust  = src->robust;
+}
+
 /* Register the CURRENT thread's userspace robust-futex list (M1141). */
 void task_set_robust(uint64_t r) { current->robust = r; }
 uint64_t task_robust(void) { return current->robust; }

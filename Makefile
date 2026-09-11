@@ -185,7 +185,12 @@ $(LXROOT)/lxfileio: tools/lx/lxfileio.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (glibc file I/O + directory listing)"
 
-LXBINS := $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio
+$(LXROOT)/lxbox: tools/lx/lxbox.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (busybox-shaped multi-call binary: fork/execve/pipe)"
+
+LXBINS := $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox
 
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a

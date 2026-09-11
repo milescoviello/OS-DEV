@@ -85,7 +85,9 @@ task_t *task_self(void);                   /* the currently running task */
  * pin_core to restore; nests correctly with an already-pinned caller. */
 int     task_pin_here(void);
 void    task_unpin(int saved_pin_core);
-void    task_set_fs_base(uint64_t b);      /* set the current thread's %fs (TLS) base (M1140) */
+void    task_set_fs_base(uint64_t b);
+void    task_copy_tls(task_t *dst, task_t *src);
+uint64_t task_fs_base(void);   /* fork: the child inherits the parent's %fs (TLS) base + robust list (M1949) */      /* set the current thread's %fs (TLS) base (M1140) */
 void    task_set_robust(uint64_t r);       /* register the current thread's robust-futex list (M1141) */
 uint64_t task_robust(void);                /* the current thread's robust-list ptr (0 = none) (M1141) */
 void    task_block(void);                  /* block current task until woken */

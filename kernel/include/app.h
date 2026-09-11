@@ -16,7 +16,13 @@ int         app_spawn_named_arg(const char *name, const char *arg);  /* launch w
 int         app_getarg(char *out, int max);      /* read the calling app's launch arg; returns length */
 int         app_list_names(char *buf, int max);  /* space-separated prog names; bytes written */
 int         app_spawn_from_file(const char *path);/* load + run an ELF from a FAT32 file */
-int         app_spawn_linux_from_file(const char *path);  /* a LINUX static-PIE binary: same loader, but a real SysV initial stack with argc/argv/envp/auxv (M1940) */
+int         app_spawn_linux_from_file(const char *path);
+int         app_spawn_linux_from_file_arg(const char *path, const char *arg);  /* + a one-shot arg that becomes argv[1] (M1948) */
+/* Forward-declared HERE, not just at line ~107: a struct first mentioned inside
+ * a prototype gets PROTOTYPE scope, which makes it a different type from the
+ * file-scope one declared later -- "conflicting types" at the definition. */
+struct registers;
+long        app_execve_linux(struct registers *r, const char *path, const char *const *argv, const char *const *envp);  /* Linux execve(2): replace this image, enter with a SysV stack; returns only on failure (M1948) */
 app_t      *app_take_pending(void);              /* next app awaiting a window (WM)    */
 void        app_browse(const char *url);         /* queue a URL for a browser window   */
 int         app_take_browse(char *out, int max); /* WM claims a queued browse URL; 0/1 */
@@ -200,6 +206,7 @@ long app_fcntl(int fd, int cmd, long arg);                 /* F_GETFD/SETFD/DUPF
 int  app_dup3(int oldfd, int newfd, int flags);            /* dup w/ O_CLOEXEC; -1 if old==new (M1218) */
 long app_close_range(unsigned lo, unsigned hi, int flags); /* close fds in [lo,hi]; 0/-1 (M1218) */
 long app_sendfile(int out_fd, int in_fd, long *off, unsigned long count); /* zero-copy fd->fd; bytes/-1 (M1219) */
+int  app_fd_is_open(int fd);        /* is fd a live fd-table entry? distinguishes a dup2'd stdio fd from an untouched one (M1949) */
 const char *app_fd_path(int fd);                           /* path behind a FILE fd (type 2), or 0 (M1221) */
 int  app_pidfd_open(int pid);                              /* a pollable process-exit handle (>=3); -1 (M1222) */
 int  app_pidfd_send_signal(int pidfd, int sig);            /* signal the pidfd's process; 0/-1 (M1222) */

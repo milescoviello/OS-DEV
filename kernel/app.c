@@ -289,6 +289,14 @@ static char     g_jail_path[64];
  * one-shot shape as g_pend_arg/g_pend_jail. (M1940) */
 static volatile int g_pend_linux;
 static char         g_pend_lxpath[256];
+/* One-shot image override for Linux execve(2) (M1948). app_exec resolves names
+ * in the compiled-in progs[] table, which a Linux binary is obviously not in.
+ * Rather than duplicate app_exec's ~70-line CR3-swap body -- the riskiest code
+ * in the file -- execve stages the already-read image here and app_exec uses it
+ * instead of the table. argv non-NULL also selects the LINUX entry convention:
+ * a System V initial stack instead of our native single launch_arg. */
+static const void *g_exec_img; static uint64_t g_exec_imgsz;
+static const char *const *g_exec_argv; static const char *const *g_exec_envp;
 
 /* text-colour palette for apps (index 0 = the default green, so an app that never
  * calls SYS_setcolor renders byte-identically). Vivid hues on the dark app background. */
@@ -3643,8 +3651,13 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
      * its stack pages are mapped -- and start it at the frame instead of at a
      * bare stack top. (M1940) */
     if (take_linux) {
-        static const char *argv0[2], *envp0[4];
-        argv0[0] = g_pend_lxpath; argv0[1] = 0;
+        static const char *argv0[3], *envp0[4];
+        argv0[0] = g_pend_lxpath;
+        /* The native one-shot launch arg (g_pend_arg, consumed into
+         * a->launch_arg above) becomes argv[1] for a Linux binary -- that is
+         * how a multi-call binary is told which applet to be. */
+        argv0[1] = a->launch_arg[0] ? a->launch_arg : 0;
+        argv0[2] = 0;
         envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/"; envp0[2] = "TERM=osdev"; envp0[3] = 0;
         uint64_t rsp = lx_spawn_stack(elf, ELF_DYN_BASE, a->entry, a->ustack,
                                       USTACK_BASE + PAGE_SIZE, argv0, envp0);
@@ -4367,6 +4380,14 @@ long app_close_range(unsigned lo, unsigned hi, int flags) {
  * *off < 0, read sequentially via the fd cursor (any fd kind). Returns bytes
  * copied, or -1. Loops in 4 KiB chunks; stops at EOF or a short write. */
 /* The file path behind a FILE fd (type 2), for fcntl record locks (M1221). */
+/* Is `fd` a live entry in the calling app's fd table? Lets the Linux ABI tell
+ * a REDIRECTED stdio fd (dup2'd onto a pipe) from an untouched one, which must
+ * still go to the console. (M1949) */
+int app_fd_is_open(int fd) {
+    struct app *a = cur();
+    return (a && fd >= 0 && fd < APP_NFD && a->fd[fd].used) ? 1 : 0;
+}
+
 const char *app_fd_path(int fd) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 2) return 0;
@@ -4746,6 +4767,7 @@ long app_fork(struct registers *r) {
     if (!a->task) { vmm_destroy_address_space(a->cr3); a->used = 0; return -1; }
     /* copy the parent's live FP/SSE state so a child mid-float-computation is correct */
     task_copy_fpu(a->task, p->task);
+    task_copy_tls(a->task, p->task);   /* the child must see the parent's %fs base (M1949) */
 
     /* give the child its own window (the WM consumes the pending queue) */
     int n = (pend_h + 1) % MAX_APPS;
@@ -4854,6 +4876,8 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
         while (*pa && *pb) { if (*pa++ != *pb++) { eq = 0; break; } }
         if (eq && !*pa && !*pb) { elf = progs[i].elf; title = progs[i].title; break; }
     }
+    uint64_t img_sz = ~0ull;
+    if (g_exec_img) { elf = g_exec_img; img_sz = g_exec_imgsz; title = name; }   /* execve (M1948) */
     if (!elf) return -1;                                /* no such program */
 
     uint64_t new_cr3 = vmm_create_address_space();
@@ -4871,7 +4895,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");   /* become the new space */
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
-    uint64_t entry = elf_load(elf, ~0ull, lazy, 4, &nlazy);
+    uint64_t entry = elf_load(elf, img_sz, lazy, 4, &nlazy);
     if (!entry) goto fail;
     for (int i = 1; i < USTACK_PAGES; i++) {   /* i=0 = unmapped guard page below the user stack (M1499) */
         uint64_t frame = pmm_alloc_frame();
@@ -4885,6 +4909,16 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     vmm_destroy_address_space(old_cr3);
     a->cr3 = new_cr3; a->task->cr3 = new_cr3;
     a->entry = entry; a->ustack = USTACK_BASE + USTACK_PAGES * PAGE_SIZE;
+
+    /* A Linux execve needs argc/argv/envp/auxv on the stack, built HERE while
+     * the new address space is active and its stack pages are mapped -- the
+     * same frame app_spawn builds, but with the caller's argv rather than a
+     * synthesised one. (M1948) */
+    if (g_exec_argv) {
+        uint64_t rsp = lx_spawn_stack(elf, ELF_DYN_BASE, entry, a->ustack,
+                                      USTACK_BASE + PAGE_SIZE, g_exec_argv, g_exec_envp);
+        if (rsp) a->ustack = rsp;       /* if it will not fit, fall back to a bare stack */
+    }
 
     /* reset per-program state (the new image starts clean); keep pid/parent/pledge */
     a->heap_end = 0; a->nvma = 0; a->mlock_future = 0;   /* mlockall(MCL_FUTURE) does not survive exec (M1283) */
@@ -5171,6 +5205,44 @@ long app_ptrace(long req, int pid, uint64_t addr, uint64_t data) {
 /* Load and run a LINUX static-PIE binary from a file. Same loader as our own
  * ELFs -- elf_load already dispatches ET_DYN to the PIE path -- but the new
  * process gets a real SysV initial stack, which a libc reads before main. */
+/* Linux execve(2): replace this process's image with the ELF at `path`, and
+ * enter it with a real System V stack carrying `argv`/`envp`. Reuses app_exec's
+ * address-space machinery through the one-shot override above rather than
+ * duplicating it. Returns only on FAILURE -- on success the trap frame has been
+ * rewritten and the iretq at the end of the syscall enters the new image.
+ * (M1948) */
+long app_execve_linux(struct registers *r, const char *path,
+                      const char *const *argv, const char *const *envp) {
+    if (!r || !path) return -1;
+    /* Read the image BEFORE touching any process state: a failed read must
+     * leave the caller running, which is what execve promises. */
+    const unsigned long CAP = 8u << 20;
+    uint8_t *buf = kmalloc(CAP);
+    if (!buf) return -1;
+    long n = vfs_read(path, buf, CAP);
+    if (n <= 0) { kfree(buf); return -1; }
+
+    g_exec_img = buf; g_exec_imgsz = (uint64_t)n;
+    g_exec_argv = argv; g_exec_envp = envp;
+    long rc = app_exec(r, path, 0);
+    g_exec_img = 0; g_exec_imgsz = 0; g_exec_argv = 0; g_exec_envp = 0;
+
+    /* Safe either way: app_exec copies the segments into the new address space
+     * synchronously, so the image buffer is dead by the time it returns. */
+    kfree(buf);
+    return rc;
+}
+
+int app_spawn_linux_from_file_arg(const char *path, const char *arg) {
+    /* Same one-shot the native app_spawn_named_arg uses; app_spawn consumes it
+     * into a->launch_arg, which the Linux stack builder turns into argv[1]. */
+    int ai = 0; if (arg) while (arg[ai] && ai < 127) { g_pend_arg[ai] = arg[ai]; ai++; }
+    g_pend_arg[ai] = 0; g_have_pend = 1;
+    int rc = app_spawn_linux_from_file(path);
+    if (rc < 0) g_have_pend = 0;          /* spawn failed: don't leak the arg */
+    return rc;
+}
+
 int app_spawn_linux_from_file(const char *path) {
     int i = 0; while (path[i] && i < (int)sizeof g_pend_lxpath - 1) { g_pend_lxpath[i] = path[i]; i++; }
     g_pend_lxpath[i] = 0;

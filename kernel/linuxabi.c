@@ -50,6 +50,7 @@
 #define MSR_STAR            0xC0000081u
 #define MSR_LSTAR           0xC0000082u
 #define MSR_SFMASK          0xC0000084u
+#define MSR_GS_BASE         0xC0000101u
 #define MSR_KERNEL_GS_BASE  0xC0000102u
 
 static inline uint64_t rdmsr(uint32_t m) {
@@ -84,7 +85,9 @@ void linux_abi_set_kernel_rsp(int cpu, uint64_t rsp) {
 
     /* Re-assert KERNEL_GS_BASE too (M1943).
      *
-     * `swapgs` is only self-restoring when every entry is PAIRED with an exit,
+     * (M1943, superseded by M1949's no-swapgs design but kept armed here
+     * because a context switch is still the cheapest place to re-assert it.)
+     * `swapgs` was only self-restoring when every entry was PAIRED with an exit,
      * and a syscall that never returns breaks the pair: exit_group calls
      * task_exit(), so the closing swapgs in the entry stub never executes.
      * KERNEL_GS_BASE is then left holding the USER's base (0, since
@@ -101,8 +104,8 @@ void linux_abi_set_kernel_rsp(int cpu, uint64_t rsp) {
      * Re-asserting here makes the invariant self-healing: a task can only reach
      * a syscall after being switched to, and this runs on every switch. The
      * rdmsr guard keeps the common case to a read rather than a write. */
-    if (rdmsr(MSR_KERNEL_GS_BASE) != (uint64_t)&lx_pc[i])
-        wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)&lx_pc[i]);
+    if (rdmsr(MSR_GS_BASE) != (uint64_t)&lx_pc[i])
+        wrmsr(MSR_GS_BASE, (uint64_t)&lx_pc[i]);
 }
 
 extern void linux_syscall_entry(void);
@@ -114,11 +117,24 @@ extern void linux_syscall_entry(void);
 void linux_abi_init_this_cpu(void) {
     int cpu = smp_current_cpu() & (LX_MAXCPUS - 1);
 
-    /* KERNEL_GS_BASE, not GS_BASE: ring 3 owns GS_BASE (and `mov gs, ax` in
-     * iret_to_user zeroes it on every fork-child/thread entry), so the entry
-     * stub's `swapgs` brings ours in and the matching one on return puts the
-     * user's back. */
-    wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)&lx_pc[cpu]);
+    /* The ACTIVE GS_BASE, and NO swapgs anywhere (M1949).
+     *
+     * The swapgs design was wrong in a way two fixes did not reach. swapgs is
+     * only correct if every entry is paired with an exit AND nothing disturbs
+     * GS_BASE in between -- but GS_BASE is a per-CORE MSR that NOTHING SAVES
+     * ACROSS A CONTEXT SWITCH. So if a Linux syscall blocks mid-call, another
+     * task's exit swapgs changes GS_BASE underneath it; the blocked syscall's
+     * own exit swapgs then writes garbage into KERNEL_GS_BASE, and the next
+     * entry loads that garbage. Symptom: `mov %gs:0, %rsp` reading absolute
+     * address 0 and a DOUBLE FAULT with rsp=0xf000ff53f000ff53 (the real-mode
+     * IVT). M1943 fixed one instance of the pairing problem; this removes the
+     * requirement altogether.
+     *
+     * Keeping the percpu pointer in the live GS_BASE at all times means the
+     * stub needs no swapgs and there is nothing to get out of sync. Ring 3
+     * cannot read through it: the percpu block is kernel .bss with no
+     * PTE_USER, so a ring-3 `mov %gs:0,%rax` faults rather than leaking. */
+    wrmsr(MSR_GS_BASE, (uint64_t)&lx_pc[cpu]);
 
     /* STAR[47:32] = the CS the CPU loads on SYSCALL; SS becomes that + 8.
      * KERNEL_CS is 0x08 and KERNEL_DS is 0x10, so this GDT already satisfies
@@ -187,6 +203,17 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_newfstatat   262
 #define LXS_unlink_       87
 #define LXS_unlinkat_    263
+#define LXS_clone_        56
+#define LXS_fork_         57
+#define LX_CLONE_VM   0x00000100
+#define LXS_vfork_        58
+#define LXS_execve_       59
+#define LXS_wait4_        61
+#define LXS_pipe_         22
+#define LXS_pipe2_       293
+#define LXS_dup2_         33
+#define LXS_dup_          32
+#define LXS_getppid_     110
 
 /* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
  * 8 here, O_TRUNC 01000 (512) vs 4. Passing them through unmapped would silently
@@ -247,7 +274,12 @@ void linux_syscall_dispatch(struct registers *r) {
 
     switch (r->rax) {
     case LXS_write: {                       /* (fd, buf, count) */
-        if (a1 != 1 && a1 != 2) {           /* a real file fd: straight to the fd table */
+        /* fd 1/2 are the console ONLY while untouched. After dup2() onto a
+         * pipe they are real fd-table entries and must go there -- routing
+         * them to the console regardless is why the first pipeline attempt
+         * produced "LXBOX-WC: 0": the writer's output went to the screen
+         * instead of down the pipe, so the reader saw EOF immediately. */
+        if ((a1 != 1 && a1 != 2) || app_fd_is_open((int)a1)) {
             if (a3 < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
             if (a3 && !vmm_user_ok(r->rsi, (uint64_t)a3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             long w = app_fd_write((int)a1, (const void *)r->rsi, (unsigned long)a3);
@@ -291,7 +323,7 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_arch_prctl:
         /* musl sets up its thread pointer here before main; refusing it is
          * fatal, because every later TLS access reads through %fs. */
-        if (a1 == ARCH_SET_FS) { task_set_fs_base(r->rsi); r->rax = 0; }
+        if (a1 == ARCH_SET_FS) { kprintf("[lxdbg] ARCH_SET_FS 0x%lx\n", (unsigned long)r->rsi); task_set_fs_base(r->rsi); r->rax = 0; }
         else                    r->rax = (uint64_t)-(long)LX_EINVAL;
         break;
     case LXS_set_tid_address:
@@ -522,6 +554,92 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)used;            /* 0 = end of directory */
         break;
     }
+    case LXS_clone_:
+        /* glibc's fork() does NOT call fork(57) -- it calls clone(56). Linux
+         * clone is (flags, stack, ptid, ctid, tls); a NULL child stack plus no
+         * CLONE_VM is exactly fork semantics, which is the only shape served
+         * here. A thread clone (CLONE_VM with a real stack) needs the flags
+         * plumbing our native app_clone lacks, so it is refused rather than
+         * quietly turned into a process -- silently forking where a caller
+         * expected a shared address space would corrupt it. */
+        if (!(r->rdi & LX_CLONE_VM) && r->rsi == 0) { r->rax = (uint64_t)app_fork(r); break; }
+        r->rax = (uint64_t)-(long)LX_ENOSYS;
+        break;
+    case LXS_fork_:
+    case LXS_vfork_:
+        /* vfork is served by a real fork. The difference (sharing the parent's
+         * memory and suspending it) is an optimisation; a plain fork is always
+         * a CORRECT implementation of it, and ours is already COW. */
+        r->rax = (uint64_t)app_fork(r);
+        break;
+    case LXS_execve_: {                     /* (path, argv[], envp[]) */
+        const char *path = (const char *)r->rdi;
+        if (!path || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* Copy argv/envp into KERNEL memory before exec'ing. The vectors live
+         * in the OLD address space, which app_execve_linux tears down partway
+         * through -- reading them afterwards would be a use-after-free of an
+         * entire address space. */
+        static char abuf[16][256]; static const char *av[17];
+        static char ebuf[16][256]; static const char *ev[17];
+        int na = 0, ne = 0;
+        const char *const *uav = (const char *const *)r->rsi;
+        const char *const *uev = (const char *const *)r->rdx;
+        if (uav && vmm_user_ok(r->rsi, sizeof(char *))) {
+            for (; na < 16 && uav[na]; na++) {
+                const char *sp = uav[na]; int k = 0;
+                if (!vmm_user_ok((uint64_t)sp, 1)) break;
+                while (sp[k] && k < 255) { abuf[na][k] = sp[k]; k++; }
+                abuf[na][k] = 0; av[na] = abuf[na];
+            }
+        }
+        av[na] = 0;
+        if (uev && vmm_user_ok(r->rdx, sizeof(char *))) {
+            for (; ne < 16 && uev[ne]; ne++) {
+                const char *sp = uev[ne]; int k = 0;
+                if (!vmm_user_ok((uint64_t)sp, 1)) break;
+                while (sp[k] && k < 255) { ebuf[ne][k] = sp[k]; k++; }
+                ebuf[ne][k] = 0; ev[ne] = ebuf[ne];
+            }
+        }
+        ev[ne] = 0;
+        static char pbuf[256];
+        { int k = 0; while (path[k] && k < 255) { pbuf[k] = path[k]; k++; } pbuf[k] = 0; }
+        if (app_execve_linux(r, pbuf, av, ev) < 0)
+            r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
+        break;
+    }
+    case LXS_wait4_: {                      /* (pid, status*, options, rusage*) */
+        int st = 0;
+        long got = app_waitpid((int)a1, &st);
+        if (got < 0) { r->rax = (uint64_t)-(long)LX_ECHILD; break; }
+        if (r->rsi) {
+            if (!vmm_user_ok(r->rsi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            /* Linux packs the exit code into bits 8-15 and leaves the low byte
+             * for the terminating signal, which is what WEXITSTATUS/WIFEXITED
+             * decode. Handing back the raw code would make WIFEXITED false and
+             * WEXITSTATUS read as 0 -- a silently wrong status, not an error. */
+            *(int *)r->rsi = (st & 0xFF) << 8;
+        }
+        r->rax = (uint64_t)got;
+        break;
+    }
+    case LXS_pipe_:
+    case LXS_pipe2_: {                      /* (int fds[2] [, flags]) */
+        if (!vmm_user_ok(r->rdi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int fds[2];
+        if (app_pipe2(fds, 0) < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        ((int *)r->rdi)[0] = fds[0]; ((int *)r->rdi)[1] = fds[1];
+        r->rax = 0;
+        break;
+    }
+    case LXS_dup2_: {
+        int nf = app_dup2((int)a1, (int)r->rsi);
+        r->rax = (nf < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)nf;
+        break;
+    }
+    case LXS_getppid_:
+        r->rax = (uint64_t)app_sys_getppid();
+        break;
     case LXS_exit:
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);
