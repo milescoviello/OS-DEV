@@ -292,7 +292,7 @@ void linux_syscall_dispatch(struct registers *r) {
          * ring 3 make the kernel read arbitrary memory and print it. */
         if (a3 < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (a3 && !vmm_user_ok(r->rsi, (uint64_t)a3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        for (long i = 0; i < a3; i++) console_putc(p2[i]);
+        console_write_n(p2, (unsigned long)a3);   /* lock once: no splicing (M1952) */
         r->rax = (uint64_t)a3;
         break;
     }
@@ -323,7 +323,7 @@ void linux_syscall_dispatch(struct registers *r) {
                 if (w < 0) { r->rax = (uint64_t)-(long)LX_EPIPE; goto done; }
                 total += w;
             } else {
-                for (unsigned long k = 0; k < n; k++) console_putc(b[k]);
+                console_write_n(b, n);                /* lock once: no splicing (M1952) */
                 total += (long)n;
             }
         }
@@ -522,7 +522,14 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     case LXS_lseek_: {                      /* (fd, offset, whence) -- SET/CUR/END match */
         long off = app_lseek((int)a1, (long)r->rsi, (int)r->rdx);
-        r->rax = (off < 0) ? (uint64_t)-(long)LX_EINVAL : (uint64_t)off;
+        if (off >= 0) { r->rax = (uint64_t)off; break; }
+        /* ESPIPE, not EINVAL, when the fd is simply not seekable. stdio probes
+         * seekability with an lseek before its first read, and ESPIPE is the
+         * documented "this is a pipe" answer it expects and shrugs off --
+         * EINVAL reads as a real error and leaves the stream unusable, so
+         * glibc never issued a single read() on a dup2'd pipe stdin and a
+         * pipeline's reader silently saw nothing at all. */
+        r->rax = (uint64_t)-(long)(app_fd_is_open((int)a1) ? LX_ESPIPE : LX_EBADF);
         break;
     }
     case LXS_newfstatat: {                  /* (dirfd, path, statbuf, flags) */
@@ -607,8 +614,16 @@ void linux_syscall_dispatch(struct registers *r) {
          * in the OLD address space, which app_execve_linux tears down partway
          * through -- reading them afterwards would be a use-after-free of an
          * entire address space. */
-        static char abuf[16][256]; static const char *av[17];
-        static char ebuf[16][256]; static const char *ev[17];
+        /* NOT static. These were shared across every process, so two execves
+         * in flight RACED on them: both children of a pipeline ended up with
+         * the SAME argv, so both ran the writer applet -- one writing to the
+         * pipe and one to the console -- and the reader never ran at all.
+         * Stack-allocated is correct and safe: the syscall frame stays live
+         * through app_exec (which switches CR3 but not the kernel stack), and
+         * lx_spawn_stack copies the strings into the new user stack before it
+         * returns. ~8 KiB against an app task's 256 KiB kernel stack. */
+        char abuf[16][256]; const char *av[17];
+        char ebuf[16][256]; const char *ev[17];
         int na = 0, ne = 0;
         const char *const *uav = (const char *const *)r->rsi;
         const char *const *uev = (const char *const *)r->rdx;
@@ -630,7 +645,7 @@ void linux_syscall_dispatch(struct registers *r) {
             }
         }
         ev[ne] = 0;
-        static char pbuf[256];
+        char pbuf[256];
         { int k = 0; while (path[k] && k < 255) { pbuf[k] = path[k]; k++; } pbuf[k] = 0; }
         if (app_execve_linux(r, pbuf, av, ev) < 0)
             r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */

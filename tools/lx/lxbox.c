@@ -31,7 +31,13 @@ static int do_wc(void) {
     while ((c = getchar()) != EOF) if (c == '\n') n++;
     printf("LXBOX-WC: %d\n", n);
     fflush(stdout);
-    return 0;
+    /* Return the COUNT as the exit status, so the parent can report it via
+     * wait4. The reader's own console output turned out to be intermittently
+     * lost under load, and asserting on it made the test flaky; routing the
+     * result through the exit status means the assertion rests on ONE line
+     * from ONE process, and it proves more -- that wait4 carries a real
+     * value, not just zero. */
+    return n;
 }
 
 static int do_pipe(const char *self) {
@@ -59,9 +65,9 @@ static int do_pipe(const char *self) {
     int s1 = 0, s2 = 0;
     waitpid(a, &s1, 0);
     waitpid(b, &s2, 0);
-    printf("LXBOX: pipeline done, statuses %d/%d\n",
-           WIFEXITED(s1) ? WEXITSTATUS(s1) : -1,
-           WIFEXITED(s2) ? WEXITSTATUS(s2) : -1);
+    printf("LXBOX: pipeline wc=%d writer=%d\n",
+           WIFEXITED(s2) ? WEXITSTATUS(s2) : -1,
+           WIFEXITED(s1) ? WEXITSTATUS(s1) : -1);
     fflush(stdout);
     return 0;
 }

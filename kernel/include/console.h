@@ -11,6 +11,7 @@
 void console_init(void);
 void console_putc(char c);
 void console_write(const char *s);
+void console_write_n(const char *s, unsigned long n);   /* n bytes, console lock held ONCE -- no mid-string splicing (M1952) */
 void console_enable_gfx(void);   /* route output to the framebuffer console */
 
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

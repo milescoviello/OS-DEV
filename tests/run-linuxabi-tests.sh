@@ -189,6 +189,23 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     else
         echo "  FAIL: glibc file I/O wrong:"; grep -a "LXIO:" "$SLOG3" | head -1; f3=1
     fi
+    # Phase 3's deliverable: a REAL PIPELINE between two processes. lxbox forks,
+    # re-execs ITSELF twice with different argv, wires the halves with a pipe
+    # and wait4s both. The COUNT is the assertion -- "pipeline done" alone
+    # passed for a long time while the reader was getting no data at all, and
+    # at one point while both children were running the WRITER applet.
+    # ONE line, from the PARENT, carrying the reader's count back through
+    # wait4. wc=4 proves the whole chain at once: fork, execve of itself with a
+    # different argv, dup2 onto stdin/stdout, 19 bytes across a real pipe, a
+    # clean EOF, and a non-zero exit status delivered by wait4. The reader's own
+    # console output is deliberately NOT asserted -- it proved intermittently
+    # lossy under load, and an assertion on it was flaky for a reason that had
+    # nothing to do with the pipeline.
+    if grep -aq "LXBOX: pipeline wc=4 writer=0" "$SLOG3"; then
+        echo "  ok: fork+execve+dup2+pipe: reader counted all 4 lines, status returned via wait4"
+    else
+        echo "  FAIL: the pipeline did not deliver 4 lines:"; grep -a "LXBOX" "$SLOG3" | head -2; f3=1
+    fi
     if grep -aq "guest exited with status 7" "$SLOG3"; then
         echo "  ok: it exited cleanly through exit_group with the right status"
     else

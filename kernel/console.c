@@ -173,6 +173,18 @@ static inline void con_give(int held, uint64_t f) {
     if (held) { con_owner = -1; __atomic_store_n(&con_lock, 0, __ATOMIC_RELEASE); }
 }
 
+/* Write exactly `n` bytes, taking the console lock ONCE for the whole run
+ * (M1952). console_putc is the unlocked primitive, so a caller looping over it
+ * per character can be spliced mid-string by any other task's output -- the
+ * same failure M1913 fixed for kprintf. The Linux ABI's write()/writev() hit
+ * this: a program's line came out with kernel log text inserted into the
+ * middle of it, which is both unreadable and invisible to a log assertion. */
+void console_write_n(const char *s, unsigned long n) {
+    uint64_t f; int held = con_take(&f);
+    for (unsigned long i = 0; i < n; i++) console_putc(s[i]);
+    con_give(held, f);
+}
+
 void console_write(const char *s) {
     uint64_t f; int held = con_take(&f);
     for (; *s; s++)
