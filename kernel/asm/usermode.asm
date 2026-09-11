@@ -43,6 +43,42 @@ enter_user:
     push rax                         ; RFLAGS
     push 0x1B                        ; CS  = USER_CS
     push rdi                         ; RIP = entry point
+
+    ; Zero every general-purpose register before crossing into ring 3 (M1945).
+    ; The iret frame is already on the stack, so the argument registers have
+    ; been consumed and this is safe. Two independent reasons, both real:
+    ;
+    ; 1) THE ABI REQUIRES IT. The x86-64 System V ABI says %rdx holds a
+    ;    function pointer for the program to register with atexit (rtld_fini)
+    ;    and must be ZERO when there is none. glibc's _start passes %rdx
+    ;    straight to __libc_start_main, which registers it via __cxa_atexit --
+    ;    so a leftover kernel value there is CALLED when the program exits.
+    ;    Measured: a glibc binary faulted on an instruction fetch at
+    ;    0xffff8000fee00000 (the kernel's LAPIC mapping) with the exit status
+    ;    still in %rsi. It was calling our stale register as an exit handler.
+    ;
+    ; 2) IT IS AN INFORMATION LEAK REGARDLESS. Ring 3 previously started with
+    ;    whatever the kernel happened to leave in every register, kernel
+    ;    pointers included -- and that applied to OS-DEV's own apps, not just
+    ;    Linux ones. Nothing in ring 3 has any business reading them.
+    ;
+    ; Only this path zeroes: iret_to_user() restores a FULL saved frame on
+    ; purpose (a fork child must resume with its parent's registers).
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d,  r8d
+    xor r9d,  r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
     iretq                            ; -> ring 3
 
 ; void return_to_kernel(long code /* rdi */)  — does not return to its caller;

@@ -261,6 +261,13 @@ void isr_dispatch(struct registers *r) {
             if (app_signal_deliver(r, 11)) return;  /* SIGSEGV: a registered handler catches the fault */
             kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) -- terminating it\n",
                     exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2);
+            /* Dump the registers for a ring-3 fault too (M1945). The panic path
+             * has always done this, but a userspace fault printed a single line
+             * -- which is exactly the case where you most need to know WHICH
+             * register held the bad value. Chasing a ring-3 jump to a kernel
+             * address, the one line could not distinguish "computed garbage"
+             * from "a kernel pointer was copied into the program". */
+            dump_registers(r);
             app_fault_current(r);  /* dump a core, mark the app exited + task_exit(); does not return */
         }
 
