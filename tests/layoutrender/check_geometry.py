@@ -63,6 +63,10 @@ COL = {
     "floatimg":  (0x33, 0x66, 0xcc),   # LOGO.SVG's blue rect = the floated image
     "wraptext":  (0xfe, 0x19, 0x19),   # span bg = where the wrapping text actually sits
     "cleared":   (0xfe, 0x1a, 0x1a),   # a block with clear:both after the float
+    # --- page 5: box geometry from a STYLESHEET RULE + viewport units (M1929) --
+    "ruleref":   (0xfe, 0x22, 0x22),   # no width -> spans the column (reference)
+    "rulew":     (0xfe, 0x20, 0x20),   # width:300px; margin:0 auto -- from a RULE
+    "rulevw":    (0xfe, 0x21, 0x21),   # width:40vw -- from a RULE
 }
 
 
@@ -314,6 +318,21 @@ def main():
     ck(boxes["cleared"][1] >= fi[3],
        "clear:both drops the next block below the float (cleared top=%d, image bottom=%d)"
        % (boxes["cleared"][1], fi[3]))
+
+    # --- box geometry from a stylesheet RULE + viewport units (M1929) --------
+    # Until now width/margin:auto only worked from an inline style= attribute, so
+    # a stylesheet could not lay a page out at all. The reference block (no width)
+    # gives the column these are measured against, so the vw assertion stays
+    # relative rather than hard-coding a window size.
+    colw = width("ruleref")
+    ck(abs(width("rulew") - 300) <= TOL,
+       "width:300px from a stylesheet rule is honoured (got %d)" % width("rulew"))
+    gl = boxes["rulew"][0] - boxes["ruleref"][0]
+    gr = boxes["ruleref"][2] - boxes["rulew"][2]
+    ck(abs(gl - gr) <= TOL + 1,
+       "margin:0 auto from a stylesheet rule centres it (gaps %d vs %d)" % (gl, gr))
+    ck(abs(width("rulevw") - colw * 40 / 100) <= 8,
+       "width:40vw resolves against the viewport (got %d, column %d)" % (width("rulevw"), colw))
 
     # --- a nested background stays inside its padded parent ------------------
     il, it, ir, ib = boxes["wide_in"]

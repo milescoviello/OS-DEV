@@ -78,10 +78,19 @@ key ret;
 sleep 5;
 shot p4a.ppm;
 sleep 4;
-shot p4b.ppm' >/dev/null 2>&1 || true
+shot p4b.ppm;
+key slash;
+sleep 1.5;
+type file:LAYCHK5.HTM;
+sleep 1.5;
+key ret;
+sleep 5;
+shot p5a.ppm;
+sleep 4;
+shot p5b.ppm' >/dev/null 2>&1 || true
 
 dumps=""
-for f in p1a p1b p2a p2b p3a p3b p4a p4b; do
+for f in p1a p1b p2a p2b p3a p3b p4a p4b p5a p5b; do
     [ -f "$OUT/$f.ppm" ] && dumps="$dumps $OUT/$f.ppm"
 done
 if [ -z "$dumps" ]; then

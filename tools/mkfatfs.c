@@ -248,6 +248,17 @@ static const struct {
     { "LAYCHK4 HTM", "<img src=\"file:LOGO.SVG\" width=\"96\" height=\"96\" style=\"float:left\">"
       "<span style=\"background:#fe1919\">Text beside a left float must begin to the RIGHT of the image and overlap it vertically, rather than starting underneath it at the full column width. These extra words give the paragraph enough lines to span the whole height of the picture so the wrap region is unambiguous.</span>"
       "<div style=\"clear:both;background:#fe1a1a\">cleared</div>" },
+    /* Page 5 of the machine-checked fixture (M1929): box geometry from a
+     * STYLESHEET RULE rather than an inline style=, plus viewport units. Both
+     * were unsupported until now, which is why real pages did not centre. */
+    { "LAYCHK5 HTM", "<style>"
+      "div.f{background:#fe2222}"
+      "div.w{width:300px;margin:0 auto;background:#fe2020}"
+      "div.v{width:40vw;background:#fe2121}"
+      "</style>"
+      "<div class=\"f\">full width reference</div>"
+      "<div class=\"w\">width + margin auto from a rule</div>"
+      "<div class=\"v\">width in vw</div>" },
     { "LOGO    SVG", "<svg width=\"64\" height=\"64\" viewBox=\"0 0 64 64\"><rect x=\"2\" y=\"2\" width=\"60\" height=\"60\" fill=\"#3366cc\"/><circle cx=\"32\" cy=\"32\" r=\"20\" fill=\"#ffcc00\"/><polygon points=\"32,12 52,52 12,52\" fill=\"#cc3333\"/></svg>" },
     { "XFORM   SVG", "<svg width=\"120\" height=\"120\" viewBox=\"0 0 120 120\"><rect width=\"120\" height=\"120\" fill=\"#eef\"/><g transform=\"translate(60,60)\"><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#e33\"/><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#3a3\" transform=\"rotate(90)\"/><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#36c\" transform=\"rotate(180)\"/><rect x=\"0\" y=\"-6\" width=\"46\" height=\"12\" fill=\"#ec0\" transform=\"rotate(270)\"/></g><g transform=\"translate(22,98) scale(1.6)\"><circle cx=\"0\" cy=\"0\" r=\"7\" fill=\"#909\"/></g></svg>" },
     { "ICON    SVG", "<svg width=\"80\" height=\"80\" viewBox=\"0 0 24 24\" fill=\"#22aa77\"><path d=\"M12 2 L2 7 L2 17 L12 22 L22 17 L22 7 Z\"/><circle cx=\"12\" cy=\"12\" r=\"3.5\" fill=\"#ffffff\"/></svg>" },

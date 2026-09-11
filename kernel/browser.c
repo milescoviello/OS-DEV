@@ -164,7 +164,13 @@ struct browser {
     struct { char tag[16]; char cls[32]; int depth; uint32_t savecolor, savebg; int savestyle, setstyle, saveul, savetransform, savealign, savescale, savelh, hidden, saveindent, saveprews; uint8_t hasborder; uint8_t hasflex; uint8_t hasmaxw; uint8_t hasbg; uint8_t padb; uint8_t margb; uint16_t boxh; uint16_t boxminh; uint16_t boxmaxh; uint8_t bordbox; uint8_t ovhidden; } sc[SC_MAX];  /* nested style scopes (color/bg/font-weight/font-style/underline/transform/align/font-size/line-height/display:none/border/flex/block-bg + the element's class, for descendant-selector matching), a stack so nested styled elements compose */
     int     sc_sp;                                              /* number of active style frames (0 = none) */
     int     n_hidden;                                          /* >0 while inside a display:none element: suppress all emission */
-    sel_t   css_sel[CSS_MAX]; uint32_t css_color[CSS_MAX]; int16_t css_style[CSS_MAX]; uint8_t css_ul[CSS_MAX]; uint8_t css_transform[CSS_MAX]; uint32_t css_bg[CSS_MAX]; uint8_t css_align[CSS_MAX]; uint8_t css_size[CSS_MAX]; uint8_t css_disp[CSS_MAX]; uint8_t css_margin[CSS_MAX]; uint8_t css_indent[CSS_MAX]; uint32_t css_border[CSS_MAX]; uint8_t css_list[CSS_MAX]; uint8_t css_lineheight[CSS_MAX]; uint8_t css_ws[CSS_MAX]; uint16_t css_spec[CSS_MAX]; uint16_t css_imp[CSS_MAX]; int n_css;  /* <style> rules: selector -> color / text-style / underline / text-transform / background / text-align / font-size / line-height / display:none / border / list-style-type / specificity */
+    sel_t   css_sel[CSS_MAX]; uint32_t css_color[CSS_MAX]; int16_t css_style[CSS_MAX]; uint8_t css_ul[CSS_MAX]; uint8_t css_transform[CSS_MAX]; uint32_t css_bg[CSS_MAX]; uint8_t css_align[CSS_MAX]; uint8_t css_size[CSS_MAX]; uint8_t css_disp[CSS_MAX]; uint8_t css_margin[CSS_MAX]; uint8_t css_indent[CSS_MAX]; uint32_t css_border[CSS_MAX]; uint8_t css_list[CSS_MAX]; uint8_t css_lineheight[CSS_MAX]; uint8_t css_ws[CSS_MAX]; uint16_t css_spec[CSS_MAX]; uint16_t css_imp[CSS_MAX];
+    /* Box geometry from a STYLESHEET rule (M1929). Until now width and auto
+     * margins could only come from an inline style= attribute, so a rule like
+     * `body{width:60vw;margin:15vh auto}` -- exactly how real pages, example.com
+     * included, centre their content -- did nothing at all. */
+    uint16_t css_w[CSS_MAX]; uint8_t css_mauto[CSS_MAX];
+    int n_css;  /* <style> rules: selector -> color / text-style / underline / text-transform / background / text-align / font-size / line-height / display:none / border / list-style-type / specificity */
     char    in_id[IN_MAX][32]; char in_val[IN_MAX][IN_VLEN]; int in_n;   /* <input> field values, by id (the typed/scripted text) */
     char    in_name[IN_MAX][32];                                /* each field's name= attr (parallel to in_id), for GET submit */
     char    ta_ids[8][32]; int ta_n;                            /* ids that are <textarea>s (so Enter inserts a newline, not submit) */
@@ -654,6 +660,32 @@ static int parse_style_lineheight(const char *s, int n) {
 /* Vertical margin (margin-top, or the `margin` shorthand's first/top value) in px,
  * so the otherwise box-model-less renderer can honour author spacing between blocks.
  * Only px and em (~16px) are read; capped so a stray huge value can't blow up layout. */
+/* ---- viewport units (M1929) -------------------------------------------------
+ * `vw`/`vh` resolve against the VIEWPORT, not the containing block, so unlike %
+ * they do not need a box tree — just the window's content box. Found by actually
+ * rendering example.com: its stylesheet is
+ *     body{background:#eee;width:60vw;margin:15vh auto;...}
+ * so without vw/vh the canonical test page laid out full-width and flush to the
+ * top instead of as a centred column. The units were simply unparsed.
+ *
+ * The viewport is recorded by browser_render and read here at PARSE time, which
+ * means a page parsed before the FIRST render of a given window size resolves
+ * against the previous size (or the seed below). That is a deliberate trade: the
+ * alternative is carrying the unit through every token payload and resolving at
+ * paint, and a window is not normally resized between parsing a page and drawing
+ * it. The seed is a typical content box so a first page is still sensible. */
+static int g_vp_w = 980, g_vp_h = 700;
+
+/* A length's unit multiplier, applied to an already-parsed integer `num`.
+ * Returns the px value. Handles em/rem (~16px), vw, vh; anything else is px. */
+static int css_unit_px(int num, const char *u, int ul) {
+    if (ul >= 2 && (u[0]|32)=='v' && (u[1]|32)=='w') return num * g_vp_w / 100;
+    if (ul >= 2 && (u[0]|32)=='v' && (u[1]|32)=='h') return num * g_vp_h / 100;
+    if (ul >= 3 && (u[0]|32)=='r' && (u[1]|32)=='e' && (u[2]|32)=='m') return num * 16;
+    if (ul >= 2 && (u[0]|32)=='e' && (u[1]|32)=='m') return num * 16;
+    return num;
+}
+
 static int parse_px_val(const char *v, int vl) {
     int i = 0, num = 0, seen = 0;
     while (i < vl && (v[i] == ' ' || v[i] == '\t')) i++;
@@ -661,7 +693,7 @@ static int parse_px_val(const char *v, int vl) {
     if (!seen) return 0;
     if (i < vl && v[i] == '.') { i++; while (i < vl && v[i] >= '0' && v[i] <= '9') i++; }  /* skip fraction */
     const char *u = v + i; int ul = vl - i;
-    if (ul >= 2 && (u[0]|32)=='e' && (u[1]|32)=='m') num *= 16;          /* em -> ~16px */
+    num = css_unit_px(num, u, ul);                                       /* em / vw / vh (M1929) */
     return num > 120 ? 120 : num;                                        /* cap */
 }
 /* Total top vertical space a block contributes in this box-model-less renderer:
@@ -825,7 +857,7 @@ static int parse_style_width_px(const char *s, int n) {
     while (i < vl && v[i] >= '0' && v[i] <= '9') { num = num*10 + (v[i]-'0'); i++; digits++; }
     if (!digits) return 0;                                   /* auto / inherit / calc(...) */
     if (i < vl && v[i] == '%') return 0;                     /* percentages not handled here */
-    if (i + 1 < vl && (v[i]|32) == 'e' && (v[i+1]|32) == 'm') num *= 16;
+    num = css_unit_px(num, v + i, vl - i);                   /* em / vw / vh (M1929) */
     return num > 4000 ? 4000 : num;
 }
 
@@ -1063,7 +1095,11 @@ static int is_void_tag(const char *t) {
 /* HTML block-level elements: a background-color on one fills the whole line band
  * (an inline element's bg only highlights behind its text). */
 static int is_block_tag(const char *t) {
-    return tageq(t,"div")||tageq(t,"p")||tageq(t,"section")||tageq(t,"article")||
+    /* `body` counts (M1929): it is a block box in CSS, and leaving it out meant a
+     * rule like `body{width:60vw;margin:15vh auto}` -- how real pages centre their
+     * content -- could never take effect, because only a block tag is given a box
+     * token to carry the geometry. */
+    return tageq(t,"body")||tageq(t,"div")||tageq(t,"p")||tageq(t,"section")||tageq(t,"article")||
            tageq(t,"header")||tageq(t,"footer")||tageq(t,"nav")||tageq(t,"main")||
            tageq(t,"aside")||tageq(t,"blockquote")||tageq(t,"ul")||tageq(t,"ol")||
            tageq(t,"li")||tageq(t,"dl")||tageq(t,"dd")||tageq(t,"dt")||tageq(t,"table")||
@@ -1078,7 +1114,7 @@ static void capture_css(browser_t *b, const char *s, int n);
 static int  css_match(browser_t *b, const char *tag, const char *attrs, int attrlen,
                       uint32_t *color, int *textstyle, int *underline, int *transform, uint32_t *bg,
                       int *align, int *size, int *hidden, int *margin, int *indent, uint32_t *border, int *flex,
-                      int *lineheight, int *ws);
+                      int *lineheight, int *ws, int *cwidth, int *cmauto);
 static int  css_match_list(browser_t *b, const char *tag, const char *attrs, int attrlen);
 
 /* Resolve the best URL for an <img> tag with "fallback only" semantics:
@@ -1171,7 +1207,9 @@ static void handle_tag(browser_t *b, const char *tag, int closing,
         }
     } else if (!is_void_tag(tag)) {
         uint32_t c = 0; int ts = -1, ul = 0, tr = 0; uint32_t bg = 0; int al = 0, fs = 0, hide = 0, mv = 0, ml = 0; uint32_t bd = 0; int flex = 0, fgap = 0, fjust = 0, mw = 0; int lh_css = 0; int prews = 0; int bwpx = 0, bmauto = 0, bpadl = 0, bpadr = 0, bpadt = 0, bpadb = 0, bmargb = 0, bbordbox = 0, bhpx = 0, bminh = 0, bmaxh = 0, bovh = 0, bclear = 0;   /* width (M1896) / padding (M1897, M1900) / margin-bottom + box-sizing (M1903) / min+max-height (M1905, M1910) */
-        if (b->n_css > 0) css_match(b, tag, attrs, attrlen, &c, &ts, &ul, &tr, &bg, &al, &fs, &hide, &mv, &ml, &bd, &flex, &lh_css, &prews);   /* <style> rules first (lower priority) */
+        int csw = 0, csma = 0;   /* box geometry from a stylesheet rule (M1929) */
+        if (b->n_css > 0) css_match(b, tag, attrs, attrlen, &c, &ts, &ul, &tr, &bg, &al, &fs, &hide, &mv, &ml, &bd, &flex, &lh_css, &prews, &csw, &csma);   /* <style> rules first (lower priority) */
+        bwpx = csw; bmauto = csma;   /* an inline style= below overrides these */
         if (mv) b->pending_vmargin = (uint16_t)mv;   /* CSS-rule vertical margin (an inline style= margin below overrides it) */
         const char *st; int stl;
         if (find_attr(attrs, attrlen, "style", &st, &stl)) {           /* inline style overrides per-property (cascade) */
@@ -2400,7 +2438,9 @@ static void capture_css(browser_t *b, const char *s, int n) {
         int lsv = parse_style_listtype(s + ds, de - ds);             /* list-style-type from a stylesheet rule (applies to a <ul>/<ol>) */
         int lhv = parse_style_lineheight(s + ds, de - ds);           /* line-height from a stylesheet rule */
         int wsv = parse_style_whitespace(s + ds, de - ds);           /* white-space from a stylesheet rule (M1819) */
-        if (!(col || tsv >= 0 || ulv || trv || bgv || alv || szv || dnv || mgv || hsv || bdv || lsv || lhv || wsv)) continue;   /* nothing we render */
+        int wv  = parse_style_width_px(s + ds, de - ds);             /* width from a stylesheet rule (M1929) */
+        int mav = parse_style_auto_margins(s + ds, de - ds);         /* margin:auto from a stylesheet rule (M1929) */
+        if (!(col || tsv >= 0 || ulv || trv || bgv || alv || szv || dnv || mgv || hsv || bdv || lsv || lhv || wsv || wv || mav)) continue;   /* nothing we render */
         const char *D = s + ds; int dn = de - ds;                    /* M1788: per-property !important bitmask, so an !important decl outranks a higher-specificity normal one */
         uint16_t imp = 0;
         if (prop_imp(D,dn,"color"))                                  imp |= 1u<<0;
@@ -2448,6 +2488,8 @@ static void capture_css(browser_t *b, const char *s, int n) {
             b->css_list[b->n_css] = (uint8_t)lsv;
             b->css_lineheight[b->n_css] = (uint8_t)(lhv > 255 ? 255 : lhv);
             b->css_ws[b->n_css] = (uint8_t)wsv;
+            b->css_w[b->n_css] = (uint16_t)(wv > 65535 ? 65535 : wv);
+            b->css_mauto[b->n_css] = (uint8_t)mav;
             b->n_css++;
         }
     }
@@ -2500,7 +2542,7 @@ static int css_rule_matches(browser_t *b, int r, const char *tag, const char *at
 static int css_match(browser_t *b, const char *tag, const char *attrs, int attrlen,
                      uint32_t *color, int *textstyle, int *underline, int *transform, uint32_t *bg,
                      int *align, int *size, int *hidden, int *margin, int *indent, uint32_t *border, int *flex,
-                     int *lineheight, int *ws) {
+                     int *lineheight, int *ws, int *cwidth, int *cmauto) {
     int hit = 0;
     /* per-property specificity watermarks: each output property is set only when the rule's
      * specificity >= the watermark for that property (ties go to source order = later wins). */
@@ -2527,6 +2569,9 @@ static int css_match(browser_t *b, const char *tag, const char *attrs, int attrl
         if (b->css_border[r]  && PRI(10) >= sp_bd)      { *border     = b->css_border[r];     sp_bd    = PRI(10); }
         if (b->css_lineheight[r] && PRI(12) >= sp_lh)   { *lineheight = b->css_lineheight[r]; sp_lh    = PRI(12); }
         if (b->css_ws[r]      && PRI(13) >= sp_ws)      { *ws         = b->css_ws[r];         sp_ws    = PRI(13); }
+        /* Box geometry rides the margin/padding priority slots (M1929). */
+        if (b->css_w[r]       && PRI(8) >= sp_mg)       { *cwidth     = b->css_w[r]; }
+        if (b->css_mauto[r]   && PRI(9) >= sp_in)       { *cmauto     = b->css_mauto[r]; }
         #undef PRI
         hit = 1;
     }
@@ -4523,6 +4568,7 @@ static uint32_t maxw_close_off(const browser_t *b, int i) {
 
 void browser_render(browser_t *b, int x, int y, int w, int h) {
     uint32_t BG = 0xFFFFFF, page_fg = 0;
+    int root_w = 0, root_ma = 0, root_mt = 0;   /* body/html width, auto-margins, margin-top (M1929) */
     for (int r = 0; r < b->n_css; r++) {                 /* page bg + default text colour from body/html (M1432, M1437) */
         sel_t *s = &b->css_sel[r];
         int is_root = !s->cls[0] && !s->id[0] && !s->attr[0] &&
@@ -4530,6 +4576,16 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
              (s->tag[0]=='h'&&s->tag[1]=='t'&&s->tag[2]=='m'&&s->tag[3]=='l'&&!s->tag[4]));
         if (is_root && b->css_bg[r])    BG = b->css_bg[r];
         if (is_root && b->css_color[r]) page_fg = b->css_color[r];   /* so a dark body{background} gets its light body{color} text (M1437) */
+        /* body/html box geometry (M1929). `<body>` is consumed by a terminal
+         * else-if in the tag parser and never reaches the generic element-scope
+         * handler, so it can never own a box token the way a <div> does. It does
+         * not need one: body's box IS the page's content column, so its width /
+         * auto-margins / top margin are applied to that column directly below.
+         * This is what makes `body{width:60vw;margin:15vh auto}` -- how real pages
+         * (example.com included) centre themselves -- actually centre. */
+        if (is_root && b->css_w[r])     root_w  = b->css_w[r];
+        if (is_root && b->css_mauto[r]) root_ma = b->css_mauto[r];
+        if (is_root && b->css_margin[r]) root_mt = b->css_margin[r];
     }
     fb_fill_rect(x, y, w, h, BG);
 
@@ -4558,7 +4614,17 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
 
     /* content */
     int cl = x + 10, cr = x + w - 14, ct = y + ADDR_H + 6, cb = y + h - 8;
+    /* Apply the root box to the content column (M1929): a narrower width, centred
+     * when both horizontal margins are auto (bits 0|1), plus any top margin. */
+    if (root_w > 0 && root_w < cr - cl) {
+        int slack = (cr - cl) - root_w;
+        if ((root_ma & 3) == 3) cl += slack / 2;        /* margin: _ auto -> centre */
+        else if (root_ma & 1)   cl += slack;            /* margin-left:auto -> right */
+        cr = cl + root_w;
+    }
+    if (root_mt > 0) ct += root_mt;
     b->view_h = cb - ct;
+    g_vp_w = cr - cl; g_vp_h = cb - ct;      /* vw/vh resolve against this (M1929) */
     int cx = cl, cy = ct - b->scroll, curlh = 18;
     b->nlrec = 0;
     b->nwrec = 0;
