@@ -60,3 +60,50 @@ fi
 
 [ $fail -eq 0 ] || { echo "FAIL: Linux ABI test"; exit 1; }
 echo "PASS: Linux ABI — a real static-PIE Linux binary runs under OS-DEV"
+
+# --- M1941: a ring-3 fault mid-print must be REPORTED, not swallowed --------
+# Exception gates clear IF, so a fault handler runs with interrupts disabled and
+# then takes the console lock. When that spin was unbounded and the lock holder
+# sat on the same core, the machine deadlocked AND the fault report vanished --
+# the worst possible combination. /disk2/hellolibc faults reliably (glibc
+# executes an AVX instruction, which is not enabled yet), so it makes a clean
+# trigger for exactly that shape.
+# The first QEMU is still alive here (its loop broke on a marker, it was never
+# killed), and QEMU takes a WRITE LOCK on a raw drive image -- so a second
+# instance opening the same ext2 volume silently fails to start and produces an
+# empty log. Reap it first.
+kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+SLOG2=$(mktemp /tmp/osdev_lxfault.XXXXXX.log)
+QPID2=""
+cleanup2() { [ -n "$QPID2" ] && { kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; }; rm -f "$SLOG2"; }
+trap 'rc=$?; cleanup2; exit $rc' EXIT
+
+echo "booting with a deliberately-faulting Linux binary (console-lock deadlock regression)..."
+timeout -s KILL 120 "$QEMU" -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+    -append "lxfaulttest" \
+    -drive file="$DISK",format=raw,if=ide \
+    -drive file="$EXT2",format=raw,if=ide \
+    -netdev user,id=net0 -device e1000,netdev=net0 \
+    -display none -serial file:"$SLOG2" >/dev/null 2>&1 &
+QPID2=$!
+i=0
+while [ $i -lt 220 ]; do
+    grep -aq "boot network self-test finished" "$SLOG2" 2>/dev/null && break
+    sleep 0.5; i=$((i+1))
+done
+
+f2=0
+if grep -aq "\[fault\].*ring-3 task" "$SLOG2"; then
+    echo "  ok: the ring-3 fault was REPORTED (the console lock did not swallow it)"
+else
+    echo "  FAIL: no [fault] line -- the report was swallowed (console-lock deadlock?)"; f2=1
+fi
+# The boot must still REACH THE END. Under the old unbounded spin it stopped
+# dead mid-listing at ~78 lines with all cores wedged.
+if grep -aq "boot network self-test finished" "$SLOG2"; then
+    echo "  ok: the boot ran to completion despite the fault (no deadlock)"
+else
+    echo "  FAIL: the boot never completed -- wedged after the fault ($(wc -l < "$SLOG2") log lines)"; f2=1
+fi
+[ $f2 -eq 0 ] || { echo "FAIL: console-lock/fault-reporting regression"; exit 1; }
+echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console"

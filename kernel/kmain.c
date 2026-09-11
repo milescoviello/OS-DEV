@@ -241,6 +241,7 @@ static volatile int g_smpthread_test;         /* -append smpthreadtest: prove re
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
 static volatile int g_journal_test;           /* -append journalguest: prove the write-ahead journal + crash recovery on REAL ata hardware (M1865) */
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
+static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
 static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
 static volatile int g_netcon;                 /* -append netcon: start the network debug console on TCP 2323 (M1870, real-HW bring-up) */
 static volatile int g_nodisk;                 /* -append nodisk: skip ALL disk-WRITE self-tests + FS mount (M1872) — safe to boot on a machine with real disks; the bring-up image sets this */
@@ -474,6 +475,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
         if (cmdline_has(cl, "lxabitest"))  g_lxabi_test = 1;              /* run a host-built static-PIE LINUX binary (M1939) */
+        if (cmdline_has(cl, "lxfaulttest")) { g_lxabi_test = 1; g_lxfault_test = 1; }   /* + a binary that FAULTS, to prove the fault is reported and does not wedge (M1941) */
         if (cmdline_has(cl, "netcon"))     g_netcon = 1;                 /* network debug console for real-HW bring-up (M1870) */
         if (cmdline_has(cl, "nodisk"))     g_nodisk = 1;                 /* skip disk-write self-tests + FS mount — safe on a machine with real disks (M1872) */
         if (cmdline_has(cl, "watchdog"))   g_watchdog = 1;              /* HW watchdog + panic-auto-reboot for the autonomous PXE loop (M1881) */
@@ -697,7 +699,25 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * glibc does that itself in _dl_relocate_static_pie, before its first
          * syscall, which is exactly where it stops. musl is the right first
          * libc target (no ifunc, far smaller startup); this stays staged in the
-         * image as the next milestone's subject. */
+         * image as the next milestone's subject.
+         *
+         * M1941 UPDATE: with the console deadlock fixed, the real cause is
+         * visible -- it faults with Invalid Opcode on `vpxor %xmm0,%xmm0,%xmm0`
+         * inside glibc's _dl_aux_init, i.e. it successfully parsed the auxv
+         * this stack provides and then executed an AVX instruction. AVX is not
+         * enabled here: fpu_init sets only CR4.OSFXSR/OSXMMEXCPT and the
+         * context switch is FXSAVE/FXRSTOR, which does not preserve YMM. That
+         * is M1942's job.
+         *
+         * Under `lxfaulttest` it IS launched, as M1941's regression test: it
+         * raises a ring-3 fault while the boot task is printing, which is
+         * exactly the shape that used to deadlock on the console lock and
+         * swallow the report. The suite asserts the [fault] line appears AND
+         * that the boot still runs to completion. */
+        if (g_lxfault_test) {
+            kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
+            app_spawn_linux_from_file("/disk2/hellolibc");
+        }
     }
 
     if (!g_nodisk && fat32_mount() == 0) {

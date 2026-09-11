@@ -136,13 +136,37 @@ static volatile int con_owner = -1;      /* TASK currently emitting, -1 = none *
  *     context, so it sees ITSELF as owner and proceeds instead of deadlocking.
  *     Its output may interleave in that rare case, which is the right trade: a
  *     lock must never be able to silence a fault or the panic path. */
+/* The spin is BOUNDED (M1941), and on timeout we print ANYWAY.
+ *
+ * Every exception gate is 0x8E -- an interrupt gate, which CLEARS IF -- so a
+ * fault handler runs with interrupts disabled. If the task holding this lock
+ * happens to be on the SAME core, it can never be scheduled to release it, and
+ * an unbounded spin here is a hard deadlock that also SWALLOWS the fault
+ * report. That is the exact failure this file's own comment above says must
+ * never happen: a lock must not be able to silence a fault or the panic path.
+ *
+ * Measured, not theorised: a ring-3 fault raised while the boot task was
+ * mid-way through printing a directory listing wedged the machine with all
+ * four cores stuck and no `[fault]` line ever appearing -- RIP sampling through
+ * the QEMU monitor showed a constant address inside this very loop.
+ *
+ * Giving up and writing unlocked risks interleaved output, which is strictly
+ * the better outcome and is the same trade already made for the same-core
+ * interrupt case. The bound is large enough that real contention (another core
+ * finishing a line) always wins the lock normally. */
+#define CON_SPIN_LIMIT 40000000u
 static inline int con_take(uint64_t *fl) {
     int me = task_current_id();
     *fl = 0;
     if (con_owner == me && con_lock) return 0;           /* re-entered: don't block */
-    while (__atomic_exchange_n(&con_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
-    con_owner = me;
-    return 1;
+    for (uint32_t i = 0; i < CON_SPIN_LIMIT; i++) {
+        if (!__atomic_exchange_n(&con_lock, 1, __ATOMIC_ACQUIRE)) {
+            con_owner = me;
+            return 1;
+        }
+        __asm__ volatile("pause");
+    }
+    return 0;   /* never acquired -> con_give must NOT release someone else's lock */
 }
 static inline void con_give(int held, uint64_t f) {
     (void)f;
