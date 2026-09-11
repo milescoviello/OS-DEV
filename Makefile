@@ -190,7 +190,12 @@ $(LXROOT)/lxbox: tools/lx/lxbox.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (busybox-shaped multi-call binary: fork/execve/pipe)"
 
-LXBINS := $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox
+$(LXROOT)/lxmmap: tools/lx/lxmmap.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (MAP_FIXED mmap)"
+
+LXBINS := $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap
 
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a

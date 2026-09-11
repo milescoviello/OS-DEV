@@ -377,11 +377,23 @@ void linux_syscall_dispatch(struct registers *r) {
          * and must fail rather than silently land elsewhere -- a caller that
          * asked for a specific address and got another one corrupts itself. */
         long len = (long)r->rsi, prot = (long)r->rdx, flags = (long)r->r10;
-        long fd = (long)r->r8;
+        /* (int), NOT (long). `fd` is an int in Linux's prototype, so a caller
+         * passing -1 leaves 0xFFFFFFFF in the low half of r8 with a ZERO upper
+         * half -- read as a long that is 4294967295, which sails past a
+         * `fd >= 0` check and made every anonymous mmap fail. Any int-typed
+         * syscall argument whose negative values are meaningful has to be
+         * narrowed like this: AT_FDCWD (-100) and wait4's pid (-1) are the
+         * other cases in this file. */
+        int fd = (int)r->r8;
         if (len <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
-        if (flags & LX_MAP_FIXED) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (!(flags & LX_MAP_ANONYMOUS) || fd >= 0) { r->rax = (uint64_t)-(long)LX_ENODEV; break; }
-        uint64_t base = app_mmap((uint64_t)len);
+        /* MAP_FIXED is honoured now (M1952) -- it used to be refused outright,
+         * which is correct-but-useless: a caller that asks for a specific
+         * address needs that address. Still refused if the range is
+         * unaligned, outside the window, or overlaps an existing VMA, because
+         * Linux's silent-replace needs VMA splitting we do not have yet. */
+        uint64_t base = (flags & LX_MAP_FIXED) ? app_mmap_fixed(r->rdi, (uint64_t)len)
+                                              : app_mmap((uint64_t)len);
         if (!base) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
         /* our regions come back writable+NX; tighten to what was asked for */
         if (prot != (1 | 2)) app_mprotect(base, (uint64_t)len, (int)prot);

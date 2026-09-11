@@ -162,6 +162,8 @@ struct app {
     int      nuv;                        /* number of unveil entries */
     int      uv_active;                  /* 1 once unveil() has been called (then file paths are checked) */
     int      uv_locked;                  /* 1 after unveil(NULL): no more unveils accepted */
+    const void *exec_img; uint64_t exec_imgsz;          /* execve hand-off, PER-PROCESS (M1952) */
+    const char *const *exec_argv; const char *const *exec_envp;
     struct registers fork_frame;         /* a forked child's saved trap frame (rax=0); iret_to_user resumes it (M1116) */
     int      parent;                     /* pid of the process that fork()ed us (0 = none) — for waitpid (M1117) */
     int      pgid;                        /* process group id (job control, M1176); inherited on fork, set by setpgid */
@@ -289,14 +291,22 @@ static char     g_jail_path[64];
  * one-shot shape as g_pend_arg/g_pend_jail. (M1940) */
 static volatile int g_pend_linux;
 static char         g_pend_lxpath[256];
-/* One-shot image override for Linux execve(2) (M1948). app_exec resolves names
- * in the compiled-in progs[] table, which a Linux binary is obviously not in.
- * Rather than duplicate app_exec's ~70-line CR3-swap body -- the riskiest code
- * in the file -- execve stages the already-read image here and app_exec uses it
- * instead of the table. argv non-NULL also selects the LINUX entry convention:
- * a System V initial stack instead of our native single launch_arg. */
-static const void *g_exec_img; static uint64_t g_exec_imgsz;
-static const char *const *g_exec_argv; static const char *const *g_exec_envp;
+/* Image override for Linux execve(2) (M1948, moved per-process M1952).
+ *
+ * app_exec resolves names in the compiled-in progs[] table, which a Linux
+ * binary is obviously not in. Rather than duplicate app_exec's ~70-line
+ * CR3-swap body -- the riskiest code in the file -- execve stages the
+ * already-read image and app_exec uses that instead of the table.
+ *
+ * These were GLOBALS, copying the g_pend_arg/g_pend_jail one-shot pattern.
+ * That pattern is only safe because those spawns are serialised by the window
+ * manager; execve is called CONCURRENTLY by unrelated processes. Two execves
+ * in flight raced, and a loser saw exec_argv == NULL, skipped building the
+ * System V stack, and entered ring 3 with RSP at the bare stack top -- one
+ * page PAST the last mapped stack page -- so its first read of argc faulted at
+ * CR2=0x50081000. Per-process fields cannot race: app_exec only ever looks at
+ * cur(). (Second time this bill came due: the argv string buffers were static
+ * for the same reason, M1951.) */
 
 /* text-colour palette for apps (index 0 = the default green, so an app that never
  * calls SYS_setcolor renders byte-identically). Vivid hues on the dark app background. */
@@ -1848,6 +1858,44 @@ static uint64_t aslr_mmap_pick(void) {
 uint64_t app_aslr_base(int pid) {
     struct app *t = pid ? app_by_pid(pid) : cur();
     return t ? t->aslr_mmap_base : 0;
+}
+
+/* MAP_FIXED anonymous mmap (M1952): reserve a demand-paged region at an
+ * ADDRESS THE CALLER CHOOSES, rather than one we pick.
+ *
+ * Needed by anything that lays out its own address space. `ld.so` maps shared
+ * objects at chosen addresses (Phase 4 cannot run a dynamically-linked
+ * toolchain without it) and V8 reserves its heap cage the same way (Phase 6).
+ * The old ABI was app_mmap(len) -- length only, address ours -- so MAP_FIXED
+ * could not be expressed at all and had to be REFUSED, because handing back a
+ * different address than the caller demanded corrupts it silently.
+ *
+ * Deliberately strict: the range must be page-aligned, inside the mmap window,
+ * and must not overlap an existing VMA. Linux's MAP_FIXED silently replaces an
+ * existing mapping, which we cannot do safely yet (no partial munmap / VMA
+ * splitting), so an overlap is refused rather than half-honoured. */
+uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
+    struct app *a = cur();
+    if (!a || len == 0) return 0;
+    if (addr & (PAGE_SIZE - 1)) return 0;                       /* must be page-aligned */
+    len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (a->nvma >= APP_MAXVMA) return 0;
+    if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
+    if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
+    for (int i = 0; i < a->nvma; i++) {                         /* no overlap -- see above */
+        uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+        if (addr < e0 && s0 < addr + len) return 0;
+    }
+    a->vma[a->nvma].start = addr;
+    a->vma[a->nvma].len   = len;
+    a->vma[a->nvma].sealed = 0;
+    a->vma[a->nvma].uffd  = 0;
+    a->vma[a->nvma].file_backed = 0;
+    a->vma[a->nvma].locked = a->mlock_future;
+    a->vma[a->nvma].huge = 0;
+    a->nvma++;
+    if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
+    return addr;
 }
 
 uint64_t app_mmap(uint64_t len) {
@@ -4877,7 +4925,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
         if (eq && !*pa && !*pb) { elf = progs[i].elf; title = progs[i].title; break; }
     }
     uint64_t img_sz = ~0ull;
-    if (g_exec_img) { elf = g_exec_img; img_sz = g_exec_imgsz; title = name; }   /* execve (M1948) */
+    if (a->exec_img) { elf = a->exec_img; img_sz = a->exec_imgsz; title = name; }   /* execve (M1948/M1952) */
     if (!elf) return -1;                                /* no such program */
 
     uint64_t new_cr3 = vmm_create_address_space();
@@ -4914,10 +4962,17 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * the new address space is active and its stack pages are mapped -- the
      * same frame app_spawn builds, but with the caller's argv rather than a
      * synthesised one. (M1948) */
-    if (g_exec_argv) {
+    if (a->exec_argv) {
         uint64_t rsp = lx_spawn_stack(elf, ELF_DYN_BASE, entry, a->ustack,
-                                      USTACK_BASE + PAGE_SIZE, g_exec_argv, g_exec_envp);
-        if (rsp) a->ustack = rsp;       /* if it will not fit, fall back to a bare stack */
+                                      USTACK_BASE + PAGE_SIZE, a->exec_argv, a->exec_envp);
+        /* A failure here must be FATAL, not a fallback. The old code kept the
+         * bare stack top on failure -- but that address is USTACK_BASE +
+         * USTACK_PAGES*PAGE_SIZE, i.e. one page PAST the last mapped stack
+         * page, so the new image entered ring 3 with an unmapped RSP and took
+         * an immediate page fault at CR2=0x50081000. Silently entering a
+         * program at a bad stack is far worse than refusing the exec. */
+        if (!rsp) { kprintf("[linuxabi] execve: could not build the initial stack\n"); goto fail; }
+        a->ustack = rsp;
     }
 
     /* reset per-program state (the new image starts clean); keep pid/parent/pledge */
@@ -5216,16 +5271,20 @@ long app_execve_linux(struct registers *r, const char *path,
     if (!r || !path) return -1;
     /* Read the image BEFORE touching any process state: a failed read must
      * leave the caller running, which is what execve promises. */
-    const unsigned long CAP = 8u << 20;
+    struct statx xst;
+    unsigned long CAP = (vfs_stat(path, &xst) == 0 && xst.stx_size) ? (unsigned long)xst.stx_size : (1u << 20);
+    if (CAP > (16u << 20)) return -1;                    /* see app_spawn_from_file (M1952) */
     uint8_t *buf = kmalloc(CAP);
     if (!buf) return -1;
     long n = vfs_read(path, buf, CAP);
     if (n <= 0) { kfree(buf); return -1; }
 
-    g_exec_img = buf; g_exec_imgsz = (uint64_t)n;
-    g_exec_argv = argv; g_exec_envp = envp;
+    struct app *me = cur();
+    if (!me) { kfree(buf); return -1; }
+    me->exec_img = buf; me->exec_imgsz = (uint64_t)n;
+    me->exec_argv = argv; me->exec_envp = envp;
     long rc = app_exec(r, path, 0);
-    g_exec_img = 0; g_exec_imgsz = 0; g_exec_argv = 0; g_exec_envp = 0;
+    me->exec_img = 0; me->exec_imgsz = 0; me->exec_argv = 0; me->exec_envp = 0;
 
     /* Safe either way: app_exec copies the segments into the new address space
      * synchronously, so the image buffer is dead by the time it returns. */
@@ -5253,11 +5312,17 @@ int app_spawn_linux_from_file(const char *path) {
 }
 
 int app_spawn_from_file(const char *path) {
-    /* 8 MiB (was 64 KiB, sized for our own <18 KB apps): a glibc static-PIE
-     * hello world is ~800 KB and a real toolchain binary is far larger. This
-     * still buffers the WHOLE image, which does not scale to a 100 MB gcc --
-     * that wants mmap-backed demand loading and is its own milestone. (M1940) */
-    const unsigned long ELFBUF = 8u << 20;
+    /* Allocate what the FILE actually needs, not a fixed ceiling (M1952).
+     * A flat 8 MiB per load looked harmless until several Linux binaries were
+     * launched at once: seven concurrent processes wanted 56 MiB of kernel
+     * heap on a 256 MiB machine, the allocation started failing, and a failed
+     * execve made a pipeline's writer _exit(127) so the reader saw an empty
+     * pipe. Sizing from the file makes the common case ~13 KB-800 KB.
+     * Still buffers the WHOLE image, which will not scale to a 100 MB gcc --
+     * that wants mmap-backed demand loading and is its own milestone. */
+    struct statx est;
+    unsigned long ELFBUF = (vfs_stat(path, &est) == 0 && est.stx_size) ? (unsigned long)est.stx_size : (1u << 20);
+    if (ELFBUF > (16u << 20)) return -1;                 /* refuse absurd images rather than exhaust the heap */
     uint8_t *buf = kmalloc(ELFBUF);
     if (!buf) return -1;
     long n = vfs_read(path, buf, ELFBUF);

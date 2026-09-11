@@ -727,6 +727,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * the two together with a real PIPE, and wait4()s both. */
             kprintf("[lxabi] launching the fork/execve/pipe demo...\n");
             app_spawn_linux_from_file_arg("/disk2/lxbox", "pipe");
+            kprintf("[lxabi] launching the MAP_FIXED mmap test...\n");
+            app_spawn_linux_from_file("/disk2/lxmmap");
         }
     }
 
