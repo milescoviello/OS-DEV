@@ -621,6 +621,19 @@ long blockdev_mount_write(int i, const char *path, const void *buf, unsigned lon
                            path ? path : "", buf, len);
 }
 
+/* Positional WRITE on mount `i` (ext2 only): place len bytes at byte offset
+ * `off`, creating/extending the file, without ever materialising the whole
+ * file. The streaming counterpart of blockdev_mount_pread — and unlike that
+ * one there is no read-prefix fallback for ISO/FAT, because ISO is read-only
+ * and a secondary FAT mount has no write path here at all. M1935. */
+long blockdev_mount_pwrite(int i, const char *path, const void *buf, unsigned long len, uint64_t off) {
+    blockdev_mount_scan();
+    if (i < 0 || i >= g_nmount) return -1;
+    if (g_mount[i].fstype != FS_EXT2) return -1;          /* read-only filesystem */
+    return ext2_pwrite_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
+                            path ? path : "", off, buf, len);
+}
+
 /* Delete a file on mount `i` (ext2 only). 0 on success, -1 otherwise. M1135. */
 long blockdev_mount_remove(int i, const char *path) {
     blockdev_mount_scan();

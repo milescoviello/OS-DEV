@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1934-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1937-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-102%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -402,9 +402,49 @@ user-stack overflow, an NX violation, and a SMEP violation and assert each one
 faults — protections that are tested, not just claimed. (See "Honest caveats"
 above for exactly what's still ring-0.)
 
-The honest current frontier: a **unified inode/page cache** (the block buffer
-cache is the seed), and extending the new crash-consistency journal to the rest
-of the filesystem write path. (Several items once listed here are done:
+### The current frontier: self-hosting (M1933-)
+
+The active campaign is the long-term goal in `GOALS.md` taken seriously:
+**develop OS-DEV inside OS-DEV.** The end state is an in-guest toolchain running
+under a **Linux ABI compatibility layer**, so that unmodified static Linux
+binaries — busybox, a real GCC, eventually Node — run here.
+
+**To be unambiguous about what this does and does not change:** the OS is, and
+stays, overwhelmingly **self-made**. The kernel, every driver, the TLS 1.3 stack
+and all its crypto, the JavaScript engine, the browser, the window manager and
+~31k lines of userspace apps are written from scratch and none of that is
+affected. The compatibility layer is a **bolt-on whose entire purpose is to run
+*other people's* binaries** — which is what every real operating system does,
+and precisely what an ABI is for. Borrowing a C compiler is not the same as
+borrowing an operating system; writing a from-scratch GCC and a from-scratch
+Node is not a credible path, and pretending otherwise would just mean the goal
+never happens.
+
+Landed so far, all on the from-scratch ext2 driver:
+- **M1933** — an ext2 directory can grow past its first block. It was capped at
+  **49 entries**; now inode-limited (600 in one directory, `e2fsck`-clean).
+- **M1934** — streaming writes. A file no longer has to fit in memory to be
+  written; reaches double-indirect (4 GiB at a 4 KiB block), and an
+  extent-mapped file is rebuilt as indirect in place so appends work.
+- **M1935** — `pwrite` wired through the VFS, plus a 512 MiB ext2 volume. A
+  4 MiB file written from inside the OS in 64 KiB chunks, then verified from
+  outside it: `e2fsck` clean, and all 4 MiB byte-compared.
+- **M1936** — the caps a real userland needs: 8 → 32 processes, 24 → 128 fds,
+  16 → 64 VMAs. `fd_set` was a single 64-bit word, so any fd ≥ 64 was
+  undefined behaviour waiting to happen.
+- **M1937** — paths **fail closed** instead of truncating. A truncated path
+  names a *different file*, and that was measurably happening: `openat()` on a
+  105-char path used to succeed and then read the wrong file.
+
+Still ahead: the `syscall`-instruction entry path and a static-PIE hello world,
+then busybox, then the toolchain. The honest scale is months, and the memory
+subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
+`flags` argument at all, so V8's address-space reservation cannot even be
+expressed).
+
+Also still open: a **unified inode/page cache** (the block buffer cache is the
+seed), and extending the crash-consistency journal to the rest of the
+filesystem write path. (Several items once listed here are done:
 **cross-core scheduling** works and is now tested — M1862; the **browser's HTTPS
 fetch now runs in ring 3** — M1863, so no TLS/crypto/X.509 runs in the kernel for
 the default browser; and a from-scratch **write-ahead journal** now makes a real

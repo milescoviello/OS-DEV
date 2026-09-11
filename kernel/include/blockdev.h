@@ -109,6 +109,7 @@ int  blockdev_mount_list(int i, const char *subpath, fatvol_dirent *out, int max
 long blockdev_mount_read(int i, const char *path, void *buf, unsigned long max);   /* read file at path */
 long blockdev_mount_pread(int i, const char *path, void *buf, unsigned long max, unsigned long offset);  /* positioned read (M1196) */
 long blockdev_mount_write(int i, const char *path, const void *buf, unsigned long len);  /* create/overwrite a file (ext2 only); M1132/M1135 */
+long blockdev_mount_pwrite(int i, const char *path, const void *buf, unsigned long len, uint64_t off);  /* positioned/streaming write (ext2 only); M1935 */
 long blockdev_mount_remove(int i, const char *path);   /* delete a file (ext2 only); 0/-1 (M1135) */
 long blockdev_mount_mkdir(int i, const char *path);    /* create a directory (ext2 only); 0/-1 (M1137) */
 long blockdev_mount_symlink(int i, const char *path, const char *target);  /* create a symlink (ext2 only); 0/-1 (M1146) */

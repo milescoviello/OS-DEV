@@ -3591,6 +3591,252 @@ static int run_command(char *line, char *cwd) {
             print(ok ? "fsync/fdatasync/sync_file_range: 0 on a real file fd (write-through already durable), -1 on a memfd; sync() returns -- OK\n"
                      : "fsynctest: VERIFY FAILED\n");
             if (!ok) g_status = 1;
+        } else if (startswith(line, "ext2caps")) {
+            /* M1937: the Phase-1 completion bar for the self-hosting campaign --
+             * everything a borrowed userland needs from a filesystem and the
+             * boot FAT32 volume cannot provide at all: long mixed-case names,
+             * deep paths, symlinks, hard links, case SENSITIVITY, a directory
+             * with far more entries than one block, and a file far larger than
+             * any buffer. Runs on the ext2 volume; pass a different mount as an
+             * argument if it is not /disk2. */
+            const char *M = "/disk2";
+            { const char *q = line + 8; while (*q == ' ') q++; if (*q) M = q; }
+            int ok = 1;
+            char p[192], p2[192];
+            int ml = 0; while (M[ml] && ml < 64) ml++;
+
+            /* (1) case SENSITIVITY: FAT32 folds case, so Foo/foo are one file
+             *     there. On ext2 they must be two, with distinct contents. */
+            { int n = 0; for (int i = 0; i < ml; i++) p[n++] = M[i];
+              for (const char *t = "/Case.txt"; *t; t++) p[n++] = *t; p[n] = 0; }
+            { int n = 0; for (int i = 0; i < ml; i++) p2[n++] = M[i];
+              for (const char *t = "/case.txt"; *t; t++) p2[n++] = *t; p2[n] = 0; }
+            sys_delete(p); sys_delete(p2);
+            if (sys_writefile(p, "UPPER", 5) < 0 || sys_writefile(p2, "lower", 5) < 0) {
+                print("ext2caps: case-pair create failed\n"); ok = 0;
+            } else {
+                char a[8], b[8];
+                long ra = sys_readfile(p, a, sizeof a), rb2 = sys_readfile(p2, b, sizeof b);
+                if (ra != 5 || rb2 != 5 || a[0] != 'U' || b[0] != 'l') {
+                    print("ext2caps: Foo.txt and foo.txt are NOT distinct files (case folded)\n"); ok = 0;
+                }
+            }
+
+            /* (2) a DEEP path: 7 nested 20-char directories, ~160 chars total.
+             *     The boot volume's 8.3 names cannot express this at all. */
+            if (ok) {
+                int n = 0; for (int i = 0; i < ml; i++) p[n++] = M[i];
+                for (int d = 0; d < 7 && ok; d++) {
+                    p[n++] = '/';
+                    for (int k = 0; k < 19; k++) p[n++] = (char)('a' + ((d * 7 + k) % 26));
+                    p[n] = 0;
+                    if (sys_mkdir(p) < 0) {
+                        char db[24]; itoa_simple(d, db);
+                        print("ext2caps: mkdir failed at depth "); print(db); print("\n"); ok = 0;
+                    }
+                }
+                if (ok) {
+                    for (const char *t = "/leaf.txt"; *t; t++) p[n++] = *t; p[n] = 0;
+                    if (sys_writefile(p, "deep", 4) < 0) { print("ext2caps: deep-path write failed\n"); ok = 0; }
+                    else { char g[8]; if (sys_readfile(p, g, sizeof g) != 4 || g[0] != 'd') {
+                             print("ext2caps: deep-path read-back wrong\n"); ok = 0; } }
+                }
+            }
+
+            /* (3) symlink: created, read back UNFOLLOWED, and followed on read */
+            if (ok) {
+                int n = 0; for (int i = 0; i < ml; i++) p2[n++] = M[i];
+                for (const char *t = "/link-to-case"; *t; t++) p2[n++] = *t; p2[n] = 0;
+                { int m = 0; for (int i = 0; i < ml; i++) p[m++] = M[i];
+                  for (const char *t = "/Case.txt"; *t; t++) p[m++] = *t; p[m] = 0; }
+                sys_delete(p2);
+                if (sys_symlink(p2, p) < 0) { print("ext2caps: symlink create failed\n"); ok = 0; }
+                else {
+                    char tgt[192]; long tn = sys_readlink(p2, tgt, sizeof tgt - 1);
+                    if (tn <= 0) { print("ext2caps: readlink failed\n"); ok = 0; }
+                    else { tgt[tn] = 0; if (!streq(tgt, p)) { print("ext2caps: symlink target wrong: "); print(tgt); print("\n"); ok = 0; } }
+                }
+            }
+
+            /* (4) hard link: a second name for the SAME inode -- the contents
+             *     must survive unlinking the original name */
+            if (ok) {
+                int n = 0; for (int i = 0; i < ml; i++) p[n++] = M[i];
+                for (const char *t = "/hl-a.txt"; *t; t++) p[n++] = *t; p[n] = 0;
+                int m = 0; for (int i = 0; i < ml; i++) p2[m++] = M[i];
+                for (const char *t = "/hl-b.txt"; *t; t++) p2[m++] = *t; p2[m] = 0;
+                sys_delete(p); sys_delete(p2);
+                if (sys_writefile(p, "shared-inode", 12) < 0) { print("ext2caps: hardlink setup failed\n"); ok = 0; }
+                else if (sys_link(p, p2) < 0) { print("ext2caps: hard link failed\n"); ok = 0; }
+                else {
+                    sys_delete(p);                       /* drop the ORIGINAL name */
+                    char g[16]; long r = sys_readfile(p2, g, sizeof g);
+                    if (r != 12 || g[0] != 's') { print("ext2caps: hard link did not survive unlinking the original\n"); ok = 0; }
+                }
+            }
+
+            /* (5) 400 files in ONE directory: ~170 entries fit a 4 KiB block,
+             *     so this needs the directory to GROW (M1933) */
+            int made = 0;
+            if (ok) {
+                int base = 0; for (int i = 0; i < ml; i++) p[base++] = M[i];
+                for (const char *t = "/many"; *t; t++) p[base++] = *t; p[base] = 0;
+                sys_mkdir(p);
+                for (int i = 0; i < 400; i++) {
+                    int n = base; p[n++] = '/';
+                    char nb[12]; itoa_simple(i, nb);
+                    for (const char *t = "entry-"; *t; t++) p[n++] = *t;
+                    for (const char *t = nb; *t; t++) p[n++] = *t;
+                    for (const char *t = ".txt"; *t; t++) p[n++] = *t;
+                    p[n] = 0;
+                    if (sys_writefile(p, "e", 1) < 0) break;
+                    made++;
+                }
+                if (made < 400) { char mb[16]; itoa_simple(made, mb);
+                    print("ext2caps: only "); print(mb); print(" of 400 files in one directory\n"); ok = 0; }
+            }
+
+            if (ok) { char mb[16]; itoa_simple(made, mb);
+                print("ext2caps: case-sensitive pair, 7-deep ~160-char path, symlink, hard link surviving unlink, ");
+                print(mb); print(" files in one directory -- OK\n"); }
+            else print("ext2caps: VERIFY FAILED\n");
+        } else if (startswith(line, "fdcaptest")) {
+            /* M1936: the raised process/fd/path caps. 24 fds (21 usable after
+             * stdio) is below what ordinary tools open at startup, and the
+             * per-fd path was 64 bytes with SILENT truncation -- which would
+             * mangle any moderately nested source path. */
+            int ok = 1, opened = 0;
+            static int fds[120];
+            sys_writefile("/tmp/CAP.TXT", "x", 1);
+            for (int i = 0; i < 120; i++) {
+                fds[i] = sys_open("/tmp/CAP.TXT");
+                if (fds[i] < 0) break;
+                opened++;
+            }
+            for (int i = 0; i < opened; i++) sys_fdclose(fds[i]);
+            sys_delete("/tmp/CAP.TXT");
+            if (opened < 100) {
+                char ob[24]; itoa_simple(opened, ob);
+                print("fdcaptest: only "); print(ob); print(" concurrent fds (want >=100)\n"); ok = 0;
+            }
+
+            /* A path longer than the old 64-byte buffer must survive a
+             * round-trip -- truncation would either fail or, far worse,
+             * silently read and write a DIFFERENT file. */
+            if (ok) {
+                /* On the EXT2 volume, not /tmp: tmpfs caps names at 64 chars,
+                 * so a 100-char basename cannot round-trip there at all (the
+                 * first version of this test used /tmp and failed for that
+                 * reason, not because of the fd path). ext2 allows 255. */
+                const char *D = "/disk2";
+                { const char *q = line + 9; while (*q == ' ') q++; if (*q) D = q; }
+                char lp[160]; int n2 = 0;
+                for (const char *t = D; *t; t++) lp[n2++] = *t;
+                lp[n2++] = '/';
+                for (int k = 0; k < 100; k++) lp[n2++] = (char)('a' + (k % 26));   /* 100-char basename */
+                lp[n2] = 0;
+                if (sys_writefile(lp, "deep-path-payload", 17) < 0) { print("fdcaptest: long-path write failed\n"); ok = 0; }
+                else {
+                    char back[32]; long r2 = sys_readfile(lp, back, sizeof back);
+                    if (r2 != 17) { print("fdcaptest: long-path read-back wrong length\n"); ok = 0; }
+                    else {
+                        int fd2 = sys_openat(AT_FDCWD, lp, O_RDONLY);
+                        if (fd2 < 0) { print("fdcaptest: long path not openable as an fd\n"); ok = 0; }
+                        else {
+                            char g[32]; long rn = sys_fdread(fd2, g, sizeof g);
+                            /* the fd remembers its OWN copy of the path -- this is
+                             * what the 64-byte buffer used to truncate */
+                            if (rn != 17 || g[0] != 'd') { print("fdcaptest: fd on a long path read wrong data\n"); ok = 0; }
+                            sys_fdclose(fd2);
+                        }
+                    }
+                    sys_delete(lp);
+                }
+            }
+            /* M1937: a path too long to REPRESENT must be refused, not
+             * truncated. Truncation is the dangerous outcome -- a shortened
+             * path names a DIFFERENT file, so the call "succeeds" against the
+             * wrong target. Before the guard this created a file at the
+             * truncated name and returned success. */
+            if (ok) {
+                char xl[400]; int n3 = 0;
+                for (const char *t = "/disk2/"; *t; t++) xl[n3++] = *t;
+                for (int k = 0; k < 300; k++) xl[n3++] = 'z';     /* ~307 chars > VFS_PATH_MAX */
+                xl[n3] = 0;
+                if (sys_writefile(xl, "nope", 4) >= 0) {
+                    print("fdcaptest: a 307-char path was ACCEPTED (silently truncated to another name)\n");
+                    ok = 0;
+                }
+            }
+            if (ok) {
+                char ob[24]; itoa_simple(opened, ob);
+                print("fdcaptest: "); print(ob);
+                print(" concurrent fds, 105-char path round-trips, 307-char path refused not truncated -- OK\n");
+            } else print("fdcaptest: VERIFY FAILED\n");
+        } else if (startswith(line, "streamtest")) {
+            /* M1935: build a file FAR larger than any buffer we hold, through
+             * the ordinary fd path, on the ext2 volume. Before this, every
+             * write through a file fd read-modify-wrote the WHOLE file and was
+             * hard-capped at 1 MiB (FILEFD_CAP), so a 4 MiB file was simply
+             * not expressible -- which is also why no toolchain could ever run
+             * here. 4 MiB in 64 KiB chunks is 64 writes; the whole point is
+             * that peak memory stays at one chunk. */
+            /* Optional path argument; defaults to the ext2 volume. Which /diskN
+             * that is depends on how many drives precede it in the scan (the
+             * FAT32 boot disk takes /disk1, so ext2 lands on /disk2) -- so the
+             * path is an argument rather than a hardcoded guess. */
+            const char *P = "/disk2/stream.bin";
+            { const char *q = line + 10; while (*q == ' ') q++; if (*q) P = q; }
+            const unsigned long CH = 64ul * 1024, TOTAL = 4ul * 1024 * 1024;
+            char *bufp = malloc(CH);
+            int ok = 1;
+            if (!bufp) { print("streamtest: out of memory\n"); ok = 0; }
+            if (ok) {
+                sys_delete(P);                              /* start clean if a previous run left it */
+                int fd = sys_openat(AT_FDCWD, P, O_WRONLY | O_CREAT);
+                if (fd < 0) {
+                    print("streamtest: cannot create "); print(P);
+                    print(" -- is an ext2 volume mounted there? (try lsblk / df)\n");
+                    ok = 0;
+                } else {
+                    for (unsigned long o = 0; ok && o < TOTAL; o += CH) {
+                        for (unsigned long k = 0; k < CH; k++) bufp[k] = (char)((o + k) * 31 + 7);
+                        if (sys_pwrite(fd, bufp, CH, (long)o) != (long)CH) {
+                            char ob[24]; ltoa_simple((long)o, ob);
+                            print("streamtest: pwrite failed at offset "); print(ob); print("\n");
+                            ok = 0;
+                        }
+                    }
+                    sys_fdclose(fd);
+                }
+            }
+            if (ok) {   /* verify by POSITION, including well past the old 1 MiB cap */
+                int rfd = sys_open(P);
+                if (rfd < 0) { print("streamtest: reopen failed\n"); ok = 0; }
+                else {
+                    unsigned long probes[4] = { 0, 1024ul * 1024 + 5, 3ul * 1024 * 1024, TOTAL - 8 };
+                    for (int t = 0; ok && t < 4; t++) {
+                        char g[8];
+                        if (sys_pread(rfd, g, 8, (long)probes[t]) != 8) {
+                            char ob[24]; ltoa_simple((long)probes[t], ob);
+                            print("streamtest: pread short at "); print(ob); print("\n"); ok = 0; break;
+                        }
+                        for (int k = 0; k < 8; k++)
+                            if (g[k] != (char)((probes[t] + (unsigned long)k) * 31 + 7)) {
+                                char ob[24]; ltoa_simple((long)probes[t] + k, ob);
+                                print("streamtest: wrong byte at "); print(ob); print("\n"); ok = 0; break;
+                            }
+                    }
+                    /* and the file must END exactly at TOTAL, not run on */
+                    char g2[8];
+                    if (ok && sys_pread(rfd, g2, 8, (long)TOTAL) != 0) { print("streamtest: file longer than written\n"); ok = 0; }
+                    sys_fdclose(rfd);
+                }
+            }
+            if (bufp) free(bufp);
+            if (ok) { print("streamtest: wrote 4 MiB to "); print(P);
+                      print(" in 64 KiB chunks (4x the old 1 MiB fd cap), 4 offsets byte-exact -- OK\n"); }
+            else    print("streamtest: VERIFY FAILED\n");
         } else if (streq(line, "preadwritetest")) {   /* pread/pwrite: explicit offset, cursor never moves (M1572) */
             int ok = 1;
             sys_writefile("/tmp/PW.TXT", "0123456789", 10);

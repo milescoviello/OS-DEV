@@ -378,20 +378,20 @@ struct mq_attr { long mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs; };
 #define SYS_sha1         344   /* (name, hexbuf) -> SHA-1 of a file as 40 hex chars; 0/-1 (M1848) */
 #define SYS_ws_serve     345   /* (port, lastmsg, lastmax, nframes*) -> accept 1 WS client + echo its frames; frames/-1 (M1849) */
 
-/* select(2) (M1584): a small, from-scratch fd_set sized for THIS fd table
- * (APP_NFD=24), not real glibc's 1024-bit/128-byte one -- every fd this OS can
- * ever hand out fits in one word, so ported code that just calls
- * FD_ZERO/FD_SET/FD_ISSET (the overwhelming common case) works unmodified;
- * code that assumes glibc's exact struct layout/size (memcpy, sizeof, raw
- * byte access) would not port cleanly regardless of what's declared here.
- * exceptfds is always reported empty -- this stack has no OOB/urgent-data
- * concept for select to observe. */
-typedef struct { unsigned long fds_bits; } fd_set;
-#define FD_SETSIZE 32
-#define FD_ZERO(s)      ((s)->fds_bits = 0)
-#define FD_SET(fd, s)   ((s)->fds_bits |= (1UL << (fd)))
-#define FD_CLR(fd, s)   ((s)->fds_bits &= ~(1UL << (fd)))
-#define FD_ISSET(fd, s) (int)(((s)->fds_bits >> (fd)) & 1UL)
+/* select(2) (M1584): a from-scratch fd_set, now a BIT ARRAY rather than a
+ * single word (M1936). It was one `unsigned long` with FD_SETSIZE 32, which was
+ * fine while APP_NFD was 24 -- but raising the fd table past 64 would have made
+ * FD_SET(fd) shift by >= the word width, which is undefined behaviour and
+ * silently corrupts a neighbouring bit or does nothing at all. An array of
+ * longs is also glibc's own shape, so ported code that pokes fds_bits[] rather
+ * than using the macros now works too. exceptfds is still always reported
+ * empty -- this stack has no OOB/urgent-data concept for select to observe. */
+#define FD_SETSIZE 256
+typedef struct { unsigned long fds_bits[FD_SETSIZE / 64]; } fd_set;
+#define FD_ZERO(s)      do { for (int _fdi = 0; _fdi < FD_SETSIZE / 64; _fdi++) (s)->fds_bits[_fdi] = 0; } while (0)
+#define FD_SET(fd, s)   ((s)->fds_bits[(unsigned)(fd) >> 6] |=  (1UL << ((unsigned)(fd) & 63)))
+#define FD_CLR(fd, s)   ((s)->fds_bits[(unsigned)(fd) >> 6] &= ~(1UL << ((unsigned)(fd) & 63)))
+#define FD_ISSET(fd, s) (int)(((s)->fds_bits[(unsigned)(fd) >> 6] >> ((unsigned)(fd) & 63)) & 1UL)
 struct timeval { long tv_sec; long tv_usec; };
 
 /* setsockopt/getsockopt (M1554): real Linux's own numbering (not a free-slot

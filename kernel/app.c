@@ -55,7 +55,12 @@
 #define APP_MIN_ROWS 6
 #define SB_ROWS  72          /* scrollback: ~3 screens of history */
 #define IQ_SIZE  128
-#define MAX_APPS 8
+/* Raised 8 -> 32 (M1936). Eight concurrent processes is nowhere near enough
+ * for a real userland: one `gcc foo.c` alone is gcc + cc1 + as + ld, and a
+ * `make` driving several of those in parallel exhausted the old table outright.
+ * Each struct app is a few tens of KB (mostly its fd table), so 32 costs low
+ * single-digit MB of .bss -- cheap against a 256 MB machine. */
+#define MAX_APPS 32
 #define HIST_N   32          /* command-history depth (up/down recall) */
 #define CLIP_MAX 2048        /* system clipboard + per-app paste buffer size */
 
@@ -72,14 +77,17 @@ struct app {
     int         used;
     int         pid;
     task_t     *task;
-#define APP_MAXTHREAD 16
+#define APP_MAXTHREAD 32   /* 16 -> 32 (M1936) */
     task_t     *thr[APP_MAXTHREAD];      /* worker threads (M1138/M1139); 0 = free slot */
     const char *title;
     char        titlebuf[24];            /* persistent copy of the title */
     char        exe_path[64];            /* the spawn/exec file path, for /proc/<pid>/exe — NOT changed by prctl (M1250) */
     uint64_t cr3, entry, ustack;
     uint64_t heap_end;                   /* current program break (0 = not yet started) */
-#define APP_MAXVMA 16
+/* 16 -> 64 (M1936). A dynamically-linked or JIT-ing program wants dozens of
+ * regions; 16 was tight even for our own apps once mmap'd thread stacks and
+ * file mappings were in play. */
+#define APP_MAXVMA 64
 #define HUGE_SIZE  0x200000ull           /* 2 MiB hugepage (M1155) */
     struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; char fpath[64]; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544) */
     int      nvma;
@@ -197,9 +205,21 @@ struct app {
     /* per-process file-descriptor table (M1187). Additive: zero on spawn/fork,
      * only touched by pipe()/fd{read,write,close}/dup2; an app that never calls
      * them has an empty table, so fork-copy + reap-close are no-ops for it. */
-#define APP_NFD 24
+/* 24 -> 128 (M1936). 24 fds is below what ordinary tools open at startup, and
+ * fd 0-2 are reserved on top of that. Bounded by fd_set's FD_SETSIZE (256,
+ * syscall.h) -- select() cannot express an fd at or past that. */
+#define APP_NFD 128
     /* type: 0=free, 1=pipe (obj=pipe index, write_end), 2=file (path+off, M1193). */
-    struct fdent { uint8_t used, type, write_end; int obj; char path[64]; long off; uint8_t cloexec; } fd[APP_NFD];   /* cloexec at END to keep the positional initializers valid (M1218) */
+    /* path 64 -> 256 (M1936): 63 usable bytes could not even hold a moderately
+     * nested source path, and the truncation was silent.
+     *
+     * It is still INLINE, which is what caps it here: struct fdent is copied by
+     * VALUE in app_fd_fork / app_dup2 / app_pidfd_getfd / the SCM_RIGHTS table,
+     * so a `char *` would be aliased by every one of those paths and need
+     * refcounting to free safely -- exactly the use-after-free shape the M1926
+     * review found. A real 4096-byte PATH_MAX therefore wants an interned path
+     * pool, which is its own milestone rather than a constant bump. */
+    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; } fd[APP_NFD];   /* cloexec at END to keep the positional initializers valid (M1218) */
     /* seccomp-BPF self-filter (M1190): a process installs a bpf.c program that
      * vets its own syscalls. Zero on spawn/fork; inherited across fork; once set
      * it's permanent (privilege drop is one-way). Empty => no filtering overhead. */
@@ -3843,11 +3863,22 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
  * matching real POSIX where pwrite() is bound by the exact same limit. */
 static long app_file_write_at(struct app *a, int fd, const void *buf, unsigned long len, long off) {
     if (!a->fd[fd].write_end) return -1;                  /* opened read-only */
-    if (off < 0 || (unsigned long)off + len > FILEFD_CAP) return -1;
+    if (off < 0) return -1;
     if (a->rlim_fsize && (unsigned long)off + len > a->rlim_fsize) {   /* RLIMIT_FSIZE (M1549) */
         app_request_signal(a, SIGXFSZ);
         return -1;
     }
+
+    /* Straight to the filesystem where it has a positional write (ext2, M1935):
+     * no whole-file buffer, so no FILEFD_CAP and no O(filesize) cost per write.
+     * That is the difference between "can append to a log" and "can link a
+     * 200 MB binary". The read-modify-write below remains for filesystems with
+     * no pwrite -- notably the FAT32 boot volume, which is writable but only
+     * whole-file -- so FILEFD_CAP is now checked on THAT path only. */
+    long pw = vfs_pwrite(a->fd[fd].path, buf, len, (uint64_t)off);
+    if (pw != VFS_PWRITE_UNSUPPORTED) return pw;
+
+    if ((unsigned long)off + len > FILEFD_CAP) return -1;
     /* read-modify-write the whole file (via vfs_read/vfs_write — no per-FS work;
      * bounded to FILEFD_CAP). Read existing, patch [off, off+len), grow if needed. */
     struct statx st; long sz = (vfs_stat(a->fd[fd].path, &st) == 0) ? (long)st.stx_size : 0;

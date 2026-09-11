@@ -52,7 +52,33 @@ BUILD   := build
 KERNEL64 := $(BUILD)/kernel.elf
 KERNEL   := $(BUILD)/kernel32.elf
 DISK      := $(BUILD)/fat.img
-DISKFLAGS := -drive file=$(BUILD)/fat.img,format=raw,if=ide
+
+# --- ext2 data volume (M1935) ------------------------------------------------
+# The self-hosting campaign needs a filesystem that can hold a real toolchain,
+# and the boot FAT32 volume cannot: this driver is 8.3-UPPERCASE-only with
+# SILENT truncation (package.json -> PACKAGE.JSO), and it has no symlinks, no
+# permissions and no case preservation. ext2 is the only filesystem here with
+# real POSIX metadata, so a second, larger ext2 drive is attached as /disk1.
+#
+# Deliberately built as CLASSIC ext2, with the ext4 `extent` feature OFF: with
+# extents on, mke2fs makes DIRECTORIES extent-mapped too, and dir_add grows a
+# directory through bmap_alloc, which cannot grow an extent tree (M1933/M1934).
+# dir_index (HTree) is off for the same reason -- the driver reads linear
+# directories. Sparse file, so the nominal size costs almost nothing on disk.
+#
+# Built only when host e2fsprogs is present; without it the guest simply has no
+# /disk1 and everything else behaves exactly as before.
+MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
+EXT2SIZE  := 512M
+ifneq ($(MKE2FS),)
+EXT2IMG   := $(BUILD)/ext2.img
+EXT2FLAGS := -drive file=$(BUILD)/ext2.img,format=raw,if=ide
+else
+EXT2IMG   :=
+EXT2FLAGS :=
+endif
+
+DISKFLAGS := -drive file=$(BUILD)/fat.img,format=raw,if=ide $(EXT2FLAGS)
 # An e1000 NIC on user-mode (SLIRP) networking: the gateway 10.0.2.2 answers
 # ARP and ICMP, which is how we test the network stack.
 NICFLAGS  := -netdev user,id=net0 -device e1000,netdev=net0
@@ -124,6 +150,15 @@ $(BUILD)/dlext.so: user/dlext_lib.c Makefile
 
 $(DISK): $(BUILD)/mkfatfs $(BUILD)/dltest.so $(BUILD)/dlbase.so $(BUILD)/dlext.so $(BUILD)/testmod.ko
 	$(BUILD)/mkfatfs $@
+
+# The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
+# reserves the size without writing it, and mke2fs only touches metadata, so a
+# 512M volume costs a few MB on the host until it is actually filled.
+$(BUILD)/ext2.img:
+	@mkdir -p $(BUILD)
+	@rm -f $@ && truncate -s $(EXT2SIZE) $@
+	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent $@ >/dev/null 2>&1
+	@echo "  MKE2FS  $@ ($(EXT2SIZE), 4K blocks, classic ext2)"
 
 $(BUILD)/%.o: %.c Makefile
 	@mkdir -p $(dir $@)
@@ -528,7 +563,7 @@ $(KERNEL): $(KERNEL64)
 	@echo "Built $@ (64-bit kernel in a multiboot-loadable 32-bit container)"
 
 # Interactive: opens a QEMU window so you can see the VGA output.
-run: $(KERNEL) $(DISK)
+run: $(KERNEL) $(DISK) $(EXT2IMG)
 	$(QEMU) $(QEMUFLAGS) $(ACCEL) -kernel $(KERNEL) $(DISKFLAGS) $(NICFLAGS) $(USBFLAGS) $(AUDIOFLAGS) -serial stdio
 
 # --- bare metal (see BAREMETAL.md) ------------------------------------------

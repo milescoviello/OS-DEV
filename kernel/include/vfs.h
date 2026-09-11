@@ -30,10 +30,27 @@ struct vfs_ops {
     long (*pread)(const char *name, void *buf, unsigned long max, uint64_t off);  /* offset read for file-backed mmap (M1136); may be NULL */
     long (*stat_path)(const char *path, uint32_t *size, int *isdir);  /* resolve a full path (absolute from root, relative from cwd), unlike list()+basename-match; 0/-1 (M1622); may be NULL */
     int  (*list_path)(const char *path, vfs_dirent *out, int max);    /* list an arbitrary directory by path, independent of the live cwd, so the GUI Files window can browse without disturbing any shell/app cwd; count or -1 (M1761); may be NULL */
+    /* KEEP NEW FIELDS LAST: fat32_ops (fat32.c:944) is a POSITIONAL
+     * initializer, so inserting a member mid-struct silently shifts every
+     * later function pointer into the wrong slot. Appending leaves it correct
+     * and simply defaults the new member to NULL. (M1935) */
+    long (*pwrite)(const char *name, const void *buf, unsigned long len, uint64_t off); /* offset write, no whole-file buffer (M1935); may be NULL */
 };
 /* Offset read of a regular file (boot FS), for file-backed mmap's demand faults.
  * Bytes read (0 past EOF), or -1 if unsupported/absent. M1136. */
 long vfs_pread(const char *name, void *buf, unsigned long max, uint64_t off);
+/* Offset WRITE, without ever materialising the whole file (M1935). Bytes
+ * written, -1 on error, or VFS_PWRITE_UNSUPPORTED when the filesystem has no
+ * positional write and the caller should read-modify-write instead. */
+#define VFS_PWRITE_UNSUPPORTED (-2L)
+/* The system path limit (M1937). Every VFS path buffer is this size, and a path
+ * at or past it is REJECTED rather than truncated -- see bind_resolve. Matches
+ * the per-fd path in app.c so the two layers cannot disagree about what is
+ * representable. 255 usable bytes covers a real source tree and a GCC install;
+ * an npm dependency tree can exceed it, which needs the interned path pool
+ * noted in app.c rather than a bigger stack buffer. */
+#define VFS_PATH_MAX 256
+long vfs_pwrite(const char *name, const void *buf, unsigned long len, uint64_t off);
 /* Mount a union overlay at /over: reads fall through LOWER->...->UPPER, writes
  * copy-up to UPPER (the lower stays read-only). One at a time. M1142. */
 void vfs_overlay_mount(const char *lower, const char *upper);

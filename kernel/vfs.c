@@ -114,7 +114,15 @@ int vfs_unshare(void) {
 
 /* Rewrite an absolute `name` through the longest-matching bind (TO -> FROM) in
  * the CURRENT namespace into out[max]; returns `name` unchanged if no match. */
+/* Returns the bind-resolved path, or NULL if `name` is too long to represent.
+ *
+ * Failing closed matters more than it looks: the old code truncated at max-1 and
+ * returned the SHORTER string, and a truncated path names a DIFFERENT FILE -- so
+ * a read returns some other file's contents and a write destroys it. M1936
+ * measured exactly that shape with the old 64-byte per-fd path: openat() on a
+ * 105-char path SUCCEEDED and the fd then read the wrong file. (M1937) */
 static const char *bind_resolve(const char *name, char *out, int max) {
+    { int n = 0; while (name[n]) if (++n >= max) return 0; }   /* unrepresentable -> refuse */
     if (name[0] != '/') return name;                /* binds are absolute */
     struct bind_ent *t = cur_ns();
     int best = -1, bestlen = 0;
@@ -428,24 +436,48 @@ int vfs_list_path(const char *path, vfs_dirent *out, int max) {
  * blockdev_mount_pread. A boot-FS path matches neither tmpfs nor a mount, so it
  * still hits fs->pread exactly as before (mmap unaffected). */
 long vfs_pread(const char *name, void *buf, unsigned long max, uint64_t off) {
-    char rb[160]; const char *rn = bind_resolve(name, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *rn = bind_resolve(name, rb, sizeof rb);
+    if (!rn) return -1;                            /* path too long to represent (M1937) */
     const char *tb;
     if (tmp_path(rn, &tb)) return tmpfs_pread(tb, buf, max, (unsigned long)off);   /* tmpfs native (M1196) */
-    int midx; char fpath[192];
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(rn, &midx, fpath, sizeof fpath))
         return blockdev_mount_pread(midx, fpath, buf, max, (unsigned long)off);    /* ext2 native / iso-fat prefix (M1196) */
     return (fs && fs->pread) ? fs->pread(name, buf, max, off) : -1;                /* boot FS (M1136) */
 }
 
+/* Positional WRITE — the streaming counterpart of vfs_pread (M1935).
+ *
+ * Only the touched bytes reach the filesystem, so a caller can build a file
+ * far larger than any buffer it holds, and the cost of a write is proportional
+ * to its length rather than to the size of the file.
+ *
+ * Returns bytes written, -1 on a real error, or VFS_PWRITE_UNSUPPORTED when
+ * this filesystem has no positional write and the caller should fall back to
+ * read-modify-write. That distinction matters: the FAT32 boot volume IS
+ * writable, just not positionally, so it must be told apart from an ISO mount
+ * where a write genuinely fails. */
+long vfs_pwrite(const char *name, const void *buf, unsigned long len, uint64_t off) {
+    char rb[VFS_PATH_MAX]; const char *rn = bind_resolve(name, rb, sizeof rb);
+    if (!rn) return -1;                            /* path too long to represent (M1937) */
+    const char *tb;
+    if (tmp_path(rn, &tb)) return VFS_PWRITE_UNSUPPORTED;      /* tmpfs: whole-file replace only */
+    int midx; char fpath[VFS_PATH_MAX];
+    if (mount_path(rn, &midx, fpath, sizeof fpath))
+        return blockdev_mount_pwrite(midx, fpath, buf, len, off);   /* ext2 native */
+    return (fs && fs->pwrite) ? fs->pwrite(name, buf, len, off) : VFS_PWRITE_UNSUPPORTED;
+}
+
 long vfs_read(const char *name, void *buf, unsigned long max) {
-    char ap[96]; const char *tb;
-    char rb[160]; name = bind_resolve(name, rb, sizeof rb);     /* bind mounts (M1091) */
+    char ap[VFS_PATH_MAX]; const char *tb;
+    char rb[VFS_PATH_MAX]; name = bind_resolve(name, rb, sizeof rb);     /* bind mounts (M1091) */
+    if (!name) return -1;                            /* path too long to represent (M1937) */
     if (over_path(name, &tb)) {                                 /* /over: upper, then lower (M1142) */
         if (ov_whiteouted(tb)) return -1;                       /* deleted via the overlay (M1143) */
-        char up[192]; ov_join(ov_upper, tb, up, sizeof up);
+        char up[VFS_PATH_MAX]; ov_join(ov_upper, tb, up, sizeof up);
         long r = vfs_read(up, buf, max);                        /* recurses, but `up` is not under /over */
         if (r >= 0) return r;
-        char lo[192]; ov_join(ov_lower, tb, lo, sizeof lo);
+        char lo[VFS_PATH_MAX]; ov_join(ov_lower, tb, lo, sizeof lo);
         return vfs_read(lo, buf, max);
     }
     if (synth_path(name, ap, sizeof ap)) return procfs_read(ap, buf, max);
@@ -465,7 +497,7 @@ long vfs_read(const char *name, void *buf, unsigned long max) {
         return tmpfs_snap_read(g, s + 1, buf, max);
     }
     if (tmp_path(name, &tb)) return tmpfs_read(tb, buf, max);
-    int midx; char fpath[192];
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(name, &midx, fpath, sizeof fpath)) return blockdev_mount_read(midx, fpath, buf, max);
     return fs ? fs->read(name, buf, max) : -1;
 }
@@ -477,12 +509,11 @@ long vfs_read(const char *name, void *buf, unsigned long max) {
 int vfs_stat(const char *path, struct statx *st) {
     for (unsigned i = 0; i < sizeof(*st); i++) ((char *)st)[i] = 0;
     st->stx_blksize = 512; st->stx_nlink = 1;
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);     /* bind mounts (M1622 follow-up) --
-                                                                  * every other vfs_* function does
-                                                                  * this; vfs_stat was the one
-                                                                  * exception, so stat-ing a path only
-                                                                  * reachable via a bind mount reported
-                                                                  * not-found */
+    /* bind mounts (M1622 follow-up) -- every other vfs_* function does this;
+     * vfs_stat was the one exception, so stat-ing a path only reachable via a
+     * bind mount reported not-found. */
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
     const char *tb;
     /* directory roots: the boot root + the synthetic/RAM mount points (tmp_path
      * wants a trailing slash, so the bare "/tmp" mount dir lands here) (M1173) */
@@ -503,7 +534,7 @@ int vfs_stat(const char *path, struct statx *st) {
        * other vfs_* function's own /diskN gate (vfs_read/vfs_write/etc. above).
        * Closes the gap the M1622 fallback below deliberately left open: its
        * FAT32-only resolve() has no notion of a mount name as a path component. */
-        int midx; char fpath[192];
+        int midx; char fpath[VFS_PATH_MAX];
         if (mount_path(path, &midx, fpath, sizeof fpath)) {
             uint32_t fsize; int fisdir;
             if (blockdev_mount_stat(midx, fpath, &fsize, &fisdir) != 0) return -1;
@@ -550,10 +581,11 @@ int vfs_stat(const char *path, struct statx *st) {
 }
 
 long vfs_write(const char *name, const void *buf, unsigned long len) {
-    char ap[96]; const char *tb;
-    char rb[160]; name = bind_resolve(name, rb, sizeof rb);     /* bind mounts (M1091) */
+    char ap[VFS_PATH_MAX]; const char *tb;
+    char rb[VFS_PATH_MAX]; name = bind_resolve(name, rb, sizeof rb);     /* bind mounts (M1091) */
+    if (!name) return -1;                            /* path too long to represent (M1937) */
     if (over_path(name, &tb)) {                                 /* /over: copy-up — writes go to the upper (M1142) */
-        char up[192]; ov_join(ov_upper, tb, up, sizeof up);
+        char up[VFS_PATH_MAX]; ov_join(ov_upper, tb, up, sizeof up);
         long r = vfs_write(up, buf, len);
         if (r >= 0) {
             char wh[192]; ov_wh(tb, wh, sizeof wh); vfs_remove(wh);   /* writing un-deletes it (M1143) */
@@ -571,7 +603,7 @@ long vfs_write(const char *name, const void *buf, unsigned long len) {
     long r;
     if (tmp_path(name, &tb)) r = tmpfs_write(tb, buf, len);
     else {
-        int midx; char fpath[192];
+        int midx; char fpath[VFS_PATH_MAX];
         if (mount_path(name, &midx, fpath, sizeof fpath))             /* a /diskN mount: ext2 is writable (M1132) */
             r = blockdev_mount_write(midx, fpath, buf, len);
         else
@@ -583,9 +615,10 @@ long vfs_write(const char *name, const void *buf, unsigned long len) {
 
 long vfs_remove(const char *name) {
     const char *tb;
-    char rb[160]; name = bind_resolve(name, rb, sizeof rb);     /* bind mounts (M1091) */
+    char rb[VFS_PATH_MAX]; name = bind_resolve(name, rb, sizeof rb);     /* bind mounts (M1091) */
+    if (!name) return -1;                            /* path too long to represent (M1937) */
     if (over_path(name, &tb)) {                                 /* delete via the overlay: whiteout (M1143) */
-        char up[192]; ov_join(ov_upper, tb, up, sizeof up);
+        char up[VFS_PATH_MAX]; ov_join(ov_upper, tb, up, sizeof up);
         vfs_remove(up);                                         /* drop the upper copy, if any */
         char wh[192]; ov_wh(tb, wh, sizeof wh);
         vfs_write(wh, "x", 1);                                  /* lay a whiteout to hide the lower */
@@ -595,7 +628,7 @@ long vfs_remove(const char *name) {
     long r;
     if (tmp_path(name, &tb)) r = tmpfs_remove(tb);
     else {
-        int midx; char fpath[192];
+        int midx; char fpath[VFS_PATH_MAX];
         if (mount_path(name, &midx, fpath, sizeof fpath))             /* a /diskN mount: ext2 is writable (M1135) */
             r = blockdev_mount_remove(midx, fpath);
         else
@@ -606,9 +639,10 @@ long vfs_remove(const char *name) {
 }
 
 long vfs_mkdir(const char *path) {
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);   /* bind mounts */
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);   /* bind mounts */
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     long r;
-    int midx; char fpath[192];
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(p, &midx, fpath, sizeof fpath))                     /* a /diskN mount: ext2 is writable (M1137) */
         r = blockdev_mount_mkdir(midx, fpath);
     else
@@ -621,14 +655,15 @@ long vfs_mkdir(const char *path) {
  * real on-disk /diskN ext2 symlink (M1146) -- the synthetic /proc·/dev stay
  * read-only, and FAT32 has no native symlink support. Returns 0 / -1. */
 long vfs_symlink(const char *linkpath, const char *target) {
-    char rb[160]; linkpath = bind_resolve(linkpath, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; linkpath = bind_resolve(linkpath, rb, sizeof rb);
+    if (!linkpath) return -1;                            /* path too long to represent (M1937) */
     const char *base;
     if (tmp_path(linkpath, &base)) {
         long r = tmpfs_symlink(base, target);
         if (r >= 0) fsevents_record('l', linkpath);
         return r;
     }
-    int midx; char fpath[192];
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(linkpath, &midx, fpath, sizeof fpath)) {     /* /diskN ext2: a real on-disk symlink (M1146) */
         long r = blockdev_mount_symlink(midx, fpath, target);
         if (r >= 0) fsevents_record('l', linkpath);
@@ -643,10 +678,11 @@ long vfs_symlink(const char *linkpath, const char *target) {
  * -- vfs_symlink has been able to CREATE the latter since M1146, but nothing
  * could ever read one back until now. Returns bytes (un-terminated) or -1. */
 long vfs_readlink(const char *path, void *buf, unsigned long max) {
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     const char *base;
     if (tmp_path(p, &base)) return tmpfs_readlink(base, buf, max);
-    int midx; char fpath[192];
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(p, &midx, fpath, sizeof fpath)) return blockdev_mount_readlink(midx, fpath, buf, max);
     return -1;
 }
@@ -657,7 +693,9 @@ long vfs_readlink(const char *path, void *buf, unsigned long max) {
 long vfs_link(const char *oldpath, const char *newpath) {
     char ob[160], nb[160];
     oldpath = bind_resolve(oldpath, ob, sizeof ob);
+    if (!oldpath) return -1;                            /* path too long to represent (M1937) */
     newpath = bind_resolve(newpath, nb, sizeof nb);
+    if (!newpath) return -1;                            /* path too long to represent (M1937) */
     int omid, nmid; char ofp[192], nfp[192];
     if (mount_path(oldpath, &omid, ofp, sizeof ofp) &&
         mount_path(newpath, &nmid, nfp, sizeof nfp) && omid == nmid) {
@@ -673,7 +711,9 @@ long vfs_link(const char *oldpath, const char *newpath) {
 long vfs_rename_path(const char *oldpath, const char *newpath) {
     char ob[160], nb[160];
     oldpath = bind_resolve(oldpath, ob, sizeof ob);
+    if (!oldpath) return -1;                            /* path too long to represent (M1937) */
     newpath = bind_resolve(newpath, nb, sizeof nb);
+    if (!newpath) return -1;                            /* path too long to represent (M1937) */
     int omid, nmid; char ofp[192], nfp[192];
     if (mount_path(oldpath, &omid, ofp, sizeof ofp) &&
         mount_path(newpath, &nmid, nfp, sizeof nfp) && omid == nmid) {
@@ -688,7 +728,9 @@ long vfs_rename_path(const char *oldpath, const char *newpath) {
 long vfs_rename2(const char *oldpath, const char *newpath, int flags) {
     char ob[160], nb[160];
     oldpath = bind_resolve(oldpath, ob, sizeof ob);
+    if (!oldpath) return -1;                            /* path too long to represent (M1937) */
     newpath = bind_resolve(newpath, nb, sizeof nb);
+    if (!newpath) return -1;                            /* path too long to represent (M1937) */
     int omid, nmid; char ofp[192], nfp[192];
     if (mount_path(oldpath, &omid, ofp, sizeof ofp) &&
         mount_path(newpath, &nmid, nfp, sizeof nfp) && omid == nmid) {
@@ -701,7 +743,8 @@ long vfs_rename2(const char *oldpath, const char *newpath, int flags) {
 /* truncate(path, newlen) (M1228): resize a regular file — tmpfs (/tmp) natively,
  * or a file on an ext2 /diskN mount. Returns -1 for the boot FAT fs / not found. */
 long vfs_truncate(const char *path, uint64_t newlen) {
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     const char *tb;
     if (tmp_path(p, &tb)) return tmpfs_truncate(tb, newlen);          /* RAM /tmp */
     int mid; char fp[192];
@@ -719,7 +762,8 @@ long vfs_truncate(const char *path, uint64_t newlen) {
  * is the implicit one at EOF. Returns the offset, or -1 (ENXIO / bad off). */
 long vfs_seek_data_hole(const char *path, long off, int find_hole) {
     if (off < 0) return -1;
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     const char *tb;
     if (!tmp_path(p, &tb)) {                                  /* not RAM /tmp: try an ext2 block map */
         int mid; char fp[192];
@@ -740,7 +784,8 @@ long vfs_seek_data_hole(const char *path, long off, int find_hole) {
  * UTIME_OMIT to negative first). tmpfs tracks only mtime; ext2 mounts set both.
  * Other paths (FAT32 boot disk, synthetic) are unsupported (-1). */
 long vfs_utimes(const char *path, long atime, long mtime) {
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     const char *tb;
     if (tmp_path(p, &tb)) return tmpfs_utimes(tb, atime, mtime);      /* RAM /tmp */
     int mid; char fp[192];
@@ -755,7 +800,8 @@ long vfs_utimes(const char *path, long atime, long mtime) {
 /* chmod (M1241): change a file's permission bits. Only ext2 /diskN mounts store
  * Unix modes; tmpfs / boot FAT32 have none, so they return -1 (EPERM-ish). */
 long vfs_chmod(const char *path, uint32_t mode) {
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     int mid; char fp[192];
     if (mount_path(p, &mid, fp, sizeof fp)) {
         long r = blockdev_mount_chmod(mid, fp, mode);
@@ -768,7 +814,8 @@ long vfs_chmod(const char *path, uint32_t mode) {
 /* chown (M1243): change a file's owner/group (negative = leave). ext2 /diskN
  * mounts only (tmpfs / boot FAT32 have no Unix ownership -> -1). */
 long vfs_chown(const char *path, long uid, long gid) {
-    char rb[160]; const char *p = bind_resolve(path, rb, sizeof rb);
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
     int mid; char fp[192];
     if (mount_path(p, &mid, fp, sizeof fp)) {
         long r = blockdev_mount_chown(mid, fp, uid, gid);
@@ -782,8 +829,9 @@ long vfs_chown(const char *path, long uid, long gid) {
  * real block layout, so route there; other paths (boot FAT32, /tmp, synth) are
  * unsupported (-1). Read-only. */
 int vfs_fiemap(const char *path, ext2_extent_t *out, int max) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);
-    int midx; char fpath[192];
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(path, &midx, fpath, sizeof fpath))
         return blockdev_mount_fiemap(midx, fpath, out, max);
     return -1;
@@ -793,8 +841,9 @@ int vfs_fiemap(const char *path, ext2_extent_t *out, int max) {
  * of an ext2-mount file, leaving a sparse hole. Only ext2 /diskN mounts support
  * it (real block allocation); other paths are unsupported (-1). */
 long vfs_punch_hole(const char *path, uint64_t offset, uint64_t len) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);
-    int midx; char fpath[192];
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(path, &midx, fpath, sizeof fpath)) {
         long r = blockdev_mount_punch(midx, fpath, offset, len);
         if (r >= 0) fsevents_record('w', path);
@@ -806,8 +855,9 @@ long vfs_punch_hole(const char *path, uint64_t offset, uint64_t len) {
 /* Extended attributes (M1182): user.* xattrs on ext2 /diskN files, stored
  * in-inode. Other paths (FAT32 boot, /tmp, synth) are unsupported (-1). */
 long vfs_setxattr(const char *path, const char *name, const void *val, unsigned long vlen) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);
-    int midx; char fpath[192];
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(path, &midx, fpath, sizeof fpath)) {
         long r = blockdev_mount_setxattr(midx, fpath, name, val, vlen);
         if (r >= 0) fsevents_record('w', path);
@@ -816,22 +866,25 @@ long vfs_setxattr(const char *path, const char *name, const void *val, unsigned 
     return -1;
 }
 long vfs_getxattr(const char *path, const char *name, void *out, unsigned long max) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);
-    int midx; char fpath[192];
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(path, &midx, fpath, sizeof fpath))
         return blockdev_mount_getxattr(midx, fpath, name, out, max);
     return -1;
 }
 long vfs_listxattr(const char *path, char *out, unsigned long max) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);
-    int midx; char fpath[192];
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(path, &midx, fpath, sizeof fpath))
         return blockdev_mount_listxattr(midx, fpath, out, max);
     return -1;
 }
 long vfs_removexattr(const char *path, const char *name) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);
-    int midx; char fpath[192];
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);
+    if (!path) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(path, &midx, fpath, sizeof fpath)) {
         long r = blockdev_mount_removexattr(midx, fpath, name);
         if (r >= 0) fsevents_record('w', path);
@@ -847,7 +900,8 @@ static void set_mount_sub(const char *sub) {
 }
 
 int vfs_chdir(const char *path) {
-    char rb[160]; path = bind_resolve(path, rb, sizeof rb);     /* bind mounts (M1091) */
+    char rb[VFS_PATH_MAX]; path = bind_resolve(path, rb, sizeof rb);     /* bind mounts (M1091) */
+    if (!path) return -1;                            /* path too long to represent (M1937) */
     if (veq(path, "/proc")) { synth_cwd = 1; return 0; }   /* enter synthetic dirs */
     if (veq(path, "/dev"))  { synth_cwd = 2; return 0; }
     if (veq(path, "/tmp"))  { synth_cwd = 3; return 0; }   /* the RAM filesystem */
