@@ -4670,8 +4670,15 @@ void browser_render(browser_t *b, int x, int y, int w, int h) {
                              { const tok_t *ct = maxw_close_tok(b, t);
                                if (ct && (ct->off & (1u << 24))) {
                                    int hgt = (int)ct->len, cap = (int)((ct->off >> 12) & 0xFFFu);
+                                   int mnh = (int)ct->link;          /* min-height */
                                    int box = (hgt > 0 && cap > 0) ? (hgt < cap ? hgt : cap)
                                            : (hgt > 0 ? hgt : cap);
+                                   /* §10.7 order, matching what TK_MAXW_CLOSE actually
+                                    * draws: max caps the height, then min overrides it.
+                                    * Without this a min-height:70 + max-height:20 box is
+                                    * DRAWN 70px tall but CLIPPED at 20px, leaving 50px of
+                                    * the box blank. (M1926) */
+                                   if (mnh > 0 && mnh > box) box = mnh;
                                    if (box > 0) {
                                        int cc = ((ct->off & 0x100u) != 0)
                                               ? box - pbtop - (int)(ct->off & 0xFF) : box;

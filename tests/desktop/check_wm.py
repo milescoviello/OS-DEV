@@ -106,9 +106,13 @@ def main():
 
     # 2. and switching back must restore it EXACTLY. This is the strong one: a
     #    half-restored window set differs by a few pixels and fails here.
+    # Not `== 0`: the terminal's caret BLINKS, so the window area is not byte-stable
+    # across a multi-second interaction -- an exact assertion failed at 0.011% in a
+    # full run. The threshold keeps essentially all of the power anyway: removing
+    # the workspace-save step makes this 28.3%, a ~280x margin over the bound.
     back = diff_pct(a, c, windows_only=True)
-    ck(back == 0.0,
-       "Ctrl+Alt+Left restores workspace 1's windows EXACTLY (%.3f%% of the window area differs)" % back)
+    ck(back < 0.1,
+       "Ctrl+Alt+Left restores workspace 1's windows (%.3f%% of the window area differs, <0.1%% required)" % back)
 
     # 3. the empty workspace really is emptier: its chip row is shorter
     ink_a, ink_b = chip_ink(a), chip_ink(b)

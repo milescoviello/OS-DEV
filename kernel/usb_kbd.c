@@ -51,8 +51,12 @@
 /* HID modifier-byte bits (boot report byte 0). */
 #define MOD_LCTRL  0x01
 #define MOD_LSHIFT 0x02
+#define MOD_LALT   0x04
+#define MOD_LGUI   0x08     /* Super / Windows key */
 #define MOD_RCTRL  0x10
 #define MOD_RSHIFT 0x20
+#define MOD_RALT   0x40
+#define MOD_RGUI   0x80
 
 /* Driver state for the one USB HID boot keyboard we support. */
 static struct {
@@ -63,6 +67,7 @@ static struct {
     int      tog_in;      /* interrupt-IN data toggle (persists)      */
     uint8_t  iface;       /* the HID interface number (for SET_PROTOCOL/IDLE) */
     uint8_t  prev[6];     /* the previous report's 6 usage slots (for key-down diff) */
+    uint8_t  prev_mods;   /* previous modifier bitmap, for raw make/break edges (M1927) */
 } kb;
 
 /* HID Keyboard/Keypad usage (page 0x07) -> the kernel's unshifted ASCII/control
@@ -120,6 +125,56 @@ static const char usage_shift[HID_USAGE_MAX] = {
     [0x32] = '|', [0x33] = ':', [0x34] = '"', [0x35] = '~', [0x36] = '<',
     [0x37] = '>', [0x38] = '?',
 };
+
+/* ---- raw events, so the desktop's modifier CHORDS work on a USB keyboard -----
+ * The window-manager chords (Alt+Tab, Alt+F4, Super, Super+Arrow, Ctrl+Alt+Arrow,
+ * the workspace keys) are driven from the RAW scancode queue, because the cooked
+ * layer carries no modifier state. That queue was fed ONLY by the PS/2 IRQ
+ * handler, so on a machine driven by a USB keyboard every one of those chords
+ * silently did nothing -- the exact "pressing it does nothing" failure they were
+ * added to fix, and it would only ever show up on real hardware. (M1927)
+ *
+ * The boot report already carries what is needed: byte 0 is the modifier bitmap
+ * (including LGui = Super) and bytes 2..7 are the held usages. Translate both into
+ * the PS/2 scancodes the desktop expects, in keyboard.c's encoding (`| 0x100` on
+ * release). Only the keys the chords look at are mapped; ordinary typing keeps
+ * going through the cooked path exactly as before. */
+#define RAW_REL 0x100
+
+static const struct { uint8_t usage, sc; } HID_RAW[] = {
+    { 0x2B, 0x0F },   /* Tab   */
+    { 0x3D, 0x3E },   /* F4    */
+    { 0x4F, 0x4D },   /* Right */
+    { 0x50, 0x4B },   /* Left  */
+    { 0x51, 0x50 },   /* Down  */
+    { 0x52, 0x48 },   /* Up    */
+    { 0x1E, 0x02 },   /* 1     */
+    { 0x1F, 0x03 },   /* 2     */
+    { 0x20, 0x04 },   /* 3     */
+    { 0x21, 0x05 },   /* 4     */
+};
+
+static uint8_t hid_raw_sc(uint8_t usage) {
+    for (unsigned i = 0; i < sizeof HID_RAW / sizeof HID_RAW[0]; i++)
+        if (HID_RAW[i].usage == usage) return HID_RAW[i].sc;
+    return 0;
+}
+
+/* Modifier bitmap -> raw make/break events on each EDGE. Left and right variants
+ * collapse to one scancode, since the desktop masks the extended bit off anyway. */
+static void push_mod_edges(uint8_t now, uint8_t before) {
+    static const struct { uint8_t mask, sc; } M[] = {
+        { MOD_LCTRL  | MOD_RCTRL,  0x1D },
+        { MOD_LSHIFT | MOD_RSHIFT, 0x2A },
+        { MOD_LALT   | MOD_RALT,   0x38 },
+        { MOD_LGUI   | MOD_RGUI,   0x5B },
+    };
+    for (unsigned i = 0; i < sizeof M / sizeof M[0]; i++) {
+        int was = (before & M[i].mask) != 0, is = (now & M[i].mask) != 0;
+        if (is && !was)      input_push_raw(M[i].sc);
+        else if (!is && was) input_push_raw((unsigned short)(M[i].sc | RAW_REL));
+    }
+}
 
 /* Translate a HID usage ID + the modifier byte into the kernel's input byte, or
  * 0 if it maps to nothing. Bounds the usage before either table lookup. */
@@ -337,6 +392,8 @@ void usb_kbd_poll(void) {
         return;                                   /* no new report (or too short to hold a key) */
 
     uint8_t mods = report[0];
+    push_mod_edges(mods, kb.prev_mods);           /* raw modifier edges (M1927) */
+
     /* Slots are bytes [2..7]. A usage present now but NOT in the previous report
      * is a fresh key DOWN; translate it and enqueue. (Held keys + releases produce
      * nothing — matching the PS/2 path's one-char-per-make-code cooking.) */
@@ -349,13 +406,29 @@ void usb_kbd_poll(void) {
             continue;
         if (was_pressed(usage))
             continue;                             /* still held since last report */
+        uint8_t sc = hid_raw_sc(usage);           /* chord keys also go out RAW (M1927) */
+        if (sc) input_push_raw(sc);
         char c = translate(usage, mods);
         if (c)
             input_push(c);
     }
 
+    /* Key RELEASES: a usage in the previous report but not this one. The cooked
+     * path ignores releases, but the raw consumer needs them -- without a break
+     * event a held-key latch never clears. (M1927) */
+    for (int i = 0; i < 6; i++) {
+        uint8_t usage = kb.prev[i];
+        if (usage == 0 || usage == 0x01) continue;
+        int still = 0;
+        for (int j = 2; j < 8; j++) if (report[j] == usage) { still = 1; break; }
+        if (still) continue;
+        uint8_t sc = hid_raw_sc(usage);
+        if (sc) input_push_raw((unsigned short)(sc | RAW_REL));
+    }
+
     /* Remember this report's slots for the next diff. */
     memcpy(kb.prev, &report[2], 6);
+    kb.prev_mods = mods;
 }
 
 void usb_kbd_selftest(void) {

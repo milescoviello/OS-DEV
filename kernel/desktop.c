@@ -106,6 +106,8 @@ static window_t windows[MAX_WINDOWS];
  * `windows[]`, so a cold-stored app is simply dead-but-unreaped and gets cleaned
  * up on the first frame after switching back. */
 #define WS_N 4
+#define WS_PILL_W (WS_N * 16 + 8)      /* width of the taskbar workspace indicator */
+static int chips_right_bound(void);    /* fwd: the taskbar draw sits above its definition */
 static window_t ws_store[WS_N][MAX_WINDOWS];
 static int      ws_count[WS_N];
 static int      cur_ws;
@@ -1268,7 +1270,7 @@ static void render_scene(void) {
     /* one chip per open window (the focused one — topmost — is highlighted) */
     for (int i = 0; i < win_count; i++) {
         int cx = TB_CHIPX0 + i * (TB_CHIPW + TB_CHIPGAP);
-        if (cx + TB_CHIPW > clkx - 8) break;                  /* out of room */
+        if (cx + TB_CHIPW > chips_right_bound()) break;       /* out of room (the ws pill keeps its strip) */
         int foc = (i == win_count - 1);
         int mini = windows[i].minimized;                      /* hidden: dim its chip */
         fb_fill_rect(cx, start_y, TB_CHIPW, start_h, foc ? THEME_PANEL_TITLE : THEME_PANEL);
@@ -1281,7 +1283,7 @@ static void render_scene(void) {
     /* workspace indicator (M1923): a compact 1-2-3-4 strip, current one lit, so
      * which desktop you are on is visible rather than inferred from the windows. */
     {
-        int wsw = WS_N * 16 + 8, wsx = clkx - wsw - 8;
+        int wsw = WS_PILL_W, wsx = clkx - wsw - 8;
         if (wsx > TB_CHIPX0) {
             fb_fill_rect(wsx, start_y, wsw, start_h, THEME_PANEL);
             glow_border(wsx, start_y, wsw, start_h, THEME_BORDER_DIM, THEME_VOID);
@@ -1502,6 +1504,15 @@ static void present_clock(void) {
 }
 
 /* Move to workspace `to`, parking the current window set (M1923). */
+/* Right edge available to the window chips. ONE definition, used by BOTH the draw
+ * and the click hit-test: they each spelled `clkx - 8`, and that bound overlapped
+ * the workspace indicator -- with enough windows a chip was drawn, painted over by
+ * the indicator, and STILL raised its window when you clicked what looked like a
+ * workspace button. (M1926) */
+static int chips_right_bound(void) {
+    return screen_w - clk_pill_w() - 8 - WS_PILL_W - 8;
+}
+
 static void switch_ws(int to) {
     if (to < 0 || to >= WS_N || to == cur_ws) return;
     for (int i = 0; i < win_count; i++) ws_store[cur_ws][i] = windows[i];
@@ -1926,13 +1937,164 @@ void desktop_run(void) {
                 }
             }
 
+        /* raw make/break key events -> the focused app, if it opted into raw mode
+         * (games like DOOM). Always drained so they never accumulate; delivered
+         * only to a focused raw-mode app, else discarded. */
+        {
+            int ev;
+            while ((ev = input_pop_raw()) >= 0) {
+                /* Recomputed PER EVENT, not once before the loop (M1926). The
+                 * chords below raise, move and close windows, so a `top` captured
+                 * up front goes stale mid-drain -- and since it is
+                 * `&windows[win_count-1]` it then names a DIFFERENT window while
+                 * `rawmode` still says "this is a raw-keyboard app". That handed
+                 * app_key_raw() a browser_t* cast to app_t*: a type-confused write
+                 * into another window's memory. */
+                window_t *top = (win_count > 0) ? &windows[win_count - 1] : 0;
+                int rawmode = top && !top->minimized && top->kind == KIND_APP &&
+                              top->app && app_get_rawkb((app_t *)top->app);
+                int code = ev & 0x7F, rel = (ev & 0x100) != 0;
+                /* Track the modifiers but STILL forward them: a raw-mode app
+                 * (DOOM) uses Alt and Shift itself. Only the Tab of an actual
+                 * Alt+Tab is swallowed. */
+                if (code == 0x38)                    alt_down   = !rel;   /* Alt (either side; 0x200 = right) */
+                else if (code == 0x2A || code == 0x36) shift_down = !rel; /* Shift */
+                else if (code == 0x1D)                 ctrl_down  = !rel; /* Ctrl  */
+
+                /* Ctrl+Alt+Left/Right: previous/next workspace (the Linux chord).
+                 * Super+1..4 jumps straight to one. (M1923) */
+                /* Super+Shift+1..4 / Ctrl+Alt+Shift+Left/Right: MOVE the window
+                 * there (M1924). Checked before the plain switch chords below, so
+                 * Shift takes precedence rather than being ignored. */
+                if (shift_down && !rel &&
+                    ((ctrl_down && alt_down && (code == 0x4B || code == 0x4D)) ||
+                     (super_down && code >= 0x02 && code <= 0x02 + WS_N - 1))) {
+                    int to;
+                    if (super_down && code >= 0x02 && code <= 0x02 + WS_N - 1) {
+                        super_used = 1;
+                        to = code - 0x02;
+                    } else {
+                        to = (code == 0x4B) ? (cur_ws + WS_N - 1) % WS_N : (cur_ws + 1) % WS_N;
+                    }
+                    move_focused_to_ws(to);
+                    close_overlays();
+                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
+                    dirty = 1;
+                    continue;
+                }
+                if (ctrl_down && alt_down && !rel && (code == 0x4B || code == 0x4D)) {
+                    int to = (code == 0x4B) ? (cur_ws + WS_N - 1) % WS_N : (cur_ws + 1) % WS_N;
+                    switch_ws(to);
+                    close_overlays();
+                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
+                    dirty = 1;
+                    continue;
+                }
+                if (super_down && !rel && code >= 0x02 && code <= 0x02 + WS_N - 1) {  /* 1..4 */
+                    super_used = 1;
+                    switch_ws(code - 0x02);
+                    close_overlays();
+                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
+                    dirty = 1;
+                    continue;
+                }
+
+                if (code == 0x0F && !rel && alt_down) {       /* Alt+Tab / Alt+Shift+Tab */
+                    if (win_count > 1) {
+                        if (!sw_open) {                        /* open it and step off the current window */
+                            close_overlays();                  /* one overlay at a time */
+                            sw_open = 1; sw_alt = 1;
+                            sw_sel = win_count - 1;
+                        }
+                        sw_sel = shift_down ? (sw_sel + 1) % win_count
+                                            : (sw_sel + win_count - 1) % win_count;
+                        dirty = 1;
+                    }
+                    continue;                                  /* never let Tab reach the app */
+                }
+                if (code == 0x3E && !rel && alt_down) {        /* Alt+F4: close the window (M1921) */
+                    if (ctx_open) ctx_open = 0;   /* a window vanishes: ctx_win would go stale (M1926) */
+                    if (close_focused_window()) {
+                        dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
+                        dirty = 1;
+                    }
+                    continue;
+                }
+                if (code == 0x5B) {                           /* Super/Windows key (M1921/M1922) */
+                    if (!rel) { super_down = 1; super_used = 0; }
+                    else {
+                        super_down = 0;
+                        /* Fire on RELEASE, and only if Super was not used as a
+                         * modifier -- otherwise Super+Left would snap AND leave the
+                         * launcher open on top of it. This is also what Windows and
+                         * GNOME do: the launcher opens on the tap, not the press. */
+                        if (!super_used) {
+                            int o = menu_open; close_overlays(); menu_open = !o; menu_sel = 0;
+                            dirty = 1;
+                        }
+                    }
+                    continue;
+                }
+                /* Super + arrows: the window-management chords everyone arrives with
+                 * (M1922). Snapping and maximizing already existed on F4/F5/F6; these
+                 * are the gestures people actually try. Arrows are E0-prefixed, but
+                 * `code` masks the extended flag off so both encodings match. */
+                if (super_down && !rel &&
+                    (code == 0x4B || code == 0x4D || code == 0x48 || code == 0x50)) {
+                    super_used = 1;
+                    if (win_count > 0) {
+                        int fi = win_count - 1;
+                        if (code == 0x4B)      snap_window(fi, 0);        /* Left  */
+                        else if (code == 0x4D) snap_window(fi, 1);        /* Right */
+                        else if (code == 0x48) toggle_maximize(fi);       /* Up    */
+                        else {                                            /* Down: minimize */
+                            int vis = 0;
+                            for (int i = 0; i < win_count; i++) if (!windows[i].minimized) vis++;
+                            if (vis > 1) { windows[fi].minimized = 1; sink_window(fi); }
+                        }
+                        dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
+                        dirty = 1;
+                    }
+                    continue;
+                }
+                if (code == 0x38 && rel && sw_open && sw_alt) {  /* Alt released: commit */
+                    /* Clamp (M1926): the reap loop removes windows every frame and
+                     * the switcher stays open across frames while Alt is held, so
+                     * an app exiting meanwhile can leave sw_sel past the end.
+                     * Raising an out-of-range index copies a stale slot over the
+                     * focused window -> a duplicate pointing at a freed app_t. */
+                    if (sw_sel >= win_count) sw_sel = win_count - 1;
+                    if (sw_sel < 0) { sw_open = sw_alt = 0; continue; }
+                    raise_window(sw_sel);
+                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
+                    sw_open = sw_alt = 0;
+                    dirty = 1;
+                    continue;                    /* do NOT fall through: `top` just changed */
+                }
+                if (rawmode) app_key_raw((app_t *)top->app, (unsigned short)ev);
+            }
+        }
+
+        /* Cooked keys AFTER the raw drain (M1926). The cooked layer carries no
+         * modifier state, so the only way it can know a key was already consumed
+         * as a chord is for the raw pass to have run first and set the modifier
+         * flags for THIS frame. With the old order the guards below tested
+         * modifiers that had not been updated yet. */
         int k;
         while ((k = input_trygetchar()) >= 0) {
             if (ctx_open) {                     /* context menu (either kind) is modal: Esc closes it, swallow */
                 if (k == 27) { ctx_open = 0; dirty = 1; }   /* the rest so no F-key reorders under it */
                 continue;
             }
-            if (k == '\t' && alt_down) continue;   /* the Tab of Alt+Tab was already consumed raw (M1920) */
+            /* Every chord the raw pass consumed ALSO arrives here as an ordinary
+             * key and would fire a second, different action: Alt+F4 delivers
+             * cooked F4 and would MAXIMIZE the window before the raw pass closed
+             * it; Super+1..4 would type "1".."4" into the focused app; Super /
+             * Ctrl+Alt arrows would scroll or move a cursor. M1920 handled only
+             * Tab; this covers the rest. (M1926) */
+            if (alt_down && (k == '\t' || k == 0x9B || k == 0x0F)) continue;  /* Alt+Tab / Alt+Shift+Tab / Alt+F4 */
+            if (super_down && k >= '1' && k <= '9') continue;                   /* Super+N */
+            if ((super_down || (ctrl_down && alt_down)) && k >= 0x11 && k <= 0x14) continue;  /* arrows */
             if (k == 0x1D) {                    /* F1: toggle the keyboard-shortcut help overlay */
                 int o = help_open; close_overlays(); help_open = !o; dirty = 1;   /* one overlay at a time */
                 continue;
@@ -2035,127 +2197,6 @@ void desktop_run(void) {
             }
         }
 
-        /* raw make/break key events -> the focused app, if it opted into raw mode
-         * (games like DOOM). Always drained so they never accumulate; delivered
-         * only to a focused raw-mode app, else discarded. */
-        {
-            window_t *top = (win_count > 0) ? &windows[win_count - 1] : 0;
-            int rawmode = top && !top->minimized && top->kind == KIND_APP &&
-                          top->app && app_get_rawkb((app_t *)top->app);
-            int ev;
-            while ((ev = input_pop_raw()) >= 0) {
-                int code = ev & 0x7F, rel = (ev & 0x100) != 0;
-                /* Track the modifiers but STILL forward them: a raw-mode app
-                 * (DOOM) uses Alt and Shift itself. Only the Tab of an actual
-                 * Alt+Tab is swallowed. */
-                if (code == 0x38)                    alt_down   = !rel;   /* Alt (either side; 0x200 = right) */
-                else if (code == 0x2A || code == 0x36) shift_down = !rel; /* Shift */
-                else if (code == 0x1D)                 ctrl_down  = !rel; /* Ctrl  */
-
-                /* Ctrl+Alt+Left/Right: previous/next workspace (the Linux chord).
-                 * Super+1..4 jumps straight to one. (M1923) */
-                /* Super+Shift+1..4 / Ctrl+Alt+Shift+Left/Right: MOVE the window
-                 * there (M1924). Checked before the plain switch chords below, so
-                 * Shift takes precedence rather than being ignored. */
-                if (shift_down && !rel &&
-                    ((ctrl_down && alt_down && (code == 0x4B || code == 0x4D)) ||
-                     (super_down && code >= 0x02 && code <= 0x02 + WS_N - 1))) {
-                    int to;
-                    if (super_down && code >= 0x02 && code <= 0x02 + WS_N - 1) {
-                        super_used = 1;
-                        to = code - 0x02;
-                    } else {
-                        to = (code == 0x4B) ? (cur_ws + WS_N - 1) % WS_N : (cur_ws + 1) % WS_N;
-                    }
-                    move_focused_to_ws(to);
-                    close_overlays();
-                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
-                    dirty = 1;
-                    continue;
-                }
-                if (ctrl_down && alt_down && !rel && (code == 0x4B || code == 0x4D)) {
-                    int to = (code == 0x4B) ? (cur_ws + WS_N - 1) % WS_N : (cur_ws + 1) % WS_N;
-                    switch_ws(to);
-                    close_overlays();
-                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
-                    dirty = 1;
-                    continue;
-                }
-                if (super_down && !rel && code >= 0x02 && code <= 0x02 + WS_N - 1) {  /* 1..4 */
-                    super_used = 1;
-                    switch_ws(code - 0x02);
-                    close_overlays();
-                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
-                    dirty = 1;
-                    continue;
-                }
-
-                if (code == 0x0F && !rel && alt_down) {       /* Alt+Tab / Alt+Shift+Tab */
-                    if (win_count > 1) {
-                        if (!sw_open) {                        /* open it and step off the current window */
-                            close_overlays();                  /* one overlay at a time */
-                            sw_open = 1; sw_alt = 1;
-                            sw_sel = win_count - 1;
-                        }
-                        sw_sel = shift_down ? (sw_sel + 1) % win_count
-                                            : (sw_sel + win_count - 1) % win_count;
-                        dirty = 1;
-                    }
-                    continue;                                  /* never let Tab reach the app */
-                }
-                if (code == 0x3E && !rel && alt_down) {        /* Alt+F4: close the window (M1921) */
-                    if (close_focused_window()) {
-                        dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
-                        dirty = 1;
-                    }
-                    continue;
-                }
-                if (code == 0x5B) {                           /* Super/Windows key (M1921/M1922) */
-                    if (!rel) { super_down = 1; super_used = 0; }
-                    else {
-                        super_down = 0;
-                        /* Fire on RELEASE, and only if Super was not used as a
-                         * modifier -- otherwise Super+Left would snap AND leave the
-                         * launcher open on top of it. This is also what Windows and
-                         * GNOME do: the launcher opens on the tap, not the press. */
-                        if (!super_used) {
-                            int o = menu_open; close_overlays(); menu_open = !o; menu_sel = 0;
-                            dirty = 1;
-                        }
-                    }
-                    continue;
-                }
-                /* Super + arrows: the window-management chords everyone arrives with
-                 * (M1922). Snapping and maximizing already existed on F4/F5/F6; these
-                 * are the gestures people actually try. Arrows are E0-prefixed, but
-                 * `code` masks the extended flag off so both encodings match. */
-                if (super_down && !rel &&
-                    (code == 0x4B || code == 0x4D || code == 0x48 || code == 0x50)) {
-                    super_used = 1;
-                    if (win_count > 0) {
-                        int fi = win_count - 1;
-                        if (code == 0x4B)      snap_window(fi, 0);        /* Left  */
-                        else if (code == 0x4D) snap_window(fi, 1);        /* Right */
-                        else if (code == 0x48) toggle_maximize(fi);       /* Up    */
-                        else {                                            /* Down: minimize */
-                            int vis = 0;
-                            for (int i = 0; i < win_count; i++) if (!windows[i].minimized) vis++;
-                            if (vis > 1) { windows[fi].minimized = 1; sink_window(fi); }
-                        }
-                        dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
-                        dirty = 1;
-                    }
-                    continue;
-                }
-                if (code == 0x38 && rel && sw_open && sw_alt) {  /* Alt released: commit */
-                    raise_window(sw_sel);
-                    dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;
-                    sw_open = sw_alt = 0;
-                    dirty = 1;
-                }
-                if (rawmode) app_key_raw((app_t *)top->app, (unsigned short)ev);
-            }
-        }
 
         int mx = mouse_x(), my = mouse_y(), btn = mouse_buttons(), left = btn & 1;
 
@@ -2305,7 +2346,7 @@ void desktop_run(void) {
                     spawn_app(KIND_APP, "calendar"); dirty = 1;
                 } else for (int i = 0; i < win_count; i++) {     /* else a window chip? */
                     int cx = TB_CHIPX0 + i * (TB_CHIPW + TB_CHIPGAP);
-                    if (cx + TB_CHIPW > clkx - 8) break;
+                    if (cx + TB_CHIPW > chips_right_bound()) break;   /* SAME bound as the draw (M1926) */
                     if (mx >= cx && mx < cx + TB_CHIPW) { raise_window(i); dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1; dirty = 1; break; }
                 }
             } else {
@@ -2498,6 +2539,7 @@ void desktop_run(void) {
                 remove_window(i); dirty = 1;
                 dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1;             /* the array shifted: drop any active gesture */
                 if (ctx_open) ctx_open = 0;     /* a window vanished: close the menu so ctx_win can't go stale */
+                if (sw_open && sw_sel >= win_count) sw_sel = win_count - 1;   /* ...and the switcher's index (M1926) */
             }
 
         uint64_t sec = timer_ticks() / 100;

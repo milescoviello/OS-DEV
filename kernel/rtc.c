@@ -175,12 +175,17 @@ static void rtc_selftest_peer(void) {
 }
 
 void rtc_selftest(void) {
-    cmos_widen_window = 1;      /* make the two-instruction race reachable */
     rtc_st_stop = rtc_st_bad = rtc_st_n = rtc_st_done = 0;
     if (!task_create_stack(rtc_selftest_peer, 0, 0, 16 * 1024)) {
         kprintf("[ ok ] rtc: concurrency self-test skipped (no task slot)\n");
         return;
     }
+    /* Raised only AFTER the bail-out (M1926). Left set on the failure path it
+     * would make every later rtc_now() -- the desktop clock, every filesystem
+     * timestamp, ring-3 clock_gettime -- yield seven times WHILE HOLDING
+     * cmos_lock, with other tasks spinning on it: exactly the
+     * spin-yield-starves-the-holder shape M1912 was about, self-inflicted. */
+    cmos_widen_window = 1;      /* make the two-instruction race reachable */
     for (int i = 0; i < 40; i++) {          /* 40 is ample: with the window forced open the\n                                             * unlocked version tears ~86% of reads (2588/3003),\n                                             * so detection is certain while boot stays fast */
         struct rtc_time t; rtc_now(&t);
         if (!rtc_time_sane(&t)) __atomic_add_fetch(&rtc_st_bad, 1, __ATOMIC_SEQ_CST);

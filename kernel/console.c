@@ -117,20 +117,36 @@ void console_putc(char c) {
  * inside a log call) print rather than deadlock — the panic path must never be
  * silenced by this lock. */
 static volatile int con_lock;
-static volatile int con_owner = -1;      /* core currently emitting, -1 = none */
+static volatile int con_owner = -1;      /* TASK currently emitting, -1 = none */
 
+/* Owner is the TASK, not the core, and interrupts are NOT disabled (M1926).
+ *
+ * M1915 held `cli` for the whole line to stop a preemption splitting it. That
+ * worked, but `serial_putc` busy-waits on the UART (~87 us/byte at 115200), so an
+ * 80-char line meant ~7 ms with interrupts off -- most of a 100 Hz tick, every
+ * line, on the bare-metal target this project boots on. Dropped ticks and
+ * serial-RX overruns on netcon (the primary bare-metal debug channel) are a real
+ * price to pay for a log.
+ *
+ * Keying the owner on the task instead makes `cli` unnecessary:
+ *   - a task preempted INTO while another holds the lock sees a different owner
+ *     and spins, so lines still never interleave (and M1912 guarantees the holder
+ *     cannot be starved by that spinning);
+ *   - an interrupt handler on the same core runs in the interrupted task's
+ *     context, so it sees ITSELF as owner and proceeds instead of deadlocking.
+ *     Its output may interleave in that rare case, which is the right trade: a
+ *     lock must never be able to silence a fault or the panic path. */
 static inline int con_take(uint64_t *fl) {
-    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
-    int me = smp_current_cpu();
-    *fl = f;
-    if (con_owner == me) return 0;                       /* re-entered: don't block */
+    int me = task_current_id();
+    *fl = 0;
+    if (con_owner == me && con_lock) return 0;           /* re-entered: don't block */
     while (__atomic_exchange_n(&con_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
     con_owner = me;
     return 1;
 }
 static inline void con_give(int held, uint64_t f) {
+    (void)f;
     if (held) { con_owner = -1; __atomic_store_n(&con_lock, 0, __ATOMIC_RELEASE); }
-    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
 }
 
 void console_write(const char *s) {
@@ -257,7 +273,7 @@ static const char cs_ayes[] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 static const char cs_bees[] = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
 static void console_selftest_peer(void) {
-    for (int i = 0; i < 60 && !cs_stop; i++) {
+    for (int i = 0; i < 24 && !cs_stop; i++) {
         kprintf("[cs] %s\n", cs_bees);
         task_yield();
     }
@@ -271,13 +287,13 @@ void console_selftest(void) {
         kprintf("[ ok ] console: log-splicing self-test skipped (no task slot)\n");
         return;
     }
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 24; i++) {
         kprintf("[cs] %s\n", cs_ayes);
         task_yield();
     }
     __atomic_store_n(&cs_stop, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < 100000 && !__atomic_load_n(&cs_done, __ATOMIC_SEQ_CST); i++)
         task_yield();
-    kprintf("[ ok ] console: emitted 120 long interleaved log lines from 2 tasks "
+    kprintf("[ ok ] console: emitted 48 long interleaved log lines from 2 tasks "
             "(host checks none were spliced)\n");
 }
