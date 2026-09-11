@@ -10,11 +10,15 @@ cases + deterministic fuzzing.
 ## Running
 
 ```sh
-make check       # run all 136 suites (~7 min total)
+make check       # run all 136 suites (~12 min total)
 make jstest      # JS engine      — tests/js/suite.js vs the golden output
 make imgtest     # image decoders — tests/img/img_test.c   (jpeg/png/gif/bmp/inflate)
 make x509test    # X.509 parser   — tests/x509/x509_test.c
 make nettest     # TCP/IP stack   — tests/net/net_test.c   (packet parse + reassembly)
+# NOTE on runtime: the suite went from ~7 min to ~12 min when linuxabitest
+# gained its -cpu max boot (M1942). That is not overhead to tune away -- TCG has
+# to EMULATE AVX, and without a CPU that has AVX the XSAVE path would never
+# execute in the whole suite, so a green run would prove nothing about it.
 make linuxabitest # LINUX ABI    — boots headless and runs a HOST-built static-PIE Linux
                  #                binary off the ext2 volume, asserting its Linux write(2)
                  #                output and exit_group status on COM1. The only in-guest

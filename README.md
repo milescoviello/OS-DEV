@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1943-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1944-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -460,8 +460,15 @@ Landed so far, all on the from-scratch ext2 driver:
   an XSAVE-based context switch, since FXSAVE does not preserve YMM. glibc now
   parses the auxv and reaches its first syscall, `brk`.
 
-Still ahead: the syscall set glibc asks for (the kernel now names each missing
-one), then busybox, then the toolchain. The honest scale is months, and the memory
+- **M1943** — a **double fault in the new syscall entry stub**, caught by a
+  flaky test: `swapgs` is only self-restoring if every entry is paired with an
+  exit, and `exit_group` never returns. Deterministic now.
+- **M1944** — **a real glibc binary runs, prints and exits.** It reports the
+  `argc`/`argv[0]` our SysV stack built, proving the frame, alignment and auxv
+  are right. Returning from `main` still faults in glibc's own `exit()`
+  handler machinery — isolated, and not in the ABI.
+
+Still ahead: busybox, then the toolchain. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be
 expressed).

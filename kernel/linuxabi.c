@@ -36,6 +36,9 @@
 #include "task.h"
 #include "lxerrno.h"
 #include "vmm.h"
+#include "app.h"
+#include "rtc.h"
+#include "random.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
 #include "timer.h"
 #include "syscall.h"   /* AT_PAGESZ/AT_ENTRY/AT_UID/... -- the auxv types we share with /proc/<pid>/auxv */
 #include <stdint.h>
@@ -154,6 +157,51 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_exit_group   231
 #define LXS_getrandom    318
 
+/* --- the batch glibc asks for next (M1943) -------------------------------
+ * Each of these is a TRANSLATION onto a native primitive that already exists,
+ * not new mechanism. The shapes differ, and the differences are where the bugs
+ * live, so each is noted where it is not a straight pass-through. */
+#define LXS_mmap           9
+#define LXS_mprotect      10
+#define LXS_munmap        11
+#define LXS_uname         63
+#define LXS_readlink      89
+#define LXS_sysinfo       99
+#define LXS_getuid       102
+#define LXS_getgid       104
+#define LXS_geteuid      107
+#define LXS_getegid      108
+#define LXS_clock_gettime 228
+#define LXS_readlinkat   267
+#define LXS_set_robust_list 273
+#define LXS_prlimit64    302
+#define LXS_rseq         334
+#define LXS_fstat          5
+#define LXS_getrandom_    318
+
+/* Linux's x86-64 `struct stat` -- 144 bytes, and the field OFFSETS are the ABI.
+ * Writing our own struct layout here would compile fine and hand glibc
+ * garbage, so the offsets are spelled out rather than mirrored in a C struct. */
+#define LXST_SIZE     144
+#define LXST_O_DEV      0
+#define LXST_O_INO      8
+#define LXST_O_NLINK   16
+#define LXST_O_MODE    24
+#define LXST_O_UID     28
+#define LXST_O_GID     32
+#define LXST_O_RDEV    40
+#define LXST_O_SIZE    48
+#define LXST_O_BLKSIZE 56
+#define LXST_O_BLOCKS  64
+#define LX_S_IFCHR  0020000
+#define LX_S_IFREG  0100000
+
+/* Linux mmap flags we care about */
+#define LX_MAP_SHARED    0x01
+#define LX_MAP_PRIVATE   0x02
+#define LX_MAP_FIXED     0x10
+#define LX_MAP_ANONYMOUS 0x20
+
 #define ARCH_SET_FS 0x1002
 
 /* struct iovec, exactly Linux's layout. */
@@ -233,6 +281,121 @@ void linux_syscall_dispatch(struct registers *r) {
          * whether to line-buffer. ENOTTY is a legitimate answer and makes it
          * pick full buffering, which is correct for a non-tty. */
         r->rax = (uint64_t)-(long)LX_ENOTTY;
+        break;
+    case LXS_brk: {
+        /* Linux brk(0) returns the CURRENT break; brk(addr) sets it and returns
+         * the resulting break -- crucially it does NOT return an errno on
+         * failure, it returns the UNCHANGED break and lets the caller notice.
+         * Returning -ENOMEM here would make glibc's malloc think it had grown.
+         *
+         * app_sbrk is grow-only and takes a DELTA, so shrink requests are
+         * accepted and ignored, which brk permits (the memory stays mapped). */
+        uint64_t cur = app_sbrk(0);
+        if (a1 == 0) { r->rax = cur; break; }
+        if ((uint64_t)a1 > cur) {
+            uint64_t want = (uint64_t)a1 - cur;
+            if (app_sbrk((long)want) == (uint64_t)-1) { r->rax = cur; break; }  /* failed: unchanged break */
+        }
+        r->rax = app_sbrk(0);
+        break;
+    }
+    case LXS_mmap: {
+        /* Linux: mmap(addr, len, prot, flags, fd, off). Ours reserves an
+         * anonymous demand-paged region and CHOOSES the address, so only the
+         * anonymous case is expressible. MAP_FIXED cannot be honoured at all
+         * and must fail rather than silently land elsewhere -- a caller that
+         * asked for a specific address and got another one corrupts itself. */
+        long len = (long)r->rsi, prot = (long)r->rdx, flags = (long)r->r10;
+        long fd = (long)r->r8;
+        if (len <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (flags & LX_MAP_FIXED) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (!(flags & LX_MAP_ANONYMOUS) || fd >= 0) { r->rax = (uint64_t)-(long)LX_ENODEV; break; }
+        uint64_t base = app_mmap((uint64_t)len);
+        if (!base) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+        /* our regions come back writable+NX; tighten to what was asked for */
+        if (prot != (1 | 2)) app_mprotect(base, (uint64_t)len, (int)prot);
+        r->rax = base;
+        break;
+    }
+    case LXS_mprotect:
+        r->rax = (uint64_t)(app_mprotect(r->rdi, r->rsi, (int)r->rdx) == 0
+                            ? 0 : -(long)LX_EINVAL);
+        break;
+    case LXS_munmap:
+        r->rax = (uint64_t)(app_munmap(r->rdi, r->rsi) == 0 ? 0 : -(long)LX_EINVAL);
+        break;
+    case LXS_set_robust_list:
+    case LXS_rseq:
+        /* Both are pure optimisations: the robust-futex list only matters if a
+         * thread dies holding a lock, and rseq is a fast-path hint. Linux
+         * itself returns -ENOSYS for rseq when unsupported and glibc copes, so
+         * accepting-and-ignoring is safe for set_robust_list and ENOSYS is the
+         * honest answer for rseq. */
+        r->rax = (r->rax == LXS_rseq) ? (uint64_t)-(long)LX_ENOSYS : 0;
+        break;
+    case LXS_getuid: case LXS_geteuid:
+    case LXS_getgid: case LXS_getegid:
+        r->rax = 0;                          /* single-user: always root */
+        break;
+    case LXS_prlimit64:
+        /* (pid, resource, new, old). Report "unlimited" for a get and accept a
+         * set: glibc reads RLIMIT_STACK here to size its thread stacks, and a
+         * failure makes it fall back to a default rather than break. */
+        if (r->r10) {
+            uint64_t *old = (uint64_t *)r->r10;
+            if (!vmm_user_ok(r->r10, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            old[0] = old[1] = ~0ull;         /* RLIM_INFINITY, both cur and max */
+        }
+        r->rax = 0;
+        break;
+    case LXS_getrandom_: {                  /* (buf, len, flags) */
+        long len = (long)r->rsi;
+        if (len < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (len && !vmm_user_ok(r->rdi, (uint64_t)len)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* glibc uses this for malloc's canary and pointer mangling, so failing
+         * it is not cosmetic -- it changes how glibc protects itself. */
+        random_bytes((void *)r->rdi, (unsigned long)len);
+        r->rax = (uint64_t)len;
+        break;
+    }
+    case LXS_clock_gettime: {               /* (clk_id, struct timespec*) */
+        if (!vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint64_t ms = timer_ms();
+        int64_t *ts = (int64_t *)r->rsi;
+        /* CLOCK_REALTIME(0) wants wall time; everything else (MONOTONIC and
+         * the CPU-time clocks) is satisfied from uptime, which is what our
+         * millisecond timer actually measures. */
+        if (a1 == 0) { ts[0] = (int64_t)rtc_unix(); ts[1] = (int64_t)((ms % 1000) * 1000000); }
+        else         { ts[0] = (int64_t)(ms / 1000); ts[1] = (int64_t)((ms % 1000) * 1000000); }
+        r->rax = 0;
+        break;
+    }
+    case LXS_fstat: {                       /* (fd, struct stat*) */
+        if (!vmm_user_ok(r->rsi, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint8_t *st = (uint8_t *)r->rsi;
+        for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
+        /* stdio calls this on its own fds to decide buffering. Reporting a
+         * CHARACTER DEVICE is both true (they are the console) and what makes
+         * glibc pick line buffering instead of a full 4 KiB buffer -- with a
+         * regular-file answer, output would not appear until an explicit
+         * fflush or exit. */
+        if (a1 >= 0 && a1 <= 2) {
+            *(uint32_t *)(st + LXST_O_MODE) = LX_S_IFCHR | 0620;
+            *(uint64_t *)(st + LXST_O_RDEV) = 0x0501;          /* a tty-ish rdev */
+            *(uint64_t *)(st + LXST_O_NLINK) = 1;
+            *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
+            r->rax = 0;
+        } else {
+            r->rax = (uint64_t)-(long)LX_EBADF;
+        }
+        break;
+    }
+    case LXS_readlinkat:
+    case LXS_readlink:
+        /* glibc probes /proc/self/exe here. ENOENT is the honest answer while
+         * that node does not exist, and glibc falls back on argv[0] -- which
+         * the M1940 stack supplies. */
+        r->rax = (uint64_t)-(long)LX_ENOENT;
         break;
     case LXS_exit:
     case LXS_exit_group:

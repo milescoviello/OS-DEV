@@ -163,14 +163,31 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # The real proof is BEHAVIOURAL: glibc must now get PAST the AVX instruction
     # in _dl_aux_init. It does that by reaching its first real syscall, brk(12).
     # Asserting "no Invalid Opcode" alone would also pass if the binary never ran.
-    if grep -aq "unimplemented Linux syscall 12" "$SLOG3"; then
-        echo "  ok: glibc executed AVX, parsed the auxv and reached its first syscall (brk)"
+    # A real LIBC binary, end to end: glibc startup (TLS, malloc, stdio), a
+    # printf that must report the argc/argv OUR stack built, and a clean exit
+    # with the right status. This is the assertion that actually proves the
+    # SysV initial stack and the syscall set, rather than just "it started".
+    if grep -aq "static-PIE LIBC binary: argc=1 argv0=/disk2/hellolibc" "$SLOG3"; then
+        echo "  ok: a real GLIBC binary ran printf() and read argc/argv from our SysV stack"
     else
-        echo "  FAIL: glibc never reached brk -- still dying before its first syscall:"
+        echo "  FAIL: the glibc binary did not print its argc/argv:"; grep -a "static-PIE LIBC" "$SLOG3" | head -1; f3=1
+    fi
+    if grep -aq "guest exited with status 7" "$SLOG3"; then
+        echo "  ok: it exited cleanly through exit_group with the right status"
+    else
+        echo "  FAIL: the glibc binary never exited cleanly:"; grep -a "guest exited\|fault\]" "$SLOG3" | head -2; f3=1
+    fi
+    # NOTE: an earlier version asserted "unimplemented Linux syscall 12" here,
+    # as a proxy for "glibc got past the AVX instruction". That was an assertion
+    # about a TRANSIENT SYMPTOM and it broke the moment brk was implemented --
+    # the two checks above supersede it, because a binary that printf'd its own
+    # argc and exited with the right status has self-evidently got past AVX.
+    if grep -aq "Invalid Opcode" "$SLOG3"; then
+        echo "  FAIL: an Invalid Opcode fault occurred (AVX not usable?):"
         grep -a "Invalid Opcode" "$SLOG3" | head -1; f3=1
     fi
     [ $f3 -eq 0 ] || { echo "FAIL: XSAVE/AVX test"; exit 1; }
-    echo "PASS: AVX enabled via XSAVE — a glibc binary gets past _dl_aux_init"
+    echo "PASS: a real GLIBC static-PIE binary runs under OS-DEV (AVX via XSAVE, SysV auxv stack, clean exit)"
 else
     echo "SKIP: XSAVE/AVX test (this QEMU has no -cpu max)"
 fi
