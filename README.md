@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1949-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1950-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -477,9 +477,17 @@ Landed so far, all on the from-scratch ext2 driver:
   directory, and exits 0. `opendir` needed three chained fixes, each of which
   had been failing *silently* with zero entries.
 
-Still ahead: a toolchain. busybox itself is not obtainable on this host, so
-the ABI surface is driven by purpose-built glibc programs exercising the same
-syscalls. The honest scale is months, and the memory
+- **M1948-M1950** — **`fork`/`execve`/`wait4`/`pipe`/`dup2`**, demonstrated by a
+  busybox-shaped multi-call binary that re-execs *itself* to build
+  `echo | wc`. Chasing it root-caused a long-standing intermittent **Double
+  Fault** (`swapgs` is unsound if a syscall blocks, because nothing saves
+  `GS_BASE` across a context switch — it is gone now) and two pre-existing
+  `fork` TLS bugs. **Still open:** the pipeline carries data but `wc` miscounts,
+  so Phase 3 is not finished.
+
+Still ahead: finishing the pipe data path, then a toolchain. busybox itself is
+not obtainable on this host, so the ABI surface is driven by purpose-built
+glibc programs exercising the same syscalls. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be
 expressed).

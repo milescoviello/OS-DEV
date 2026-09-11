@@ -296,8 +296,16 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)a3;
         break;
     }
-    case LXS_writev: {                      /* (fd, iov, iovcnt) -- musl's printf path */
-        if (a1 != 1 && a1 != 2) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+    case LXS_writev: {                      /* (fd, iov, iovcnt) -- glibc's stdio flush path */
+        /* Same rule as write(): fd 1/2 are the console ONLY while untouched.
+         * This handler previously hard-coded them to the console and returned
+         * EBADF for everything else, so a dup2'd stdout still went to the
+         * SCREEN -- which is why the pipeline's writer produced console output
+         * and the reader saw an empty pipe, even after write() was fixed.
+         * glibc's buffered stdio flushes through writev, not write, so fixing
+         * only write() fixed only the unbuffered cases. */
+        int fd_tab = app_fd_is_open((int)a1);
+        if (a1 != 1 && a1 != 2 && !fd_tab) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
         const struct lx_iovec *v = (const struct lx_iovec *)r->rsi;
         if (a3 < 0 || a3 > 1024) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         /* The iovec ARRAY is a user pointer, and so is every iov_base inside
@@ -310,8 +318,14 @@ void linux_syscall_dispatch(struct registers *r) {
             unsigned long n = v[i].iov_len;
             if (!n) continue;
             if (!b || !vmm_user_ok((uint64_t)b, n)) { r->rax = (uint64_t)-(long)LX_EFAULT; goto done; }
-            for (unsigned long k = 0; k < n; k++) console_putc(b[k]);
-            total += (long)n;
+            if (fd_tab) {
+                long w = app_fd_write((int)a1, b, n);
+                if (w < 0) { r->rax = (uint64_t)-(long)LX_EPIPE; goto done; }
+                total += w;
+            } else {
+                for (unsigned long k = 0; k < n; k++) console_putc(b[k]);
+                total += (long)n;
+            }
         }
         r->rax = (uint64_t)total;
         break;
@@ -323,7 +337,7 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_arch_prctl:
         /* musl sets up its thread pointer here before main; refusing it is
          * fatal, because every later TLS access reads through %fs. */
-        if (a1 == ARCH_SET_FS) { kprintf("[lxdbg] ARCH_SET_FS 0x%lx\n", (unsigned long)r->rsi); task_set_fs_base(r->rsi); r->rax = 0; }
+        if (a1 == ARCH_SET_FS) { task_set_fs_base(r->rsi); r->rax = 0; }
         else                    r->rax = (uint64_t)-(long)LX_EINVAL;
         break;
     case LXS_set_tid_address:
@@ -450,7 +464,21 @@ void linux_syscall_dispatch(struct registers *r) {
              * FILE fd's path, so stat that. */
             const char *fp = app_fd_path((int)a1);
             struct statx sx;
-            if (!fp || vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            if (!fp) {
+                /* A non-FILE fd -- a pipe, socket, eventfd and so on. Report a
+                 * FIFO rather than EBADF: stdio calls fstat() on its own fds to
+                 * pick a buffering mode, and an error there leaves it guessing.
+                 * S_IFIFO is also the truthful answer for the pipe case, which
+                 * is the one a shell pipeline depends on. */
+                if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+                *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
+                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                *(uint64_t *)(st + LXST_O_INO)     = 1;
+                r->rax = 0;
+                break;
+            }
+            if (vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
             int isdir = (sx.stx_mode & 0170000u) == 0040000u;
             *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
             *(uint64_t *)(st + LXST_O_NLINK)   = 1;
@@ -643,7 +671,15 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_exit:
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);
-        task_exit();
+        /* app_sys_exit, NOT a bare task_exit(). It records the status, marks
+         * the app dead AND RELEASES ITS FDS -- and that last part is what makes
+         * a pipe signal EOF to the other end. Calling task_exit() directly left
+         * the process's pipe write end open forever, so a reader blocked in
+         * read() never saw EOF: the pipeline deadlocked with the writer already
+         * finished, the reader stuck, and the parent stuck in wait4. Deferring
+         * the close to app_reap is not enough either -- that runs on the window
+         * manager's schedule, while POSIX requires the fds to close at EXIT. */
+        app_sys_exit((int)a1);
         break;
     default:
         /* Log it. Implementing a Linux ABI by GUESSING which calls a libc makes
