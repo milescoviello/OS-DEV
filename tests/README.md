@@ -10,11 +10,17 @@ cases + deterministic fuzzing.
 ## Running
 
 ```sh
-make check       # run all 102 suites (~7 min total)
+make check       # run all 134 suites (~7 min total)
 make jstest      # JS engine      — tests/js/suite.js vs the golden output
 make imgtest     # image decoders — tests/img/img_test.c   (jpeg/png/gif/bmp/inflate)
 make x509test    # X.509 parser   — tests/x509/x509_test.c
 make nettest     # TCP/IP stack   — tests/net/net_test.c   (packet parse + reassembly)
+make linuxabitest # LINUX ABI    — boots headless and runs a HOST-built static-PIE Linux
+                 #                binary off the ext2 volume, asserting its Linux write(2)
+                 #                output and exit_group status on COM1. The only in-guest
+                 #                suite needing no screenshot: the Linux write() lands on
+                 #                the kernel console, which IS mirrored to serial, unlike
+                 #                ring-3 print() from OS-DEV's own apps (M1939)
 make fstest      # FAT32 driver   — tests/fs/fs_test.c     (corrupt/cyclic on-disk structures + write stress)
 make kattest     # crypto KAT     — tests/crypto/crypto_test.c (RFC/FIPS known-answer vectors)
 make svgtest     # SVG rasterizer — tests/svg/svg_test.c   (shapes/paths + adversarial XML fuzz)

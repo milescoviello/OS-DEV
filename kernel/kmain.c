@@ -241,6 +241,7 @@ static volatile int g_smpthread_test;         /* -append smpthreadtest: prove re
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
 static volatile int g_journal_test;           /* -append journalguest: prove the write-ahead journal + crash recovery on REAL ata hardware (M1865) */
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
+static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
 static volatile int g_netcon;                 /* -append netcon: start the network debug console on TCP 2323 (M1870, real-HW bring-up) */
 static volatile int g_nodisk;                 /* -append nodisk: skip ALL disk-WRITE self-tests + FS mount (M1872) — safe to boot on a machine with real disks; the bring-up image sets this */
 /* -append nonetdemo: skip the boot network self-test (M1909). net_demo() runs as a
@@ -472,6 +473,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "smpschedtest"))  g_smpsched_test = 1;       /* general-scheduler cross-core migration test (M1862) */
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
+        if (cmdline_has(cl, "lxabitest"))  g_lxabi_test = 1;              /* run a host-built static-PIE LINUX binary (M1939) */
         if (cmdline_has(cl, "netcon"))     g_netcon = 1;                 /* network debug console for real-HW bring-up (M1870) */
         if (cmdline_has(cl, "nodisk"))     g_nodisk = 1;                 /* skip disk-write self-tests + FS mount — safe on a machine with real disks (M1872) */
         if (cmdline_has(cl, "watchdog"))   g_watchdog = 1;              /* HW watchdog + panic-auto-reboot for the autonomous PXE loop (M1881) */
@@ -676,6 +678,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * `nodisk` (real-HW bring-up): fat32_mount reads a real disk to validate it,
      * and a match would arm the write-ahead journal on it — neither is wanted when
      * the attached disks hold someone else's data. */
+    /* -append lxabitest (M1939): launch a REAL Linux binary. Deliberately does
+     * not need the keyboard, so the whole check is a COM1 assertion -- the
+     * Linux write(2) lands on the kernel console, which is mirrored to serial,
+     * unlike ring-3 print() from our own apps. */
+    if (g_lxabi_test) {
+        kprintf("[lxabi] launching a host-built static-PIE Linux binary from /disk2...\n");
+        if (app_spawn_from_file("/disk2/hellofree") < 0)
+            kprintf("[FAIL] lxabi: could not load /disk2/hellofree\n");
+    }
+
     if (!g_nodisk && fat32_mount() == 0) {
         kprintf("[ ok ] mounted FAT32 volume (ATA primary master).\n\n");
         if (g_fatjournal_test)             /* -append fatjournaltest: live FAT32 create crash-atomicity (M1866) */
