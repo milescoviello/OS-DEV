@@ -46,6 +46,32 @@ below are what comes *after* it, and each adds large subsystems.
 - **🤖 Run Claude Code — still a multi-year stretch.** Unchanged: needs a Linux
   syscall ABI + a JS runtime. Not attempted.
 
+## Update (2026-09): the minimal DOM landed, and a stylesheet can now lay out a page
+
+Two corrections to the 2026-06 note below, which has gone stale in one direction
+and been confirmed in the other:
+
+- **The "next big build" it names is done.** A minimal DOM shipped: pages get
+  `getElementById`-style access (`browser_dom_get`/`browser_dom_set`,
+  text *and* HTML), element `onclick` handlers, and a canvas bridge. In-page JS
+  is no longer only `document.write` + `javascript:` links.
+- **CSS got the missing half (M1928-M1931).** Until recently the cascade carried
+  **no box geometry at all** — width, margins, padding and height could only come
+  from an inline `style=` attribute, so a *stylesheet* could not lay out a page,
+  which is how essentially every real page is built. That is fixed, along with
+  viewport units (`vw`/`vh`), `float`/`clear`, and `max-height`/`overflow:hidden`.
+  example.com now renders as the centred column its stylesheet asks for, and
+  danluu.com and `text.npr.org` render close to a real browser.
+
+**The honest ceiling below is unchanged.** None of this moves Chromium, Google Docs
+or a modern SPA into reach — those need a full layout engine, an event loop and a
+Linux ABI. What changed is that *text-oriented real pages* now render largely
+correctly, which is exactly the "best little from-scratch browser" target. Still
+genuinely out of reach in the renderer: `position`, `z-index`, and floated block
+containers, all of which need real out-of-flow boxes.
+
+---
+
 ## Update (later 2026-06): HTTPS + a JavaScript engine landed
 
 Two big things changed since the note above:
