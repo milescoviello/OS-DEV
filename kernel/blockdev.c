@@ -784,11 +784,14 @@ int blockdev_mount_isdir(int i, const char *path) {
  * same 3-way dispatch as blockdev_mount_isdir, feeding vfs_stat so an
  * ABSOLUTE /diskN/... path resolves even when cwd is outside that mount
  * (vfs_stat's own FAT32-only fallback has no notion of a mount name at all). */
-int blockdev_mount_stat(int i, const char *path, uint32_t *out_size, int *out_isdir) {
+int blockdev_mount_stat(int i, const char *path, uint32_t *out_size, int *out_isdir, uint32_t *out_ino) {
     blockdev_mount_scan();
+    if (out_ino) *out_ino = 0;                  /* 0 = this filesystem has no inode to report */
     if (i < 0 || i >= g_nmount) return -1;
     blk_read_fn r = mount_rfn(i); void *c = mount_ctx(i); uint64_t s = g_mount[i].start;
-    return g_mount[i].fstype == FS_EXT2    ? ext2_stat_path(r, c, s, path ? path : "", out_size, out_isdir)
+    /* Only ext2 has real inodes. FAT32 and ISO9660 have none, so they leave
+     * out_ino at 0 and vfs_stat synthesizes one from the path instead. */
+    return g_mount[i].fstype == FS_EXT2    ? ext2_stat_path(r, c, s, path ? path : "", out_size, out_isdir, out_ino)
          : g_mount[i].fstype == FS_ISO9660 ? iso9660_stat_path(r, c, s, path ? path : "", out_size, out_isdir)
                                            : fatvol_stat_path(r, c, s, path ? path : "", out_size, out_isdir);
 }

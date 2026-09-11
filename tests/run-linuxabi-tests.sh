@@ -173,7 +173,11 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # printf that must report the argc/argv OUR stack built, and a clean exit
     # with the right status. This is the assertion that actually proves the
     # SysV initial stack and the syscall set, rather than just "it started".
-    if grep -aq "static-PIE LIBC binary: argc=1 argv0=/disk2/hellolibc" "$SLOG3"; then
+    # argv0 is "/hellolibc", NOT "/disk2/hellolibc": a Linux process sees the ext2
+    # volume as its root, so M1954 strips the mount prefix from argv[0] -- without
+    # that, a program re-execing itself by argv[0] asks for /disk2/disk2/... The
+    # leading "/" still matters, so this is not just a suffix match.
+    if grep -aq "static-PIE LIBC binary: argc=1 argv0=/hellolibc" "$SLOG3"; then
         echo "  ok: a real GLIBC binary ran printf() and read argc/argv from our SysV stack"
     else
         echo "  FAIL: the glibc binary did not print its argc/argv:"; grep -a "static-PIE LIBC" "$SLOG3" | head -1; f3=1
@@ -220,6 +224,28 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     else
         echo "  FAIL: file-backed mmap offset wrong:"; grep -a "LXFMAP" "$SLOG3" | head -1; f3=1
     fi
+    # M1954 -- THE Phase-4 unlock: a DYNAMICALLY LINKED binary. Everything
+    # before this was -static-pie, built by us. This one is an ordinary
+    # `gcc -o lxdyn lxdyn.c` with no flags at all: it has a PT_INTERP, and
+    # running it means ld-linux-x86-64.so.2 itself executed under OS-DEV,
+    # opened libc.so.6, laid out its segments and resolved its relocations.
+    # That is what makes the host toolchain (as/ld/objcopy/nasm/make, all
+    # dynamically linked) reachable at all.
+    #
+    # argc/argv0 is the assertion, not just "it ran": a program whose argv is
+    # wrong got a stack the loader built by accident. ld.so is passed the
+    # EXECUTABLE's argv, and getting that wrong makes it try to load itself.
+    if grep -aq "LXDYN: a dynamically-linked binary ran, argc=1 argv0=/lxdyn" "$SLOG3"; then
+        echo "  ok: ld-linux-x86-64.so.2 ran, mapped libc.so.6 and started a dynamic binary"
+    else
+        echo "  FAIL: the dynamically-linked binary did not run:"
+        grep -aE "LXDYN|dynamically linked|error while loading" "$SLOG3" | head -3; f3=1
+    fi
+    if grep -aq "guest exited with status 11" "$SLOG3"; then
+        echo "  ok: the dynamic binary exited through glibc's exit path with status 11"
+    else
+        echo "  FAIL: the dynamic binary did not exit cleanly:"; grep -a "guest exited" "$SLOG3" | tail -3; f3=1
+    fi
     if grep -aq "guest exited with status 7" "$SLOG3"; then
         echo "  ok: it exited cleanly through exit_group with the right status"
     else
@@ -236,6 +262,74 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     fi
     [ $f3 -eq 0 ] || { echo "FAIL: XSAVE/AVX test"; exit 1; }
     echo "PASS: a real GLIBC static-PIE binary runs under OS-DEV (AVX via XSAVE, SysV auxv stack, clean exit)"
+
+    # --- M1955: PHASE 4 -- the BORROWED toolchain, running in-guest ----------
+    # Everything else under test here is written from scratch in this repo.
+    # These are not: unmodified host binutils, copied in whole and driven
+    # through the Linux ABI shim. The demo assembles a real .s file with `as`,
+    # links the object with `ld`, and then RUNS the result -- inside OS-DEV.
+    #
+    # Its own boot, because it needs 1 GiB (five shared libraries mapped per
+    # process) and because bundling it into lxfulltest would make one failure
+    # indistinguishable from the other.
+    SLOG4=$(mktemp /tmp/osdev_lxtool.XXXXXX.log)
+    kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; QPID3=""
+    QPID4=""
+    cleanup4() { [ -n "$QPID4" ] && { kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; }; rm -f "$SLOG4"; }
+    trap 'rc=$?; cleanup4; exit $rc' EXIT
+
+    echo "booting to assemble+link a program with the borrowed host toolchain..."
+    timeout -s KILL 300 "$QEMU" -cpu max -no-reboot -no-shutdown -m 1G -smp 4 -kernel "$KERNEL" \
+        -append "lxtooltest nonetdemo" \
+        -drive file="$DISK",format=raw,if=ide \
+        -drive file="$EXT2",format=raw,if=ide \
+        -display none -serial file:"$SLOG4" >/dev/null 2>&1 &
+    QPID4=$!
+    i=0
+    while [ $i -lt 500 ]; do
+        grep -aqE "SELFBUILT exit|KERNEL PANIC" "$SLOG4" 2>/dev/null && break
+        sleep 0.5; i=$((i+1))
+    done
+
+    f4=0
+    if grep -aq "KERNEL PANIC" "$SLOG4"; then
+        echo "  FAIL: KERNEL PANIC while running the toolchain:"
+        grep -a -A2 "KERNEL PANIC" "$SLOG4" | head -3; f4=1
+    fi
+    # 1. the assembler's OWN output. Proves ld.so mapped five distinct shared
+    #    objects -- the bug this caught was st_ino being a constant, which made
+    #    ld.so treat libz/libzstd/libc as already-loaded copies of libbfd.
+    if grep -aq "GNU assembler" "$SLOG4"; then
+        echo "  ok: real GNU as printed its version ($(grep -ao 'GNU assembler.*' "$SLOG4" | head -1))"
+    else
+        echo "  FAIL: the borrowed assembler did not run:"
+        grep -aE "symbol lookup|error while loading|openat.*ENOENT|fault\]" "$SLOG4" | head -3; f4=1
+    fi
+    # 2/3. as and ld must both exit ZERO. A non-zero status here means the tool
+    #      ran but the job failed, which is a different bug from not starting.
+    if grep -aq "\[lxtool\] as -> 0" "$SLOG4"; then
+        echo "  ok: as assembled /hello.s -> /t.o inside OS-DEV"
+    else
+        echo "  FAIL: as could not assemble:"; grep -a "\[lxtool\] as ->" "$SLOG4" | tail -1; f4=1
+    fi
+    if grep -aq "\[lxtool\] ld -> 0" "$SLOG4"; then
+        echo "  ok: ld linked /t.o -> /t.elf inside OS-DEV"
+    else
+        echo "  FAIL: ld could not link:"; grep -a "\[lxtool\] ld ->" "$SLOG4" | tail -1; f4=1
+    fi
+    # 4. THE assertion: run what the guest just built. Both halves matter --
+    #    the program's own output, and its own exit status 23 through the ABI.
+    #    A staged binary could produce the message; only a real assemble+link
+    #    of hello.s produces it from bytes that did not exist at boot.
+    if grep -aq "SELFBUILT: assembled and linked by binutils running inside OS-DEV" "$SLOG4" &&
+       grep -aq "\[lxtool\] SELFBUILT exit -> 23" "$SLOG4"; then
+        echo "  ok: OS-DEV RAN THE PROGRAM IT JUST BUILT (exit 23, its own status)"
+    else
+        echo "  FAIL: the self-built program did not run:"
+        grep -aE "SELFBUILT" "$SLOG4" | head -2; f4=1
+    fi
+    [ $f4 -eq 0 ] || { echo "FAIL: in-guest toolchain"; exit 1; }
+    echo "PASS: PHASE 4 -- real GNU binutils assembled, linked and ran a program inside OS-DEV"
 else
-    echo "SKIP: XSAVE/AVX test (this QEMU has no -cpu max)"
+    echo "SKIP: XSAVE/AVX + toolchain tests (this QEMU has no -cpu max)"
 fi

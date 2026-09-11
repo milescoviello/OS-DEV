@@ -73,7 +73,7 @@ static int do_pipe(const char *self) {
 }
 
 int main(int argc, char **argv) {
-    const char *self = argc > 0 ? argv[0] : "/disk2/lxbox";
+    const char *self = argc > 0 ? argv[0] : "/lxbox";
     if (argc > 1 && !strcmp(argv[1], "echo")) return do_echo(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "wc"))   return do_wc();
     if (argc > 1 && !strcmp(argv[1], "pipe")) return do_pipe(self);

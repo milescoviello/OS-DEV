@@ -42,3 +42,15 @@ uint64_t elf_image_size(const void *image, uint64_t maxsz);
  * boot's low 1 GiB identity map, which is supervisor-only and so cannot hold
  * user pages at all. (M1465; hoisted M1940) */
 #define ELF_DYN_BASE 0x40000000ull
+
+/* Dynamic-linking support (M1954). A dynamically-linked image names its
+ * interpreter in PT_INTERP; elf_interp_path reports that path (it does NOT
+ * read the file -- elf.c has no VFS and stays host-testable), and elf_load_at
+ * maps a PIE at a base the caller chooses, so the interpreter can be placed
+ * clear of the executable it will load. */
+int      elf_interp_path(const void *image, uint64_t maxsz, char *out, int max);
+uint64_t elf_load_at(const void *image, uint64_t maxsz, uint64_t base);
+
+/* Where the dynamic linker is mapped: clear of ELF_DYN_BASE (the executable)
+ * and of the mmap window, so the three cannot collide. */
+#define ELF_INTERP_BASE 0x48000000ull

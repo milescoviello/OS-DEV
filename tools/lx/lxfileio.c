@@ -12,7 +12,7 @@
 #include <sys/stat.h>
 
 int main(int argc, char **argv) {
-    const char *dir  = argc > 1 ? argv[1] : "/disk2";
+    const char *dir  = argc > 1 ? argv[1] : "/";   /* the Linux root IS the ext2 volume (M1954) */
     char path[256];
     snprintf(path, sizeof path, "%s/lxio.txt", dir);
 

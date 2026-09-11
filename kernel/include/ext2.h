@@ -20,7 +20,7 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
 long ext2_read_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
                     void *buf, unsigned long max);                  /* read a file; bytes, or -1 */
 int  ext2_isdir_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path);  /* 1 dir / 0 file / -1 absent */
-int  ext2_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path, uint32_t *out_size, int *out_isdir);  /* 0/-1 (M1624) */
+int  ext2_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path, uint32_t *out_size, int *out_isdir, uint32_t *out_ino);  /* 0/-1; out_ino = the real inode number (M1955) */
 /* Create a NEW regular file `path` with `buf`/`len` (block + inode allocation,
  * directory insertion). Fails (-1) if the file already exists, the parent dir is
  * missing/full, or there's no space. Direct + single-indirect extents only. M1132. */

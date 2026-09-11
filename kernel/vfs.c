@@ -533,6 +533,23 @@ long vfs_read(const char *name, void *buf, unsigned long max) {
  * real mtime (M1173 stamps it on write); for other paths the dirent channel
  * carries only size, so we report size + a regular-file type (mtime 0). Returns
  * 0, or -1 if the path isn't found. */
+/* A stable, distinct inode number for a filesystem that has none of its own
+ * (FAT32, ISO9660, tmpfs, the synthetic mount roots). 32-bit FNV-1a over the
+ * resolved path: the same path always yields the same number and two different
+ * paths practically never collide, which is the property callers rely on.
+ *
+ * This is not cosmetic. A dynamic linker decides "have I already loaded this
+ * object?" by comparing (st_dev, st_ino), so reporting a CONSTANT inode makes
+ * every shared library look like the first one already mapped -- ld.so opened
+ * libz, libzstd and libc, matched them all against libbfd, and mapped none of
+ * them, which surfaced as `undefined symbol: free, version GLIBC_2.2.5`
+ * with no indication of the cause. (M1955) */
+static unsigned path_ino(const char *p) {
+    unsigned h = 2166136261u;
+    for (int i = 0; p && p[i]; i++) { h ^= (unsigned char)p[i]; h *= 16777619u; }
+    return h ? h : 1u;                          /* 0 means "none", so never return it */
+}
+
 int vfs_stat(const char *path, struct statx *st) {
     for (unsigned i = 0; i < sizeof(*st); i++) ((char *)st)[i] = 0;
     st->stx_blksize = 512; st->stx_nlink = 1;
@@ -546,7 +563,7 @@ int vfs_stat(const char *path, struct statx *st) {
      * wants a trailing slash, so the bare "/tmp" mount dir lands here) (M1173) */
     if (veq(path, "/") || veq(path, "/tmp") || veq(path, "/tmp/") || veq(path, "/proc") || veq(path, "/proc/") ||
         veq(path, "/dev") || veq(path, "/dev/") || veq(path, "/snap") || veq(path, "/snap/")) {
-        st->stx_mode = S_IFDIR | 0755u; return 0;
+        st->stx_mode = S_IFDIR | 0755u; st->stx_ino = path_ino(path); return 0;
     }
     if (tmp_path(path, &tb)) {                          /* RAM /tmp: full metadata */
         int islink = 0; unsigned long sz = 0, mt = 0;
@@ -554,6 +571,7 @@ int vfs_stat(const char *path, struct statx *st) {
         st->stx_mode = (unsigned)(islink ? S_IFLNK : S_IFREG) | 0644u;
         st->stx_size = sz; st->stx_blocks = (sz + 511) / 512;
         st->stx_mtime = st->stx_ctime = st->stx_atime = mt;
+        st->stx_ino = path_ino(path);
         return 0;
     }
     { /* a /diskN mount (M1624) -- ABSOLUTE regardless of cwd, or relative while
@@ -574,10 +592,14 @@ int vfs_stat(const char *path, struct statx *st) {
                 st->stx_mode = S_IFDIR | 0755u;
                 return 0;
             }
-            uint32_t fsize; int fisdir;
-            if (blockdev_mount_stat(midx, fpath, &fsize, &fisdir) != 0) return -1;
+            uint32_t fsize; int fisdir; uint32_t fino = 0;
+            if (blockdev_mount_stat(midx, fpath, &fsize, &fisdir, &fino) != 0) return -1;
             st->stx_mode = (unsigned)(fisdir ? S_IFDIR : S_IFREG) | (fisdir ? 0755u : 0644u);
             st->stx_size = fsize; st->stx_blocks = (fsize + 511) / 512;
+            /* The real ext2 inode when the filesystem has one; a path hash
+             * otherwise. Hash the FULL path, not fpath, so the same name on
+             * two different mounts gets two different inodes. */
+            st->stx_ino = fino ? fino : path_ino(path);
             return 0;
         }
     }
@@ -608,11 +630,12 @@ int vfs_stat(const char *path, struct statx *st) {
         return -1;
     }
     const char *base = path; for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
-    if (!*base) { st->stx_mode = S_IFDIR | 0755u; return 0; }   /* trailing slash -> a directory */
+    if (!*base) { st->stx_mode = S_IFDIR | 0755u; st->stx_ino = path_ino(path); return 0; }   /* trailing slash -> a directory */
     vfs_dirent ents[64]; int n = vfs_list(ents, 64);
     for (int i = 0; i < n; i++) if (veq(ents[i].name, base)) {
         st->stx_mode = S_IFREG | 0644u;                /* the dirent carries no type bit -> assume regular */
         st->stx_size = ents[i].size; st->stx_blocks = (ents[i].size + 511) / 512;
+        st->stx_ino = path_ino(path);
         return 0;
     }
     return -1;

@@ -90,7 +90,7 @@ struct app {
  * file mappings were in play. */
 #define APP_MAXVMA 64
 #define HUGE_SIZE  0x200000ull           /* 2 MiB hugepage (M1155) */
-    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; char fpath[64]; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544) */
+    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; char fpath[256]; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fpath is 256 like the fd table's, NOT 64 -- see M1955 */
     int      nvma;
     uint64_t mmap_next;                  /* bump allocator for mmap addresses */
     int      mlock_future;               /* mlockall(MCL_FUTURE): new mmaps are born locked (M1283) */
@@ -280,6 +280,17 @@ static struct {
     int        monitor_waiting;
 } g_uffd;
 static char g_pend_arg[128];             /* arg for the next app_spawn, copied into its launch_arg */
+/* A FULL argv for the next Linux spawn (M1955). One arg was enough to pick an
+ * applet out of a multi-call binary; a real tool invocation is not -- `as -o
+ * out.o in.s` is three. Safe as a one-shot global for the same reason
+ * g_pend_arg is: app_spawn is called synchronously and spawns are serialised.
+ * execve is NOT (it is called concurrently by unrelated processes), which is
+ * why its argv lives per-process in exec_argv instead -- see M1952. */
+#define LX_PEND_ARGS   12
+#define LX_PEND_ARGLEN 192
+static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
+static int  g_pend_lxargc;
+static int  g_last_spawn_pid;            /* pid of the last successful app_spawn (M1955) */
 static int  g_have_pend;
 /* A pending "jail" for the next app_spawn (M1088): pledge promises + an optional
  * unveil prefix applied to the child BEFORE it runs (a parent-enforced sandbox). */
@@ -291,6 +302,13 @@ static char     g_jail_path[64];
  * one-shot shape as g_pend_arg/g_pend_jail. (M1940) */
 static volatile int g_pend_linux;
 static char         g_pend_lxpath[256];
+/* Pending INTERPRETER image for a dynamically-linked Linux binary (M1954).
+ * Read before the spawn so no disk I/O happens inside app_spawn's cli/CR3
+ * critical section. A pending global is acceptable HERE, unlike execve's --
+ * spawns are serialised (kmain at boot, the window manager afterwards),
+ * whereas execve is called concurrently by unrelated processes, which is
+ * exactly what bit M1952. */
+static void        *g_pend_interp; static unsigned long g_pend_interp_sz;
 /* Image override for Linux execve(2) (M1948, moved per-process M1952).
  *
  * app_exec resolves names in the compiled-in progs[] table, which a Linux
@@ -1842,6 +1860,10 @@ uint64_t app_sbrk(long inc) {
  * up front — the first touch of each page faults, and app_fault_handle (called
  * from the #PF handler) lazily allocates + maps a zeroed frame. This is the
  * core demand-paging mechanism, and the seed for file-backed mmap + COW/fork. */
+/* Forward: defined next to app_munmap, which is its other caller. MAP_FIXED
+ * and munmap are the same operation on the VMA list. */
+static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len);
+
 #define MMAP_BASE  0x60000000ull        /* above the 0x50000000 user stack, clear of the heap */
 #define MMAP_TOP   0x70000000ull
 
@@ -1882,10 +1904,11 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
     if (a->nvma >= APP_MAXVMA) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-    for (int i = 0; i < a->nvma; i++) {                         /* no overlap -- see above */
-        uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
-        if (addr < e0 && s0 < addr + len) return 0;
-    }
+    /* MAP_FIXED REPLACES whatever is there -- that is its defining behaviour,
+     * not a detail. Refusing on overlap (which is what this did) is what broke
+     * ld.so: it reserves a span and then MAP_FIXEDs its segments into it. */
+    if (app_vma_carve(a, addr, len) != 0) return 0;
+    if (a->nvma >= APP_MAXVMA) return 0;                        /* re-check: the carve may have split */
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -1893,6 +1916,9 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
     a->vma[a->nvma].file_backed = 0;
     a->vma[a->nvma].locked = a->mlock_future;
     a->vma[a->nvma].huge = 0;
+    a->vma[a->nvma].shared = 0;          /* slots are recycled by the carve: never inherit */
+    a->vma[a->nvma].foff = 0;
+    a->vma[a->nvma].fpath[0] = 0;
     a->nvma++;
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -1974,13 +2000,11 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     if (!addr) {
         if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
         addr = a->mmap_next;
-    } else {
-        for (int i = 0; i < a->nvma; i++) {                /* MAP_FIXED: no overlap */
-            uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
-            if (addr < e0 && s0 < addr + len) return 0;
-        }
+    } else if (app_vma_carve(a, addr, len) != 0) {
+        return 0;                                          /* MAP_FIXED: replace what is there */
     }
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
+    if (a->nvma >= APP_MAXVMA) return 0;                   /* re-check: the carve may have split */
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -1990,8 +2014,16 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     a->vma[a->nvma].huge = 0;
     a->vma[a->nvma].shared = shared ? 1 : 0;
     a->vma[a->nvma].foff = off;
-    int i = 0; for (; path[i] && i < 63; i++) a->vma[a->nvma].fpath[i] = path[i];
+    int i = 0; for (; path[i] && i < 255; i++) a->vma[a->nvma].fpath[i] = path[i];
     a->vma[a->nvma].fpath[i] = 0;
+    /* REFUSE rather than truncate. This buffer was 64 bytes, and binutils'
+     * libbfd lives 98 characters down /usr/lib64/binutils/<triplet>/<ver>/ --
+     * so every demand-fault on that mapping read a path that does not exist,
+     * got a page of zeros, and handed ld.so a shared object whose entire
+     * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
+     * inside _dl_check_map_versions, with nothing pointing at the cause.
+     * A short path is now an error, which is a diagnosable failure. */
+    if (path[i]) return 0;               /* nvma not yet incremented: nothing to undo */
     a->nvma++;
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -2015,8 +2047,16 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     a->vma[a->nvma].huge = 0;
     a->vma[a->nvma].shared = shared ? 1 : 0;
     a->vma[a->nvma].foff = 0;
-    int i = 0; for (; path[i] && i < 63; i++) a->vma[a->nvma].fpath[i] = path[i];
+    int i = 0; for (; path[i] && i < 255; i++) a->vma[a->nvma].fpath[i] = path[i];
     a->vma[a->nvma].fpath[i] = 0;
+    /* REFUSE rather than truncate. This buffer was 64 bytes, and binutils'
+     * libbfd lives 98 characters down /usr/lib64/binutils/<triplet>/<ver>/ --
+     * so every demand-fault on that mapping read a path that does not exist,
+     * got a page of zeros, and handed ld.so a shared object whose entire
+     * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
+     * inside _dl_check_map_versions, with nothing pointing at the cause.
+     * A short path is now an error, which is a diagnosable failure. */
+    if (path[i]) return 0;               /* nvma not yet incremented: nothing to undo */
     a->nvma++;
     a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -2075,37 +2115,105 @@ int app_msync(uint64_t addr, uint64_t len) {
     return 0;
 }
 
+/* Remove [addr, addr+len) from this process's VMA list, splitting any VMA it
+ * partially covers and freeing the frames inside the range (M1954).
+ *
+ * This is the primitive Linux's mmap semantics are built on and the one thing
+ * we did not have. A dynamic linker maps a shared object by FIRST reserving
+ * the whole span with one file-backed mmap and THEN overwriting sub-ranges of
+ * its own reservation with MAP_FIXED -- so "refuse if it overlaps" (which is
+ * what app_mmap_fixed and app_mmap_file_at did) rejects the second segment of
+ * every library. glibc reports that as
+ *
+ *     libc.so.6: failed to map segment from shared object
+ *
+ * which is how this surfaced: ld.so itself ran fine, found libc, and then
+ * could not lay it out. Partial munmap() has the same shape, so both go
+ * through here.
+ *
+ * Validated in full BEFORE anything is mutated: a carve that runs out of VMA
+ * slots half way through would leave the address space describing memory that
+ * is no longer mapped. Returns 0, or -1 with nothing changed. */
+static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
+    if (!a || !len) return -1;
+    uint64_t end = addr + len;
+    if (end < addr) return -1;
+
+    /* --- pre-flight: refuse for the whole range or not at all --- */
+    int extra = 0;                      /* VMA slots the splits will need */
+    for (int i = 0; i < a->nvma; i++) {
+        uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+        if (end <= s0 || e0 <= addr) continue;                  /* no overlap */
+        if (a->vma[i].sealed) return -1;                        /* mseal'd (M1130) */
+        uint64_t cs = addr > s0 ? addr : s0, ce = end < e0 ? end : e0;
+        /* A hugepage can only be freed as a whole 2 MiB run, so a carve that
+         * cuts one in half has no correct answer -- refusing is the only
+         * honest one. Nothing maps hugepages through the Linux path today. */
+        if (a->vma[i].huge && ((cs | ce) & (HUGE_SIZE - 1))) return -1;
+        if (cs > s0 && ce < e0) extra++;                        /* middle: becomes two VMAs */
+    }
+    if (a->nvma + extra > APP_MAXVMA) return -1;
+
+    /* --- mutate --- */
+    for (int i = 0; i < a->nvma; ) {
+        uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+        if (end <= s0 || e0 <= addr) { i++; continue; }
+        uint64_t cs = addr > s0 ? addr : s0, ce = end < e0 ? end : e0;
+
+        /* Flush before the frames go away: munmap()ing a MAP_SHARED mapping
+         * without an explicit msync() first is the common pattern (M1602). */
+        if (a->vma[i].file_backed && a->vma[i].shared) app_msync(cs, ce - cs);
+
+        if (a->vma[i].huge) {
+            for (uint64_t p = cs; p < ce; p += HUGE_SIZE) {
+                uint64_t ph = vmm_translate(p);
+                if (ph) { vmm_unmap_huge(p); pmm_free_contiguous(ph & ~(HUGE_SIZE - 1), HUGE_SIZE / PAGE_SIZE); }
+            }
+        } else {
+            for (uint64_t p = cs; p < ce; p += PAGE_SIZE) {
+                uint64_t ph = vmm_translate(p);
+                if (ph) { vmm_unmap(p); pmm_free_frame(ph); }
+            }
+        }
+
+        if (cs == s0 && ce == e0) {                 /* whole VMA goes */
+            a->vma[i] = a->vma[a->nvma - 1];
+            a->nvma--;
+            continue;                               /* re-test the swapped-in entry at this index */
+        }
+        if (cs == s0) {                             /* head trimmed */
+            a->vma[i].start = ce;
+            a->vma[i].len   = e0 - ce;
+            /* The file offset tracks the VMA's new start, or every later
+             * demand-fault in this region reads the wrong part of the file. */
+            if (a->vma[i].file_backed) a->vma[i].foff += ce - s0;
+        } else if (ce == e0) {                      /* tail trimmed */
+            a->vma[i].len = cs - s0;
+        } else {                                    /* hole punched: split in two */
+            a->vma[a->nvma] = a->vma[i];            /* slot reserved by the pre-flight count */
+            a->vma[a->nvma].start = ce;
+            a->vma[a->nvma].len   = e0 - ce;
+            if (a->vma[a->nvma].file_backed) a->vma[a->nvma].foff += ce - s0;
+            a->nvma++;
+            a->vma[i].len = cs - s0;
+        }
+        i++;
+    }
+    return 0;
+}
+
 int app_munmap(uint64_t addr, uint64_t len) {
     struct app *a = cur();
     if (!a) return -1;
-    (void)len;
-    for (int i = 0; i < a->nvma; i++) {
-        if (a->vma[i].start == addr) {
-            if (a->vma[i].sealed) return -1;          /* mseal'd: unmapping is forbidden (M1130) */
-            if (a->vma[i].file_backed && a->vma[i].shared)
-                app_msync(a->vma[i].start, a->vma[i].len);   /* flush dirty pages to the file before their frames are freed below --
-                                                               * munmap()ing a MAP_SHARED mapping without an explicit msync() first
-                                                               * is the overwhelmingly common pattern; without this the write was
-                                                               * silently discarded (M1602). Runs in our own context (a plain
-                                                               * syscall, unlike app_reap/app_exec's cross-context callers), so
-                                                               * a->cr3 is already the live address space -- no cr3 dance needed. */
-            if (a->vma[i].huge) {                     /* 2 MiB hugepages: free per-2 MiB run, not per-4 KiB (M1155) */
-                for (uint64_t p = a->vma[i].start; p < a->vma[i].start + a->vma[i].len; p += HUGE_SIZE) {
-                    uint64_t ph = vmm_translate(p);   /* p is 2 MiB-aligned -> base of the run */
-                    if (ph) { vmm_unmap_huge(p); pmm_free_contiguous(ph & ~(HUGE_SIZE - 1), HUGE_SIZE / PAGE_SIZE); }
-                }
-            } else {
-                for (uint64_t p = a->vma[i].start; p < a->vma[i].start + a->vma[i].len; p += PAGE_SIZE) {
-                    uint64_t ph = vmm_translate(p);
-                    if (ph) { vmm_unmap(p); pmm_free_frame(ph); }
-                }
-            }
-            a->vma[i] = a->vma[a->nvma - 1];
-            a->nvma--;
-            return 0;
-        }
-    }
-    return -1;
+    /* Was: "find a VMA starting at exactly addr, free all of it, ignore len".
+     * That is wrong for both of munmap's real uses -- unmapping the middle of
+     * a region, and unmapping the tail of one -- and it silently freed MORE
+     * than asked when len was smaller than the VMA. Now a true range
+     * operation, and the range need not correspond to a whole mapping. */
+    if (addr & (PAGE_SIZE - 1)) return -1;
+    len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (!len) return -1;
+    return app_vma_carve(a, addr, len);
 }
 
 /* mremap (M1179): resize the anonymous mmap region that starts at old_addr.
@@ -3739,22 +3847,43 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         }
     }
     a->ustack = USTACK_BASE + USTACK_PAGES * PAGE_SIZE;
+    uint64_t prog_entry = a->entry;          /* auxv AT_ENTRY: the EXECUTABLE's entry, even when the interpreter runs first (M1954) */
 
     /* A Linux binary reads argc/argv/envp/auxv off its stack before main, so
      * build the frame HERE -- while the new address space is still active and
      * its stack pages are mapped -- and start it at the frame instead of at a
      * bare stack top. (M1940) */
     if (take_linux) {
-        static const char *argv0[3], *envp0[4];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[4];
+        /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
+         * inside a Linux process that volume IS the root, and a program that
+         * re-execs itself by argv[0] (lxbox does) would otherwise ask for
+         * /disk2/disk2/... (M1954) */
         argv0[0] = g_pend_lxpath;
+        { const char *pre = "/disk2"; int k = 0;
+          while (pre[k] && g_pend_lxpath[k] == pre[k]) k++;
+          if (!pre[k] && g_pend_lxpath[k] == '/') argv0[0] = g_pend_lxpath + k; }
         /* The native one-shot launch arg (g_pend_arg, consumed into
          * a->launch_arg above) becomes argv[1] for a Linux binary -- that is
          * how a multi-call binary is told which applet to be. */
-        argv0[1] = a->launch_arg[0] ? a->launch_arg : 0;
-        argv0[2] = 0;
+        int an = 1;
+        for (int i = 0; i < g_pend_lxargc && an < 1 + LX_PEND_ARGS; i++) argv0[an++] = g_pend_lxargs[i];
+        if (an == 1 && a->launch_arg[0]) argv0[an++] = a->launch_arg;
+        argv0[an] = 0;
+        g_pend_lxargc = 0;                   /* one-shot: never leak into a later spawn */
         envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/"; envp0[2] = "TERM=osdev"; envp0[3] = 0;
-        uint64_t rsp = lx_spawn_stack(elf, ELF_DYN_BASE, a->entry, a->ustack,
-                                      USTACK_BASE + PAGE_SIZE, argv0, envp0);
+        /* Dynamically linked? Map the interpreter too and enter IT: a
+         * dynamically-linked program cannot be started directly, ld.so has to
+         * map its shared libraries first and only then jump to the entry. */
+        uint64_t interp_base = 0;
+        if (g_pend_interp) {
+            uint64_t ie = elf_load_at(g_pend_interp, g_pend_interp_sz, ELF_INTERP_BASE);
+            if (!ie) goto fail_in_space;
+            interp_base = ELF_INTERP_BASE;
+            a->entry = ie;                   /* the INTERPRETER runs first */
+        }
+        uint64_t rsp = lx_spawn_stack_dyn(elf, ELF_DYN_BASE, prog_entry, interp_base,
+                                          a->ustack, USTACK_BASE + PAGE_SIZE, argv0, envp0);
         if (!rsp) goto fail_in_space;        /* stack too small for the frame */
         a->ustack = rsp;
     }
@@ -3777,6 +3906,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     /* queue it for the window manager to give it a window */
     int n = (pend_h + 1) % MAX_APPS;
     if (n != pend_t) { pending[pend_h] = a; pend_h = n; }
+    g_last_spawn_pid = a->pid;           /* so a kernel-context caller can wait for it (M1955) */
     return a;
 
 fail_in_space:
@@ -5348,13 +5478,107 @@ int app_spawn_linux_from_file_arg(const char *path, const char *arg) {
     return rc;
 }
 
-int app_spawn_linux_from_file(const char *path) {
+static int lx_spawn_file(const char *path) {
     int i = 0; while (path[i] && i < (int)sizeof g_pend_lxpath - 1) { g_pend_lxpath[i] = path[i]; i++; }
     g_pend_lxpath[i] = 0;
+
+    /* Peek at the image to see whether it is dynamically linked, and if so read
+     * the interpreter NOW -- app_spawn runs with interrupts off and a foreign
+     * CR3 loaded, which is no place to start disk I/O. (M1954) */
+    g_pend_interp = 0; g_pend_interp_sz = 0;
+    {
+        /* vfs_pread, not vfs_read: this is a deliberate PARTIAL read of the
+         * first pages, and some read paths refuse a buffer smaller than the
+         * file rather than returning a short count. */
+        uint8_t hdr[2048];
+        long hn = vfs_pread(path, hdr, sizeof hdr, 0);
+        char interp[192];
+        if (hn > 64 && elf_interp_path(hdr, (uint64_t)hn, interp, sizeof interp)) {
+            /* The interpreter path is absolute in the LINUX process's world
+             * (/lib64/...), so it needs the same /disk2 root prefix the ABI
+             * applies to every other path. (M1954) */
+            char ipath[256];
+            { int k = 0; const char *pre = "/disk2";
+              while (pre[k]) { ipath[k] = pre[k]; k++; }
+              for (int j = 0; interp[j] && k < (int)sizeof ipath - 1; j++) ipath[k++] = interp[j];
+              ipath[k] = 0; }
+            struct statx ist;
+            unsigned long isz = (vfs_stat(ipath, &ist) == 0 && ist.stx_size) ? (unsigned long)ist.stx_size : 0;
+            if (!isz || isz > (16u << 20)) {
+                kprintf("[linuxabi] %s needs interpreter %s (%s), which is missing\n", path, interp, ipath);
+                return -1;                   /* refuse rather than enter a program that cannot start */
+            }
+            void *ib = kmalloc(isz);
+            if (!ib) return -1;
+            if (vfs_read(ipath, ib, isz) <= 0) { kfree(ib); return -1; }
+            g_pend_interp = ib; g_pend_interp_sz = isz;
+            kprintf("[linuxabi] %s is dynamically linked; loading %s\n", path, interp);
+        }
+    }
+
     g_pend_linux = 1;
     int rc = app_spawn_from_file(path);
     g_pend_linux = 0;                       /* never leak the flag to a later spawn */
+    if (g_pend_interp) { kfree(g_pend_interp); g_pend_interp = 0; g_pend_interp_sz = 0; }
     return rc;
+}
+
+int app_spawn_linux_from_file(const char *path) {
+    g_pend_lxargc = 0;                      /* argv[0] only */
+    return lx_spawn_file(path);
+}
+
+/* Launch a Linux binary with a real argv: argv[0] is the path itself (minus the
+ * mount prefix), and `args[0..n)` become argv[1..n]. This is what lets the
+ * borrowed host toolchain be driven -- `as -o /t.o /t.s` (M1955). */
+int app_spawn_linux_from_file_argv(const char *path, const char *const *args, int n) {
+    if (n < 0) n = 0;
+    if (n > LX_PEND_ARGS) n = LX_PEND_ARGS;
+    for (int i = 0; i < n; i++) {
+        int k = 0;
+        if (args[i]) while (args[i][k] && k < LX_PEND_ARGLEN - 1) { g_pend_lxargs[i][k] = args[i][k]; k++; }
+        g_pend_lxargs[i][k] = 0;
+    }
+    g_pend_lxargc = n;
+    int rc = lx_spawn_file(path);
+    g_pend_lxargc = 0;                      /* spawn may have failed before consuming it */
+    return rc;
+}
+
+/* Run a Linux binary and wait, IN KERNEL CONTEXT, until it exits (M1955).
+ *
+ * app_waitpid cannot serve this: it needs cur() to be the parent app, and the
+ * boot task is not an app at all. It also only sees children of the caller.
+ * So this polls the slot directly and yields, which is what a kernel thread
+ * can legitimately do.
+ *
+ * Sequencing is the whole point. A toolchain is a PIPELINE -- `as` must have
+ * finished writing the object file before `ld` opens it -- and every earlier
+ * demo in this file fired its spawns off concurrently, which is why their log
+ * lines interleave. Returns the exit status, or -1 if it never started, or
+ * -2 on timeout. */
+int app_run_linux_sync(const char *path, const char *const *args, int n, int timeout_ms) {
+    g_last_spawn_pid = 0;
+    if (app_spawn_linux_from_file_argv(path, args, n) < 0 || !g_last_spawn_pid) return -1;
+    int pid = g_last_spawn_pid;
+    for (int waited = 0; waited < timeout_ms; waited += 5) {
+        uint64_t f = irq_save();
+        struct app *found = 0;
+        for (int i = 0; i < MAX_APPS; i++)
+            if (apps[i].used && apps[i].pid == pid) { found = &apps[i]; break; }
+        /* Gone from the table entirely (already reaped) counts as finished --
+         * treating that as "still running" would spin until the timeout. */
+        if (!found) { irq_restore(f); return 0; }
+        if (found->exited || found->zombie) {
+            int code = found->exit_code;
+            found->used = 0; found->zombie = 0;   /* collect it: nobody else will */
+            irq_restore(f);
+            return code;
+        }
+        irq_restore(f);
+        task_sleep_ms(5);
+    }
+    return -2;
 }
 
 int app_spawn_from_file(const char *path) {

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1953-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1955-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -492,13 +492,39 @@ Landed so far, all on the from-scratch ext2 driver:
   bug (reading an `int` argument as `long`, so `fd = -1` read as 4 billion) and
   a concurrency bug in `execve` (per-process now, not globals).
 
-Still ahead: `PT_INTERP` so the kernel can load `ld-linux-x86-64.so.2` — every
-host toolchain binary is dynamically linked, so that is what gates the
-toolchain. busybox itself is not obtainable on this host, so the ABI surface is
-driven by purpose-built glibc programs exercising the same syscalls. The honest scale is months, and the memory
-subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
-`flags` argument at all, so V8's address-space reservation cannot even be
-expressed).
+- **M1954** — **`PT_INTERP`: dynamically-linked Linux binaries run.** The kernel
+  now reads a program's interpreter, maps `ld-linux-x86-64.so.2` alongside it and
+  enters *that*, with `AT_BASE` describing the interpreter and `AT_PHDR`/`AT_ENTRY`
+  still describing the executable. Linux processes get a **chroot-style root**
+  (`/disk2` prefixed onto every absolute path) so `/lib64/...` resolves without
+  re-rooting the whole OS. The unlock was `MAP_FIXED` learning to **replace**
+  rather than refuse: `ld.so` reserves a library's whole span with one mapping
+  and then `MAP_FIXED`s each segment *into its own reservation*, so "refuse on
+  overlap" rejected the second segment of every library. VMA carving (split /
+  trim / punch, with the file offset following the new start) also turned
+  `munmap` into a real range operation — it used to ignore its `len`.
+
+- **M1955** — **real GNU binutils assembles, links and runs a program, inside
+  OS-DEV.** `as` and `ld` are unmodified host binaries with five shared
+  libraries each; the demo assembles a `.s`, links the object, and then *runs
+  the result*, which exits with its own status. Two bugs stood between: the VMA's
+  backing-path buffer was **64 bytes** and binutils' `libbfd` lives 98 characters
+  down `/usr/lib64/binutils/<triplet>/<version>/`, so every demand-fault on that
+  mapping read a nonexistent path, got zeros, and handed `ld.so` a library whose
+  entire dynamic section was `NULL`; and `fstat` reported **`st_ino = 1` for every
+  file**, so `ld.so` — which decides "already loaded?" by comparing
+  `(st_dev, st_ino)` — mapped `libbfd` and then skipped `libz`, `libzstd` and
+  `libc` as duplicates of it. ext2 inodes are now reported for real. Neither
+  failure named its cause: the first was a page fault at `CR2=0x8` inside
+  `_dl_check_map_versions`, the second `undefined symbol: free, version
+  GLIBC_2.2.5`.
+
+Still ahead: a C compiler. `cc1` is a 42 MB dynamically-linked PIE, which the
+ABI can now load in principle, but `app_spawn_from_file` still buffers a whole
+image in the kernel heap — that wants mmap-backed demand loading first. The
+honest scale is months, and the memory subsystem needs more work before Node
+(`MMAP_TOP` is 256 MiB and the mmap allocator never recycles addresses, so V8's
+address-space cage still cannot be expressed).
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

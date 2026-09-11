@@ -18,6 +18,8 @@ int         app_list_names(char *buf, int max);  /* space-separated prog names; 
 int         app_spawn_from_file(const char *path);/* load + run an ELF from a FAT32 file */
 int         app_spawn_linux_from_file(const char *path);
 int         app_spawn_linux_from_file_arg(const char *path, const char *arg);  /* + a one-shot arg that becomes argv[1] (M1948) */
+int         app_spawn_linux_from_file_argv(const char *path, const char *const *args, int n);  /* + a FULL argv: args[] become argv[1..n] (M1955) */
+int         app_run_linux_sync(const char *path, const char *const *args, int n, int timeout_ms);  /* spawn + BLOCK in kernel context until it exits; exit status, -1 no-start, -2 timeout (M1955) */
 /* Forward-declared HERE, not just at line ~107: a struct first mentioned inside
  * a prototype gets PROTOTYPE scope, which makes it a different type from the
  * file-scope one declared later -- "conflicting types" at the definition. */

@@ -21,6 +21,15 @@ void linux_abi_selftest(void);
  * binary at the top of an already-mapped user stack, and return the RSP it
  * should start with (0 on failure). Must be called with the TARGET address
  * space active. `image` is the raw ELF, needed for AT_PHDR/PHENT/PHNUM. M1939. */
+/* As lx_spawn_stack, but for a DYNAMICALLY-LINKED image: interp_base is the
+ * interpreter's load bias and becomes auxv AT_BASE, while AT_PHDR/AT_ENTRY
+ * still describe the executable. (M1954) */
+uint64_t lx_spawn_stack_dyn(const void *image, uint64_t base, uint64_t entry,
+                            uint64_t interp_base,
+                            uint64_t stack_top, uint64_t stack_bottom,
+                            const char *const *argv, const char *const *envp);
 uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
                         uint64_t stack_top, uint64_t stack_bottom,
                         const char *const *argv, const char *const *envp);
+
+extern int g_lx_mmap_trace;    /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */

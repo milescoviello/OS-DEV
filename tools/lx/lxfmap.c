@@ -13,7 +13,7 @@
 #define PGSZ 4096
 
 int main(int argc, char **argv) {
-    const char *path = argc > 1 ? argv[1] : "/disk2/lxfmap.bin";
+    const char *path = argc > 1 ? argv[1] : "/lxfmap.bin";
     /* Build a file whose every page is stamped with its own page number, so a
      * wrong offset is immediately visible rather than plausible. */
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);

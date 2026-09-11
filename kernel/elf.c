@@ -46,6 +46,7 @@ typedef struct {
 } __attribute__((packed)) Elf64_Phdr;
 
 #define PT_LOAD 1
+#define PT_INTERP 3
 #define PF_X 0x1   /* segment is executable */
 #define PF_W 0x2   /* segment is writable   */
 #define PF_R 0x4   /* segment is readable    */
@@ -139,15 +140,42 @@ uint64_t elf_image_size(const void *image, uint64_t maxsz) {
     return hi > maxsz ? maxsz : hi;
 }
 
+/* Does `image` name an ELF interpreter (PT_INTERP)? If so it is DYNAMICALLY
+ * LINKED and cannot be entered directly: the interpreter (ld.so) runs first,
+ * maps the program's shared libraries, and only then jumps to the program's
+ * entry. Copies the path into `out` and returns 1; returns 0 for a static or
+ * static-PIE image.
+ *
+ * Only the PATH is reported. elf.c is device-agnostic (blk callbacks, no VFS)
+ * and is #included by host tests, so reading the interpreter file has to stay
+ * in app.c -- the same division that keeps this file host-testable. (M1954) */
+int elf_interp_path(const void *image, uint64_t maxsz, char *out, int max) {
+    uint64_t phoff, entry; uint16_t phnum, phentsize;
+    if (!out || max <= 0) return 0;
+    if (!elf_check_header(image, maxsz, &phoff, &phnum, &phentsize, &entry)) return 0;
+    for (uint16_t i = 0; i < phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)((const uint8_t *)image + phoff + (uint64_t)i * phentsize);
+        if (ph->p_type != PT_INTERP) continue;
+        if (ph->p_offset > maxsz || ph->p_filesz > maxsz - ph->p_offset) return 0;   /* bounds, as everywhere here */
+        if (ph->p_filesz == 0) return 0;
+        uint64_t n = ph->p_filesz; if (n > (uint64_t)max - 1) n = (uint64_t)max - 1;
+        const char *src = (const char *)image + ph->p_offset;
+        uint64_t k = 0; for (; k < n && src[k]; k++) out[k] = src[k];
+        out[k] = 0;
+        return k ? 1 : 0;
+    }
+    return 0;
+}
+
 /* Load a position-independent executable (ET_DYN): map every PT_LOAD at
  * ELF_DYN_BASE + p_vaddr, apply R_X86_64_RELATIVE relocations from PT_DYNAMIC,
  * then return the based entry. Separate from elf_load so the ET_EXEC path stays
  * unchanged. Every field is bounds-checked against the loaded span so a corrupt
  * dynamic section can never write outside the image's mapped pages (M1465). */
-static uint64_t elf_load_dyn(const void *image, uint64_t maxsz) {
+static uint64_t elf_load_dyn_base(const void *image, uint64_t maxsz, uint64_t want_base) {
     uint64_t phoff, entry; uint16_t phnum, phentsize;
     if (!elf_check_header(image, maxsz, &phoff, &phnum, &phentsize, &entry)) return 0;
-    const uint64_t base = ELF_DYN_BASE;
+    const uint64_t base = want_base ? want_base : ELF_DYN_BASE;
     uint64_t max_eff = 0;                                 /* highest mapped address (base + vaddr + memsz) */
 
     for (uint16_t i = 0; i < phnum; i++) {                /* map + copy each PT_LOAD, writable for now */
@@ -210,6 +238,16 @@ static uint64_t elf_load_dyn(const void *image, uint64_t maxsz) {
         }
     }
     return base + entry;
+}
+
+static uint64_t elf_load_dyn(const void *image, uint64_t maxsz) {
+    return elf_load_dyn_base(image, maxsz, ELF_DYN_BASE);
+}
+
+/* Public: map a PIE at a CHOSEN base. Used for the dynamic linker, which must
+ * not land on top of the executable it is going to load. (M1954) */
+uint64_t elf_load_at(const void *image, uint64_t maxsz, uint64_t base) {
+    return elf_load_dyn_base(image, maxsz, base);
 }
 
 uint64_t elf_load(const void *image, uint64_t maxsz,

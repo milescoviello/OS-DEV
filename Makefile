@@ -200,12 +200,47 @@ $(LXROOT)/lxfmap: tools/lx/lxfmap.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (file-backed mmap at an offset)"
 
-LXBINS := $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap
+# Dynamically linked ON PURPOSE (no -static-pie): needs PT_INTERP + ld.so.
+# The interpreter and libc are copied in beside it, because the guest has no
+# /lib64 of its own -- that is the point of the exercise.
+$(LXROOT)/lxdyn: tools/lx/lxdyn.c
+	@mkdir -p $(LXROOT)/lib64 $(LXROOT)/usr/lib64
+	$(CC) -O2 -o $@ $<
+	@for so in $$(ldd $@ 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do \
+	   d=$(LXROOT)$$(dirname $$so); mkdir -p $$d; cp -f $$so $$d/ 2>/dev/null || true; \
+	 done
+	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
+
+LXBINS := $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap
+
+# --- the borrowed Linux toolchain (M1955) ---------------------------------
+# THE overwhelming majority of what runs on OS-DEV is written from scratch in
+# this repo. This is the exception, and it is bolted on rather than ported:
+# unmodified host binutils/nasm/make binaries, copied in whole, run through
+# the Linux ABI shim. We do not port GCC -- we run it.
+#
+# Order-only against ext2.img via a stamp, because the tools are not built
+# here and their mtimes are the host package manager's.
+LXTOOLS := as ld objcopy nasm
+
+# The source the in-guest toolchain assembles. Staged as a plain file, at the
+# path a Linux process inside OS-DEV sees as /hello.s.
+$(LXROOT)/hello.s: tools/lx/hello.s
+	@mkdir -p $(LXROOT)
+	@cp -f $< $@
+	@echo "  STAGE   $@ (source for the in-guest assemble+link demo)"
+
+$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
+	@mkdir -p $(LXROOT)
+	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
+	@tools/stage-linux-tool.sh $(LXROOT) make "$$(command -v gmake || command -v make)"
+	@touch $@
+
 
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(LXBINS)
+$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \

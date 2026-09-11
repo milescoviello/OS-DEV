@@ -242,6 +242,7 @@ static volatile int g_smpsched_test;          /* -append smpschedtest: prove the
 static volatile int g_journal_test;           /* -append journalguest: prove the write-ahead journal + crash recovery on REAL ata hardware (M1865) */
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
+static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
 static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
 static volatile int g_netcon;                 /* -append netcon: start the network debug console on TCP 2323 (M1870, real-HW bring-up) */
@@ -483,6 +484,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * console dragged that boot past any sensible wait budget. They only do
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
+        if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
         if (cmdline_has(cl, "netcon"))     g_netcon = 1;                 /* network debug console for real-HW bring-up (M1870) */
         if (cmdline_has(cl, "nodisk"))     g_nodisk = 1;                 /* skip disk-write self-tests + FS mount — safe on a machine with real disks (M1872) */
         if (cmdline_has(cl, "watchdog"))   g_watchdog = 1;              /* HW watchdog + panic-auto-reboot for the autonomous PXE loop (M1881) */
@@ -740,6 +743,48 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             app_spawn_linux_from_file("/disk2/lxmmap");
             kprintf("[lxabi] launching the file-backed mmap (offset) test...\n");
             app_spawn_linux_from_file("/disk2/lxfmap");
+            /* The Phase 4 gate: a DYNAMICALLY-LINKED binary, which needs
+             * PT_INTERP + ld.so + libc.so.6 all working. */
+            kprintf("[lxabi] launching a DYNAMICALLY-LINKED binary...\n");
+            app_spawn_linux_from_file("/disk2/lxdyn");
+        }
+        if (g_lxtool_test) {
+            /* PHASE 4 (M1955): drive the BORROWED host toolchain inside OS-DEV.
+             *
+             * Everything else that runs here is written from scratch in this
+             * repo. These four binaries are not: they are unmodified host
+             * binutils, copied in whole and run through the Linux ABI shim.
+             * That is the deal -- we never port a toolchain, we run one.
+             *
+             * Sequential on purpose, via app_run_linux_sync: `ld` must not
+             * open the object file before `as` has finished writing it. */
+            static const char *av_asver[] = { "--version" };
+            static const char *av_as[]    = { "-o", "/t.o", "/hello.s" };
+            static const char *av_ld[]    = { "--no-dynamic-linker", "-pie", "-e", "_start",
+                                              "-o", "/t.elf", "/t.o" };
+            /* Delete the outputs FIRST. The ext2 volume is persistent across
+             * boots, so without this a stale /t.elf from an earlier run
+             * satisfies the "ran the program it just built" assertion even
+             * when the assembler never started -- which is exactly what a
+             * mutation test caught: reverting the st_ino fix broke as and ld,
+             * and that last check still passed. */
+            vfs_remove("/disk2/t.o");
+            vfs_remove("/disk2/t.elf");
+            kprintf("[lxtool] running the borrowed GNU assembler...\n");
+            int rc = app_run_linux_sync("/disk2/usr/bin/as", av_asver, 1, 60000);
+            kprintf("[lxtool] as --version -> %d\n", rc);
+            kprintf("[lxtool] assembling /hello.s -> /t.o ...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/as", av_as, 3, 120000);
+            kprintf("[lxtool] as -> %d\n", rc);
+            kprintf("[lxtool] linking /t.o -> /t.elf ...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/ld", av_ld, 7, 120000);
+            kprintf("[lxtool] ld -> %d\n", rc);
+            /* The only assertion that matters: RUN what the guest just built.
+             * Exit status 23 is hello.s's own, so it proves the bytes on disk
+             * came from this assemble+link and not from a staged binary. */
+            kprintf("[lxtool] running the program OS-DEV just built...\n");
+            rc = app_run_linux_sync("/disk2/t.elf", 0, 0, 60000);
+            kprintf("[lxtool] SELFBUILT exit -> %d\n", rc);
         }
     }
 

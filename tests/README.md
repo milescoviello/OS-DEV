@@ -24,7 +24,13 @@ make linuxabitest # LINUX ABI    — boots headless and runs a HOST-built static
                  #                output and exit_group status on COM1. The only in-guest
                  #                suite needing no screenshot: the Linux write() lands on
                  #                the kernel console, which IS mirrored to serial, unlike
-                 #                ring-3 print() from OS-DEV's own apps (M1939)
+                 #                ring-3 print() from OS-DEV's own apps (M1939).
+                 #                FOUR boots now: the static-PIE hello, the fault/console-lock
+                 #                regression, the full glibc demo set under -cpu max, and
+                 #                (M1955) one that drives the BORROWED host binutils --
+                 #                `as` assembles a .s, `ld` links it, and the RESULT is run
+                 #                in-guest and must exit with its own status. That last boot
+                 #                wants -m 1G: five shared libraries get mapped per process.
 make fstest      # FAT32 driver   — tests/fs/fs_test.c     (corrupt/cyclic on-disk structures + write stress)
 make kattest     # crypto KAT     — tests/crypto/crypto_test.c (RFC/FIPS known-answer vectors)
 make svgtest     # SVG rasterizer — tests/svg/svg_test.c   (shapes/paths + adversarial XML fuzz)

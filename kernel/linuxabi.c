@@ -203,6 +203,9 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_newfstatat   262
 #define LXS_unlink_       87
 #define LXS_unlinkat_    263
+#define LXS_pread64_      17
+#define LXS_access_       21
+#define LXS_faccessat_   269
 #define LXS_clone_        56
 #define LXS_fork_         57
 #define LX_CLONE_VM   0x00000100
@@ -214,6 +217,9 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_dup2_         33
 #define LXS_dup_          32
 #define LXS_getppid_     110
+#define LXS_fcntl_        72
+#define LXS_getrusage_    98
+#define LXS_time_        201
 
 /* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
  * 8 here, O_TRUNC 01000 (512) vs 4. Passing them through unmapped would silently
@@ -230,6 +236,7 @@ void linux_abi_init_this_cpu(void) {
  * garbage, so the offsets are spelled out rather than mirrored in a C struct. */
 #define LXST_SIZE     144
 #define LXST_O_DEV      0
+#define LX_FAKE_DEV 0x0801ull      /* one device for everything; st_ino is what distinguishes files (M1955) */
 #define LXST_O_INO      8
 #define LXST_O_NLINK   16
 #define LXST_O_MODE    24
@@ -249,6 +256,31 @@ void linux_abi_init_this_cpu(void) {
 #define LX_MAP_ANONYMOUS 0x20
 
 #define ARCH_SET_FS 0x1002
+
+/* ---- the Linux process root (M1954) ------------------------------------
+ * A Linux binary's absolute paths are absolute in ITS world: it asks for
+ * /lib64/ld-linux-x86-64.so.2, not /disk2/lib64/... But the ext2 volume that
+ * holds the Linux userland is mounted at /disk2, and re-rooting the whole OS
+ * onto it would break every OS-DEV app, fixture and test that expects the
+ * FAT32 boot volume at /.
+ *
+ * So Linux processes get their OWN root instead -- effectively a chroot into
+ * the ext2 volume. It is the right abstraction rather than a workaround: a
+ * toolchain installed later needs /usr/lib and /usr/include to mean something,
+ * and this is how they come to. Relative paths pass through untouched. */
+int g_lx_mmap_trace;                      /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
+#define LX_ROOT     "/disk2"
+#define LX_ROOT_LEN 6
+
+/* Translate a Linux path into one the VFS understands. Returns `out`. */
+static const char *lx_xlate(const char *p, char *out, int max) {
+    if (!p || p[0] != '/') return p;                  /* relative: leave alone */
+    int n = 0;
+    for (const char *r = LX_ROOT; *r && n < max - 1; r++) out[n++] = *r;
+    for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
+    out[n] = 0;
+    return out;
+}
 
 /* struct iovec, exactly Linux's layout. */
 struct lx_iovec { void *iov_base; unsigned long iov_len; };
@@ -395,7 +427,15 @@ void linux_syscall_dispatch(struct registers *r) {
             uint64_t fbase = app_mmap_file_at(fpath, (flags & LX_MAP_FIXED) ? r->rdi : 0,
                                               (uint64_t)len, (uint64_t)r->r9,
                                               (flags & LX_MAP_SHARED) ? 1 : 0);
-            if (!fbase) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+            if (g_lx_mmap_trace)
+                kprintf("[lxmmap] file addr=%lx len=%lx off=%lx prot=%ld fixed=%d -> %lx\n",
+                        (unsigned long)r->rdi, (unsigned long)len, (unsigned long)r->r9,
+                        prot, (flags & LX_MAP_FIXED) ? 1 : 0, (unsigned long)fbase);
+            if (!fbase) {
+                kprintf("[linuxabi] mmap(%s, len=%ld, off=%ld, fixed=%d) FAILED\n",
+                        fpath, len, (long)r->r9, (flags & LX_MAP_FIXED) ? 1 : 0);
+                r->rax = (uint64_t)-(long)LX_ENOMEM; break;
+            }
             if (prot != (1 | 2)) app_mprotect(fbase, (uint64_t)len, (int)prot);
             r->rax = fbase;
             break;
@@ -414,10 +454,14 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = base;
         break;
     }
-    case LXS_mprotect:
-        r->rax = (uint64_t)(app_mprotect(r->rdi, r->rsi, (int)r->rdx) == 0
-                            ? 0 : -(long)LX_EINVAL);
+    case LXS_mprotect: {
+        int mrc = app_mprotect(r->rdi, r->rsi, (int)r->rdx);
+        if (g_lx_mmap_trace)
+            kprintf("[lxmmap] mprotect addr=%lx len=%lx prot=%ld -> %d\n",
+                    (unsigned long)r->rdi, (unsigned long)r->rsi, (long)r->rdx, mrc);
+        r->rax = (uint64_t)(mrc == 0 ? 0 : -(long)LX_EINVAL);
         break;
+    }
     case LXS_munmap:
         r->rax = (uint64_t)(app_munmap(r->rdi, r->rsi) == 0 ? 0 : -(long)LX_EINVAL);
         break;
@@ -500,7 +544,11 @@ void linux_syscall_dispatch(struct registers *r) {
                 *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
                 *(uint64_t *)(st + LXST_O_NLINK)   = 1;
                 *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                *(uint64_t *)(st + LXST_O_INO)     = 1;
+                /* Per-fd, so two different pipes are not reported as the
+                 * same file. The 0x1000 bias keeps these clear of the
+                 * path-hash inodes vfs_stat hands out for real files. */
+                *(uint64_t *)(st + LXST_O_INO)     = 0x1000ull + (uint64_t)a1;
+                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
                 r->rax = 0;
                 break;
             }
@@ -511,7 +559,13 @@ void linux_syscall_dispatch(struct registers *r) {
             *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
             *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
             *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
-            *(uint64_t *)(st + LXST_O_INO)     = 1;
+            /* A REAL inode, not a constant. ld.so decides "is this object
+             * already loaded?" by comparing (st_dev, st_ino) -- reporting 1
+             * for everything made it map libbfd and then skip libz, libzstd
+             * and libc as duplicates of it, and the only symptom was
+             * `undefined symbol: free, version GLIBC_2.2.5`. (M1955) */
+            *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;
+            *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
             r->rax = 0;
         }
         break;
@@ -524,14 +578,21 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)-(long)LX_ENOENT;
         break;
     case LXS_openat_: {                     /* (dirfd, path, flags, mode) */
-        const char *path = (const char *)r->rsi;
-        if (!path || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const char *upath = (const char *)r->rsi;
+        if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
         long lf = (long)r->rdx, nf = 0;
         if (lf & (LXO_WRONLY | LXO_RDWR)) nf |= O_WRONLY;   /* we have no separate RDWR */
         if (lf & LXO_CREAT)  nf |= O_CREAT;
         if (lf & LXO_TRUNC)  nf |= O_TRUNC;
         if (lf & LXO_APPEND) nf |= O_APPEND;
         int fd = app_open(path, (int)nf);
+        /* Report the miss. A dynamic linker probes many paths that are MEANT
+         * to be absent, but when something it actually needs is missing the
+         * failure surfaces much later as a NULL deref inside ld.so -- this
+         * line is the difference between "page fault at 0x8" and "libbfd is
+         * not where you put it". (M1955) */
+        if (fd < 0) kprintf("[linuxabi] openat(%s) -> ENOENT\n", path);
         r->rax = (fd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)fd;
         break;
     }
@@ -559,8 +620,9 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_newfstatat: {                  /* (dirfd, path, statbuf, flags) */
-        const char *path = (const char *)r->rsi;
-        if (!path || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const char *upath = (const char *)r->rsi;
+        if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
         if (!vmm_user_ok(r->rdx, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         struct statx sx;
         if (vfs_stat(path, &sx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
@@ -572,7 +634,8 @@ void linux_syscall_dispatch(struct registers *r) {
         *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
         *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
         *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);  /* 512-byte units, as Linux defines it */
-        *(uint64_t *)(st + LXST_O_INO)     = 1;
+        *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;   /* a real inode -- see LXS_fstat (M1955) */
+        *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
         r->rax = 0;
         break;
     }
@@ -671,8 +734,9 @@ void linux_syscall_dispatch(struct registers *r) {
             }
         }
         ev[ne] = 0;
-        char pbuf[256];
-        { int k = 0; while (path[k] && k < 255) { pbuf[k] = path[k]; k++; } pbuf[k] = 0; }
+        char pbuf[VFS_PATH_MAX];
+        { char t[VFS_PATH_MAX]; const char *xp = lx_xlate(path, t, sizeof t);
+          int k = 0; while (xp[k] && k < (int)sizeof pbuf - 1) { pbuf[k] = xp[k]; k++; } pbuf[k] = 0; }
         if (app_execve_linux(r, pbuf, av, ev) < 0)
             r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
         break;
@@ -706,9 +770,78 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (nf < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)nf;
         break;
     }
+    case LXS_fcntl_: {                      /* (fd, cmd, arg) */
+        /* F_DUPFD/F_GETFD/F_SETFD/F_DUPFD_CLOEXEC happen to be numbered
+         * identically in our native fcntl, so they pass straight through.
+         * F_GETFL/F_SETFL do not exist there: `as` calls F_GETFD on the object
+         * file it just opened, and glibc's stdio calls F_GETFL to learn a
+         * stream's access mode. */
+        long cmd = (long)r->rsi, arg = (long)r->rdx;
+        if (cmd == 3) {                     /* F_GETFL */
+            /* O_RDWR. We do not record per-fd access modes, and claiming
+             * read-write is the permissive answer -- an fd we handed out is
+             * usable, and stdio only uses this to reject an impossible
+             * operation it was never going to attempt. */
+            r->rax = 2;
+            break;
+        }
+        if (cmd == 4) { r->rax = 0; break; } /* F_SETFL: accepted; we have no O_NONBLOCK on files */
+        long fr = app_fcntl((int)a1, (int)cmd, arg);
+        r->rax = (fr < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)fr;
+        break;
+    }
+    case LXS_getrusage_: {                  /* (who, struct rusage*) */
+        /* 144 bytes: ru_utime + ru_stime (two 16-byte timevals) then 14 longs.
+         * `as` reads this to report assembly time with --statistics; zeros are
+         * a truthful "we do not account this" rather than a failure, and an
+         * error here makes it print nothing at all. */
+        if (!vmm_user_ok(r->rsi, 144)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint8_t *ru = (uint8_t *)r->rsi;
+        for (int i = 0; i < 144; i++) ru[i] = 0;
+        uint64_t ms = timer_ms();
+        *(int64_t *)(ru + 0) = (int64_t)(ms / 1000);            /* ru_utime.tv_sec  */
+        *(int64_t *)(ru + 8) = (int64_t)((ms % 1000) * 1000);   /* ru_utime.tv_usec */
+        r->rax = 0;
+        break;
+    }
+    case LXS_time_:                         /* (time_t *tloc) */
+        /* Returns the value AND stores it when tloc is non-NULL -- both, not
+         * either. `as` stamps the object file's timestamp from this. */
+        if (r->rdi) {
+            if (!vmm_user_ok(r->rdi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            *(int64_t *)r->rdi = (int64_t)rtc_unix();
+        }
+        r->rax = (uint64_t)rtc_unix();
+        break;
     case LXS_getppid_:
         r->rax = (uint64_t)app_sys_getppid();
         break;
+    case LXS_pread64_: {                    /* (fd, buf, count, offset) */
+        long n = (long)r->rdx; uint64_t off = r->r10;
+        if (n < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (n && !vmm_user_ok(r->rsi, (uint64_t)n)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* ld.so reads a shared object's headers with pread rather than
+         * seek+read, precisely so it does not disturb the fd's cursor -- so
+         * this must NOT go through app_fd_read. */
+        const char *fp = app_fd_path((int)a1);
+        if (!fp) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        long got = vfs_pread(fp, (void *)r->rsi, (unsigned long)n, off);
+        r->rax = (got < 0) ? (uint64_t)-(long)LX_EIO : (uint64_t)got;
+        break;
+    }
+    case LXS_access_:
+    case LXS_faccessat_: {                  /* (path, mode) / (dirfd, path, mode, flags) */
+        uint64_t pa = (r->rax == LXS_access_) ? r->rdi : r->rsi;
+        const char *up = (const char *)pa;
+        if (!up || !vmm_user_ok(pa, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
+        struct statx sx;
+        /* Existence only. Everything runs as root here and there are no mode
+         * bits on the boot volume, so reporting a permission failure would be
+         * inventing one -- ld.so uses this to probe for library paths. */
+        r->rax = (vfs_stat(path, &sx) == 0) ? 0 : (uint64_t)-(long)LX_ENOENT;
+        break;
+    }
     case LXS_exit:
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);
@@ -881,16 +1014,29 @@ uint64_t lx_build_stack(uint64_t stack_top, uint64_t stack_bottom,
  * AT_PHDR is computed as base + e_phoff, which is correct when the program
  * headers fall inside a PT_LOAD that maps file offset 0 at vaddr 0 -- true for
  * every normal static-PIE image, and the only shape we load. */
-uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
-                        uint64_t stack_top, uint64_t stack_bottom,
-                        const char *const *argv, const char *const *envp) {
+uint64_t lx_spawn_stack_dyn(const void *image, uint64_t base, uint64_t entry,
+                            uint64_t interp_base,
+                            uint64_t stack_top, uint64_t stack_bottom,
+                            const char *const *argv, const char *const *envp) {
     const uint8_t *e = (const uint8_t *)image;
     uint64_t phoff   = *(const uint64_t *)(e + 32);   /* e_phoff */
     uint16_t phent   = *(const uint16_t *)(e + 54);   /* e_phentsize */
     uint16_t phnum   = *(const uint16_t *)(e + 56);   /* e_phnum */
+    /* AT_BASE names the INTERPRETER's load bias when there is one -- that is
+     * how ld.so finds itself to self-relocate. AT_PHDR and AT_ENTRY must still
+     * describe the EXECUTABLE, because that is the program ld.so is being
+     * asked to start. Getting these crossed makes the linker relocate itself
+     * against the wrong bias. (M1954) */
     struct lx_stack_info si = {
-        .phdr = base + phoff, .entry = entry, .base = base,
+        .phdr = base + phoff, .entry = entry,
+        .base = interp_base ? interp_base : base,
         .phent = phent, .phnum = phnum,
     };
     return lx_build_stack(stack_top, stack_bottom, argv, envp, &si);
+}
+
+uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
+                        uint64_t stack_top, uint64_t stack_bottom,
+                        const char *const *argv, const char *const *envp) {
+    return lx_spawn_stack_dyn(image, base, entry, 0, stack_top, stack_bottom, argv, envp);
 }
