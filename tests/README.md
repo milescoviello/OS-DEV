@@ -10,7 +10,7 @@ cases + deterministic fuzzing.
 ## Running
 
 ```sh
-make check       # run all 75 suites (~5 min total)
+make check       # run all 102 suites (~5 min total)
 make jstest      # JS engine      — tests/js/suite.js vs the golden output
 make imgtest     # image decoders — tests/img/img_test.c   (jpeg/png/gif/bmp/inflate)
 make x509test    # X.509 parser   — tests/x509/x509_test.c
