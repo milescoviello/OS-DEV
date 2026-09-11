@@ -83,14 +83,55 @@ extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void fpu_save(void *area16);            /* FXSAVE  (kernel/asm/fpu.asm) */
 extern void fpu_restore(const void *area16);   /* FXRSTOR */
 extern uint8_t fpu_template[];                 /* a clean FP state, captured at boot */
+/* XSAVE/AVX (M1942) — see kernel/asm/fpu.asm for why enabling AVX REQUIRES
+ * moving the context switch off FXSAVE: FXSAVE preserves XMM but not the upper
+ * halves of YMM, so two AVX-using tasks would silently corrupt each other. */
+extern void     fpu_xsave_to(void *area64);
+extern void     fpu_xrstor_from(const void *area64);
+extern void     fpu_xsave_template(void *area64);
+extern uint32_t fpu_xsave_size(void);
+extern uint8_t  fpu_xtemplate[];
 
-/* 16-byte-aligned FXSAVE pointer inside a task's over-allocated fxbuf. */
+/* 0 until fpu_xsave_arm() finds XSAVE+AVX. While 0 everything below behaves
+ * exactly as it did before, which is what QEMU's default CPU (no AVX) gets. */
+static int      g_use_xsave;
+static uint32_t g_fpu_area = FXSZ;             /* bytes a task's FP area needs */
+static uint32_t g_fpu_align = 16;              /* FXSAVE wants 16, XSAVE wants 64 */
+
+/* Called once per core at boot, BEFORE any task exists (the area size decides
+ * every later allocation). CR4.OSXSAVE and XCR0 are per-core, so every AP must
+ * call it too, but only the first caller sizes the area. */
+void fpu_xsave_arm(void) {
+    extern int fpu_enable_xsave(void);
+    if (!fpu_enable_xsave()) {                 /* no XSAVE/AVX: stay on FXSAVE */
+        static int once; if (!once) { once = 1; kprintf("[ .. ] fpu: no XSAVE/AVX on this CPU -- staying on FXSAVE (AVX binaries will #UD)\n"); }
+        return;
+    }
+    if (!g_use_xsave) {
+        uint32_t sz = fpu_xsave_size();
+        if (sz < FXSZ) sz = FXSZ;              /* paranoia: never shrink */
+        g_fpu_area = sz; g_fpu_align = 64; g_use_xsave = 1;
+        fpu_xsave_template(fpu_xtemplate);     /* a CLEAN state, not a zeroed buffer */
+        kprintf("[ ok ] fpu: XSAVE+AVX enabled (XCR0 state area %u bytes)\n", sz);
+    }
+}
+
+/* Aligned FP-save pointer inside a task's over-allocated fxbuf. XSAVE #GPs on a
+ * misaligned area and kmalloc only guarantees 16, hence the slack + mask. */
 static inline void *fxptr(task_t *t) {
-    return (void *)(((uintptr_t)t->fxbuf + 15) & ~(uintptr_t)15);
+    uintptr_t a = g_fpu_align - 1;
+    return (void *)(((uintptr_t)t->fxbuf + a) & ~a);
 }
 static void fx_alloc(task_t *t) {              /* give a task its own FP save area */
-    t->fxbuf = kmalloc(FXSZ + 16);
-    if (t->fxbuf) memcpy(fxptr(t), fpu_template, FXSZ);
+    t->fxbuf = kmalloc(g_fpu_area + g_fpu_align);
+    if (t->fxbuf)
+        memcpy(fxptr(t), g_use_xsave ? fpu_xtemplate : fpu_template, g_fpu_area);
+}
+static inline void fpu_store(task_t *t) {
+    if (g_use_xsave) fpu_xsave_to(fxptr(t)); else fpu_save(fxptr(t));
+}
+static inline void fpu_load(task_t *t) {
+    if (g_use_xsave) fpu_xrstor_from(fxptr(t)); else fpu_restore(fxptr(t));
 }
 
 /* Copy the FP/SSE state of `src` (which must be the running task) into `dst` —
@@ -98,8 +139,8 @@ static void fx_alloc(task_t *t) {              /* give a task its own FP save ar
  * fpu_save captures the live CPU FP state into src's area first. */
 void task_copy_fpu(task_t *dst, task_t *src) {
     if (!dst || !src || !dst->fxbuf || !src->fxbuf) return;
-    fpu_save(fxptr(src));                      /* src is current: capture its live FP state */
-    memcpy(fxptr(dst), fxptr(src), FXSZ);
+    fpu_store(src);                            /* src is current: capture its live FP state */
+    memcpy(fxptr(dst), fxptr(src), g_fpu_area);
 }
 
 struct registers *task_uframe(task_t *t) { return t ? t->uframe : 0; }
@@ -540,8 +581,8 @@ static void switch_to_next(void) {
     }
     if (next->kstack_top)
         tss_set_rsp0(next->kstack_top);     /* traps from ring 3 land here */
-    if (prev->fxbuf) fpu_save(fxptr(prev));     /* preserve FP/SSE across the switch */
-    if (next->fxbuf) fpu_restore(fxptr(next));
+    if (prev->fxbuf) fpu_store(prev);           /* preserve FP/SSE/AVX across the switch */
+    if (next->fxbuf) fpu_load(next);
     load_fs_base(next->fs_base);                 /* restore the thread's TLS base (M1140) */
     context_switch(&prev->rsp, next->rsp);
     task_finish_switch();   /* runs once THIS exact call site is resumed later (M1531) */
@@ -906,7 +947,7 @@ void task_exit(void) {
     }
     if (next->kstack_top)
         tss_set_rsp0(next->kstack_top);
-    if (next->fxbuf) fpu_restore(fxptr(next));   /* the dead task's FP state is discarded */
+    if (next->fxbuf) fpu_load(next);             /* the dead task's FP state is discarded */
     load_fs_base(next->fs_base);                 /* restore the thread's TLS base (M1140) */
     context_switch(&dead->rsp, next->rsp);   /* dead->rsp save is discarded */
     /* unreachable */

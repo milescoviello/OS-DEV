@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1941-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1942-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-135%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -451,7 +451,17 @@ Landed so far, all on the from-scratch ext2 driver:
   resolves itself before its first syscall, and dies there. **musl** is the
   right first libc target.
 
-Still ahead: musl, then busybox, then the toolchain. The honest scale is months, and the memory
+- **M1941** — a pre-existing deadlock: fault handlers run with interrupts off
+  and spun *unbounded* on the console lock, so a same-core holder wedged the
+  machine **and swallowed the fault report**. Bounded now; a boot that died at
+  78 log lines completes at 306.
+- **M1942** — **AVX, via XSAVE.** Real Linux binaries contain AVX (glibc's
+  `_dl_aux_init` opens with `vpxor`), which needs `CR4.OSXSAVE` + `XCR0` *and*
+  an XSAVE-based context switch, since FXSAVE does not preserve YMM. glibc now
+  parses the auxv and reaches its first syscall, `brk`.
+
+Still ahead: the syscall set glibc asks for (the kernel now names each missing
+one), then busybox, then the toolchain. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be
 expressed).

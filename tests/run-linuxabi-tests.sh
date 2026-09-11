@@ -107,3 +107,53 @@ else
 fi
 [ $f2 -eq 0 ] || { echo "FAIL: console-lock/fault-reporting regression"; exit 1; }
 echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console"
+
+# --- M1942: AVX via XSAVE ---------------------------------------------------
+# Real Linux binaries contain AVX: glibc's _dl_aux_init opens with
+# `vpxor %xmm0,%xmm0,%xmm0`, which #UDs unless CR4.OSXSAVE is set and XCR0
+# enables the SSE+AVX state.
+#
+# This MUST run under -cpu max. QEMU's default model has no AVX at all, so the
+# XSAVE path would otherwise never execute in the whole suite -- a green run
+# proving nothing about the code it was added for.
+if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
+    SLOG3=$(mktemp /tmp/osdev_lxavx.XXXXXX.log)
+    kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; QPID2=""
+    QPID3=""
+    cleanup3() { [ -n "$QPID3" ] && { kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; }; rm -f "$SLOG3"; }
+    trap 'rc=$?; cleanup3; exit $rc' EXIT
+
+    echo "booting with -cpu max to exercise the XSAVE/AVX path..."
+    timeout -s KILL 150 "$QEMU" -cpu max -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+        -append "lxfaulttest" \
+        -drive file="$DISK",format=raw,if=ide \
+        -drive file="$EXT2",format=raw,if=ide \
+        -netdev user,id=net0 -device e1000,netdev=net0 \
+        -display none -serial file:"$SLOG3" >/dev/null 2>&1 &
+    QPID3=$!
+    i=0
+    while [ $i -lt 280 ]; do
+        grep -aq "boot network self-test finished" "$SLOG3" 2>/dev/null && break
+        sleep 0.5; i=$((i+1))
+    done
+
+    f3=0
+    if grep -aq "XSAVE+AVX enabled" "$SLOG3"; then
+        echo "  ok: XSAVE+AVX armed on a CPU that has it ($(grep -ao 'state area [0-9]* bytes' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: XSAVE/AVX was not enabled under -cpu max"; f3=1
+    fi
+    # The real proof is BEHAVIOURAL: glibc must now get PAST the AVX instruction
+    # in _dl_aux_init. It does that by reaching its first real syscall, brk(12).
+    # Asserting "no Invalid Opcode" alone would also pass if the binary never ran.
+    if grep -aq "unimplemented Linux syscall 12" "$SLOG3"; then
+        echo "  ok: glibc executed AVX, parsed the auxv and reached its first syscall (brk)"
+    else
+        echo "  FAIL: glibc never reached brk -- still dying before its first syscall:"
+        grep -a "Invalid Opcode" "$SLOG3" | head -1; f3=1
+    fi
+    [ $f3 -eq 0 ] || { echo "FAIL: XSAVE/AVX test"; exit 1; }
+    echo "PASS: AVX enabled via XSAVE — a glibc binary gets past _dl_aux_init"
+else
+    echo "SKIP: XSAVE/AVX test (this QEMU has no -cpu max)"
+fi

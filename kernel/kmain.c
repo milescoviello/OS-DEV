@@ -490,6 +490,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     interrupts_init();
     linux_abi_init_this_cpu();   /* arm the `syscall` instruction on the BSP (M1938) */
     fpu_init();                    /* enable x87 + SSE so userspace can use floating point */
+    { extern void fpu_xsave_arm(void); fpu_xsave_arm(); }   /* + AVX via XSAVE where the CPU has it (M1942) */
     cpu_harden();                  /* SMEP + UMIP: kernel can't run ring-3 pages; ring-3 can't SGDT/etc (M1269) */
     timer_init(100);
     keyboard_init();
