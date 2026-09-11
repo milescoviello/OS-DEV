@@ -134,7 +134,7 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # boot network self-test does a real TLS handshake (bignum RSA/ECDSA) on top
     # of that. Skipping it keeps this boot to the part being tested.
     timeout -s KILL 300 "$QEMU" -cpu max -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
-        -append "lxfaulttest nonetdemo" \
+        -append "lxfulltest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
         -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -205,6 +205,20 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
         echo "  ok: fork+execve+dup2+pipe: reader counted all 4 lines, status returned via wait4"
     else
         echo "  FAIL: the pipeline did not deliver 4 lines:"; grep -a "LXBOX" "$SLOG3" | head -2; f3=1
+    fi
+    # mmap: the two shapes a dynamic linker needs. MAP_FIXED (an address the
+    # caller chose) and file-backed AT AN OFFSET. The offset test asserts the
+    # BYTES, not just success -- a mapping that silently ignores the offset
+    # succeeds and hands back the wrong page, which is the bug worth catching.
+    if grep -aq "LXMMAP: MAP_FIXED honoured" "$SLOG3"; then
+        echo "  ok: mmap honoured MAP_FIXED at the caller's address"
+    else
+        echo "  FAIL: MAP_FIXED not honoured:"; grep -a "LXMMAP" "$SLOG3" | head -1; f3=1
+    fi
+    if grep -aq "LXFMAP: file-backed mmap at offset 8192 read the right page" "$SLOG3"; then
+        echo "  ok: file-backed mmap at a non-zero offset read the correct page"
+    else
+        echo "  FAIL: file-backed mmap offset wrong:"; grep -a "LXFMAP" "$SLOG3" | head -1; f3=1
     fi
     if grep -aq "guest exited with status 7" "$SLOG3"; then
         echo "  ok: it exited cleanly through exit_group with the right status"

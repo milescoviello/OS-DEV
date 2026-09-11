@@ -241,6 +241,7 @@ static volatile int g_smpthread_test;         /* -append smpthreadtest: prove re
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
 static volatile int g_journal_test;           /* -append journalguest: prove the write-ahead journal + crash recovery on REAL ata hardware (M1865) */
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
+static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
 static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
 static volatile int g_netcon;                 /* -append netcon: start the network debug console on TCP 2323 (M1870, real-HW bring-up) */
@@ -475,7 +476,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
         if (cmdline_has(cl, "lxabitest"))  g_lxabi_test = 1;              /* run a host-built static-PIE LINUX binary (M1939) */
-        if (cmdline_has(cl, "lxfaulttest")) { g_lxabi_test = 1; g_lxfault_test = 1; }   /* + a binary that FAULTS, to prove the fault is reported and does not wedge (M1941) */
+        if (cmdline_has(cl, "lxfaulttest")) { g_lxabi_test = 1; g_lxfault_test = 1; }   /* + ONE binary that FAULTS, to prove the fault is reported and does not wedge (M1941) */
+        /* The full demo set (M1954). Separate from lxfaulttest on purpose: those
+         * binaries are glibc, so under QEMU's DEFAULT (no-AVX) CPU every one of
+         * them faults, and five fault register-dumps over the slow serial
+         * console dragged that boot past any sensible wait budget. They only do
+         * useful work under -cpu max anyway, so only that boot launches them. */
+        if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "netcon"))     g_netcon = 1;                 /* network debug console for real-HW bring-up (M1870) */
         if (cmdline_has(cl, "nodisk"))     g_nodisk = 1;                 /* skip disk-write self-tests + FS mount — safe on a machine with real disks (M1872) */
         if (cmdline_has(cl, "watchdog"))   g_watchdog = 1;              /* HW watchdog + panic-auto-reboot for the autonomous PXE loop (M1881) */
@@ -720,6 +727,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             app_spawn_linux_from_file("/disk2/hellolibc");
             /* A demanding one: real file I/O + a directory listing, i.e. what a
              * `cat` and an `ls` need. Drives the next ENOSYS batch. */
+        }
+        if (g_lxfull_test) {
             kprintf("[lxabi] launching a glibc file-I/O binary...\n");
             app_spawn_linux_from_file("/disk2/lxfileio");
             /* Phase 3's real deliverable: a busybox-shaped multi-call binary
@@ -729,6 +738,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             app_spawn_linux_from_file_arg("/disk2/lxbox", "pipe");
             kprintf("[lxabi] launching the MAP_FIXED mmap test...\n");
             app_spawn_linux_from_file("/disk2/lxmmap");
+            kprintf("[lxabi] launching the file-backed mmap (offset) test...\n");
+            app_spawn_linux_from_file("/disk2/lxfmap");
         }
     }
 

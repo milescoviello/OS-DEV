@@ -386,7 +386,21 @@ void linux_syscall_dispatch(struct registers *r) {
          * other cases in this file. */
         int fd = (int)r->r8;
         if (len <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
-        if (!(flags & LX_MAP_ANONYMOUS) || fd >= 0) { r->rax = (uint64_t)-(long)LX_ENODEV; break; }
+        if (!(flags & LX_MAP_ANONYMOUS)) {
+            /* File-backed: resolve the fd to its path and map at the given
+             * offset. This is the shape a dynamic linker uses for every
+             * PT_LOAD of a shared object. (M1953) */
+            const char *fpath = (fd >= 0) ? app_fd_path(fd) : 0;
+            if (!fpath) { r->rax = (uint64_t)-(long)LX_ENODEV; break; }
+            uint64_t fbase = app_mmap_file_at(fpath, (flags & LX_MAP_FIXED) ? r->rdi : 0,
+                                              (uint64_t)len, (uint64_t)r->r9,
+                                              (flags & LX_MAP_SHARED) ? 1 : 0);
+            if (!fbase) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+            if (prot != (1 | 2)) app_mprotect(fbase, (uint64_t)len, (int)prot);
+            r->rax = fbase;
+            break;
+        }
+        if (fd >= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }   /* MAP_ANONYMOUS with an fd */
         /* MAP_FIXED is honoured now (M1952) -- it used to be refused outright,
          * which is correct-but-useless: a caller that asks for a specific
          * address needs that address. Still refused if the range is

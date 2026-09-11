@@ -1951,6 +1951,52 @@ uint64_t app_mmap_huge(uint64_t len) {
  * is MAP_SHARED (M1544): writes are flushed back to the file by an explicit
  * msync(), by munmap, or (best-effort) at process exit -- see app_msync. Returns
  * the base VA, or 0. */
+/* File-backed mmap with an OFFSET, and optionally at an address the caller
+ * chooses (M1953). This is what a dynamic linker actually needs: ld.so maps
+ * each PT_LOAD of a shared object separately, from a file offset, at an
+ * address it picked when it reserved the object's span -- none of which the
+ * old path-and-offset-zero form could express.
+ *
+ * `addr == 0` means "anywhere" (the old behaviour); non-zero is MAP_FIXED and
+ * is refused on overlap, exactly as app_mmap_fixed does and for the same
+ * reason (no VMA splitting yet). `off` must be page-aligned, because the
+ * demand-fault handler reads file bytes at vma.foff + (fault - vma.start).
+ *
+ * Returns the base VA, or 0. */
+uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
+                          uint64_t off, int shared) {
+    struct app *a = cur();
+    if (!a || len == 0 || !path) return 0;
+    if ((addr | off) & (PAGE_SIZE - 1)) return 0;          /* both must be page-aligned */
+    len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (a->nvma >= APP_MAXVMA) return 0;
+    if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
+    if (!addr) {
+        if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
+        addr = a->mmap_next;
+    } else {
+        for (int i = 0; i < a->nvma; i++) {                /* MAP_FIXED: no overlap */
+            uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+            if (addr < e0 && s0 < addr + len) return 0;
+        }
+    }
+    if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
+    a->vma[a->nvma].start = addr;
+    a->vma[a->nvma].len   = len;
+    a->vma[a->nvma].sealed = 0;
+    a->vma[a->nvma].uffd  = 0;
+    a->vma[a->nvma].file_backed = 1;
+    a->vma[a->nvma].locked = 0;
+    a->vma[a->nvma].huge = 0;
+    a->vma[a->nvma].shared = shared ? 1 : 0;
+    a->vma[a->nvma].foff = off;
+    int i = 0; for (; path[i] && i < 63; i++) a->vma[a->nvma].fpath[i] = path[i];
+    a->vma[a->nvma].fpath[i] = 0;
+    a->nvma++;
+    if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
+    return addr;
+}
+
 uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     struct app *a = cur();
     if (!a || len == 0 || !path) return 0;

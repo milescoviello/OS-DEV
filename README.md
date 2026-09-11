@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1952-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1953-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -486,9 +486,16 @@ Landed so far, all on the from-scratch ext2 driver:
   TLS bugs, and a concurrency bug in the new `execve` (static argv buffers
   shared across processes).
 
-Still ahead: a toolchain. busybox itself is not obtainable on this host, so the
-ABI surface is driven by purpose-built glibc programs exercising the same
-syscalls. The honest scale is months, and the memory
+- **M1952-M1953** — a real **`mmap`**: `MAP_FIXED` (an address the caller
+  chooses) and **file-backed at an offset** — the two shapes a dynamic linker
+  needs for every `PT_LOAD` of a shared object. Chasing them also found an ABI
+  bug (reading an `int` argument as `long`, so `fd = -1` read as 4 billion) and
+  a concurrency bug in `execve` (per-process now, not globals).
+
+Still ahead: `PT_INTERP` so the kernel can load `ld-linux-x86-64.so.2` — every
+host toolchain binary is dynamically linked, so that is what gates the
+toolchain. busybox itself is not obtainable on this host, so the ABI surface is
+driven by purpose-built glibc programs exercising the same syscalls. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be
 expressed).

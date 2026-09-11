@@ -108,7 +108,8 @@ uint64_t app_sbrk(long inc);            /* grow the calling app's heap; old brea
 uint64_t app_mmap(uint64_t len);
 uint64_t app_mmap_fixed(uint64_t addr, uint64_t len);   /* MAP_FIXED anon: reserve at the CALLER's address; 0 if unaligned/out of range/overlapping (M1952) */        /* reserve a demand-paged anonymous region; base VA or 0 */
 uint64_t app_mmap_huge(uint64_t len);   /* reserve a 2 MiB-backed demand-paged region (MAP_HUGETLB); base VA or 0 (M1155) */
-uint64_t app_mmap_file(const char *path, uint64_t len, int shared);   /* demand-paged file-backed region; shared=0 MAP_PRIVATE (M1136), shared=1 MAP_SHARED (M1544); base VA or 0 */
+uint64_t app_mmap_file(const char *path, uint64_t len, int shared);
+uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len, uint64_t off, int shared);  /* file-backed at a chosen addr + file OFFSET -- what ld.so needs (M1953) */   /* demand-paged file-backed region; shared=0 MAP_PRIVATE (M1136), shared=1 MAP_SHARED (M1544); base VA or 0 */
 int      app_msync(uint64_t addr, uint64_t len);   /* flush a MAP_SHARED file-backed mmap's dirty pages to disk; 0/-1 (M1544) */
 struct registers;
 long     app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg);  /* spawn a thread sharing this address space; tid/-1 (M1138) */
