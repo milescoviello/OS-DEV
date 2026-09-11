@@ -16,6 +16,7 @@ int         app_spawn_named_arg(const char *name, const char *arg);  /* launch w
 int         app_getarg(char *out, int max);      /* read the calling app's launch arg; returns length */
 int         app_list_names(char *buf, int max);  /* space-separated prog names; bytes written */
 int         app_spawn_from_file(const char *path);/* load + run an ELF from a FAT32 file */
+int         app_spawn_linux_from_file(const char *path);  /* a LINUX static-PIE binary: same loader, but a real SysV initial stack with argc/argv/envp/auxv (M1940) */
 app_t      *app_take_pending(void);              /* next app awaiting a window (WM)    */
 void        app_browse(const char *url);         /* queue a URL for a browser window   */
 int         app_take_browse(char *out, int max); /* WM claims a queued browse URL; 0/1 */

@@ -62,7 +62,6 @@ typedef struct {
 #define DT_RELA           7
 #define DT_RELASZ         8
 #define R_X86_64_RELATIVE 8
-#define ELF_DYN_BASE      0x40000000ull   /* load base for a PIE (just above the kernel's 0..1 GiB identity map, like user.ld) */
 
 typedef struct { int64_t  d_tag; uint64_t d_val;            } Elf64_Dyn;
 typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;

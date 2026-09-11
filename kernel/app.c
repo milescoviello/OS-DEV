@@ -24,6 +24,7 @@
 #include "pmm.h"
 #include "vdso.h"
 #include "elf.h"
+#include "linuxabi.h"
 #include "measure.h"
 #include "fb.h"
 #include "font.h"
@@ -283,6 +284,11 @@ static int  g_have_pend;
 static int      g_pend_jail;
 static uint32_t g_jail_promises;
 static char     g_jail_path[64];
+/* One-shot: the next app_spawn() is a LINUX binary and needs a System V initial
+ * stack (argc/argv/envp/auxv) rather than the bare RSP our own apps get. Same
+ * one-shot shape as g_pend_arg/g_pend_jail. (M1940) */
+static volatile int g_pend_linux;
+static char         g_pend_lxpath[256];
 
 /* text-colour palette for apps (index 0 = the default green, so an app that never
  * calls SYS_setcolor renders byte-identically). Vivid hues on the dark app background. */
@@ -3589,6 +3595,8 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         }
         g_pend_jail = 0;
     }
+    int take_linux = g_pend_linux;        /* consume before the CR3 switch, like the two above */
+    g_pend_linux = 0;
     grid_clear(a);
     a->cr3 = vmm_create_address_space();
     if (!a->cr3) { a->used = 0; return 0; }   /* OOM: no address space — loading CR3=0 would triple-fault */
@@ -3629,6 +3637,21 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         }
     }
     a->ustack = USTACK_BASE + USTACK_PAGES * PAGE_SIZE;
+
+    /* A Linux binary reads argc/argv/envp/auxv off its stack before main, so
+     * build the frame HERE -- while the new address space is still active and
+     * its stack pages are mapped -- and start it at the frame instead of at a
+     * bare stack top. (M1940) */
+    if (take_linux) {
+        static const char *argv0[2], *envp0[4];
+        argv0[0] = g_pend_lxpath; argv0[1] = 0;
+        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/"; envp0[2] = "TERM=osdev"; envp0[3] = 0;
+        uint64_t rsp = lx_spawn_stack(elf, ELF_DYN_BASE, a->entry, a->ustack,
+                                      USTACK_BASE + PAGE_SIZE, argv0, envp0);
+        if (!rsp) goto fail_in_space;        /* stack too small for the frame */
+        a->ustack = rsp;
+    }
+
     a->aslr_mmap_base = aslr_mmap_pick(); a->mmap_next = a->aslr_mmap_base;   /* ASLR: randomize the mmap region start (M1287) */
 
     __asm__ volatile("mov %0, %%cr3" : : "r"(old) : "memory");
@@ -5145,10 +5168,27 @@ long app_ptrace(long req, int pid, uint64_t addr, uint64_t data) {
 /* Load and run an ELF program from a FAT32 file (e.g. `run calc.elf`). The ELF
  * bytes are read into a kernel buffer; app_spawn/elf_load copy the segments into
  * the new address space synchronously, so the buffer is freed right after. */
+/* Load and run a LINUX static-PIE binary from a file. Same loader as our own
+ * ELFs -- elf_load already dispatches ET_DYN to the PIE path -- but the new
+ * process gets a real SysV initial stack, which a libc reads before main. */
+int app_spawn_linux_from_file(const char *path) {
+    int i = 0; while (path[i] && i < (int)sizeof g_pend_lxpath - 1) { g_pend_lxpath[i] = path[i]; i++; }
+    g_pend_lxpath[i] = 0;
+    g_pend_linux = 1;
+    int rc = app_spawn_from_file(path);
+    g_pend_linux = 0;                       /* never leak the flag to a later spawn */
+    return rc;
+}
+
 int app_spawn_from_file(const char *path) {
-    uint8_t *buf = kmalloc(64 * 1024);          /* our user ELFs are < 18 KB */
+    /* 8 MiB (was 64 KiB, sized for our own <18 KB apps): a glibc static-PIE
+     * hello world is ~800 KB and a real toolchain binary is far larger. This
+     * still buffers the WHOLE image, which does not scale to a 100 MB gcc --
+     * that wants mmap-backed demand loading and is its own milestone. (M1940) */
+    const unsigned long ELFBUF = 8u << 20;
+    uint8_t *buf = kmalloc(ELFBUF);
     if (!buf) return -1;
-    long n = vfs_read(path, buf, 64 * 1024);
+    long n = vfs_read(path, buf, ELFBUF);
     int rc = (n > 0 && app_spawn(buf, path, (uint64_t)n)) ? 0 : -1;  /* title = filename */
     kfree(buf);
     return rc;

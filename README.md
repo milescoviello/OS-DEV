@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1939-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1940-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-134%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -445,9 +445,13 @@ Landed so far, all on the from-scratch ext2 driver:
   `write(2)` and exiting with the right status. Asserted headlessly by
   `make linuxabitest`.
 
-Still ahead: a real libc binary (which needs the SysV initial stack with auxv
-— `AT_RANDOM` is where musl's stack canary comes from), then busybox, then the
-toolchain. The honest scale is months, and the memory
+- **M1940** — a real **SysV initial stack** (argc/argv/envp/auxv, 16-byte
+  aligned, with `AT_RANDOM`), which a libc reads before `main`. Hit an honest
+  wall: a *glibc* static-PIE binary carries ifunc (`IRELATIVE`) relocations it
+  resolves itself before its first syscall, and dies there. **musl** is the
+  right first libc target.
+
+Still ahead: musl, then busybox, then the toolchain. The honest scale is months, and the memory
 subsystem needs real work before Node (today's `mmap` has no `addr`, `prot` or
 `flags` argument at all, so V8's address-space reservation cannot even be
 expressed).

@@ -171,7 +171,16 @@ $(LXROOT)/hellofree: tools/lx/hellofree.c
 	$(CC) $(LXFLAGS) -o $@ $<
 	@echo "  HOSTCC  $@ (a real Linux static-PIE binary)"
 
-LXBINS := $(LXROOT)/hellofree
+# A real LIBC binary, to exercise what the freestanding one deliberately does
+# not: a libc reads argc/argv/envp/auxv off the stack before main, and musl/glibc
+# both read AT_RANDOM there for the stack canary. Built with the host's default
+# libc, statically and position-independent.
+$(LXROOT)/hellolibc: tools/lx/hellolibc.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (a real static-PIE LIBC binary)"
+
+LXBINS := $(LXROOT)/hellofree $(LXROOT)/hellolibc
 
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a

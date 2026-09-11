@@ -35,3 +35,10 @@ uint64_t elf_load(const void *image, uint64_t maxsz,
  * capped at maxsz; 0 on a bad header). Lets measured-boot hash the exact image
  * bytes of an app even when it was spawned with maxsz = ~0 (trusted embedded). */
 uint64_t elf_image_size(const void *image, uint64_t maxsz);
+
+/* Load base for a position-independent executable (ET_DYN). Lives in the header
+ * because the Linux ABI layer must report exactly this value as auxv AT_BASE --
+ * a mismatch would make a libc self-relocate against the wrong bias. Just above
+ * boot's low 1 GiB identity map, which is supervisor-only and so cannot hold
+ * user pages at all. (M1465; hoisted M1940) */
+#define ELF_DYN_BASE 0x40000000ull

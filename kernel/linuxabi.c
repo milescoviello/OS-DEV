@@ -36,6 +36,8 @@
 #include "task.h"
 #include "lxerrno.h"
 #include "vmm.h"
+#include "timer.h"
+#include "syscall.h"   /* AT_PAGESZ/AT_ENTRY/AT_UID/... -- the auxv types we share with /proc/<pid>/auxv */
 #include <stdint.h>
 
 /* ---- MSRs ---------------------------------------------------------------- */
@@ -215,8 +217,174 @@ void linux_syscall_dispatch(struct registers *r) {
         task_exit();
         break;
     default:
+        /* Log it. Implementing a Linux ABI by GUESSING which calls a libc makes
+         * is hopeless; making the binary say so turns the whole thing into a
+         * mechanical loop -- run it, read the numbers, implement, repeat.
+         * Rate-limited so a libc that retries in a loop cannot bury the log. */
         lx_unknown_count++;
+        if (lx_unknown_count <= 40)
+            kprintf("[linuxabi] ENOSYS: unimplemented Linux syscall %lu "
+                    "(args %lx %lx %lx)\n", (unsigned long)r->rax,
+                    (unsigned long)r->rdi, (unsigned long)r->rsi, (unsigned long)r->rdx);
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
     }
+}
+
+/* ---- the System V initial process stack (M1939) --------------------------
+ *
+ * A Linux binary does not get its arguments in registers. It expects, at the
+ * exact address RSP holds on entry:
+ *
+ *     [rsp]      argc
+ *     [rsp+8]    argv[0..argc-1], then a NULL
+ *                envp[0..], then a NULL
+ *                auxv: (a_type, a_val) pairs, terminated by AT_NULL
+ *                ...the string bytes those pointers refer to...
+ *
+ * Our own loader never built any of this -- app.c:1162 says so outright, and
+ * passes a single 128-byte argument out of band via SYS_getarg instead. That
+ * is fine for our apps and fatal for a real libc: musl reads the auxiliary
+ * vector in __init_libc BEFORE main, and **AT_RANDOM is not optional** -- it
+ * is where the stack-protector canary and malloc's pointer-mangling secret
+ * come from. A missing AT_RANDOM is a NULL dereference before the program's
+ * first instruction, which looks like "the binary just dies instantly".
+ *
+ * RSP must also be 16-byte aligned with argc AT [rsp]. Getting this wrong does
+ * not fault immediately; it corrupts the first SSE spill, so the failure shows
+ * up somewhere unrelated and much later.
+ */
+#define LX_AT_PHDR    3
+#define LX_AT_PHENT   4
+#define LX_AT_PHNUM   5
+#define LX_AT_BASE    7
+#define LX_AT_FLAGS   8
+#define LX_AT_HWCAP  16
+#define LX_AT_RANDOM 25
+#define LX_AT_EXECFN 31
+
+struct lx_stack_info {
+    uint64_t phdr, entry, base;      /* runtime addresses */
+    uint16_t phent, phnum;
+};
+
+/* Push `n` bytes to the stack, keeping it descending. Returns the new top. */
+static uint64_t sp_push(uint64_t sp, const void *src, uint64_t n) {
+    sp -= n;
+    for (uint64_t i = 0; i < n; i++) ((uint8_t *)sp)[i] = ((const uint8_t *)src)[i];
+    return sp;
+}
+static uint64_t sp_str(uint64_t sp, const char *s, uint64_t *out_addr) {
+    uint64_t n = 0; while (s[n]) n++;
+    sp = sp_push(sp, s, n + 1);
+    *out_addr = sp;
+    return sp;
+}
+
+/* Build the frame at the top of an already-mapped user stack. Must run with
+ * the TARGET address space active. Returns the entry RSP, or 0 on overflow. */
+uint64_t lx_build_stack(uint64_t stack_top, uint64_t stack_bottom,
+                        const char *const *argv, const char *const *envp,
+                        const struct lx_stack_info *si) {
+    uint64_t sp = stack_top & ~(uint64_t)15;
+    uint64_t argp[64], envpp[64];
+    int argc = 0, envc = 0;
+
+    /* 1. strings first, at the very top, so the pointer arrays below can name
+     *    them. Bounded at 64 each: more than any real invocation, and a cap is
+     *    required since these are fixed arrays. */
+    for (; argv && argv[argc] && argc < 64; argc++) { }
+    for (; envp && envp[envc] && envc < 64; envc++) { }
+    for (int i = argc - 1; i >= 0; i--) sp = sp_str(sp, argv[i], &argp[i]);
+    for (int i = envc - 1; i >= 0; i--) sp = sp_str(sp, envp[i], &envpp[i]);
+
+    uint64_t execfn = argc > 0 ? argp[0] : 0;      /* AT_EXECFN: argv[0] will do */
+
+    /* 2. 16 bytes of AT_RANDOM seed. Not decorative: musl's canary and
+     *    malloc secret are read straight out of here. */
+    uint8_t rnd[16];
+    for (int i = 0; i < 16; i++) rnd[i] = (uint8_t)(timer_ms() * 31u + i * 131u + 7u);
+    uint64_t rnd_addr;
+    sp = sp_push(sp, rnd, sizeof rnd);
+    rnd_addr = sp;
+
+    /* 3. Build the auxv into a local array FIRST, then size the reservation
+     *    from what it actually contains. An earlier version hand-counted the
+     *    pairs into an `n_aux` constant and got it wrong twice -- which writes
+     *    past the reserved block and corrupts the strings just above it. This
+     *    shape makes that class of mistake impossible rather than fixing one
+     *    instance of it. */
+    uint64_t aux[2 * 24]; int na = 0;
+#define AUX(t, v) do { aux[na++] = (uint64_t)(t); aux[na++] = (uint64_t)(v); } while (0)
+    /* AT_PHDR/PHENT/PHNUM let a static-PIE binary find its own program headers,
+     * which it needs to locate PT_DYNAMIC (self-relocation) and PT_TLS (its
+     * thread pointer). AT_BASE is the load bias. */
+    AUX(LX_AT_PHDR,   si->phdr);
+    AUX(LX_AT_PHENT,  si->phent);
+    AUX(LX_AT_PHNUM,  si->phnum);
+    AUX(LX_AT_BASE,   si->base);
+    AUX(AT_ENTRY,     si->entry);
+    AUX(AT_PAGESZ,    4096);
+    AUX(LX_AT_RANDOM, rnd_addr);        /* NOT optional -- see the header comment */
+    AUX(LX_AT_HWCAP,  0);
+    AUX(AT_CLKTCK,    100);
+    AUX(AT_UID,       0);
+    AUX(AT_EUID,      0);
+    AUX(AT_GID,       0);
+    AUX(AT_EGID,      0);
+    AUX(AT_SECURE,    0);
+    AUX(LX_AT_FLAGS,  0);
+    AUX(LX_AT_EXECFN, execfn);
+    AUX(AT_NULL,      0);               /* terminator -- must be last */
+#undef AUX
+
+    /* Reserve the pointer block and align its BASE to 16, because that base is
+     * the RSP the program starts with and argc must sit exactly there.
+     * Aligning `sp` first and then subtracting would undo itself.
+     *
+     * A misaligned RSP does not fault: it corrupts the first SSE spill, so the
+     * damage surfaces somewhere unrelated and much later. */
+    uint64_t words = 1                             /* argc */
+                   + (uint64_t)argc + 1            /* argv + NULL */
+                   + (uint64_t)envc + 1            /* envp + NULL */
+                   + (uint64_t)na;                 /* auxv, already counted in words */
+    uint64_t need = words * 8;
+    if (sp < stack_bottom + need + 16) return 0;   /* would run off the stack */
+    uint64_t p = (sp - need) & ~(uint64_t)15;
+
+    uint64_t *w = (uint64_t *)p;
+    uint64_t k = 0;
+    w[k++] = (uint64_t)argc;
+    for (int i = 0; i < argc; i++) w[k++] = argp[i];
+    w[k++] = 0;
+    for (int i = 0; i < envc; i++) w[k++] = envpp[i];
+    w[k++] = 0;
+    for (int i = 0; i < na; i++) w[k++] = aux[i];
+    if (k != words) {                              /* belt and braces: the two
+                                                    * must agree by construction */
+        kprintf("[linuxabi] BUG: stack words %lu != written %lu\n", words, k);
+        return 0;
+    }
+    return p;
+}
+
+/* Parse the just-loaded image's program-header location and build the initial
+ * stack for it. Keeps ELF field decoding out of app.c, which only knows it is
+ * spawning "a Linux binary". Returns the entry RSP, or 0.
+ *
+ * AT_PHDR is computed as base + e_phoff, which is correct when the program
+ * headers fall inside a PT_LOAD that maps file offset 0 at vaddr 0 -- true for
+ * every normal static-PIE image, and the only shape we load. */
+uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
+                        uint64_t stack_top, uint64_t stack_bottom,
+                        const char *const *argv, const char *const *envp) {
+    const uint8_t *e = (const uint8_t *)image;
+    uint64_t phoff   = *(const uint64_t *)(e + 32);   /* e_phoff */
+    uint16_t phent   = *(const uint16_t *)(e + 54);   /* e_phentsize */
+    uint16_t phnum   = *(const uint16_t *)(e + 56);   /* e_phnum */
+    struct lx_stack_info si = {
+        .phdr = base + phoff, .entry = entry, .base = base,
+        .phent = phent, .phnum = phnum,
+    };
+    return lx_build_stack(stack_top, stack_bottom, argv, envp, &si);
 }

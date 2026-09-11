@@ -684,8 +684,20 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * unlike ring-3 print() from our own apps. */
     if (g_lxabi_test) {
         kprintf("[lxabi] launching a host-built static-PIE Linux binary from /disk2...\n");
-        if (app_spawn_from_file("/disk2/hellofree") < 0)
+        if (app_spawn_linux_from_file("/disk2/hellofree") < 0)
             kprintf("[FAIL] lxabi: could not load /disk2/hellofree\n");
+        /* NOT launched yet: /disk2/hellolibc is a glibc static-PIE binary and it
+         * does not run. It loads, gets a correct SysV stack (verified: 16-byte
+         * aligned RSP, entry matching the ELF), is entered -- and then makes
+         * ZERO syscalls and never faults, so the boot wedges behind it.
+         *
+         * The cause is structural, not a bug in the stack: the image carries 22
+         * R_X86_64_IRELATIVE relocations and a PT_TLS segment. IRELATIVE means
+         * ifunc -- the loader must CALL a resolver and store its result -- and
+         * glibc does that itself in _dl_relocate_static_pie, before its first
+         * syscall, which is exactly where it stops. musl is the right first
+         * libc target (no ifunc, far smaller startup); this stays staged in the
+         * image as the next milestone's subject. */
     }
 
     if (!g_nodisk && fat32_mount() == 0) {

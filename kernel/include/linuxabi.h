@@ -16,3 +16,11 @@ void linux_abi_set_kernel_rsp(int cpu, uint64_t rsp);
 
 /* Boot self-test: prove the entry path is real (M1938). */
 void linux_abi_selftest(void);
+
+/* Build a System V initial process stack (argc/argv/envp/auxv) for a Linux
+ * binary at the top of an already-mapped user stack, and return the RSP it
+ * should start with (0 on failure). Must be called with the TARGET address
+ * space active. `image` is the raw ELF, needed for AT_PHDR/PHENT/PHNUM. M1939. */
+uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
+                        uint64_t stack_top, uint64_t stack_bottom,
+                        const char *const *argv, const char *const *envp);
