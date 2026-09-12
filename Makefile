@@ -69,7 +69,7 @@ DISK      := $(BUILD)/fat.img
 # Built only when host e2fsprogs is present; without it the guest simply has no
 # /disk1 and everything else behaves exactly as before.
 MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
-EXT2SIZE  := 512M
+EXT2SIZE  := 1500M   # 512M -> 1500M (M1964): Node is 102 MB plus 21 shared libraries, on top of the 195 MB toolchain+source tree
 ifneq ($(MKE2FS),)
 EXT2IMG   := $(BUILD)/ext2.img
 EXT2FLAGS := -drive file=$(BUILD)/ext2.img,format=raw,if=ide
@@ -118,7 +118,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest clean
 
 all: $(KERNEL) $(DISK)
 
@@ -299,6 +299,10 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 	@for t in mkdir rm cp touch printf nm; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@mkdir -p $(LXROOT)/bin && for t in mkdir rm cp touch printf; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@tools/stage-linux-tool.sh $(LXROOT) bash
+	@# PHASE 6: Node. 102 MB and 21 shared libraries (libuv, c-ares, OpenSSL,
+	@# ICU, nghttp2, simdjson) -- staged whole and unmodified, exactly like the
+	@# toolchain. We do not port Node; we run it.
+	@tools/stage-linux-tool.sh $(LXROOT) node
 	@for t in echo cat ls; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
@@ -1055,6 +1059,11 @@ fstest:
 # NOT in `check`: stage 1 compiles 136 real source files with a real compiler
 # under TCG and takes ~15 minutes. Run it when the self-hosting claim needs
 # re-proving.
+# PHASE 6: real Node.js in-guest. NOT in `check` -- V8 under TCG is minutes per
+# start and this runs Node three times.
+nodetest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@sh tests/run-node-test.sh
+
 selfhosttest: $(KERNEL) $(DISK) $(EXT2IMG)
 	@sh tests/run-selfhost-test.sh
 

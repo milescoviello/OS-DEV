@@ -46,6 +46,15 @@ for so in $(ldd "$BIN" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
     [ -f "$r" ] || continue
     mkdir -p "$ROOT$(dirname "$so")"
     cp -f "$r" "$ROOT$so"
+    # ...and again in /usr/lib64, which IS a default ld.so search directory.
+    # A library outside the default paths is found on the host only through
+    # /etc/ld.so.cache, and we have no cache: node's libstdc++ lives under
+    # /usr/lib/gcc/<triplet>/<ver>/ and ld.so simply reported
+    # "libstdc++.so.6: cannot open shared object file". Generating a real
+    # binary cache would be fiddly; a second copy on a path ld.so already
+    # searches is the same answer for a few megabytes.
+    mkdir -p "$ROOT/usr/lib64"
+    cp -f "$r" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
     n=$((n+1))
 done
 echo "  STAGE   $NAME <- $BIN (+ $n shared libs)"

@@ -327,7 +327,10 @@ static char g_pend_arg[128];             /* arg for the next app_spawn, copied i
  * execve is NOT (it is called concurrently by unrelated processes), which is
  * why its argv lives per-process in exec_argv instead -- see M1952. */
 #define LX_PEND_ARGS   28
-#define LX_PEND_ARGLEN 192
+/* 192 -> 1024 (M1964). A `node -e '<script>'` invocation puts an entire
+ * program in ONE argument; at 192 characters it was silently cut mid-string
+ * and Node reported a SyntaxError about source it had never been given. */
+#define LX_PEND_ARGLEN 1024
 static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
 static int  g_pend_lxargc;
 static int  g_last_spawn_pid;            /* pid of the last successful app_spawn (M1955) */
@@ -1939,8 +1942,24 @@ uint64_t app_sbrk(long inc) {
  * and munmap are the same operation on the VMA list. */
 static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len);
 
-#define MMAP_BASE  0x60000000ull        /* above the 0x50000000 user stack, clear of the heap */
-#define MMAP_TOP   0xA0000000ull      /* 256 MiB -> 1 GiB: a compiler's allocator outgrew it (M1961) */
+/* The mmap window moved ABOVE 4 GiB and grew to 252 GiB (M1964).
+ *
+ * V8 reserves an enormous contiguous region for its pointer-compression cage
+ * -- gigabytes of PROT_NONE address space it then commits into piecemeal --
+ * and with a 1 GiB window Node died at startup with
+ *
+ *     Fatal process out of memory: SegmentedTable::InitializeTable
+ *
+ * There was never a reason to keep user mappings inside the first 4 GiB
+ * beyond our own constants: this is 4-level paging with a 48-bit address
+ * space, and everything from 4 GiB to 256 GiB sits in PML4[0], whose PDPT is
+ * allocated PER ADDRESS SPACE. Reserving address space costs one VMA; only
+ * touched pages cost memory.
+ *
+ * The layout below 4 GiB is unchanged: executable at ELF_DYN_BASE, heap,
+ * stack, interpreter at 0xB0000000. */
+#define MMAP_BASE  0x100000000ull       /* 4 GiB: clear of the executable, heap, stack and interpreter */
+#define MMAP_TOP   0x4000000000ull   /* 256 GiB. A compiler outgrew 256 MiB (M1961); V8's cage outgrew 1 GiB (M1964) */
 
 /* Interned backing-file paths for file-backed VMAs (M1962).
  *
@@ -2029,7 +2048,7 @@ static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align) {
  * buffers no longer sit at a fixed address — the partner of W^X. */
 static uint64_t aslr_mmap_pick(void) {
     uint16_t r = 0; random_bytes(&r, sizeof r);
-    return MMAP_BASE + ((uint64_t)(r & 0x3FFF) * PAGE_SIZE);   /* [MMAP_BASE, MMAP_BASE+64 MiB), page-aligned */
+    return MMAP_BASE + ((uint64_t)(r & 0x3FFF) * PAGE_SIZE);   /* [MMAP_BASE, MMAP_BASE+64 MiB), page-aligned; vma_find_gap wraps to MMAP_BASE if the tail fills */
 }
 /* The randomized mmap base of process `pid` (0 = self), for the ASLR self-test
  * to confirm two independently-exec'd processes landed at different bases. */
@@ -4302,7 +4321,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * all. gcc creates its intermediate .s exactly that way. (M1960) */
         vfs_cwd_set_for(a, "/disk2");
         { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
-        static const char *argv0[2 + LX_PEND_ARGS], *envp0[4];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[6];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
          * re-execs itself by argv[0] (lxbox does) would otherwise ask for
@@ -4319,7 +4338,13 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         if (an == 1 && a->launch_arg[0]) argv0[an++] = a->launch_arg;
         argv0[an] = 0;
         g_pend_lxargc = 0;                   /* one-shot: never leak into a later spawn */
-        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/"; envp0[2] = "TERM=osdev"; envp0[3] = 0;
+        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/"; envp0[2] = "TERM=osdev";
+        /* We have no /etc/ld.so.cache, so anything outside ld.so's default
+         * directories is invisible to it. Naming the non-default library
+         * directories explicitly is the portable substitute, and it
+         * propagates to everything a program execs. (M1964) */
+        envp0[3] = "LD_LIBRARY_PATH=/usr/lib64:/lib64:/usr/lib/gcc/x86_64-pc-linux-gnu/15:/usr/lib64/binutils/x86_64-pc-linux-gnu/2.46.0";
+        envp0[4] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to
          * map its shared libraries first and only then jump to the entry. */
@@ -6145,6 +6170,9 @@ int app_spawn_linux_from_file_argv(const char *path, const char *const *args, in
         int k = 0;
         if (args[i]) while (args[i][k] && k < LX_PEND_ARGLEN - 1) { g_pend_lxargs[i][k] = args[i][k]; k++; }
         g_pend_lxargs[i][k] = 0;
+        if (args[i] && args[i][k])
+            kprintf("[app] launch argv[%d] TRUNCATED at %d chars -- the program sees a short argument\n",
+                    i + 1, LX_PEND_ARGLEN - 1);
     }
     g_pend_lxargc = n;
     int rc = lx_spawn_file(path);

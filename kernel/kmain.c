@@ -243,6 +243,7 @@ static volatile int g_journal_test;           /* -append journalguest: prove the
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
+static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
@@ -488,6 +489,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
@@ -858,6 +860,37 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             rc = app_run_linux_sync("/disk2/mk.elf", 0, 0, 60000);
             kprintf("[lxtool] MAKEBUILT exit -> %d\n", rc);
 
+        }
+        if (g_lxnode_test) {
+            /* PHASE 6: real Node.js, unmodified, through the compatibility
+             * shim. Start with --version -- the cheapest thing that still
+             * requires the whole 102 MB image to load, ld.so to resolve 21
+             * shared libraries, and V8 to initialise. (M1964) */
+            int rc;
+            static const char *av_nv[] = { "--version" };
+            kprintf("[lxnode] running real Node.js...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_nv, 1, 600000);
+            kprintf("[lxnode] node --version -> %d\n", rc);
+
+            /* Now actually EXECUTE JavaScript: V8 has to parse, compile and
+             * JIT it. The arithmetic is deliberate -- "2" can only be printed
+             * by a working engine, not by a startup path that happens to
+             * survive. (M1964) */
+            static const char *av_ne[] = { "-e", "console.log('LXNODE:', 1+1, process.platform, process.arch)" };
+            kprintf("[lxnode] running JavaScript...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_ne, 2, 600000);
+            kprintf("[lxnode] node -e -> %d\n", rc);
+
+            /* Real FILE I/O from JavaScript: write a file, read it back,
+             * stat it, and list a directory -- the whole fs module path
+             * through libuv onto our ext2 driver. */
+            static const char *av_nf[] = { "-e",
+                "const fs=require('fs');fs.writeFileSync('/nodetest.txt','hello from node in OS-DEV\\n');"
+                "const s=fs.readFileSync('/nodetest.txt','utf8');"
+                "console.log('LXNODEFS:', s.trim().length, fs.statSync('/nodetest.txt').size, fs.readdirSync('/').length>0);" };
+            kprintf("[lxnode] running JavaScript that does FILE I/O...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_nf, 2, 600000);
+            kprintf("[lxnode] node fs -> %d\n", rc);
         }
         if (g_lxgcc_test) {
             /* PHASE 5, ON ITS OWN BOOT: the real GCC DRIVER compiling OS-DEV's

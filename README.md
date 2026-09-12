@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1963-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1964-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -611,8 +611,19 @@ Landed so far, all on the from-scratch ext2 driver:
   with interrupts off). A boot-time self-test caught the first version waiting
   **15.9 seconds** for acks that were never coming; it now acks in 0 ms.
 
-Still ahead: Node, Claude Code, and Firefox on a from-scratch Wayland display
-path. The honest scale is still months, and the memory subsystem needs
+- **M1964** — **real Node.js runs JavaScript inside OS-DEV.** `node --version`
+  prints `v26.3.0`; `node -e` prints `LXNODE: 2 linux x64` (V8 parsing,
+  compiling and JIT-ing); and the `fs` module writes, re-reads, stats and lists
+  files **through the from-scratch ext2 driver**. An unmodified 102 MB binary
+  with 21 shared libraries — we don't port Node, we run it. The blocker was
+  V8's pointer-compression cage: it reserves gigabytes of address space, and
+  our mmap window was 1 GiB, so Node died with `Fatal process out of memory:
+  SegmentedTable::InitializeTable`. The window moved **above 4 GiB and grew to
+  256 GiB** — free, since reserving address space costs one VMA and only
+  touched pages cost memory. Plus `epoll`/`poll`/`eventfd2`/`uname` and friends.
+
+Still ahead: Node networking (sockets are not yet pollable), Claude Code, and
+Firefox on a from-scratch Wayland display path. The honest scale is still months, and the memory subsystem needs
 more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
 recycles addresses, so V8's address-space cage still cannot be expressed).
 

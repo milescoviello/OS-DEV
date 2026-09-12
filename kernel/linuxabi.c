@@ -234,6 +234,17 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_gettid_      186
 #define LXS_madvise_      28
 #define LXS_mremap_       25
+#define LXS_prctl_       157
+#define LXS_capget_      125
+#define LXS_sched_getaffinity_ 204
+#define LXS_clock_getres_ 229
+#define LXS_epoll_create1_ 291
+#define LXS_epoll_ctl_   233
+#define LXS_epoll_wait_  232
+#define LXS_epoll_pwait_ 281
+#define LXS_eventfd2_    290
+#define LXS_poll_          7
+#define LXS_ppoll_       271
 #define LXS_chdir_        80
 #define LXS_tgkill_      234
 #define LXS_tkill_       200
@@ -525,6 +536,158 @@ void linux_syscall_dispatch(struct registers *r) {
             break;
         }
         r->rax = 0;                          /* other signals: accepted, undelivered */
+        break;
+    }
+    case LXS_uname: {                       /* (struct utsname *) */
+        /* Six fixed 65-byte fields: sysname, nodename, release, version,
+         * machine, domainname. The LAYOUT is the ABI -- libuv reads `release`
+         * and parses a version out of it, and a program that cannot parse it
+         * may refuse to start.
+         *
+         * We report "Linux" and a plausible release on purpose: that is what
+         * the compatibility layer is FOR, and a binary asking this question
+         * wants to know which ABI it is talking to, not which project built
+         * the kernel. `version` says OS-DEV, so anyone actually reading the
+         * output learns the truth. (M1964) */
+        if (!vmm_user_ok(r->rdi, 6 * 65)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char *u = (char *)r->rdi;
+        for (int i = 0; i < 6 * 65; i++) u[i] = 0;
+        static const char *f[6] = { "Linux", "osdev", "6.1.0",
+                                    "OS-DEV (from-scratch kernel, Linux ABI layer)",
+                                    "x86_64", "(none)" };
+        for (int k = 0; k < 6; k++)
+            for (int i = 0; f[k][i] && i < 64; i++) u[k * 65 + i] = f[k][i];
+        r->rax = 0;
+        break;
+    }
+    case LXS_capget_:
+        /* (hdrp, datap). Single-user, everything runs as root, so there are no
+         * capability sets to report -- but ENOSYS made Node ask hundreds of
+         * times. Zeroed data means "no capabilities", which is a coherent
+         * answer rather than an error. */
+        if (r->rsi && vmm_user_ok(r->rsi, 12)) {
+            uint8_t *d = (uint8_t *)r->rsi;
+            for (int i = 0; i < 12; i++) d[i] = 0;
+        }
+        r->rax = 0;
+        break;
+    case LXS_sched_getaffinity_: {          /* (pid, cpusetsize, mask) */
+        long sz = (long)r->rsi;
+        if (sz < 8) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (!vmm_user_ok(r->rdx, (uint64_t)sz)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint8_t *m = (uint8_t *)r->rdx;
+        for (long i = 0; i < sz; i++) m[i] = 0;
+        /* One bit per online core. Node sizes its libuv thread pool and
+         * reports os.cpus() from this, so a wrong answer here is a wrong
+         * answer in the program. */
+        for (int c = 0; c < smp_cpu_count && c < sz * 8; c++) m[c / 8] |= (uint8_t)(1u << (c % 8));
+        r->rax = (uint64_t)sz;              /* Linux returns the size written */
+        break;
+    }
+    case LXS_prctl_:
+        /* Node calls PR_SET_NAME(15) for its threads and PR_SET_VMA
+         * (0x53564d41, "AMVS") to label V8's heap regions for /proc/maps.
+         * Both are purely cosmetic to us -- there is nothing to name -- and
+         * accepting them is what Linux does when the option is understood. */
+        r->rax = 0;
+        break;
+    case LXS_clock_getres_: {               /* (clk_id, struct timespec *) */
+        if (!r->rsi) { r->rax = 0; break; }
+        if (!vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int64_t *ts = (int64_t *)r->rsi;
+        /* Our clocks tick in milliseconds, and saying so is more useful than
+         * claiming nanoseconds we cannot deliver. */
+        ts[0] = 0; ts[1] = 1000000;
+        r->rax = 0;
+        break;
+    }
+    case LXS_eventfd2_: {                   /* (initval, flags) */
+        int efd = app_eventfd_create((unsigned)r->rdi, 0);
+        r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;
+        break;
+    }
+    case LXS_epoll_create1_: {              /* (flags) */
+        int efd = app_epoll_create();
+        r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;
+        break;
+    }
+    case LXS_epoll_ctl_: {                  /* (epfd, op, fd, struct epoll_event *) */
+        /* LAYOUT: Linux's struct epoll_event is PACKED -- 4-byte events then
+         * an 8-byte data field at offset 4, twelve bytes total. Ours is a
+         * plain struct and therefore 16 with padding. Reading it as our own
+         * type would take `data` from the wrong offset, which is the same
+         * class of bug as struct stat's field offsets. Unpack by hand. */
+        unsigned ev = 0; unsigned long data = 0;
+        if (r->r10) {
+            if (!vmm_user_ok(r->r10, 12)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            const uint8_t *p = (const uint8_t *)r->r10;
+            ev   = *(const uint32_t *)(p + 0);
+            data = *(const uint64_t *)(p + 4);
+        }
+        int rc2 = app_epoll_ctl((int)a1, (int)r->rsi, (int)r->rdx, ev, data);
+        r->rax = (rc2 == 0) ? 0 : (uint64_t)-(long)LX_EINVAL;
+        break;
+    }
+    case LXS_epoll_wait_:
+    case LXS_epoll_pwait_: {                /* (epfd, events, maxevents, timeout[, sigmask]) */
+        long maxev = (long)r->rdx, timeout = (long)r->r10;
+        if (maxev <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (maxev > 64) maxev = 64;         /* app_epoll_check's own clamp */
+        if (!vmm_user_ok(r->rsi, (uint64_t)maxev * 12)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        struct epoll_event tmp[64];
+        uint64_t start = timer_ms();
+        long k = 0;
+        __asm__ volatile("sti");            /* this loop sleeps on the timer */
+        for (;;) {
+            k = app_epoll_check((int)a1, tmp, (int)maxev);
+            if (k != 0) break;
+            if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
+            task_sleep_ms(10);
+        }
+        __asm__ volatile("cli");
+        if (k < 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        uint8_t *out = (uint8_t *)r->rsi;   /* pack back into Linux's 12-byte layout */
+        for (long i = 0; i < k; i++) {
+            *(uint32_t *)(out + i * 12 + 0) = tmp[i].events;
+            *(uint64_t *)(out + i * 12 + 4) = tmp[i].data;
+        }
+        r->rax = (uint64_t)k;
+        break;
+    }
+    case LXS_poll_:
+    case LXS_ppoll_: {                      /* (fds, nfds, timeout | timespec) */
+        /* struct pollfd { int fd; short events; short revents; } -- 8 bytes,
+         * same on both sides. */
+        long nfds = (long)r->rsi;
+        if (nfds < 0 || nfds > 256) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (nfds && !vmm_user_ok(r->rdi, (uint64_t)nfds * 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        long timeout;
+        if (r->rax == LXS_poll_) timeout = (long)r->rdx;
+        else if (!r->rdx) timeout = -1;     /* ppoll: NULL timespec = forever */
+        else {
+            if (!vmm_user_ok(r->rdx, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            const int64_t *ts = (const int64_t *)r->rdx;
+            timeout = (long)(ts[0] * 1000 + ts[1] / 1000000);
+        }
+        uint8_t *fds = (uint8_t *)r->rdi;
+        uint64_t start = timer_ms();
+        long ready = 0;
+        __asm__ volatile("sti");
+        for (;;) {
+            ready = 0;
+            for (long i = 0; i < nfds; i++) {
+                int fd = *(const int32_t *)(fds + i * 8);
+                short want = *(const int16_t *)(fds + i * 8 + 4);
+                int re = (fd < 0) ? 0 : app_fd_ready(app_current(), fd, want);
+                *(int16_t *)(fds + i * 8 + 6) = (short)re;
+                if (re) ready++;
+            }
+            if (ready) break;
+            if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
+            task_sleep_ms(10);
+        }
+        __asm__ volatile("cli");
+        r->rax = (uint64_t)ready;
         break;
     }
     case LXS_mremap_: {                     /* (old, old_len, new_len, flags, new_addr) */
