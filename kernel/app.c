@@ -102,7 +102,13 @@ struct app {
 /* 16 -> 64 (M1936). A dynamically-linked or JIT-ing program wants dozens of
  * regions; 16 was tight even for our own apps once mmap'd thread stacks and
  * file mappings were in play. */
-#define APP_MAXVMA 192   /* 64 -> 192 (M1961): ld.so maps EIGHT shared libraries for cc1, each costing several VMAs once MAP_FIXED carving splits the reservation, plus the executable, its BSS and the allocator */
+/* 64 -> 192 (M1961) -> 1024 (M1962). ld.so alone costs several VMAs per shared
+ * library once MAP_FIXED carving splits each reservation, and GCC's garbage
+ * collector then makes HUNDREDS of small mappings -- cc1 died with "virtual
+ * memory exhausted" having run out of SLOTS with a gigabyte of address space
+ * still free. Affordable only because the backing-file path is interned
+ * (see fpaths) rather than stored inline per region. */
+#define APP_MAXVMA 1024
 #define HUGE_SIZE  0x200000ull           /* 2 MiB hugepage (M1155) */
 /* Zero the next free VMA slot before filling it. Slots are RECYCLED -- the
  * carve compacts the list by swapping the last entry down -- so a field a
@@ -111,13 +117,14 @@ struct app {
  * a freshly MAP_FIXED'd read-WRITE data segment inherited prot=1 from the
  * read-only reservation it replaced, and ld.so faulted zeroing the BSS tail.
  * Resetting the whole slot makes every field opt-in. (M1956) */
-#define VMA_NEW(a) do { for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(a)->nvma])[_b] = 0; } while (0)
+#define VMA_NEW(a) do { for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(a)->nvma])[_b] = 0; \
+                        (a)->vma[(a)->nvma].fidx = -1; } while (0)   /* 0 is a VALID path index, so zeroing is not "no path" (M1962) */
 
 /* Linux PROT_* bits, as recorded on a VMA and honoured by app_fault_handle (M1956) */
 #define VMA_PROT_READ  0x1
 #define VMA_PROT_WRITE 0x2
 #define VMA_PROT_EXEC  0x4
-    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; char fpath[256]; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fpath is 256 like the fd table's, NOT 64 -- see M1955; prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
+    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; short fidx; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fidx indexes the global path table (M1962: an inline 256-byte path made the struct so big the TABLE was the limit, not the address space); prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
     int      nvma;
     uint64_t mmap_next;                  /* bump allocator for mmap addresses */
     int      mlock_future;               /* mlockall(MCL_FUTURE): new mmaps are born locked (M1283) */
@@ -240,7 +247,11 @@ struct app {
 /* 24 -> 128 (M1936). 24 fds is below what ordinary tools open at startup, and
  * fd 0-2 are reserved on top of that. Bounded by fd_set's FD_SETSIZE (256,
  * syscall.h) -- select() cannot express an fd at or past that. */
-#define APP_NFD 128
+/* 128 -> 512 (M1962). A LINKER opens every object file at once: OS-DEV's own
+ * kernel is 146 of them, so a 128-fd ceiling meant ld simply never saw the
+ * tail of its own command line. It reported "undefined reference to kmalloc"
+ * about a file that defines it perfectly well. */
+#define APP_NFD 512
     /* type: 0=free, 1=pipe (obj=pipe index, write_end), 2=file (path+off, M1193). */
     /* path 64 -> 256 (M1936): 63 usable bytes could not even hold a moderately
      * nested source path, and the truncation was silent.
@@ -1896,6 +1907,23 @@ uint64_t app_sbrk(long inc) {
             app_oom_kill();          /* shed the fattest other process so the system recovers (M1275; cooperative) */
             return (uint64_t)-1;
         }
+        /* ZERO IT FIRST. Two separate bugs in one omission (M1962):
+         *
+         * 1. An information leak. The frame still holds whatever its last
+         *    owner wrote -- another process's data, or its CODE. The mmap
+         *    demand-fault path has always zeroed for exactly this reason
+         *    ("never leak stale RAM to userspace"); brk was the hole.
+         *
+         * 2. Corruption, because Linux GUARANTEES brk memory is zero-filled
+         *    and glibc's calloc RELIES on it: for memory freshly obtained
+         *    from the kernel it skips the memset entirely. GCC allocates its
+         *    hash tables with xcalloc, so it read recycled frames as
+         *    populated slots and dereferenced them. The faulting register
+         *    held 0x2e6666001f0f0000 -- `0f 1f 00 66 66 2e`, x86 NOP padding
+         *    -- i.e. a previous process's INSTRUCTIONS, used as a pointer.
+         *    It presented as cc1 either faulting or looping forever, and only
+         *    on inputs big enough to reach recycled frames. */
+        { uint8_t *z = (uint8_t *)hhdm(frame); for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0; }
         vmm_map(v, frame, PTE_WRITABLE | PTE_USER | PTE_NX);   /* heap: data, never code (W^X) */
     }
     a->heap_end = newend;
@@ -1913,6 +1941,87 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len);
 
 #define MMAP_BASE  0x60000000ull        /* above the 0x50000000 user stack, clear of the heap */
 #define MMAP_TOP   0xA0000000ull      /* 256 MiB -> 1 GiB: a compiler's allocator outgrew it (M1961) */
+
+/* Interned backing-file paths for file-backed VMAs (M1962).
+ *
+ * ONE GLOBAL TABLE, not one per process. Paths are immutable strings, so
+ * sharing them costs nothing and dedupes across processes; a per-process table
+ * has to be copied on fork and sized for the worst case in every slot. It was
+ * 24 per process at first, which a LINKER blows through instantly: ld mmaps
+ * every object file, and OS-DEV's own kernel is 146 of them. The failure was
+ * silent -- the mapping was refused, ld saw an object with no symbols, and the
+ * link reported "undefined reference to kmalloc" about a file that defines it
+ * perfectly well.
+ *
+ * Interning is what makes a big VMA table affordable at all: storing a
+ * 256-byte path per REGION rather than per FILE is what kept APP_MAXVMA at 64
+ * when GCC's allocator needs hundreds. */
+#define VMA_NPATH 1024
+static char g_vma_paths[VMA_NPATH][256];
+static int  g_vma_npath;
+
+static short vma_intern_path(const char *p) {
+    if (!p || !p[0]) return -1;
+    for (int i = 0; i < g_vma_npath; i++) {
+        int k = 0;
+        while (g_vma_paths[i][k] && g_vma_paths[i][k] == p[k]) k++;
+        if (!g_vma_paths[i][k] && !p[k]) return (short)i;
+    }
+    if (g_vma_npath >= VMA_NPATH) {
+        kprintf("[app] VMA path table FULL (%d) -- refusing to map %s\n", VMA_NPATH, p);
+        return -1;
+    }
+    int k = 0; for (; p[k] && k < 255; k++) g_vma_paths[g_vma_npath][k] = p[k];
+    g_vma_paths[g_vma_npath][k] = 0;
+    if (p[k]) return -1;                  /* refuse a truncated path (M1955) */
+    return (short)g_vma_npath++;
+}
+static const char *vma_path(struct app *a, int vi) {
+    short f = a->vma[vi].fidx;
+    return (f >= 0 && f < g_vma_npath) ? g_vma_paths[f] : "";
+}
+
+/* First-fit search for `len` bytes of free address space in the mmap window
+ * (M1962).
+ *
+ * This replaces a BUMP POINTER that never recycled: every mmap moved
+ * mmap_next forward and munmap never gave anything back, so a program that
+ * maps and unmaps in a loop marched through the window and then failed --
+ * however much of it was actually free. GCC's garbage collector does exactly
+ * that, and cc1 died with "virtual memory exhausted: Cannot allocate memory"
+ * on a large source file with the window almost entirely unused.
+ *
+ * Reuse only became correct once munmap really removed VMAs (the carve in
+ * M1954); before that a "free" gap was not necessarily free.
+ *
+ * Starts at the per-process ASLR base and wraps once, so the randomised
+ * layout is preserved while still being able to use everything below it.
+ * O(nvma) per probe with nvma <= APP_MAXVMA, which is nothing next to the
+ * page faults the mapping will take. */
+static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align) {
+    if (!len) return 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t cand = pass == 0 ? (a->aslr_mmap_base ? a->aslr_mmap_base : MMAP_BASE) : MMAP_BASE;
+        if (cand < MMAP_BASE) cand = MMAP_BASE;
+        if (align) cand = (cand + align - 1) & ~(align - 1);
+        for (;;) {
+            uint64_t end = cand + len;
+            if (end > MMAP_TOP || end < cand) break;       /* off the end: try the next pass */
+            int clash = 0;
+            for (int i = 0; i < a->nvma; i++) {
+                uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+                if (cand < e0 && s0 < end) {               /* overlaps: skip past it */
+                    cand = e0 + PAGE_SIZE;                 /* + a guard gap, as the bump allocator left */
+                    if (align) cand = (cand + align - 1) & ~(align - 1);
+                    clash = 1;
+                    break;
+                }
+            }
+            if (!clash) return cand;
+        }
+    }
+    return 0;
+}
 
 /* ASLR (M1287): pick a per-exec random start for the mmap region, drawn from
  * the CSPRNG (kernel/random.c). 14 bits of entropy => the base lands anywhere
@@ -1966,7 +2075,7 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
     a->vma[a->nvma].huge = 0;
     a->vma[a->nvma].shared = 0;          /* slots are recycled by the carve: never inherit */
     a->vma[a->nvma].foff = 0;
-    a->vma[a->nvma].fpath[0] = 0;
+    a->vma[a->nvma].fidx = -1;
     a->nvma++;
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -1975,11 +2084,14 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
 uint64_t app_mmap(uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
+    if (a->nvma >= APP_MAXVMA)
+        kprintf("[app] '%s': OUT OF VMA SLOTS (%d) -- mmap refused with the window still free\n",
+                a->title ? a->title : "?", APP_MAXVMA);
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (a->nvma >= APP_MAXVMA) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-    uint64_t addr = a->mmap_next;
+    uint64_t addr = vma_find_gap(a, len, 0);
+    if (!addr) return 0;
     if (len >= HUGE_SIZE) addr = (addr + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);   /* 2 MiB-align big anon regions so MADV_COLLAPSE can fold them (M1168) */
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
     VMA_NEW(a);
@@ -2005,8 +2117,8 @@ uint64_t app_mmap_huge(uint64_t len) {
     len = (len + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);          /* whole 2 MiB pages */
     if (a->nvma >= APP_MAXVMA) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-    uint64_t addr = (a->mmap_next + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);   /* 2 MiB-align the base */
+    uint64_t addr = vma_find_gap(a, len, HUGE_SIZE);   /* 2 MiB-aligned base */
+    if (!addr) return 0;
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
     VMA_NEW(a);
     a->vma[a->nvma].start = addr;
@@ -2048,8 +2160,8 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     if (a->nvma >= APP_MAXVMA) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     if (!addr) {
-        if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-        addr = a->mmap_next;
+        addr = vma_find_gap(a, len, 0);
+        if (!addr) return 0;
     } else if (app_vma_carve(a, addr, len) != 0) {
         return 0;                                          /* MAP_FIXED: replace what is there */
     }
@@ -2065,8 +2177,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     a->vma[a->nvma].huge = 0;
     a->vma[a->nvma].shared = shared ? 1 : 0;
     a->vma[a->nvma].foff = off;
-    int i = 0; for (; path[i] && i < 255; i++) a->vma[a->nvma].fpath[i] = path[i];
-    a->vma[a->nvma].fpath[i] = 0;
+    a->vma[a->nvma].fidx = vma_intern_path(path);
     /* REFUSE rather than truncate. This buffer was 64 bytes, and binutils'
      * libbfd lives 98 characters down /usr/lib64/binutils/<triplet>/<ver>/ --
      * so every demand-fault on that mapping read a path that does not exist,
@@ -2074,7 +2185,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (path[i]) return 0;               /* nvma not yet incremented: nothing to undo */
+    if (a->vma[a->nvma].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
     a->nvma++;
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -2086,8 +2197,8 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (a->nvma >= APP_MAXVMA) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-    uint64_t addr = a->mmap_next;
+    uint64_t addr = vma_find_gap(a, len, 0);
+    if (!addr) return 0;
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
     VMA_NEW(a);
     a->vma[a->nvma].start = addr;
@@ -2099,8 +2210,7 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     a->vma[a->nvma].huge = 0;
     a->vma[a->nvma].shared = shared ? 1 : 0;
     a->vma[a->nvma].foff = 0;
-    int i = 0; for (; path[i] && i < 255; i++) a->vma[a->nvma].fpath[i] = path[i];
-    a->vma[a->nvma].fpath[i] = 0;
+    a->vma[a->nvma].fidx = vma_intern_path(path);
     /* REFUSE rather than truncate. This buffer was 64 bytes, and binutils'
      * libbfd lives 98 characters down /usr/lib64/binutils/<triplet>/<ver>/ --
      * so every demand-fault on that mapping read a path that does not exist,
@@ -2108,7 +2218,7 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (path[i]) return 0;               /* nvma not yet incremented: nothing to undo */
+    if (a->vma[a->nvma].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
     a->nvma++;
     a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -2142,13 +2252,13 @@ int app_msync(uint64_t addr, uint64_t len) {
             if (vmm_pte_in(a->cr3, page) & PTE_DIRTY) { any_dirty = 1; break; }
         if (!any_dirty) continue;
 
-        struct statx st; long sz = (vfs_stat(a->vma[i].fpath, &st) == 0) ? (long)st.stx_size : 0;
+        struct statx st; long sz = (vfs_stat(vma_path(a, i), &st) == 0) ? (long)st.stx_size : 0;
         uint64_t need = a->vma[i].foff + a->vma[i].len;      /* the mapping's own span sets the ceiling */
         if ((uint64_t)sz > need) need = (uint64_t)sz;        /* preserve any bytes past the mapping */
         if (need == 0 || need > (16u << 20)) continue;       /* refuse to RMW something absurd (16 MiB cap) */
         char *tmp = kmalloc((size_t)need);
         if (!tmp) continue;
-        long got = vfs_read(a->vma[i].fpath, tmp, need);
+        long got = vfs_read(vma_path(a, i), tmp, need);
         if (got < 0) got = 0;
         for (long b = got; b < (long)need; b++) tmp[b] = 0;  /* zero-fill any gap, mirrors app_fd_write */
 
@@ -2161,7 +2271,7 @@ int app_msync(uint64_t addr, uint64_t len) {
             vmm_set_pte_in(a->cr3, page, pte & ~PTE_DIRTY);
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         }
-        vfs_write(a->vma[i].fpath, tmp, need);
+        vfs_write(vma_path(a, i), tmp, need);
         kfree(tmp);
     }
     return 0;
@@ -2348,8 +2458,8 @@ uint64_t app_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int f
 
     /* MOVE: reserve a fresh region (bump allocator, like app_mmap), copy, free old */
     if (a->nvma >= APP_MAXVMA) return (uint64_t)-1;
-    if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-    uint64_t nbase = a->mmap_next;
+    uint64_t nbase = vma_find_gap(a, new_len, 0);
+    if (!nbase) return (uint64_t)-1;
     if (nbase + new_len > MMAP_TOP || nbase + new_len < nbase) return (uint64_t)-1;
     if (a->rlim_as && app_vma_total(a) + new_len > a->rlim_as) return (uint64_t)-1;
     uint64_t copy_len = old_len < new_len ? old_len : new_len;
@@ -2750,8 +2860,8 @@ uint64_t app_ringbuf(uint64_t len) {
     uint64_t total = len * 2;
     if (total < len) return 0;                       /* overflow */
     if (a->nvma >= APP_MAXVMA) return 0;
-    if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-    uint64_t base = a->mmap_next;
+    uint64_t base = vma_find_gap(a, total, 0);
+    if (!base) return 0;
     if (base + total > MMAP_TOP || base + total < base) return 0;
     uint64_t mapped = 0;
     for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
@@ -2797,8 +2907,9 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
     uint64_t *frames; int np;
     if (shm_get(name, size, &frames, &np) < 0) return 0;
     if (a->nvma >= APP_MAXVMA) return 0;
-    if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
-    uint64_t base = a->mmap_next, total = (uint64_t)np * PAGE_SIZE;
+    uint64_t total = (uint64_t)np * PAGE_SIZE;
+    uint64_t base = vma_find_gap(a, total, 0);
+    if (!base) return 0;
     if (base + total > MMAP_TOP || base + total < base) return 0;
     for (int p = 0; p < np; p++) {
         vmm_map(base + (uint64_t)p * PAGE_SIZE, frames[p], PTE_WRITABLE | PTE_USER | PTE_NX);
@@ -2979,6 +3090,16 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                     return 0;
                 }
                 if (err & 0x10) {
+                    /* Symmetric with the write case above: the VMA is the
+                     * authority on protection, so a PTE that is NX while its
+                     * VMA says executable simply predates the prot being
+                     * recorded -- fix it rather than kill the process. Only a
+                     * mapping whose VMA genuinely is not executable is an
+                     * error worth reporting. (M1962) */
+                    if (a->vma[i].prot & VMA_PROT_EXEC) {
+                        vmm_protect(page, vma_pte_flags(a->vma[i].prot));
+                        return 1;
+                    }
                     kprintf("[fault] instruction fetch from a non-executable mapping at %lx (vma prot=%d)\n", page, a->vma[i].prot);
                     return 0;
                 }
@@ -3056,7 +3177,7 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                 }
                 if (want) {
                     __asm__ volatile("sti");            /* the FS read may touch the disk */
-                    vfs_pread(a->vma[i].fpath, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
+                    vfs_pread(vma_path(a, i), z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
                     __asm__ volatile("cli");
                 }
                 a->majflt++;                            /* page filled from disk => major fault (M1150) */
@@ -4021,9 +4142,8 @@ static int app_vma_add_mapped(struct app *a, const char *path, uint64_t addr, ui
         a->vma[a->nvma].file_backed = 1;
         a->vma[a->nvma].foff = foff;
         a->vma[a->nvma].fvalid = fvalid;
-        int i = 0; for (; path[i] && i < 255; i++) a->vma[a->nvma].fpath[i] = path[i];
-        a->vma[a->nvma].fpath[i] = 0;
-        if (path[i]) return 0;               /* refuse a truncated path (M1955) */
+        a->vma[a->nvma].fidx = vma_intern_path(path);
+        if (a->vma[a->nvma].fidx < 0) return 0;   /* no slot, or too long: refuse (M1955) */
     }
     a->nvma++;
     return 1;
@@ -5280,6 +5400,8 @@ long app_fork_at(struct registers *r, uint64_t child_rsp) {
     a->entry = p->entry; a->ustack = p->ustack; a->heap_end = p->heap_end;
     a->mmap_next = p->mmap_next; a->nvma = p->nvma; a->aslr_mmap_base = p->aslr_mmap_base;   /* inherit the ASLR layout across fork (M1287) */
     for (int i = 0; i < APP_MAXVMA; i++) a->vma[i] = p->vma[i];
+    /* The path table the VMAs index into is GLOBAL, so a forked child inherits
+     * it for free -- and cannot be handed indices into an empty one. (M1962) */
     for (int i = 0; i < APP_NSIG; i++) a->sig_handler[i] = p->sig_handler[i];
     a->sig_restorer = p->sig_restorer; a->curcol = p->curcol;
     a->rlim_nproc = p->rlim_nproc;                      /* RLIMIT_NPROC is inherited across fork (M1163) */
@@ -6061,6 +6183,25 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
                 if (apps[i].used) { live++; maj += apps[i].majflt; min += apps[i].minflt; }
             kprintf("[runsync] t=%ds free=%luK apps=%d majflt=%lu minflt=%lu\n", waited / 1000,
                     (unsigned long)(pmm_free_bytes() >> 10), live, maj, min);
+            /* ...and WHERE a still-running one is. Frozen counters plus a
+             * RUNNING task means a userspace loop, and the only thing that
+             * identifies it is the ring-3 RIP together with the mapping that
+             * contains it -- otherwise "it hangs" is all you ever learn. */
+            for (int i = 0; i < MAX_APPS; i++) {
+                if (!apps[i].used || !apps[i].task || apps[i].task->state != TASK_RUNNING) continue;
+                struct registers *uf = task_uframe(apps[i].task);
+                if (!uf) continue;
+                uint64_t rip = uf->rip;
+                const char *where = "(no mapping)"; uint64_t voff = 0;
+                for (int v = 0; v < apps[i].nvma; v++)
+                    if (rip >= apps[i].vma[v].start && rip < apps[i].vma[v].start + apps[i].vma[v].len) {
+                        where = apps[i].vma[v].fidx >= 0 ? vma_path(&apps[i], v) : "(anon)";
+                        voff = apps[i].vma[v].foff + (rip - apps[i].vma[v].start);
+                        break;
+                    }
+                kprintf("[runsync]   pid %d RUNNING at rip=%lx in %s +%lx\n",
+                        apps[i].pid, (unsigned long)rip, where, (unsigned long)voff);
+            }
         }
     }
     /* Say WHY it timed out instead of just reporting -2. A hang in a threaded

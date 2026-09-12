@@ -42,6 +42,7 @@
 #include "vfs.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
 #include "timer.h"
 #include "pmm.h"    /* sysinfo reports real memory totals (M1958) */
+#include "kheap.h"  /* execve copies argv/envp into heap buffers, not onto the kernel stack (M1962) */
 #include "syscall.h"   /* AT_PAGESZ/AT_ENTRY/AT_UID/... -- the auxv types we share with /proc/<pid>/auxv */
 #include <stdint.h>
 
@@ -798,13 +799,24 @@ void linux_syscall_dispatch(struct registers *r) {
         if (lf & LXO_TRUNC)  nf |= O_TRUNC;
         if (lf & LXO_APPEND) nf |= O_APPEND;
         int fd = app_open(path, (int)nf);
+        if (fd >= 0) { r->rax = (uint64_t)fd; break; }
+        /* WHY it failed matters. Reporting ENOENT for everything told `ld`
+         * that an object file it had just been handed did not exist, when in
+         * fact we were out of descriptors -- and EMFILE is a condition BFD
+         * knows how to handle, by closing a cached file and retrying. The
+         * result was a link that silently dropped the tail of its input and
+         * blamed the source. A stat distinguishes the two without changing
+         * app_open's contract. (M1962) */
+        struct statx exs;
+        int exists = (vfs_stat(path, &exs) == 0);
+        if (exists) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
         /* Report the miss. A dynamic linker probes many paths that are MEANT
          * to be absent, but when something it actually needs is missing the
          * failure surfaces much later as a NULL deref inside ld.so -- this
          * line is the difference between "page fault at 0x8" and "libbfd is
          * not where you put it". (M1955) */
-        if (fd < 0) kprintf("[linuxabi] openat(%s) -> ENOENT\n", path);
-        r->rax = (fd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)fd;
+        kprintf("[linuxabi] openat(%s) -> ENOENT\n", path);
+        r->rax = (uint64_t)-(long)LX_ENOENT;
         break;
     }
     case LXS_read_: {                       /* (fd, buf, count) */
@@ -866,9 +878,26 @@ void linux_syscall_dispatch(struct registers *r) {
          * caller actually opened. */
         const char *dp = app_fd_path((int)a1);
         if (!dp) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
-        static vfs_dirent ents[64];         /* static: 64 * sizeof(vfs_dirent) is far too much stack */
-        int n = vfs_list_path(dp, ents, 64);
-        if (n < 0) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+        /* 64 -> 1024, and from the HEAP rather than a shared static (M1962).
+         *
+         * A directory listing that stops at 64 entries is a silent wrong
+         * answer, not an error: GNU make's $(wildcard kernel/*.c) saw only the
+         * first 64 of OS-DEV's 136 kernel sources, so the build linked a
+         * PARTIAL object list and came back as pages of "undefined reference
+         * to kmalloc / pci_find / wav_parse" -- every one of them a file
+         * alphabetically after the cut. Nothing in that error mentions
+         * directories.
+         *
+         * Static was also wrong once two processes can list at once; a build
+         * runs several. Per-call from the heap costs a kmalloc on a syscall
+         * that already walks a filesystem. */
+        int ecap = 1024;                    /* NB: `cap` is already the user buffer size */
+        vfs_dirent *ents = kmalloc((unsigned long)ecap * sizeof *ents);
+        if (!ents) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+        int n = vfs_list_path(dp, ents, ecap);
+        if (n < 0) { kfree(ents); r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+        if (n == ecap)
+            kprintf("[linuxabi] getdents64(%s): at least %d entries -- listing TRUNCATED\n", dp, ecap);
         /* The offset is carried in the fd's own cursor, so a second call
          * returns 0 and readdir() terminates instead of looping forever. */
         long start = app_lseek((int)a1, 0, 1 /*SEEK_CUR*/);
@@ -892,6 +921,7 @@ void linux_syscall_dispatch(struct registers *r) {
             used += rec; emitted++;
         }
         app_lseek((int)a1, start + emitted, 0 /*SEEK_SET*/);
+        kfree(ents);
         r->rax = (uint64_t)used;            /* 0 = end of directory */
         break;
     }
@@ -1030,9 +1060,23 @@ void linux_syscall_dispatch(struct registers *r) {
          * truncation of an argument vector is not survivable; it is reported
          * now as well as being far larger. 64*256*2 = 32 KiB against an app
          * task's 256 KiB kernel stack. (M1960) */
-#define LX_EXEC_ARGS 64
-        char abuf[LX_EXEC_ARGS][256]; const char *av[LX_EXEC_ARGS + 1];
-        char ebuf[LX_EXEC_ARGS][256]; const char *ev[LX_EXEC_ARGS + 1];
+/* 16 -> 64 -> 512, and off the kernel stack (M1962). A real link line names
+ * every object file: OS-DEV's own kernel is ~75, and a 64-entry cap silently
+ * handed `ld` a short command line, which came back as pages of "undefined
+ * reference" -- an error about the CODE, not about the exec that mangled it.
+ * At 512 entries these no longer fit on a 256 KiB kernel stack, so they come
+ * from the heap; per-call, so still free of the cross-process race that made
+ * them stack-allocated in the first place (M1952). */
+#define LX_EXEC_ARGS 512
+        char (*abuf)[256] = kmalloc(LX_EXEC_ARGS * 256);
+        char (*ebuf)[256] = kmalloc(LX_EXEC_ARGS * 256);
+        const char **av = kmalloc((LX_EXEC_ARGS + 1) * sizeof *av);
+        const char **ev = kmalloc((LX_EXEC_ARGS + 1) * sizeof *ev);
+        if (!abuf || !ebuf || !av || !ev) {
+            if (abuf) kfree(abuf); if (ebuf) kfree(ebuf);
+            if (av) kfree(av); if (ev) kfree(ev);
+            r->rax = (uint64_t)-(long)LX_ENOMEM; break;
+        }
         int na = 0, ne = 0;
         const char *const *uav = (const char *const *)r->rsi;
         const char *const *uev = (const char *const *)r->rdx;
@@ -1062,8 +1106,11 @@ void linux_syscall_dispatch(struct registers *r) {
         char pbuf[VFS_PATH_MAX];
         { char t[VFS_PATH_MAX]; const char *xp = lx_xlate(path, t, sizeof t);
           int k = 0; while (xp[k] && k < (int)sizeof pbuf - 1) { pbuf[k] = xp[k]; k++; } pbuf[k] = 0; }
-        if (app_execve_linux(r, pbuf, av, ev) < 0)
-            r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
+        long xrc = app_execve_linux(r, pbuf, av, ev);
+        /* Safe on both paths: lx_spawn_stack has already copied the strings
+         * into the NEW user stack by the time app_exec returns. */
+        kfree(abuf); kfree(ebuf); kfree(av); kfree(ev);
+        if (xrc < 0) r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
         break;
     }
     case LXS_wait4_: {                      /* (pid, status*, options, rusage*) */
@@ -1088,6 +1135,11 @@ void linux_syscall_dispatch(struct registers *r) {
         if (app_pipe2(fds, 0) < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
         ((int *)r->rdi)[0] = fds[0]; ((int *)r->rdi)[1] = fds[1];
         r->rax = 0;
+        break;
+    }
+    case LXS_dup_: {                        /* (fd) -> lowest free fd (M1962) */
+        long nf = app_fcntl((int)a1, 0 /*F_DUPFD*/, 0);
+        r->rax = (nf < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)nf;
         break;
     }
     case LXS_dup2_: {
@@ -1257,14 +1309,26 @@ uint64_t lx_build_stack(uint64_t stack_top, uint64_t stack_bottom,
                         const char *const *argv, const char *const *envp,
                         const struct lx_stack_info *si) {
     uint64_t sp = stack_top & ~(uint64_t)15;
-    uint64_t argp[64], envpp[64];
+    /* 64 -> 512 (M1962). "More than any real invocation" was wrong: a LINK
+     * names every object file, and OS-DEV's own kernel is 146 of them. The
+     * execve handler had already been raised to copy that many, but the stack
+     * builder still stopped at 64 -- so `ld` was handed 57 objects plus its
+     * own flags and reported "undefined reference to kmalloc" about the
+     * sources it never saw. Three separate caps in one path, each silently
+     * truncating; this was the last. 512 * 8 = 4 KiB per array on a 256 KiB
+     * kernel stack. */
+#define LX_STACK_ARGS 512
+    uint64_t argp[LX_STACK_ARGS], envpp[LX_STACK_ARGS];
     int argc = 0, envc = 0;
 
     /* 1. strings first, at the very top, so the pointer arrays below can name
-     *    them. Bounded at 64 each: more than any real invocation, and a cap is
-     *    required since these are fixed arrays. */
-    for (; argv && argv[argc] && argc < 64; argc++) { }
-    for (; envp && envp[envc] && envc < 64; envc++) { }
+     *    them. A cap is required since these are fixed arrays -- but hitting
+     *    it is REPORTED, because a short argv is a wrong answer that the
+     *    program then blames on its own inputs. */
+    for (; argv && argv[argc] && argc < LX_STACK_ARGS; argc++) { }
+    for (; envp && envp[envc] && envc < LX_STACK_ARGS; envc++) { }
+    if (argc == LX_STACK_ARGS && argv[argc])
+        kprintf("[linuxabi] initial stack: argv TRUNCATED at %d\n", LX_STACK_ARGS);
     for (int i = argc - 1; i >= 0; i--) sp = sp_str(sp, argv[i], &argp[i]);
     for (int i = envc - 1; i >= 0; i--) sp = sp_str(sp, envp[i], &envpp[i]);
 

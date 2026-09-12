@@ -118,7 +118,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest clean
+.PHONY: all selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest clean
 
 all: $(KERNEL) $(DISK)
 
@@ -255,7 +255,7 @@ $(LXROOT)/.src-staged: $(wildcard kernel/*.c kernel/include/*.h boot/*.asm kerne
 	@# The 128 prebuilt userspace ELFs kernel/asm/user_blob.asm incbin's, plus
 	@# the AP trampoline. This milestone rebuilds the KERNEL from source; the
 	@# applications are reused as blobs, which is stated plainly in the docs.
-	@cp -f build/*.elf build/*.bin $(LXROOT)/src/build/ 2>/dev/null || true
+	@cp -f build/*.elf build/*.bin build/*.ko $(LXROOT)/src/build/ 2>/dev/null || true
 	@printf '#include "ksyms.h"\nconst struct ksym ksyms[]={{0,0}};\nconst int ksyms_count=0;\n' > $(LXROOT)/src/ksyms_stub.c
 	@touch $@
 	@echo "  STAGE   $(LXROOT)/src (OS-DEV's own kernel source + Makefile, for the in-guest build)"
@@ -1050,6 +1050,13 @@ tcpreliabletest:
 # Host-side fuzz test of the FAT32 read path over corrupt/cyclic on-disk structures (ASan+UBSan).
 fstest:
 	@tests/run-fs-tests.sh
+
+# PHASE 5: OS-DEV builds its OWN kernel inside itself, and that kernel boots.
+# NOT in `check`: stage 1 compiles 136 real source files with a real compiler
+# under TCG and takes ~15 minutes. Run it when the self-hosting claim needs
+# re-proving.
+selfhosttest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@sh tests/run-selfhost-test.sh
 
 linuxabitest: $(KERNEL) $(DISK) $(EXT2IMG)
 	@tests/run-linuxabi-tests.sh

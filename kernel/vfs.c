@@ -6,6 +6,7 @@
  * VFS has, and it means kmain/syscalls never mention FAT32 directly — swapping
  * in ext2 later would touch only the driver, not its callers.
  */
+#include "kheap.h"   /* directory listings are sized to the caller, from the heap (M1962) */
 #include "vfs.h"
 #include "procfs.h"
 #include "blockdev.h"
@@ -461,10 +462,18 @@ int vfs_list_path(const char *path, vfs_dirent *out, int max) {
     if (mount_path(p, &midx, fpath, sizeof fpath)) {
         /* fatvol_dirent carries is_dir, vfs_dirent does not, so the two are
          * NOT layout-compatible -- copy field by field rather than casting. */
-        static fatvol_dirent fe[64];
-        int cap = max < 64 ? max : 64;
-        int n = blockdev_mount_list(midx, fpath, fe, cap);
-        if (n < 0) return -1;
+        /* Sized to what the CALLER asked for, from the heap (M1962). This was
+         * `static fatvol_dirent fe[64]` with max clamped to 64 -- a silent
+         * wrong answer for any directory with more entries, and a shared
+         * buffer besides. OS-DEV's own kernel/ has 136 .c files, so GNU make's
+         * $(wildcard kernel/*.c) saw 62 of them and the in-guest build linked a
+         * PARTIAL object list; it came back as pages of "undefined reference to
+         * kmalloc / pci_find / wav_parse", every one a file alphabetically
+         * after the cut, with nothing pointing at directory listing. */
+        fatvol_dirent *fe = kmalloc((unsigned long)max * sizeof *fe);
+        if (!fe) return -1;
+        int n = blockdev_mount_list(midx, fpath, fe, max);
+        if (n < 0) { kfree(fe); return -1; }
         for (int i = 0; i < n; i++) {
             int k = 0;
             while (fe[i].name[k] && k < (int)sizeof out[i].name - 1) { out[i].name[k] = fe[i].name[k]; k++; }
@@ -472,6 +481,7 @@ int vfs_list_path(const char *path, vfs_dirent *out, int max) {
             out[i].size = fe[i].size;
             out[i].date = out[i].time = 0;
         }
+        kfree(fe);
         return n;
     }
     if (!fs || !fs->list_path) return -1;

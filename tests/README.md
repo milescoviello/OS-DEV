@@ -19,6 +19,13 @@ make nettest     # TCP/IP stack   — tests/net/net_test.c   (packet parse + rea
 # gained its -cpu max boot (M1942). That is not overhead to tune away -- TCG has
 # to EMULATE AVX, and without a CPU that has AVX the XSAVE path would never
 # execute in the whole suite, so a green run would prove nothing about it.
+make selfhosttest # SELF-HOSTING — PHASE 5. Boots OS-DEV, has GNU make drive the
+                 #                in-guest gcc/as/ld over all 136 kernel sources, then
+                 #                pulls the resulting kernel32.elf out of the ext2 image
+                 #                and BOOTS IT, asserting it reaches full bring-up, SMP
+                 #                and the desktop launch. NOT part of `make check`:
+                 #                compiling 136 real files under TCG takes ~15 min, and
+                 #                check is already ~20 and runs constantly (M1962)
 make linuxabitest # LINUX ABI    — boots headless and runs a HOST-built static-PIE Linux
                  #                binary off the ext2 volume, asserting its Linux write(2)
                  #                output and exit_group status on COM1. The only in-guest

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1961-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1962-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -587,8 +587,23 @@ Landed so far, all on the from-scratch ext2 driver:
   shared library — measured (no syscalls, frozen fault counters, RIP sampled via
   the QEMU monitor), not guessed. Everything smaller builds.
 
-Still ahead: finishing Phase 5 — a complete in-guest kernel build — then Node,
-Claude Code, and Firefox on a from-scratch Wayland display path. The honest scale is still months, and the memory subsystem needs
+- **M1962** — **PHASE 5 DONE: OS-DEV built its own kernel, inside itself, and
+  that kernel boots.** GNU make drove the in-guest `gcc`/`as`/`ld` over all 136
+  kernel sources, linked them with OS-DEV's own linker script, and produced an
+  8.7 MB `kernel32.elf`; booted under QEMU it brings up ACPI and the HPET, puts
+  4 of 4 CPUs online and reaches the desktop launch. The loop is closed. Five
+  silent-wrong-answer bugs stood in the way, the worst being that **`brk` handed
+  out frames without zeroing them** — an information leak, *and* corruption,
+  because glibc's `calloc` skips its `memset` for memory fresh from the kernel,
+  so GCC read a previous process's **instruction bytes** as hash-table pointers.
+  The rest were caps that truncated in silence: `execve`'s argv at 16, the
+  initial-stack builder's at 64 (so `ld` got 57 of its 146 objects), and
+  directory listings at 64 entries (so `$(wildcard)` saw 62 of 136 sources).
+  `make selfhosttest` proves it end to end — not part of `make check`, since
+  compiling 136 real files under emulation takes fifteen minutes.
+
+Still ahead: Node, Claude Code, and Firefox on a from-scratch Wayland display
+path. The honest scale is still months, and the memory subsystem needs
 more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
 recycles addresses, so V8's address-space cage still cannot be expressed).
 

@@ -897,11 +897,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * 128 application ELFs are reused as prebuilt blobs. (M1961) */
             int rc;
             kprintf("[lxbuild] building OS-DEV's OWN KERNEL inside OS-DEV...\n");
+            /* Up to four passes. Individual cc1 invocations still crash
+             * intermittently under this much process churn -- a different
+             * source file each run -- and make stops at the first failure.
+             * Object files persist, so each pass resumes where the last left
+             * off. This is a WORKAROUND for a real bug, not a fix, and it is
+             * recorded as such. */
             /* --jobserver-style=pipe: the default fifo jobserver needs mknodat, and
              * make only WARNS when it cannot create the fifo -- then silently runs
              * serially. Pipes work with what we have. */
             static const char *av_kb[] = { "-C", "/src", "-j4", "--jobserver-style=pipe" };
-            rc = app_run_linux_sync("/disk2/usr/bin/make", av_kb, 4, 2400000);
+            rc = -1;
+            for (int pass = 1; pass <= 4 && rc != 0; pass++) {
+                rc = app_run_linux_sync("/disk2/usr/bin/make", av_kb, 4, 2400000);
+                kprintf("[lxbuild] make pass %d -> %d\n", pass, rc);
+            }
             kprintf("[lxbuild] make -> %d\n", rc);
             vfs_dirent kents[64];
             int kn = vfs_list_path("/disk2/src", kents, 64), ksz = -1;
