@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1955-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1957-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -519,12 +519,30 @@ Landed so far, all on the from-scratch ext2 driver:
   `_dl_check_map_versions`, the second `undefined symbol: free, version
   GLIBC_2.2.5`.
 
-Still ahead: a C compiler. `cc1` is a 42 MB dynamically-linked PIE, which the
-ABI can now load in principle, but `app_spawn_from_file` still buffers a whole
-image in the kernel heap — that wants mmap-backed demand loading first. The
-honest scale is months, and the memory subsystem needs more work before Node
-(`MMAP_TOP` is 256 MiB and the mmap allocator never recycles addresses, so V8's
-address-space cage still cannot be expressed).
+- **M1956** — **`mmap` was never actually lazy.** A file-backed mapping with any
+  protection other than read-write faulted its *whole range* in at `mmap` time,
+  because `app_mprotect` validated with `vmm_user_ok` and `vmm_user_ok`
+  **materialises** a lazily-resolvable page. A VMA now records its `prot` and the
+  fault handler honours it. Four bugs fell out: a permission fault on a present
+  page was an **infinite retry loop** (a hang with no diagnostic); recycled VMA
+  slots let a `MAP_FIXED` read-write segment **inherit `prot=1`** from the
+  read-only reservation it replaced; a partial-range `mprotect` would have
+  restricted the whole mapping; and a process killed by a fault reported
+  **success** to anything that waited on it (139 now).
+
+- **M1957** — **PHASE 4 COMPLETE: OS-DEV compiled a C program with a real GCC,
+  inside itself, and ran it.** `cc1` is a 42 MB dynamically-linked PIE and could
+  not previously be *loaded* — the spawn path read whole images into the kernel
+  heap with a 16 MB ceiling. Executables are now **demand-paged from the file**:
+  the kernel reads 8 KiB of headers, maps each `PT_LOAD` as a file-backed VMA,
+  and pages arrive as the compiler executes them. The demo compiles a
+  freestanding `.c` with `cc1`, assembles it with `as`, links it with `ld` and
+  runs the result, which exits with its own status.
+
+Still ahead: Phase 5, self-hosting — `make` driving that toolchain over the
+OS-DEV tree. The honest scale is still months, and the memory subsystem needs
+more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
+recycles addresses, so V8's address-space cage still cannot be expressed).
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

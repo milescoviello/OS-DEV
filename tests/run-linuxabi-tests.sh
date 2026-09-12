@@ -279,15 +279,18 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     trap 'rc=$?; cleanup4; exit $rc' EXIT
 
     echo "booting to assemble+link a program with the borrowed host toolchain..."
-    timeout -s KILL 300 "$QEMU" -cpu max -no-reboot -no-shutdown -m 1G -smp 4 -kernel "$KERNEL" \
+    # -m 2G: cc1 is a 42 MB image with five shared libraries, and it is a
+    # compiler -- it allocates. Demand paging means only what it touches is
+    # resident, but the headroom has to exist.
+    timeout -s KILL 420 "$QEMU" -cpu max -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
         -append "lxtooltest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
         -display none -serial file:"$SLOG4" >/dev/null 2>&1 &
     QPID4=$!
     i=0
-    while [ $i -lt 500 ]; do
-        grep -aqE "SELFBUILT exit|KERNEL PANIC" "$SLOG4" 2>/dev/null && break
+    while [ $i -lt 800 ]; do
+        grep -aqE "CCSELF exit|KERNEL PANIC" "$SLOG4" 2>/dev/null && break
         sleep 0.5; i=$((i+1))
     done
 
@@ -328,8 +331,29 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
         echo "  FAIL: the self-built program did not run:"
         grep -aE "SELFBUILT" "$SLOG4" | head -2; f4=1
     fi
+    # --- M1957: a C COMPILER. The whole point of Phase 4. -------------------
+    # cc1 is a 42 MB dynamically-linked PIE. It only became loadable once the
+    # kernel stopped buffering an executable's whole image in the kernel heap
+    # (the old ceiling was 16 MB) and started mapping its PT_LOADs from the
+    # file, demand-paged. So "cc1 ran at all" is itself the regression test for
+    # the mapped loader.
+    if grep -aq "\[lxtool\] cc1 -> 0" "$SLOG4"; then
+        echo "  ok: real GCC (cc1, 42 MB) compiled a C file to assembly inside OS-DEV"
+    else
+        echo "  FAIL: cc1 did not compile:"; grep -aE "\[lxtool\] cc1 ->|cc1:|mapload" "$SLOG4" | head -3; f4=1
+    fi
+    # THE assertion: run the C program the guest compiled. Its own exit status
+    # (29, distinct from hello.s's 23) is what makes this unfakeable -- an
+    # empty .s from a failed cc1 still assembles and links, and the resulting
+    # do-nothing ELF faults at its entry. That exact failure was observed.
+    if grep -aq "CCSELF: compiled by real GCC running inside OS-DEV" "$SLOG4" &&
+       grep -aq "\[lxtool\] CCSELF exit -> 29" "$SLOG4"; then
+        echo "  ok: OS-DEV COMPILED, ASSEMBLED, LINKED AND RAN A C PROGRAM (exit 29)"
+    else
+        echo "  FAIL: the compiled C program did not run:"; grep -aE "CCSELF" "$SLOG4" | head -2; f4=1
+    fi
     [ $f4 -eq 0 ] || { echo "FAIL: in-guest toolchain"; exit 1; }
-    echo "PASS: PHASE 4 -- real GNU binutils assembled, linked and ran a program inside OS-DEV"
+    echo "PASS: PHASE 4 -- real GCC compiled, as assembled, ld linked and OS-DEV ran a C program, in-guest"
 else
     echo "SKIP: XSAVE/AVX + toolchain tests (this QEMU has no -cpu max)"
 fi

@@ -54,3 +54,28 @@ uint64_t elf_load_at(const void *image, uint64_t maxsz, uint64_t base);
 /* Where the dynamic linker is mapped: clear of ELF_DYN_BASE (the executable)
  * and of the mmap window, so the three cannot collide. */
 #define ELF_INTERP_BASE 0x48000000ull
+
+/* A loadable segment, reported to a caller that wants to MAP the image from
+ * disk instead of having elf.c copy it out of a buffer (M1956). */
+typedef struct { unsigned long vaddr, memsz, file_off, filesz; unsigned flags; } elf_pt_load_t;
+
+/* List an image's PT_LOAD segments from its HEADER ALONE -- the ELF header plus
+ * the program-header table, which live in the first page or two. Nothing else
+ * of the file is read.
+ *
+ * This is what lets a 42 MB binary be loaded without a 42 MB kernel buffer:
+ * app.c maps each segment file-backed and demand-pages it, instead of
+ * elf_load() memcpy'ing from an image the caller had to slurp whole.
+ *
+ * Pure and fully bounds-checked, like the rest of elf.c, so it stays
+ * host-testable. `hdrsz` bounds the buffer; `imgsz` is the FILE's real size and
+ * is what segment offsets are validated against -- the two differ precisely
+ * because the file is not in memory. Returns the number of segments written (<= max), or -1
+ * if the header is malformed or the phdr table is not inside hdrsz.
+ * *out_entry is the raw e_entry field and *out_bias the load bias to add to
+ * it (and to every vaddr): ELF_DYN_BASE for an ET_DYN image, 0 for ET_EXEC.
+ * The bias is decided here so validation and placement cannot disagree. */
+int elf_pt_loads(const void *hdr, unsigned long hdrsz, unsigned long imgsz,
+                 elf_pt_load_t *out, int max,
+                 unsigned long *out_entry, unsigned long *out_bias,
+                 unsigned long *out_phoff, unsigned *out_phent, unsigned *out_phnum);

@@ -785,6 +785,29 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxtool] running the program OS-DEV just built...\n");
             rc = app_run_linux_sync("/disk2/t.elf", 0, 0, 60000);
             kprintf("[lxtool] SELFBUILT exit -> %d\n", rc);
+
+            /* And the real thing: a C COMPILER. cc1 is a 42 MB dynamically
+             * linked PIE, which only became loadable once the kernel stopped
+             * buffering an executable's whole image and started mapping its
+             * segments from the file. (M1957) */
+            vfs_remove("/disk2/t.s");
+            vfs_remove("/disk2/tc.o");
+            vfs_remove("/disk2/tc.elf");
+            static const char *av_cc1[] = { "-quiet", "-nostdinc", "/hello.c", "-o", "/t.s" };   /* -nostdinc: the source is freestanding, and without it cc1 goes looking for stdc-predef.h */
+            static const char *av_as2[] = { "-o", "/tc.o", "/t.s" };
+            static const char *av_ld2[] = { "--no-dynamic-linker", "-pie", "-e", "_start",
+                                            "-o", "/tc.elf", "/tc.o" };
+            kprintf("[lxtool] COMPILING /hello.c with real GCC (cc1)...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/cc1", av_cc1, 5, 180000);
+            kprintf("[lxtool] cc1 -> %d\n", rc);
+            kprintf("[lxtool] assembling the compiler's output...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/as", av_as2, 3, 120000);
+            kprintf("[lxtool] as(cc1 output) -> %d\n", rc);
+            rc = app_run_linux_sync("/disk2/usr/bin/ld", av_ld2, 7, 120000);
+            kprintf("[lxtool] ld(cc1 output) -> %d\n", rc);
+            kprintf("[lxtool] running the C program OS-DEV just compiled...\n");
+            rc = app_run_linux_sync("/disk2/tc.elf", 0, 0, 60000);
+            kprintf("[lxtool] CCSELF exit -> %d\n", rc);
         }
     }
 

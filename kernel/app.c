@@ -90,7 +90,20 @@ struct app {
  * file mappings were in play. */
 #define APP_MAXVMA 64
 #define HUGE_SIZE  0x200000ull           /* 2 MiB hugepage (M1155) */
-    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; char fpath[256]; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fpath is 256 like the fd table's, NOT 64 -- see M1955 */
+/* Zero the next free VMA slot before filling it. Slots are RECYCLED -- the
+ * carve compacts the list by swapping the last entry down -- so a field a
+ * creation site forgets to assign silently inherits the previous tenant's
+ * value. That is not hypothetical: app_mmap_file_at never assigned .prot, so
+ * a freshly MAP_FIXED'd read-WRITE data segment inherited prot=1 from the
+ * read-only reservation it replaced, and ld.so faulted zeroing the BSS tail.
+ * Resetting the whole slot makes every field opt-in. (M1956) */
+#define VMA_NEW(a) do { for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(a)->nvma])[_b] = 0; } while (0)
+
+/* Linux PROT_* bits, as recorded on a VMA and honoured by app_fault_handle (M1956) */
+#define VMA_PROT_READ  0x1
+#define VMA_PROT_WRITE 0x2
+#define VMA_PROT_EXEC  0x4
+    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; char fpath[256]; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fpath is 256 like the fd table's, NOT 64 -- see M1955; prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
     int      nvma;
     uint64_t mmap_next;                  /* bump allocator for mmap addresses */
     int      mlock_future;               /* mlockall(MCL_FUTURE): new mmaps are born locked (M1283) */
@@ -291,6 +304,15 @@ static char g_pend_arg[128];             /* arg for the next app_spawn, copied i
 static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
 static int  g_pend_lxargc;
 static int  g_last_spawn_pid;            /* pid of the last successful app_spawn (M1955) */
+/* One-shot: when set, app_spawn MAPS the executable's PT_LOADs from this path
+ * instead of copying them out of a buffer the caller had to slurp whole.
+ * Only used for DYNAMICALLY LINKED images -- a static PIE needs its
+ * R_X86_64_RELATIVE relocations applied by elf_load, and those are small
+ * anyway; a dynamically linked one is relocated by ld.so, so the kernel only
+ * has to place the segments. That is what makes a 42 MB cc1 loadable at all:
+ * app_spawn_from_file's whole-image kmalloc has a 16 MB ceiling. (M1956) */
+static char g_pend_mappath[VFS_PATH_MAX];
+static uint64_t g_pend_mapsize;          /* and its real on-disk size: segment offsets are validated against THAT, not against the header buffer */
 static int  g_have_pend;
 /* A pending "jail" for the next app_spawn (M1088): pledge promises + an optional
  * unveil prefix applied to the child BEFORE it runs (a parent-enforced sandbox). */
@@ -1909,6 +1931,7 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
      * ld.so: it reserves a span and then MAP_FIXEDs its segments into it. */
     if (app_vma_carve(a, addr, len) != 0) return 0;
     if (a->nvma >= APP_MAXVMA) return 0;                        /* re-check: the carve may have split */
+    VMA_NEW(a);
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -1934,6 +1957,7 @@ uint64_t app_mmap(uint64_t len) {
     uint64_t addr = a->mmap_next;
     if (len >= HUGE_SIZE) addr = (addr + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);   /* 2 MiB-align big anon regions so MADV_COLLAPSE can fold them (M1168) */
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
+    VMA_NEW(a);
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -1959,6 +1983,7 @@ uint64_t app_mmap_huge(uint64_t len) {
     if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
     uint64_t addr = (a->mmap_next + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);   /* 2 MiB-align the base */
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
+    VMA_NEW(a);
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -2005,6 +2030,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     }
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
     if (a->nvma >= APP_MAXVMA) return 0;                   /* re-check: the carve may have split */
+    VMA_NEW(a);
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -2038,6 +2064,7 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     if (a->mmap_next < MMAP_BASE) a->mmap_next = MMAP_BASE;
     uint64_t addr = a->mmap_next;
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
+    VMA_NEW(a);
     a->vma[a->nvma].start = addr;
     a->vma[a->nvma].len   = len;
     a->vma[a->nvma].sealed = 0;
@@ -2111,6 +2138,38 @@ int app_msync(uint64_t addr, uint64_t len) {
         }
         vfs_write(a->vma[i].fpath, tmp, need);
         kfree(tmp);
+    }
+    return 0;
+}
+
+/* Split the VMA containing `addr` so that `addr` becomes a boundary. No-op if
+ * nothing contains it, or if it is already a start/end. Returns 0, or -1 if
+ * there is no free slot.
+ *
+ * mprotect needs this: ld.so's RELRO pass protects only the FRONT of the data
+ * segment, and recording that stricter protection on the whole VMA would make
+ * the rest of .data read-only -- a fault on the first write to a global. (M1956) */
+static int app_vma_split_at(struct app *a, uint64_t addr) {
+    if (!a) return -1;
+    for (int i = 0; i < a->nvma; i++) {
+        uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+        if (addr <= s0 || addr >= e0) continue;
+        if (a->nvma >= APP_MAXVMA) return -1;
+        a->vma[a->nvma] = a->vma[i];       /* a COPY on purpose: no VMA_NEW here */
+        a->vma[a->nvma].start = addr;
+        a->vma[a->nvma].len   = e0 - addr;
+        if (a->vma[a->nvma].file_backed) {
+            a->vma[a->nvma].foff += addr - s0;
+            /* fvalid is measured from the VMA start, so the tail's shrinks by
+             * exactly what the head keeps -- and clamps at zero when the split
+             * lands past the last file-backed byte. */
+            uint64_t used = addr - s0;
+            a->vma[a->nvma].fvalid = (a->vma[i].fvalid > used) ? a->vma[i].fvalid - used : 0;
+            if (a->vma[i].fvalid && a->vma[a->nvma].fvalid == 0) a->vma[a->nvma].fvalid = 1;  /* 0 means "no limit"; keep "nothing valid" expressible */
+        }
+        a->nvma++;
+        a->vma[i].len = addr - s0;
+        return 0;
     }
     return 0;
 }
@@ -2190,7 +2249,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
         } else if (ce == e0) {                      /* tail trimmed */
             a->vma[i].len = cs - s0;
         } else {                                    /* hole punched: split in two */
-            a->vma[a->nvma] = a->vma[i];            /* slot reserved by the pre-flight count */
+            a->vma[a->nvma] = a->vma[i];        /* a COPY on purpose (slot reserved by the pre-flight count): no VMA_NEW here */
             a->vma[a->nvma].start = ce;
             a->vma[a->nvma].len   = e0 - ce;
             if (a->vma[a->nvma].file_backed) a->vma[a->nvma].foff += ce - s0;
@@ -2281,6 +2340,7 @@ uint64_t app_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int f
         for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
         vmm_map(nbase + off, nf, PTE_WRITABLE | PTE_USER | PTE_NX);
     }
+    VMA_NEW(a);
     a->vma[a->nvma].start = nbase; a->vma[a->nvma].len = new_len;
     a->vma[a->nvma].sealed = a->vma[a->nvma].uffd = a->vma[a->nvma].file_backed = a->vma[a->nvma].locked = a->vma[a->nvma].huge = 0;
     a->nvma++;
@@ -2603,13 +2663,49 @@ int app_mprotect(uint64_t addr, uint64_t len, int prot) {
     if (len == 0) return -1;
     uint64_t a0 = addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t end = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    if (end <= a0 || !vmm_user_ok(a0, end - a0)) return -1;   /* must be the caller's mapped user pages */
+    if (end <= a0) return -1;
     struct app *a = cur();                                     /* deny if the range hits a sealed region (M1130) */
     if (a) for (int i = 0; i < a->nvma; i++)
         if (a->vma[i].sealed && a0 < a->vma[i].start + a->vma[i].len && a->vma[i].start < end) return -1;
     uint64_t flags = PTE_USER;
     if (prot & 0x2) flags |= PTE_WRITABLE;       /* PROT_WRITE  */
     if (!(prot & 0x4)) flags |= PTE_NX;          /* not PROT_EXEC -> no-execute */
+
+    /* Is the whole range inside this app's own demand-paged regions? If so,
+     * record the protection ON THE VMA and touch only the pages that are
+     * actually resident. The old code validated with vmm_user_ok first --
+     * and vmm_user_ok MATERIALISES a lazily-resolvable page, so an mprotect
+     * over an untouched mapping read every page of it from disk just to set
+     * a PTE bit. That is why an mmap with a non-default prot was never lazy.
+     * (M1956) */
+    int covered = 0;
+    if (a) {
+        covered = 1;
+        for (uint64_t p = a0; p < end && covered; p += PAGE_SIZE) {
+            int in = 0;
+            for (int i = 0; i < a->nvma; i++)
+                if (p >= a->vma[i].start && p < a->vma[i].start + a->vma[i].len) { in = 1; break; }
+            if (!in) covered = 0;
+        }
+    }
+    if (covered) {
+        /* PROT_NONE records as READ, because we have no "reserved but
+         * inaccessible" state -- which is exactly what the old code did too
+         * (PTE_USER|PTE_NX), so this changes nothing. 0 is reserved for
+         * "never recorded". */
+        uint8_t np = (uint8_t)((prot & 0x7) ? (prot & 0x7) : VMA_PROT_READ);
+        /* Make a0 and end VMA boundaries first, so only fully-covered VMAs
+         * take the new protection. */
+        if (app_vma_split_at(a, a0) != 0 || app_vma_split_at(a, end) != 0) return -1;
+        for (int i = 0; i < a->nvma; i++) {
+            uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+            if (s0 >= a0 && e0 <= end) a->vma[i].prot = np;
+        }
+        for (uint64_t p = a0; p < end; p += PAGE_SIZE)
+            if (vmm_translate(p)) { if (vmm_protect(p, flags) < 0) return -1; }
+        return 0;
+    }
+    if (!vmm_user_ok(a0, end - a0)) return -1;   /* must be the caller's mapped user pages */
     for (uint64_t p = a0; p < end; p += PAGE_SIZE)
         if (vmm_protect(p, flags) < 0) return -1;
     return 0;
@@ -2652,6 +2748,7 @@ uint64_t app_ringbuf(uint64_t len) {
         __asm__ volatile("invlpg (%0)" : : "r"(base + len + off) : "memory");
         mapped += PAGE_SIZE;
     }
+    VMA_NEW(a);
     a->vma[a->nvma].start = base;
     a->vma[a->nvma].len   = total;
     a->vma[a->nvma].sealed = 0;
@@ -2683,6 +2780,7 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
         pmm_addref(frames[p]);                       /* this mapping holds a ref on the shared frame */
         __asm__ volatile("invlpg (%0)" : : "r"(base + (uint64_t)p * PAGE_SIZE) : "memory");
     }
+    VMA_NEW(a);
     a->vma[a->nvma].start = base; a->vma[a->nvma].len = total; a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0; a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0; a->nvma++;
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
@@ -2753,6 +2851,17 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
  * inside a reserved mmap region, map a fresh zeroed frame into the (active) app
  * space and report it resolved so the instruction retries; else 0 = a real
  * fault, and the app is terminated as before. */
+/* PTE flags for a VMA's Linux PROT_* bits. prot == 0 means "not recorded":
+ * every VMA creator predating M1956 leaves it zero and gets exactly the old
+ * behaviour, read-write and never executable. */
+static uint64_t vma_pte_flags(uint8_t prot) {
+    if (!prot) return PTE_WRITABLE | PTE_USER | PTE_NX;
+    uint64_t f = PTE_USER;
+    if (prot & VMA_PROT_WRITE) f |= PTE_WRITABLE;
+    if (!(prot & VMA_PROT_EXEC)) f |= PTE_NX;
+    return f;
+}
+
 int app_fault_handle(uint64_t cr2, uint64_t err) {
     struct app *a = cur();
     if (!a) return 0;
@@ -2793,7 +2902,32 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
     for (int i = 0; i < a->nvma; i++) {
         if (cr2 >= a->vma[i].start && cr2 < a->vma[i].start + a->vma[i].len) {
             uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
-            if (vmm_translate(page)) return 1;          /* already mapped (race) -> retry */
+            uint64_t cpte = vmm_pte_raw(page);
+            if (cpte & PTE_PRESENT) {
+                /* The page IS mapped, so this is a PERMISSION fault, not a
+                 * missing one -- and "return 1" (retry) on a permission fault
+                 * is an infinite loop: the instruction re-executes and faults
+                 * again forever. That is a hang with no diagnostic at all,
+                 * which is exactly what honouring VMA prot first produced.
+                 * (M1956) */
+                if ((err & 2) && !(cpte & PTE_WRITABLE)) {
+                    /* MAP_PRIVATE means a write gets a private copy. If the
+                     * mapping is writable per its VMA, the PTE simply predates
+                     * an mprotect; otherwise the program really did write to a
+                     * read-only mapping and deserves to hear about it. */
+                    if (a->vma[i].prot & VMA_PROT_WRITE) {
+                        vmm_protect(page, vma_pte_flags(a->vma[i].prot));
+                        return 1;
+                    }
+                    kprintf("[fault] write to a read-only mapping at %lx (vma prot=%d)\n", page, a->vma[i].prot);
+                    return 0;
+                }
+                if (err & 0x10) {
+                    kprintf("[fault] instruction fetch from a non-executable mapping at %lx (vma prot=%d)\n", page, a->vma[i].prot);
+                    return 0;
+                }
+                return 1;                               /* a genuine race: another core mapped it */
+            }
             if (a->vma[i].huge) {                        /* 2 MiB hugepage: map the whole enclosing 2 MiB at once (M1155) */
                 uint64_t hpage = cr2 & ~(HUGE_SIZE - 1);
                 uint64_t phys = pmm_alloc_contiguous(HUGE_SIZE / PAGE_SIZE, HUGE_SIZE / PAGE_SIZE);  /* 512 contiguous, 2 MiB-aligned */
@@ -2835,15 +2969,37 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
             uint8_t *z = (uint8_t *)hhdm(frame);
             for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0; /* never leak stale RAM to userspace */
             if (a->vma[i].file_backed) {                /* fill the page from the backing file (M1136) */
-                uint64_t fileoff = a->vma[i].foff + (page - a->vma[i].start);
-                __asm__ volatile("sti");                /* the FS read may touch the disk */
-                vfs_pread(a->vma[i].fpath, z, PAGE_SIZE, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
-                __asm__ volatile("cli");
+                uint64_t voff = page - a->vma[i].start;
+                uint64_t fileoff = a->vma[i].foff + voff;
+                /* fvalid bounds how much of this mapping comes from the file.
+                 * An ELF data segment's last page holds real bytes up to
+                 * filesz and .bss after it -- and the file does NOT end there,
+                 * so "bytes past EOF stay zero" is not enough: without this the
+                 * start of .bss would be filled with whatever follows the
+                 * segment in the file. 0 means "no limit" (a plain mmap of a
+                 * whole file), which is what every pre-M1956 caller wants. */
+                uint64_t want = PAGE_SIZE;
+                if (a->vma[i].fvalid) {
+                    want = (voff >= a->vma[i].fvalid) ? 0 : a->vma[i].fvalid - voff;
+                    if (want > PAGE_SIZE) want = PAGE_SIZE;
+                }
+                if (want) {
+                    __asm__ volatile("sti");            /* the FS read may touch the disk */
+                    vfs_pread(a->vma[i].fpath, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
+                    __asm__ volatile("cli");
+                }
                 a->majflt++;                            /* page filled from disk => major fault (M1150) */
             } else {
                 a->minflt++;                            /* demand-zero anonymous page => minor fault (M1150) */
             }
-            vmm_map(page, frame, PTE_WRITABLE | PTE_USER | PTE_NX);
+            /* Honour the VMA's protection. This used to be unconditionally
+             * WRITABLE|NX, which was survivable only because app_mprotect goes
+             * through vmm_user_ok -- and vmm_user_ok MATERIALISES lazily
+             * resolvable pages, so every mmap with a non-default prot faulted
+             * its whole range in eagerly and then fixed the PTEs. Correct, but
+             * it means an mmap was never actually lazy; a 42 MB executable
+             * would be read in full before its first instruction. (M1956) */
+            vmm_map(page, frame, vma_pte_flags(a->vma[i].prot));
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
             return 1;
         }
@@ -3691,7 +3847,14 @@ void app_core_dump(struct registers *r) {
 void app_fault_current(struct registers *r) {
     struct app *a = (struct app *)task_self()->proc;
     if (a && r) app_core_dump(r);
-    if (a) a->exited = 1;
+    if (a) {
+        a->exited = 1;
+        /* 128 + SIGSEGV, the shell's convention for "killed by a signal".
+         * exit_code was left at its memset-0 value, so a process that DIED on
+         * a fault reported SUCCESS to anything that waited on it -- which is
+         * how a crashed `as` came back as "as --version -> 0". (M1956) */
+        a->exit_code = 139;
+    }
     task_exit();
 }
 
@@ -3772,6 +3935,69 @@ static void app_trampoline(void) {
     enter_user(a->entry, a->ustack);   /* -> ring 3; returns only via SYS_exit */
 }
 
+/* Add a VMA directly, WITHOUT the [MMAP_BASE, MMAP_TOP) window check that
+ * app_mmap* enforces. That window exists for the mmap ALLOCATOR, which picks
+ * addresses; an executable's segments live at ELF_DYN_BASE, far below it, and
+ * are placed by the image itself. Returns 1/0. (M1956) */
+static int app_vma_add_mapped(struct app *a, const char *path, uint64_t addr, uint64_t len,
+                              uint64_t foff, uint64_t fvalid, int prot) {
+    if (!a || !len || a->nvma >= APP_MAXVMA) return 0;
+    VMA_NEW(a);
+    a->vma[a->nvma].start = addr;
+    a->vma[a->nvma].len   = len;
+    a->vma[a->nvma].prot  = (uint8_t)(prot & 0x7);
+    if (path) {
+        a->vma[a->nvma].file_backed = 1;
+        a->vma[a->nvma].foff = foff;
+        a->vma[a->nvma].fvalid = fvalid;
+        int i = 0; for (; path[i] && i < 255; i++) a->vma[a->nvma].fpath[i] = path[i];
+        a->vma[a->nvma].fpath[i] = 0;
+        if (path[i]) return 0;               /* refuse a truncated path (M1955) */
+    }
+    a->nvma++;
+    return 1;
+}
+
+/* Place a dynamically-linked executable's PT_LOADs as demand-paged mappings,
+ * reading only its header. Returns the entry point (biased), or 0.
+ *
+ * The whole point is that nothing but the ELF header is read at spawn time:
+ * pages arrive on first touch, from the file, so the resident cost is what the
+ * program actually executes rather than its size on disk. (M1956) */
+static uint64_t app_load_mapped(struct app *a, const char *path, const void *hdr, uint64_t hdrsz, uint64_t imgsz) {
+    elf_pt_load_t segs[8];
+    unsigned long entry = 0, phoff = 0, bias = 0; unsigned phent = 0, phnum = 0;
+    int n = elf_pt_loads(hdr, hdrsz, imgsz, segs, 8, &entry, &bias, &phoff, &phent, &phnum);
+    if (n <= 0) { kprintf("[mapload] %s: elf_pt_loads -> %d (hdrsz=%lu imgsz=%lu)\n", path, n, hdrsz, imgsz); return 0; }
+    for (int i = 0; i < n; i++) {
+        uint64_t va = bias + segs[i].vaddr;
+        /* A file mapping can only express a segment whose in-page offset
+         * matches the file's. Every real toolchain uses p_align >= 4096, so
+         * this holds; refusing is the honest answer if it ever does not. */
+        if ((va & (PAGE_SIZE - 1)) != (segs[i].file_off & (PAGE_SIZE - 1))) { kprintf("[mapload] seg %d: va %lx vs off %lx misaligned\n", i, va, segs[i].file_off); return 0; }
+        uint64_t vstart = va & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t fstart = segs[i].file_off & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t fend = (va + segs[i].filesz + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t mend = (va + segs[i].memsz  + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+        /* p_flags: PF_X=1, PF_W=2, PF_R=4 (elf.c keeps its own copies private) */
+        int prot = ((segs[i].flags & 0x4) ? VMA_PROT_READ  : 0)
+                 | ((segs[i].flags & 0x2) ? VMA_PROT_WRITE : 0)
+                 | ((segs[i].flags & 0x1) ? VMA_PROT_EXEC  : 0);
+        if (!prot) prot = VMA_PROT_READ;
+        if (fend > vstart) {
+            /* fvalid stops the file read at filesz: the last page of a data
+             * segment holds real bytes up to filesz and .bss after it, and the
+             * file does NOT end there -- without the limit, .bss would start
+             * out holding whatever follows the segment in the file. */
+            uint64_t fvalid = (va - vstart) + segs[i].filesz;
+            if (!app_vma_add_mapped(a, path, vstart, fend - vstart, fstart, fvalid, prot)) { kprintf("[mapload] seg %d: vma add failed (nvma=%d)\n", i, a->nvma); return 0; }
+        }
+        if (mend > fend)                     /* the whole-page .bss tail: anonymous, demand-zero */
+            if (!app_vma_add_mapped(a, 0, fend, mend - fend, 0, 0, prot)) return 0;
+    }
+    return bias + entry;
+}
+
 app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     struct app *a = 0;
     for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { a = &apps[i]; break; }
@@ -3807,6 +4033,9 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     }
     int take_linux = g_pend_linux;        /* consume before the CR3 switch, like the two above */
     g_pend_linux = 0;
+    char mappath[VFS_PATH_MAX];           /* likewise one-shot: copy it out before anything can re-enter */
+    { int mi = 0; while (g_pend_mappath[mi] && mi < VFS_PATH_MAX - 1) { mappath[mi] = g_pend_mappath[mi]; mi++; }
+      mappath[mi] = 0; g_pend_mappath[0] = 0; }
     grid_clear(a);
     a->cr3 = vmm_create_address_space();
     if (!a->cr3) { a->used = 0; return 0; }   /* OOM: no address space — loading CR3=0 would triple-fault */
@@ -3821,7 +4050,8 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(a->cr3) : "memory");
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
-    a->entry = elf_load(elf, elfsz, lazy, 4, &nlazy);
+    if (mappath[0]) a->entry = app_load_mapped(a, mappath, elf, elfsz, g_pend_mapsize);
+    else            a->entry = elf_load(elf, elfsz, lazy, 4, &nlazy);
     if (!a->entry) goto fail_in_space;       /* bad ELF: don't spawn a null task */
     /* Register each deferred whole-BSS range as a demand-zero VMA (a->nvma is
      * 0 here — freshly memset above) so its pages are lazily allocated+zeroed
@@ -3831,6 +4061,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
      * fully use. Same effective permissions either way (writable, non-exec —
      * enforced by elf_load only ever deferring !PF_X segments). */
     for (int li = 0; li < nlazy && a->nvma < APP_MAXVMA; li++) {
+        VMA_NEW(a);
         a->vma[a->nvma].start = lazy[li].start; a->vma[a->nvma].len = lazy[li].len;
         a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
         a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
@@ -5157,6 +5388,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * done here, after a->nvma was just reset above, not right after elf_load
      * ran (which is before this reset would wipe them back out). */
     for (int li = 0; li < nlazy && a->nvma < APP_MAXVMA; li++) {
+        VMA_NEW(a);
         a->vma[a->nvma].start = lazy[li].start; a->vma[a->nvma].len = lazy[li].len;
         a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
         a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
@@ -5517,8 +5749,21 @@ static int lx_spawn_file(const char *path) {
     }
 
     g_pend_linux = 1;
+    /* Dynamically linked? Then ld.so does the relocating and the kernel only
+     * has to PLACE the segments -- so map them from the file instead of
+     * buffering the whole image. cc1 is 42 MB; the buffered path caps at 16.
+     * A static PIE still goes through elf_load, which has to apply its
+     * R_X86_64_RELATIVE relocations. (M1956) */
+    if (g_pend_interp) {
+        struct statx mst;
+        int mi = 0; while (path[mi] && mi < VFS_PATH_MAX - 1) { g_pend_mappath[mi] = path[mi]; mi++; }
+        g_pend_mappath[mi] = 0;
+        g_pend_mapsize = (vfs_stat(path, &mst) == 0) ? (uint64_t)mst.stx_size : 0;
+        if (!g_pend_mapsize) g_pend_mappath[0] = 0;    /* unknown size: fall back to the buffered path */
+    }
     int rc = app_spawn_from_file(path);
     g_pend_linux = 0;                       /* never leak the flag to a later spawn */
+    g_pend_mappath[0] = 0;                  /* and never leak the map request either */
     if (g_pend_interp) { kfree(g_pend_interp); g_pend_interp = 0; g_pend_interp_sz = 0; }
     return rc;
 }
@@ -5592,10 +5837,15 @@ int app_spawn_from_file(const char *path) {
      * that wants mmap-backed demand loading and is its own milestone. */
     struct statx est;
     unsigned long ELFBUF = (vfs_stat(path, &est) == 0 && est.stx_size) ? (unsigned long)est.stx_size : (1u << 20);
+    /* A mapped load needs the ELF header and program-header table and nothing
+     * else -- that is the whole point of it. 8 KiB covers both with room to
+     * spare (a phdr is 56 bytes). (M1956) */
+    int mapped = g_pend_mappath[0] != 0;
+    if (mapped && ELFBUF > 8192) ELFBUF = 8192;
     if (ELFBUF > (16u << 20)) return -1;                 /* refuse absurd images rather than exhaust the heap */
     uint8_t *buf = kmalloc(ELFBUF);
     if (!buf) return -1;
-    long n = vfs_read(path, buf, ELFBUF);
+    long n = mapped ? vfs_pread(path, buf, ELFBUF, 0) : vfs_read(path, buf, ELFBUF);
     int rc = (n > 0 && app_spawn(buf, path, (uint64_t)n)) ? 0 : -1;  /* title = filename */
     kfree(buf);
     return rc;

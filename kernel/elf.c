@@ -106,20 +106,36 @@ static int elf_check_header(const void *image, uint64_t maxsz,
  * elf_check_header). Returns 1 = loadable, *seg filled; 0 = skip (not PT_LOAD);
  * -1 = malformed, reject the whole image. Checks the segment against the image
  * bounds and the user address range. Pure: reads only header bytes. */
-static int elf_check_phdr(const void *image, uint64_t maxsz, uint64_t phoff,
-                          uint16_t phentsize, uint16_t i, elf_seg_t *seg) {
+/* `hdrsz` bounds the buffer the PHDR TABLE was read from; `contentsz` bounds
+ * where the segment's BYTES live. They are the same number for a caller that
+ * slurped the whole image, and deliberately different for one that read only
+ * the header and will map the rest from the file (elf_pt_loads, M1956) --
+ * conflating them rejected every segment of a header-only parse. */
+static int elf_check_phdr_ex(const void *image, uint64_t hdrsz, uint64_t contentsz, uint64_t bias,
+                             uint64_t phoff, uint16_t phentsize, uint16_t i, elf_seg_t *seg) {
+    (void)hdrsz;                 /* elf_check_header already proved the table fits in it */
     const Elf64_Phdr *ph = (const Elf64_Phdr *)
         ((const uint8_t *)image + phoff + (uint64_t)i * phentsize);
     if (ph->p_type != PT_LOAD) return 0;
-    if (ph->p_offset > maxsz || ph->p_filesz > maxsz - ph->p_offset) return -1;
+    if (ph->p_offset > contentsz || ph->p_filesz > contentsz - ph->p_offset) return -1;
     if (ph->p_memsz < ph->p_filesz) return -1;
-    if (ph->p_vaddr < PAGE_SIZE) return -1;                         /* no null page */
-    if (ph->p_memsz > ELF_VADDR_MAX || ph->p_vaddr > ELF_VADDR_MAX - ph->p_memsz)
+    /* The EFFECTIVE address, i.e. with the load bias applied -- a PIE's first
+     * PT_LOAD is routinely at p_vaddr 0, so checking p_vaddr alone rejects
+     * every position-independent image (which is what elf_load_dyn_base has
+     * always got right, checking base + p_vaddr). bias is 0 for ET_EXEC. */
+    uint64_t eff = bias + ph->p_vaddr;
+    if (eff < PAGE_SIZE) return -1;                                 /* no null page */
+    if (ph->p_memsz > ELF_VADDR_MAX || eff > ELF_VADDR_MAX - ph->p_memsz)
         return -1;                                                  /* fits below the stack, no overflow */
     seg->vaddr = ph->p_vaddr; seg->memsz = ph->p_memsz;
     seg->file_off = ph->p_offset; seg->filesz = ph->p_filesz;
     seg->flags = ph->p_flags;
     return 1;
+}
+
+static int elf_check_phdr(const void *image, uint64_t maxsz, uint64_t phoff,
+                          uint16_t phentsize, uint16_t i, elf_seg_t *seg) {
+    return elf_check_phdr_ex(image, maxsz, maxsz, 0, phoff, phentsize, i, seg);
 }
 
 /* The on-disk byte extent of the ELF image: max(p_offset + p_filesz) over its
@@ -246,6 +262,36 @@ static uint64_t elf_load_dyn(const void *image, uint64_t maxsz) {
 
 /* Public: map a PIE at a CHOSEN base. Used for the dynamic linker, which must
  * not land on top of the executable it is going to load. (M1954) */
+int elf_pt_loads(const void *hdr, unsigned long hdrsz, unsigned long imgsz,
+                 elf_pt_load_t *out, int max,
+                 unsigned long *out_entry, unsigned long *out_bias,
+                 unsigned long *out_phoff, unsigned *out_phent, unsigned *out_phnum) {
+    uint64_t phoff, entry; uint16_t phnum, phentsize;
+    if (!elf_check_header(hdr, hdrsz, &phoff, &phnum, &phentsize, &entry)) return -1;
+    /* The bias is decided HERE, not by the caller, so validation and placement
+     * cannot disagree about where the image lands. */
+    uint64_t bias = (((const Elf64_Ehdr *)hdr)->e_type == ET_DYN) ? ELF_DYN_BASE : 0;
+    if (out_entry) *out_entry = (unsigned long)entry;
+    if (out_bias)  *out_bias  = (unsigned long)bias;
+    if (out_phoff) *out_phoff = (unsigned long)phoff;
+    if (out_phent) *out_phent = phentsize;
+    if (out_phnum) *out_phnum = phnum;
+    int n = 0;
+    for (uint16_t i = 0; i < phnum && n < max; i++) {
+        elf_seg_t sg;
+        int r = elf_check_phdr_ex(hdr, hdrsz, imgsz, bias, phoff, phentsize, i, &sg);
+        if (r == 0) continue;                 /* not PT_LOAD */
+        if (r < 0)  return -1;                /* malformed: reject the image */
+        out[n].vaddr    = (unsigned long)sg.vaddr;
+        out[n].memsz    = (unsigned long)sg.memsz;
+        out[n].file_off = (unsigned long)sg.file_off;
+        out[n].filesz   = (unsigned long)sg.filesz;
+        out[n].flags    = sg.flags;
+        n++;
+    }
+    return n;
+}
+
 uint64_t elf_load_at(const void *image, uint64_t maxsz, uint64_t base) {
     return elf_load_dyn_base(image, maxsz, base);
 }
