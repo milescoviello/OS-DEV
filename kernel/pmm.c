@@ -19,6 +19,7 @@
 #include "string.h"
 
 /* End of the kernel image in memory, provided by the linker script. */
+#include "vmm.h"           /* kvirt_to_phys: linker symbols are higher-half addresses now (M1968) */
 extern char kernel_end[];
 
 static uint8_t  *bitmap;          /* one bit per frame */
@@ -114,7 +115,9 @@ void pmm_init(uint64_t mb_info_phys) {
     total_frames = highest / PAGE_SIZE;
     bitmap_bytes = align_up(total_frames / 8, PAGE_SIZE);
 
-    /* Park the bitmap right after the kernel image. */
+    /* Park the bitmap right after the kernel image. `kernel_end` is a VIRTUAL
+     * (higher-half) address: correct for reaching the storage, wrong for any
+     * arithmetic that means physical -- see the reservation below. (M1968) */
     bitmap = (uint8_t *)align_up((uintptr_t)kernel_end, PAGE_SIZE);
 
     /* Start with everything marked used... */
@@ -143,7 +146,7 @@ void pmm_init(uint64_t mb_info_phys) {
 
     /* Re-reserve everything from address 0 through the end of our bitmap:
      * the low BIOS area, the kernel image, and the bitmap storage itself. */
-    uint64_t reserved_top = (uint64_t)(uintptr_t)bitmap + bitmap_bytes;
+    uint64_t reserved_top = kvirt_to_phys(bitmap) + bitmap_bytes;   /* PHYSICAL: the frames, not the window onto them (M1968) */
     for (uint64_t a = 0; a < reserved_top; a += PAGE_SIZE)
         mark_used(a / PAGE_SIZE);
 

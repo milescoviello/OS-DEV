@@ -14,9 +14,17 @@ $CC -std=gnu11 -O1 -g $SAN -fno-stack-protector -Ikernel -Ikernel/include \
 echo "running ELF-loader regression + fuzz..."
 # If the app binaries have been built, also load every shipped ELF through the
 # loader as a regression guard (the test runs the synthetic suite either way).
+# Exclude every KERNEL image, not two of them by name. The list used to name
+# build/kernel.elf and build/kernel32.elf and so let build/kernel_pass1.elf (an
+# intermediate link) through, where it passed only because the kernel happened
+# to be linked at 1 MiB and therefore looked like a user binary. Since M1968 it
+# is linked at 0xFFFFFFFF80100000 and elf_load REJECTS it -- correctly: a kernel
+# image is not a user program, and this check is "every app the OS ships stays
+# loadable".
 REAL=""
 for e in build/*.elf; do
-    [ -f "$e" ] && [ "$e" != "build/kernel.elf" ] && [ "$e" != "build/kernel32.elf" ] && REAL="$REAL $e"
+    case "$e" in build/kernel*.elf) continue ;; esac
+    [ -f "$e" ] && REAL="$REAL $e"
 done
 if /tmp/osdev_elf_test $REAL; then
     echo "PASS: ELF loader (validators + load round-trip, fuzz/corrupt safe, ASan/UBSan clean)"

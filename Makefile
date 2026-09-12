@@ -21,8 +21,13 @@ QEMU    := qemu-system-x86_64
 # stack-overflow protection is provided structurally instead: kernel stacks get an
 # unmapped GUARD PAGE below them (task.c / boot.asm), and W^X marks every stack NX
 # (vmm_harden_kernel). Keep -fno-stack-protector explicit so the intent is clear.
+# -mcmodel=kernel (M1968): the kernel is LINKED into the top 2 GiB
+# (0xFFFFFFFF80000000), and the default `small` model assumes every symbol fits
+# in the low 2 GiB -- it would emit 32-bit displacements that truncate every
+# kernel address. `kernel` is the model for exactly this layout: symbols in the
+# top 2 GiB, still reachable with cheap sign-extended 32-bit operands.
 CFLAGS  := -std=gnu11 -ffreestanding -nostdlib \
-           -fno-stack-protector -fno-pic -fno-pie \
+           -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel \
            -mno-red-zone -mgeneral-regs-only -fwrapv \
            -fno-omit-frame-pointer \
            -Wall -Wextra -Ikernel/include -O2 -g -MMD -MP

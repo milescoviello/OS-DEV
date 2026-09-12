@@ -24,6 +24,16 @@
  * the kernel can reach any physical frame by adding this base. */
 #define HHDM_BASE 0xFFFF800000000000ull
 
+/* Where the kernel IMAGE is linked (M1968). It is loaded at physical 1 MiB but
+ * runs at KERNEL_VMA + 1 MiB, so a linker symbol is a VIRTUAL address and must
+ * be converted before it is used as a physical one. Getting that wrong is not
+ * subtle when it happens to a loop bound -- pmm_init reserved frames from 0 up
+ * to `kernel_end`, and with kernel_end suddenly 0xFFFFFFFF8... that loop had
+ * 2^52 iterations to get through. The boot simply stopped, with no fault and
+ * no message. */
+#define KERNEL_VMA 0xFFFFFFFF80000000ull
+static inline uint64_t kvirt_to_phys(const void *v) { return (uint64_t)(uintptr_t)v - KERNEL_VMA; }
+
 void     vmm_init(void);
 int      vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
 

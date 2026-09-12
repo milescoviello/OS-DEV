@@ -65,16 +65,23 @@ mb2_end:
 ; ---------------------------------------------------------------------------
 ; 32-bit entry point
 ; ---------------------------------------------------------------------------
+; HIGHER-HALF (M1968). The kernel is LINKED at KVMA+1MiB but LOADED at physical
+; 1 MiB, and this code runs before paging is on -- so every symbol it touches has
+; to be converted back to its physical address. V2P does that. Once we have
+; jumped into the higher half, symbols are used directly and V2P disappears.
+%define KVMA 0xFFFFFFFF80000000
+%define V2P(x) ((x) - KVMA)
+
 section .text
 bits 32
 global _start
 _start:
-    mov esp, stack_top              ; we have a stack now
+    mov esp, V2P(stack_top)         ; we have a stack now (physical: paging is off)
 
     ; eax/ebx are set by the bootloader; stash the multiboot info pointer (ebx)
     ; so a future kmain can read the memory map. (eax = magic, ebx = info ptr)
-    mov [multiboot_info_ptr], ebx
-    mov [multiboot_magic], eax      ; stash the boot magic too (MB1 0x2BADB002 / MB2 0x36d76289)
+    mov [V2P(multiboot_info_ptr)], ebx
+    mov [V2P(multiboot_magic)], eax ; stash the boot magic too (MB1 0x2BADB002 / MB2 0x36d76289)
 
     call check_multiboot
     call check_cpuid
@@ -83,8 +90,12 @@ _start:
     call setup_page_tables
     call enable_paging
 
-    lgdt [gdt64.pointer]            ; load the 64-bit GDT
-    jmp gdt64.code:long_mode_start  ; far jump reloads CS -> we are now in 64-bit
+    ; The GDT pointer has to name a PHYSICAL base here -- we are still running
+    ; identity-mapped -- and long_mode_start is now a HIGH address, so the far
+    ; jump has to target its low alias. Both views are mapped, so stepping from
+    ; one to the other is legal at any point after paging is on.
+    lgdt [V2P(gdt64.pointer_low)]   ; 64-bit GDT, physical base
+    jmp gdt64.code:V2P(long_mode_start)
 
     ; should never get here
     hlt
@@ -151,17 +162,19 @@ check_long_mode:
 ; A larger identity map must skip/UC the MMIO hole; kept at the proven 1 GiB until
 ; a real-hardware signal says the info pointer actually lands above it.
 setup_page_tables:
-    ; PML4[0] = PDPT | present | writable
-    mov eax, pdpt_table
+    ; PML4[0] = PDPT | present | writable  -- the IDENTITY map, which we still
+    ; need: this code is executing at a low physical address right now, and it
+    ; has to keep executing across the instruction that turns paging on.
+    mov eax, V2P(pdpt_table)
     or eax, 0b11
-    mov [pml4_table], eax
-    mov dword [pml4_table + 4], 0
+    mov [V2P(pml4_table)], eax
+    mov dword [V2P(pml4_table) + 4], 0
 
     ; PDPT[0] = PD | present | writable
-    mov eax, pd_table
+    mov eax, V2P(pd_table)
     or eax, 0b11
-    mov [pdpt_table], eax
-    mov dword [pdpt_table + 4], 0
+    mov [V2P(pdpt_table)], eax
+    mov dword [V2P(pdpt_table) + 4], 0
 
     ; PD[ecx] = (ecx * 2 MiB) | present | writable | huge
     xor ecx, ecx
@@ -169,15 +182,31 @@ setup_page_tables:
     mov eax, ecx
     shl eax, 21                     ; ecx * 2 MiB
     or eax, 0b10000011              ; present | writable | huge
-    mov [pd_table + ecx*8], eax
-    mov dword [pd_table + ecx*8 + 4], 0
+    mov [V2P(pd_table) + ecx*8], eax
+    mov dword [V2P(pd_table) + ecx*8 + 4], 0
     inc ecx
     cmp ecx, 512
     jne .map_pd
+
+    ; ...and the HIGHER HALF (M1968): 0xFFFFFFFF80000000 -> physical 0..1 GiB,
+    ; which is where the kernel is linked and where it will run from a moment
+    ; from now. It reuses the SAME PD, so the two views share one set of
+    ; entries and cannot drift apart.
+    ;   0xFFFFFFFF80000000 >> 39 & 0x1FF = 511   (PML4 index)
+    ;   0xFFFFFFFF80000000 >> 30 & 0x1FF = 510   (PDPT index)
+    mov eax, V2P(pdpt_high)
+    or eax, 0b11
+    mov [V2P(pml4_table) + 511*8], eax
+    mov dword [V2P(pml4_table) + 511*8 + 4], 0
+
+    mov eax, V2P(pd_table)
+    or eax, 0b11
+    mov [V2P(pdpt_high) + 510*8], eax
+    mov dword [V2P(pdpt_high) + 510*8 + 4], 0
     ret
 
 enable_paging:
-    mov eax, pml4_table             ; CR3 = address of PML4
+    mov eax, V2P(pml4_table)        ; CR3 = PHYSICAL address of the PML4
     mov cr3, eax
 
     mov eax, cr4                    ; enable PAE (CR4.PAE)
@@ -221,6 +250,18 @@ error:
 ; ---------------------------------------------------------------------------
 bits 64
 long_mode_start:
+    ; We are in 64-bit mode but still executing the LOW alias. One absolute jump
+    ; moves RIP into the higher half; everything after this line runs at the
+    ; address the kernel was linked for, so V2P is no longer needed.
+    mov rax, higher_half_entry
+    jmp rax
+
+higher_half_entry:
+    ; Re-load the GDT through its high mapping. The physical pointer used above
+    ; is still valid, but leaving GDTR pointing into the identity map would make
+    ; the kernel depend on a mapping the whole point of this change is to remove.
+    lgdt [gdt64.pointer]
+
     ; reload data segment registers with the 64-bit data selector
     mov ax, gdt64.data
     mov ss, ax
@@ -255,9 +296,17 @@ gdt64:
     dq (1<<43) | (1<<44) | (1<<47) | (1<<53)            ; code: exec, type, present, long-mode
 .data: equ $ - gdt64
     dq (1<<41) | (1<<44) | (1<<47)                      ; data: writable, type, present
+.end:
+    ; Two pointers, ONE limit. Deriving the limit from `$` would have given the
+    ; second pointer a different (wrong) value, because `$` has moved by then --
+    ; an off-by-ten that would load a GDT limit covering part of itself. .end is
+    ; a fixed anchor, so both agree by construction.
 .pointer:
-    dw $ - gdt64 - 1                                    ; limit
-    dq gdt64                                            ; base
+    dw gdt64.end - gdt64 - 1                            ; limit
+    dq gdt64                                            ; base (high, used after the jump)
+.pointer_low:
+    dw gdt64.end - gdt64 - 1                            ; limit
+    dq V2P(gdt64)                                       ; base (physical, used before the jump)
 
 ; ---------------------------------------------------------------------------
 ; BSS: page tables (4 KiB aligned) and the boot stack
@@ -266,6 +315,7 @@ section .bss
 alignb 4096
 pml4_table: resb 4096
 pdpt_table: resb 4096
+pdpt_high:  resb 4096                   ; PDPT for PML4[511] -- the kernel's higher-half window (M1968)
 pd_table:   resb 4096
 
 global multiboot_info_ptr
