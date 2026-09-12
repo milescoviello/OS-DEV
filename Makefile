@@ -203,6 +203,15 @@ $(LXROOT)/lxfmap: tools/lx/lxfmap.c
 # Dynamically linked ON PURPOSE (no -static-pie): needs PT_INTERP + ld.so.
 # The interpreter and libc are copied in beside it, because the guest has no
 # /lib64 of its own -- that is the point of the exercise.
+# Real POSIX threads, dynamically linked so it uses glibc's actual NPTL (M1959).
+$(LXROOT)/lxthread: tools/lx/lxthread.c
+	@mkdir -p $(LXROOT)
+	$(CC) -O2 -o $@ $< -lpthread
+	@for so in $$(ldd $@ 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do \
+	   d=$(LXROOT)$$(dirname $$so); mkdir -p $$d; cp -f $$so $$d/ 2>/dev/null || true; \
+	 done
+	@echo "  HOSTCC  $@ (REAL pthreads: clone/futex/TLS)"
+
 $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	@mkdir -p $(LXROOT)/lib64 $(LXROOT)/usr/lib64
 	$(CC) -O2 -o $@ $<
@@ -211,7 +220,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

@@ -34,6 +34,13 @@ typedef struct task {
     int           rt_priority; /* 1..99 for FIFO/RR; higher preempts lower (0 for OTHER) (M1172) */
     int           rt_ticks;    /* SCHED_RR: timeslice ticks left before rotating among equal-priority RR tasks (M1172) */
     uint64_t      wake_at;     /* if BLOCKED via task_sleep_ms: timer_ms() deadline (0 = not a timed sleep) */
+    int           wake_pending; /* a task_wake() arrived while this task was still RUNNING, i.e. in the
+                                 * window between deciding to block and actually blocking. The next
+                                 * task_block() consumes it instead of sleeping. Without this the wake is
+                                 * silently DROPPED (task_wake only acts on an already-BLOCKED task) and
+                                 * the task sleeps forever -- the classic lost wakeup. Rare with one
+                                 * blocking caller per process; constant once real threads park several
+                                 * of them on a futex at once (M1959). */
     struct registers *uframe;  /* most recent ring-3 trap frame (for /proc/<pid>/regs); valid while stopped (M1119) */
     struct registers *start_frame;  /* a thread's initial ring-3 frame: iret'd to once at startup, then freed (M1138) */
     uint64_t      fs_base;     /* per-thread %fs base for TLS; 0 = unused (restored on switch, M1140) */

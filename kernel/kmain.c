@@ -749,6 +749,23 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * PT_INTERP + ld.so + libc.so.6 all working. */
             kprintf("[lxabi] launching a DYNAMICALLY-LINKED binary...\n");
             app_spawn_linux_from_file("/disk2/lxdyn");
+            /* REAL THREADS (M1959): glibc's own NPTL -- pthread_create, a
+             * mutex, a condvar and pthread_join -- which needs clone with the
+             * full pthread flag set, CLONE_SETTLS, set_tid_address and futex.
+             * The shared blocker for Node, Claude Code AND Firefox. */
+            /* SYNCHRONOUS, unlike the demos above. Fire-and-forget left it
+             * competing for a 256 MiB machine with eight other live glibc
+             * processes, and it simply never finished dynamic loading -- no
+             * fault, no error, just still searching for libc when the boot
+             * ended. Running it after the others have drained makes it
+             * deterministic, and the exit status is then assertable directly
+             * rather than inferred from output that the console can drop under
+             * load. (M1959) */
+            kprintf("[lxabi] launching a REAL PTHREADS binary...\n");
+            if (g_lxtrace_make) g_lx_systrace = 1;
+            int trc = app_run_linux_sync("/disk2/lxthread", 0, 0, 120000);
+            g_lx_systrace = 0;
+            kprintf("[lxabi] LXTHREAD exit -> %d\n", trc);
         }
         if (g_lxtool_test) {
             /* PHASE 4 (M1955): drive the BORROWED host toolchain inside OS-DEV.

@@ -210,6 +210,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_clone_        56
 #define LXS_fork_         57
 #define LX_CLONE_VM   0x00000100
+#define LX_CLONE_THREAD 0x00010000
+#define LX_CLONE_VFORK  0x00004000
 #define LXS_vfork_        58
 #define LXS_execve_       59
 #define LXS_wait4_        61
@@ -227,6 +229,9 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_clone3_      435
 #define LXS_sysinfo_      99
 #define LXS_gettimeofday_ 96
+#define LXS_futex_       202
+#define LXS_gettid_      186
+#define LXS_madvise_      28
 
 /* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
  * 8 here, O_TRUNC 01000 (512) vs 4. Passing them through unmapped would silently
@@ -382,8 +387,61 @@ void linux_syscall_dispatch(struct registers *r) {
         else                    r->rax = (uint64_t)-(long)LX_EINVAL;
         break;
     case LXS_set_tid_address:
-        r->rax = (uint64_t)task_current_id();   /* Linux returns the caller's tid */
+        /* Was: return the tid and THROW THE POINTER AWAY. That pointer is what
+         * the kernel zeroes and FUTEX_WAKEs on thread exit, so discarding it
+         * makes a blocking pthread_join wait forever. (M1959) */
+        r->rax = (uint64_t)app_set_tid_address(r->rdi);
         break;
+    case LXS_madvise_:                      /* (addr, len, advice) */
+        /* app_madvise already existed (swap/zram work): it handles
+         * DONTNEED/COLD/PAGEOUT/COLLAPSE and treats the rest as an accepted
+         * no-op. It returns a PAGE COUNT, not 0 -- madvise(2) returns 0 on
+         * success, so only the negative case is an error. glibc's thread-stack
+         * cache calls this on every stack it retires, so it is on the
+         * pthread_create path. (M1959) */
+        r->rax = (uint64_t)(app_madvise(r->rdi, r->rsi, (int)r->rdx) < 0 ? -(long)LX_EINVAL : 0);
+        break;
+    case LXS_gettid_:
+        r->rax = (uint64_t)app_gettid();        /* a thread's id, NOT the process's */
+        break;
+    case LXS_futex_: {                          /* (uaddr, op, val, timeout, uaddr2, val3) */
+        /* FUTEX_PRIVATE_FLAG(128) and FUTEX_CLOCK_REALTIME(256) are hints about
+         * scope and clock source; neither changes what we do, so mask them off
+         * rather than failing an op we do support. */
+        int op = (int)r->rsi & 0x7F;
+        int val = (int)r->rdx;
+        if (!vmm_user_ok(r->rdi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (op == 0 /*FUTEX_WAIT*/ || op == 9 /*FUTEX_WAIT_BITSET*/) {
+            /* The value check happens HERE, not inside app_futex, because
+             * app_futex returns -1 for both "value changed" and "timed out"
+             * and glibc treats them completely differently: EAGAIN means retry
+             * the fast path, ETIMEDOUT means give up. Checking first makes the
+             * common case unambiguous. */
+            if (*(volatile int *)r->rdi != val) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }
+            long ms = -1;
+            if (r->r10) {                       /* struct timespec { sec; nsec; } */
+                if (!vmm_user_ok(r->r10, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+                const int64_t *ts = (const int64_t *)r->r10;
+                ms = (long)(ts[0] * 1000 + ts[1] / 1000000);
+                if (ms < 0) ms = 0;
+            }
+            long fr = app_futex(r->rdi, FUTEX_WAIT, val, ms);
+            /* We got past the value check, so a -1 now is the timeout (or the
+             * waiter table being full, which is indistinguishable here and
+             * equally a "could not wait"). */
+            r->rax = (fr == 0) ? 0 : (uint64_t)-(long)(ms >= 0 ? LX_ETIMEDOUT : LX_EAGAIN);
+            break;
+        }
+        if (op == 1 /*FUTEX_WAKE*/ || op == 10 /*FUTEX_WAKE_BITSET*/) {
+            long woke = app_futex(r->rdi, FUTEX_WAKE, val, -1);
+            r->rax = (woke < 0) ? 0 : (uint64_t)woke;   /* waking nothing is success, not an error */
+            break;
+        }
+        /* REQUEUE/CMP_REQUEUE/WAKE_OP/PI are optimisations glibc has fallbacks
+         * for. ENOSYS is the honest answer and makes it use them. */
+        r->rax = (uint64_t)-(long)LX_ENOSYS;
+        break;
+    }
     case LXS_rt_sigaction:
     case LXS_rt_sigprocmask:
         r->rax = 0;                         /* accepted-and-ignored for now */
@@ -702,10 +760,17 @@ void linux_syscall_dispatch(struct registers *r) {
          * quietly turned into a process -- silently forking where a caller
          * expected a shared address space would corrupt it. */
         if (!(r->rdi & LX_CLONE_VM) && r->rsi == 0) { r->rax = (uint64_t)app_fork(r); break; }
-        /* CLONE_VM with a child stack is what glibc's posix_spawn uses, and
-         * therefore what GNU make needs to run a recipe. Served by a COW fork
-         * with the child's rsp overridden -- see app_fork_at for why sharing
-         * the address space for real would be worse than this. (M1958) */
+        /* A REAL THREAD: CLONE_THREAD means share the address space, and the
+         * caller genuinely wants that -- this is pthread_create. (M1959) */
+        if ((r->rdi & LX_CLONE_THREAD) && r->rsi) {
+            long tid = app_clone_linux(r, (unsigned long)r->rdi, r->rsi, r->rdx, r->r10, r->r8);
+            r->rax = (tid < 0) ? (uint64_t)-(long)LX_EAGAIN : (uint64_t)tid;
+            break;
+        }
+        /* CLONE_VM|CLONE_VFORK WITHOUT CLONE_THREAD is posix_spawn, which is a
+         * process, not a thread -- it execs immediately. Served by a COW fork
+         * with the child's rsp overridden; see app_fork_at for why sharing the
+         * address space for real would be worse here. (M1958) */
         if (r->rsi) { r->rax = (uint64_t)app_fork_at(r, r->rsi); break; }
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
@@ -722,6 +787,12 @@ void linux_syscall_dispatch(struct registers *r) {
         const uint64_t *ca = (const uint64_t *)r->rdi;
         uint64_t cflags = ca[0], cstack = ca[5], cssize = ca[6];
         if (!(cflags & LX_CLONE_VM) && !cstack) { r->rax = (uint64_t)app_fork(r); break; }
+        if ((cflags & LX_CLONE_THREAD) && cstack) {
+            long tid = app_clone_linux(r, (unsigned long)cflags, cstack + cssize,
+                                       ca[3] /*parent_tid*/, ca[2] /*child_tid*/, ca[7] /*tls*/);
+            r->rax = (tid < 0) ? (uint64_t)-(long)LX_EAGAIN : (uint64_t)tid;
+            break;
+        }
         if (cstack) { r->rax = (uint64_t)app_fork_at(r, cstack + cssize); break; }
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
@@ -939,6 +1010,12 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_exit:
+        /* exit(2) ends ONE THREAD. Routing it to process exit killed every
+         * sibling the moment a pthread returned -- but the MAIN thread calling
+         * exit(2) really does end the process, or a program returning from
+         * main would leave a husk nothing ever reaps. (M1959) */
+        if (!app_is_main_thread()) { app_thread_exit(); break; }
+        /* fall through */
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);
         /* app_sys_exit, NOT a bare task_exit(). It records the status, marks

@@ -638,6 +638,12 @@ void task_yield(void) {
 void task_block(void) {
     uint64_t f = irq_save();
     rq_lock_take();
+    if (current->wake_pending) {        /* a wake raced us here: consume it, don't sleep (M1959) */
+        current->wake_pending = 0;
+        rq_lock_give();
+        irq_restore(f);
+        return;
+    }
     current->wchan = (uint64_t)__builtin_return_address(0);   /* who we're blocking in, for /proc/sched WCHAN (M1166) */
     current->wake_at = 0;          /* not a timed sleep -> the timer scan must ignore it */
     current->state = TASK_BLOCKED;
@@ -661,6 +667,12 @@ void task_block(void) {
 void task_block_timeout(uint64_t deadline_ms) {
     uint64_t f = irq_save();
     rq_lock_take();
+    if (current->wake_pending) {        /* same lost-wakeup guard as task_block (M1959) */
+        current->wake_pending = 0;
+        rq_lock_give();
+        irq_restore(f);
+        return;
+    }
     current->wchan = (uint64_t)__builtin_return_address(0);
     current->wake_at = deadline_ms;
     current->state = TASK_BLOCKED;
@@ -676,7 +688,21 @@ void task_wake(task_t *t) {
         t->wake_at = 0;            /* cancel any pending timed wake */
         t->state = TASK_READY;
         t->ready_since = timer_ms();   /* re-entered the run queue (M1148) */
+        t->wake_pending = 0;           /* being woken NOW: nothing left to remember */
         sched_place_wake(t);           /* clamp vruntime up to the floor: no head-start, no starvation (M1171) */
+    } else if (t) {
+        /* It is not blocked YET. Every blocking caller in this kernel is
+         * "check the condition, release the lock, then block", and a waker on
+         * another core can land in that gap -- it would find the task RUNNING,
+         * do nothing, and the task would then sleep forever. Remember the wake
+         * so the next task_block() consumes it. (M1959)
+         *
+         * The cost is an occasional SPURIOUS wakeup if the remembered wake is
+         * consumed by an unrelated later block. That is the standard contract
+         * for these primitives and every caller here re-checks its condition
+         * (app_futex's callers loop in glibc, app_waitpid rescans) -- a
+         * spurious wake is safe, a lost one is a hang. */
+        t->wake_pending = 1;
     }
     rq_lock_give();
     irq_restore(f);

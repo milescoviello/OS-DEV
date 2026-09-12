@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1958-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1959-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -548,8 +548,22 @@ Landed so far, all on the from-scratch ext2 driver:
   which had not started yet. `cc1` → `as` → `ld` → `echo` now runs in dependency
   order and make exits 0.
 
+- **M1959** — **real threads: glibc's own NPTL runs.** `pthread_create`, a mutex,
+  a condition variable, `pthread_join` and per-thread TLS, across four threads
+  sharing one address space. The thread machinery mostly existed (M1138/M1226);
+  what was missing was the *entry convention* — Linux's `clone` **returns in the
+  child** rather than starting it at `fn(arg)` — plus `futex`(202), `gettid`,
+  `madvise`, and `exit(2)` ending one thread instead of the process. Real threads
+  then exposed **two lost-wakeup races that predate them**: `task_wake` silently
+  dropped a wake aimed at a task that had decided to block but not yet blocked,
+  and a woken futex waiter cleared its slot *unconditionally* — erasing the
+  registration of whichever thread had claimed that slot in the meantime, which
+  then slept forever. It hung in three runs of four; it now passes four of four.
+  This is the shared prerequisite for everything still ahead.
+
 Still ahead: Phase 5 proper, self-hosting — `make` driving that toolchain over
-the OS-DEV tree. The honest scale is still months, and the memory subsystem needs
+the OS-DEV tree — then Node, Claude Code, and Firefox on a from-scratch Wayland
+display path. The honest scale is still months, and the memory subsystem needs
 more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
 recycles addresses, so V8's address-space cage still cannot be expressed).
 

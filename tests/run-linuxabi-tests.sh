@@ -148,7 +148,7 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # makes it terminate as soon as the answer exists, pass or fail.
     i=0
     while [ $i -lt 560 ]; do
-        grep -aqE "unimplemented Linux syscall 12|Invalid Opcode|KERNEL PANIC" "$SLOG3" 2>/dev/null && break
+        grep -aqE "LXTHREAD exit ->|Invalid Opcode|KERNEL PANIC" "$SLOG3" 2>/dev/null && break
         sleep 0.5; i=$((i+1))
     done
 
@@ -245,6 +245,30 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
         echo "  ok: the dynamic binary exited through glibc's exit path with status 11"
     else
         echo "  FAIL: the dynamic binary did not exit cleanly:"; grep -a "guest exited" "$SLOG3" | tail -3; f3=1
+    fi
+    # M1959 -- REAL THREADS, via glibc's own NPTL. The shared blocker for Node,
+    # Claude Code and Firefox alike, so this is the assertion that matters most
+    # for everything still ahead.
+    #
+    # Every number in the line is load-bearing. counter=8000 proves the four
+    # threads genuinely SHARED one address space (a fork would give each its own
+    # copy and the total would be 2000) and that the mutex serialised them.
+    # joined=406 proves pthread_join collected each thread's return value, which
+    # needs set_tid_address + the futex wake on thread exit. tls=per-thread
+    # proves CLONE_SETTLS gave each thread its own %fs -- without it every
+    # __thread variable aliases one slot.
+    if grep -aq "LXTHREAD: 4 threads, counter=8000 (want 8000), joined=406 (want 406), tls=per-thread" "$SLOG3"; then
+        echo "  ok: REAL pthreads -- 4 threads, shared memory, mutex, condvar, join, per-thread TLS"
+    else
+        echo "  FAIL: real threads did not work:"; grep -aE "LXTHREAD|unimplemented Linux syscall (56|202|186|435)" "$SLOG3" | head -3; f3=1
+    fi
+    # Asserted through the EXIT STATUS, which the runner reports directly --
+    # the console drops lines under load, and this boot has eight other glibc
+    # processes running concurrently.
+    if grep -aq "\[lxabi\] LXTHREAD exit -> 17" "$SLOG3"; then
+        echo "  ok: the threaded program exited 17 after joining every thread"
+    else
+        echo "  FAIL: the threaded program did not exit cleanly:"; grep -a "LXTHREAD exit" "$SLOG3" | tail -2; f3=1
     fi
     if grep -aq "guest exited with status 7" "$SLOG3"; then
         echo "  ok: it exited cleanly through exit_group with the right status"

@@ -2801,8 +2801,46 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
  * Futexes exist specifically to synchronize across threads/cores, so a real
  * WAIT-vs-WAKE race here (unlike most of this file's other sites) is not a
  * rare corner case -- it's the primitive's own primary use. */
-#define FUTEX_NWAIT 32
+/* 32 -> 256 (M1959): one GLOBAL table shared by every process, and a real
+ * threaded program parks most of its threads on a futex at once. 32 was a
+ * hard ceiling on how many threads could block anywhere in the system. */
+#define FUTEX_NWAIT 256
 static struct { uint64_t key; void *task; int used; } g_futex[FUTEX_NWAIT];
+
+/* Release our futex slot after waking, and report whether we were STILL
+ * registered (i.e. nobody woke us -- a timeout).
+ *
+ * The ownership check is the whole point. The old code did a bare
+ * `g_futex[slot].used = 0`, calling it "idempotent w/ WAKE" -- which is true
+ * with one waiter and false the moment there are two:
+ *
+ *   1. thread A waits, claims slot 3, blocks
+ *   2. a WAKE clears slot 3 and marks A runnable
+ *   3. before A is scheduled, thread B waits, finds slot 3 free, claims it
+ *   4. A finally resumes and zeroes slot 3 -- ERASING B's registration
+ *   5. B is now blocked and invisible; the next WAKE finds nothing and B
+ *      sleeps forever
+ *
+ * That is exactly what the timeout dump showed: threads BLOCKED with no futex
+ * slot, and one lone registration left in the table. Harmless until real
+ * threads arrived, then a hang in roughly three runs out of four. (M1959) */
+static int futex_release(int slot) {
+    uint64_t f = irq_save();
+    int still_ours = (g_futex[slot].used && g_futex[slot].task == task_self());
+    if (still_ours) g_futex[slot].used = 0;
+    irq_restore(f);
+    return still_ours;
+}
+
+/* Who is parked on a futex right now, and on what key. Printed when a
+ * synchronous run times out -- a threaded hang is a lost wakeup until proven
+ * otherwise, and this is the evidence. (M1959) */
+void app_futex_dump(void) {
+    for (int i = 0; i < FUTEX_NWAIT; i++)
+        if (g_futex[i].used)
+            kprintf("[futex] slot %d key=%lx task=%d\n", i, g_futex[i].key,
+                    g_futex[i].task ? ((task_t *)g_futex[i].task)->id : -1);
+}
 
 long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
     if (!vmm_user_ok(uaddr, 4)) return -1;
@@ -2820,18 +2858,11 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         irq_restore(f);                 /* release BEFORE blocking (M1612) -- see app_wake_lock's own comment */
         if (timeout_ms >= 0) {          /* bounded wait (M1578): matches epoll_wait/poll's own -1=forever, else ms convention */
             task_block_timeout(timer_ms() + (uint64_t)timeout_ms);   /* woken by a WAKE, the deadline, a kill, or a signal */
-            int timed_out = g_futex[slot].used;   /* still registered -> nobody satisfied it via FUTEX_WAKE. NB: this specific
-                                                    * read is deliberately outside the lock -- a FUTEX_WAKE landing in the
-                                                    * same instant the deadline expires can clear `used` even though the
-                                                    * timer path is what actually flipped the task back to READY -- a
-                                                    * benign, narrow "reports woken instead of timed-out" ambiguity (a wake
-                                                    * WAS credited to this waiter either way), not a hang or corruption.
-                                                    * Not worth locking further. */
-            g_futex[slot].used = 0;
+            int timed_out = futex_release(slot);
             return timed_out ? -1 : 0;
         }
         task_block();                                       /* woken by a WAKE, a kill, or a signal (unbounded, unchanged) */
-        g_futex[slot].used = 0;                             /* reclaim our slot on resume (idempotent w/ WAKE) */
+        futex_release(slot);
         return 0;
     }
     if (op == FUTEX_WAKE) {
@@ -5275,6 +5306,66 @@ long app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg) {
     return t->id;
 }
 
+/* Linux clone(2) for a THREAD (M1959).
+ *
+ * The difference from app_clone is the entry convention, and it is the whole
+ * reason this exists: our native clone starts the new thread at fn(arg),
+ * whereas Linux's clone RETURNS IN THE CHILD -- same RIP as the parent, rax 0,
+ * rsp the caller's stack. glibc's pthread_create relies on exactly that: its
+ * wrapper checks rax and branches to the start routine itself.
+ *
+ * Everything else the thread layer already had (M1138/M1226): a task sharing
+ * this process's CR3 and app_t, a per-task %fs base, and CLONE_CHILD_CLEARTID
+ * zeroing + FUTEX_WAKE'ing the tid word on exit, which is what a blocking
+ * pthread_join waits on.
+ *
+ * Returns the new tid, or -1. */
+#define LXC_SETTLS          0x00080000
+#define LXC_PARENT_SETTID   0x00100000
+#define LXC_CHILD_CLEARTID  0x00200000
+#define LXC_CHILD_SETTID    0x01000000
+long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
+                     uint64_t ptid, uint64_t ctid, uint64_t tls) {
+    struct app *a = cur();
+    if (!a || !r || !stack) return -1;
+    /* Refuse when the thread table is full rather than creating a task nothing
+     * can join or reap. */
+    int slot = -1;
+    for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) { slot = i; break; }
+    if (slot < 0) return -1;
+
+    struct registers *f = kmalloc(sizeof *f);
+    if (!f) return -1;
+    *f = *r;
+    f->rsp = stack;
+    f->rax = 0;                                         /* the child's clone() returns 0 */
+    f->rflags |= 0x200;                                 /* IF set in ring 3 */
+    task_t *t = task_create_stack(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app */
+    if (!t) { kfree(f); return -1; }
+    t->start_frame = f;
+    /* TLS: CLONE_SETTLS carries the new thread's %fs base. Without it a thread
+     * would inherit the CREATOR's TLS block and every __thread variable in it
+     * would alias the parent's. */
+    t->fs_base = (flags & LXC_SETTLS) ? tls : task_fs_base();
+    if (flags & LXC_CHILD_CLEARTID) t->clear_child_tid = ctid;
+    if ((flags & LXC_CHILD_SETTID) && vmm_user_ok(ctid, 4)) *(volatile int *)ctid = t->id;
+    /* PARENT_SETTID is written HERE, in the parent, before we return -- the
+     * caller may read it the instant clone() returns, and the child may not
+     * have run yet. */
+    if ((flags & LXC_PARENT_SETTID) && vmm_user_ok(ptid, 4)) *(volatile int *)ptid = t->id;
+    a->thr[slot] = t;
+    return t->id;
+}
+
+/* Is the calling task this process's MAIN thread? exit(2) ends one thread,
+ * exit_group(2) ends the process -- and the main thread calling exit(2) must
+ * end the process, or a program that returns from main would leave a husk
+ * behind that nothing ever reaps. (M1959) */
+int app_is_main_thread(void) {
+    struct app *a = cur();
+    return !a || !a->task || a->task == task_self();
+}
+
 /* End just the calling thread's task (not the whole process). M1138. Before
  * exiting, honour robust futexes (M1141): if this thread holds any robust locks,
  * mark each OWNER_DIED and wake a waiter, so a peer recovers the lock instead of
@@ -5910,6 +6001,26 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
             if (apps[i].used && apps[i].exited && !apps[i].zombie && apps[i].pid != pid)
                 app_reap(&apps[i]);           /* returns 0 and retries if it is not off-CPU yet */
         task_sleep_ms(5);
+    }
+    /* Say WHY it timed out instead of just reporting -2. A hang in a threaded
+     * program is almost always a lost wakeup, and the one thing that
+     * distinguishes it is which tasks are BLOCKED and where. (M1959) */
+    {
+        uint64_t f = irq_save();
+        for (int i = 0; i < MAX_APPS; i++) {
+            if (!apps[i].used || apps[i].pid != pid) continue;
+            kprintf("[runsync] pid %d timed out: main task state=%d wchan=%lx\n",
+                    pid, apps[i].task ? (int)apps[i].task->state : -1,
+                    apps[i].task ? apps[i].task->wchan : 0ull);
+            for (int k = 0; k < APP_MAXTHREAD; k++)
+                if (apps[i].thr[k])
+                    kprintf("[runsync]   thread %d state=%d wchan=%lx wake_pending=%d\n",
+                            apps[i].thr[k]->id, (int)apps[i].thr[k]->state,
+                            apps[i].thr[k]->wchan, apps[i].thr[k]->wake_pending);
+            break;
+        }
+        irq_restore(f);
+        app_futex_dump();
     }
     return -2;
 }
