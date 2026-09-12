@@ -33,7 +33,16 @@ static uint64_t  next_hint;       /* where to start the next allocation scan */
  * so the first N frees just decrement and only the last actually releases it.
  * 0-initialized, so untouched frames keep the exact prior behaviour — the guard
  * in pmm_free_frame is a no-op for them. */
-#define PMM_MAXREFS (1u << 18)    /* covers up to 1 GiB of RAM (256 KiB array) */
+/* 1<<18 -> 1<<22: covers 16 GiB of RAM instead of 1 GiB, for a 4 MiB array.
+ *
+ * Above the ceiling pmm_addref() SILENTLY DOES NOTHING and pmm_refcount()
+ * reports 0, so a COW frame shared by a fork was freed the first time either
+ * side unmapped it -- while the other was still using it. A real
+ * use-after-free, and invisible until something both forks a lot and runs on
+ * a machine with more than 1 GiB: `make` driving gcc driving cc1 on a 3 GiB
+ * guest corrupted cc1's hash tables and faulted it on a garbage slot pointer,
+ * naming nothing. (M1961) */
+#define PMM_MAXREFS (1u << 22)    /* covers up to 16 GiB of RAM (4 MiB array) */
 static uint8_t  pmm_refs[PMM_MAXREFS];
 
 /* The bitmap is shared mutable state, and the allocator runs from more than one

@@ -1,0 +1,56 @@
+# OS-DEV's kernel, built BY OS-DEV, INSIDE OS-DEV (M1961).
+#
+# A faithful reduction of the host Makefile's kernel rules: the same CFLAGS,
+# the same linker script, the same two-stage objcopy into a multiboot-loadable
+# 32-bit container. What it does NOT rebuild is OS-DEV's own userspace -- the
+# 128 application ELFs that kernel/asm/user_blob.asm incbin's are staged as
+# prebuilt blobs, so this compiles the KERNEL from source and reuses those.
+#
+# ksyms is the one-pass empty-table form (exactly what the host Makefile's
+# first link pass uses): the panic backtrace loses symbol NAMES, nothing else.
+# The two-pass version needs nm piped through a shell script, which is a
+# separate dependency and not what this milestone is about.
+
+CC      := /usr/bin/gcc
+AS      := /usr/bin/nasm
+LD      := /usr/bin/ld
+OBJCOPY := /usr/bin/objcopy
+
+CFLAGS  := -std=gnu11 -ffreestanding -nostdlib -fno-stack-protector -fno-pic \
+           -fno-pie -mno-red-zone -mgeneral-regs-only -fwrapv \
+           -fno-omit-frame-pointer -Ikernel/include -O2
+ASFLAGS := -f elf64
+LDFLAGS := -n -T linker.ld
+
+# $(wildcard) is built into make itself -- no `find` needed in the guest.
+C_SRCS  := $(filter-out kernel/testmod.c,$(wildcard kernel/*.c kernel/lib/*.c))
+ASM_SRCS:= $(filter-out kernel/asm/ap_trampoline.asm,$(wildcard boot/*.asm kernel/asm/*.asm))
+OBJS    := $(patsubst %.c,o/%.o,$(C_SRCS)) $(patsubst %.asm,o/%.o,$(ASM_SRCS))
+
+all: kernel32.elf
+	/bin/echo KBUILD-DONE
+
+kernel32.elf: kernel.elf
+	$(OBJCOPY) -I elf64-x86-64 -O elf32-i386 $< $@
+
+kernel.elf: $(OBJS) ksyms_stub.o
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) ksyms_stub.o
+
+# The empty symbol table the host build's first pass uses too.
+ksyms_stub.o: ksyms_stub.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+o/%.o: %.c
+	/bin/mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+o/%.o: %.asm
+	/bin/mkdir -p $(dir $@)
+	$(AS) $(ASFLAGS) $< -o $@
+
+# js.c uses real IEEE-754 doubles, so it drops -mgeneral-regs-only and adds
+# SSE -- exactly as the host Makefile does. An exact-target rule wins over the
+# pattern rule above.
+o/kernel/js.o: kernel/js.c
+	/bin/mkdir -p o/kernel
+	$(CC) $(filter-out -mgeneral-regs-only,$(CFLAGS)) -msse2 -mfpmath=sse -c $< -o $@

@@ -72,7 +72,7 @@ static inline uint64_t page_up(uint64_t x)   { return (x + PAGE_SIZE - 1) & ~(ui
 
 /* User segments must sit in the low range, below the user stack — this also
  * rejects any p_vaddr aimed at kernel/higher-half memory. */
-#define ELF_VADDR_MAX 0x50000000ull
+#define ELF_VADDR_MAX 0xC0000000ull   /* must clear ELF_INTERP_BASE (0xB0000000) and the 1 GiB mmap window (M1961) */
 
 /* A validated PT_LOAD segment: file bytes [file_off, file_off+filesz) of the
  * image map to [vaddr, vaddr+memsz), the tail beyond filesz being zero (.bss). */

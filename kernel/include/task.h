@@ -34,6 +34,15 @@ typedef struct task {
     int           rt_priority; /* 1..99 for FIFO/RR; higher preempts lower (0 for OTHER) (M1172) */
     int           rt_ticks;    /* SCHED_RR: timeslice ticks left before rotating among equal-priority RR tasks (M1172) */
     uint64_t      wake_at;     /* if BLOCKED via task_sleep_ms: timer_ms() deadline (0 = not a timed sleep) */
+    int           off_cpu;     /* a DEAD task has finished its final context_switch and is no longer
+                                 * executing on its own kernel stack. task_exit sets TASK_DEAD and then
+                                 * RELEASES THE RUN-QUEUE LOCK before switching away -- so between those
+                                 * two points the task is "dead" and still running, and its final
+                                 * context_switch still WRITES to its own task_t (saving rsp). A reaper on
+                                 * another core that freed it on state alone corrupted whatever memory the
+                                 * stack and task_t were handed to next: intermittent, and it looked like
+                                 * wild-pointer faults inside whichever ring-3 program got the pages.
+                                 * Set by the task that runs NEXT on that core. (M1961) */
     int           wake_pending; /* a task_wake() arrived while this task was still RUNNING, i.e. in the
                                  * window between deciding to block and actually blocking. The next
                                  * task_block() consumes it instead of sleeping. Without this the wake is

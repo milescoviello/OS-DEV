@@ -258,8 +258,16 @@ static inline void irq_restore(uint64_t f) {
  * it: thread_trampoline for a brand-new task, or switch_to_next's own line
  * right after context_switch returns for a task resuming a previous switch. */
 static task_t *core_prev[MAX_SCHED_CPUS];
+/* The task that called task_exit on this core and is still finishing its last
+ * context_switch. Cleared -- and the task marked off_cpu -- by whoever runs
+ * next on the same core, which is proof it has left its stack. (M1961) */
+static task_t *core_dying[MAX_SCHED_CPUS];
 void task_finish_switch(void) {
     int c = mycore();
+    /* BEFORE the early return below: we are running on this core, so anything
+     * that exited here has finished its final context_switch. */
+    task_t *d = core_dying[c];
+    if (d) { core_dying[c] = 0; __atomic_store_n(&d->off_cpu, 1, __ATOMIC_RELEASE); }
     task_t *p = core_prev[c];
     if (!p) return;
     core_prev[c] = 0;
@@ -994,6 +1002,10 @@ void task_exit(void) {
         tss_set_rsp0(next->kstack_top);
     if (next->fxbuf) fpu_load(next);             /* the dead task's FP state is discarded */
     load_fs_base(next->fs_base);                 /* restore the thread's TLS base (M1140) */
+    /* Publish that we are ABOUT to leave this stack. Whoever runs next on this
+     * core clears it and marks us off_cpu; until then no reaper may free us,
+     * because the context_switch below still writes dead->rsp. (M1961) */
+    core_dying[mycore()] = dead;
     context_switch(&dead->rsp, next->rsp);   /* dead->rsp save is discarded */
     /* unreachable */
 }

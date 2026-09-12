@@ -53,7 +53,7 @@ uint64_t elf_load_at(const void *image, uint64_t maxsz, uint64_t base);
 
 /* Where the dynamic linker is mapped: clear of ELF_DYN_BASE (the executable)
  * and of the mmap window, so the three cannot collide. */
-#define ELF_INTERP_BASE 0x48000000ull
+#define ELF_INTERP_BASE 0xB0000000ull   /* was 0x48000000, which is INSIDE the heap -- see the map in app.c (M1961) */
 
 /* A loadable segment, reported to a caller that wants to MAP the image from
  * disk instead of having elf.c copy it out of a buffer (M1956). */

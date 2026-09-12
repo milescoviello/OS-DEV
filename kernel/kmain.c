@@ -243,6 +243,7 @@ static volatile int g_journal_test;           /* -append journalguest: prove the
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
+static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
 static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
@@ -487,6 +488,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
         if (cmdline_has(cl, "lxsystrace")) g_lxtrace_make = 1;          /* trace every Linux syscall, but only around the make run (M1958) */
@@ -866,16 +868,51 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 "-std=gnu11", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
                 "-fno-pic", "-fno-pie", "-mno-red-zone", "-mgeneral-regs-only",
                 "-fwrapv", "-fno-omit-frame-pointer", "-Wall", "-Wextra",
-                "-I/src/kernel/include", "-O2", "-c", "/src/kernel/elf.c", "-o", "/elf.o", "-v"
+                "-I/src/kernel/include", "-O2", "-c", "/src/kernel/elf.c", "-o", "/elf.o"
             };
+            /* Assemble a LARGE pre-generated .s first: it reproduces in
+             * seconds what the full compile takes fifteen minutes to reach. */
+            vfs_remove("/disk2/big.o");
+            static const char *av_bigas[] = { "-o", "/big.o", "/big.s" };
+            kprintf("[lxtool] assembling a large .s (496 KB)...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/as", av_bigas, 3, 240000);
+            kprintf("[lxtool] as(big.s) -> %d\n", rc);
+            if (g_lxtrace_make) g_lx_systrace = 1;
             kprintf("[lxtool] COMPILING OS-DEV's OWN kernel/elf.c with the real gcc driver...\n");
-            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 19, 300000);
+            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 18, 300000);
+            g_lx_systrace = 0;
             kprintf("[lxtool] gcc(kernel/elf.c) -> %d\n", rc);
             /* Prove the object is REAL by reading its symbol table with nm --
              * an empty or truncated file still "exists". */
             static const char *av_nm[] = { "/elf.o" };
             rc = app_run_linux_sync("/disk2/usr/bin/nm", av_nm, 1, 60000);
             kprintf("[lxtool] nm(elf.o) -> %d\n", rc);
+        }
+        if (g_lxbuild_test) {
+            /* PHASE 5's DEMO: OS-DEV builds its OWN KERNEL, inside itself.
+             * GNU make drives gcc over all 136 kernel sources, nasm over the
+             * assembly, then ld and objcopy -- the same CFLAGS, the same
+             * linker script, the same multiboot container the host build
+             * produces. What it does NOT rebuild is OS-DEV's userspace: the
+             * 128 application ELFs are reused as prebuilt blobs. (M1961) */
+            int rc;
+            kprintf("[lxbuild] building OS-DEV's OWN KERNEL inside OS-DEV...\n");
+            /* --jobserver-style=pipe: the default fifo jobserver needs mknodat, and
+             * make only WARNS when it cannot create the fifo -- then silently runs
+             * serially. Pipes work with what we have. */
+            static const char *av_kb[] = { "-C", "/src", "-j4", "--jobserver-style=pipe" };
+            rc = app_run_linux_sync("/disk2/usr/bin/make", av_kb, 4, 2400000);
+            kprintf("[lxbuild] make -> %d\n", rc);
+            vfs_dirent kents[64];
+            int kn = vfs_list_path("/disk2/src", kents, 64), ksz = -1;
+            for (int i = 0; i < kn; i++) {
+                const char *nm = kents[i].name;
+                if (nm[0]=='k'&&nm[1]=='e'&&nm[2]=='r'&&nm[3]=='n'&&nm[4]=='e'&&nm[5]=='l'&&
+                    nm[6]=='3'&&nm[7]=='2'&&nm[8]=='.'&&nm[9]=='e'&&nm[10]=='l'&&nm[11]=='f'&&!nm[12])
+                    ksz = (int)kents[i].size;
+            }
+            if (ksz > 0) kprintf("[lxbuild] kernel32.elf built in-guest: %d bytes\n", ksz);
+            else         kprintf("[lxbuild] kernel32.elf MISSING -- the build produced no kernel\n");
         }
     }
 

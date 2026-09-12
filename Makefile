@@ -247,12 +247,26 @@ $(LXROOT)/hello.c: tools/lx/hello.c
 # OS-DEV's OWN SOURCE, staged into the volume so the in-guest toolchain can
 # compile it. This is Phase 5: the OS building itself. Copied rather than
 # generated -- these are the same files this host Makefile compiles.
-$(LXROOT)/.src-staged: $(wildcard kernel/*.c kernel/include/*.h boot/*.asm kernel/asm/*.asm)
-	@mkdir -p $(LXROOT)/src
-	@cp -r kernel boot $(LXROOT)/src/ 2>/dev/null || true
-	@rm -rf $(LXROOT)/src/kernel/testmod.c
+$(LXROOT)/.src-staged: $(wildcard kernel/*.c kernel/include/*.h boot/*.asm kernel/asm/*.asm) tools/lx/Makefile.kernel
+	@mkdir -p $(LXROOT)/src/build
+	@cp -r kernel boot linker.ld $(LXROOT)/src/ 2>/dev/null || true
+	@rm -f $(LXROOT)/src/kernel/testmod.c
+	@cp -f tools/lx/Makefile.kernel $(LXROOT)/src/Makefile
+	@# The 128 prebuilt userspace ELFs kernel/asm/user_blob.asm incbin's, plus
+	@# the AP trampoline. This milestone rebuilds the KERNEL from source; the
+	@# applications are reused as blobs, which is stated plainly in the docs.
+	@cp -f build/*.elf build/*.bin $(LXROOT)/src/build/ 2>/dev/null || true
+	@printf '#include "ksyms.h"\nconst struct ksym ksyms[]={{0,0}};\nconst int ksyms_count=0;\n' > $(LXROOT)/src/ksyms_stub.c
 	@touch $@
-	@echo "  STAGE   $(LXROOT)/src (OS-DEV's own kernel source, for the in-guest build)"
+	@echo "  STAGE   $(LXROOT)/src (OS-DEV's own kernel source + Makefile, for the in-guest build)"
+
+# A LARGE real assembly file (OS-DEV's own biggest source, compiled to .s on
+# the host) for the in-guest assembler to chew on. Half a megabyte of real
+# input catches size-dependent bugs a hello-world never would.
+$(LXROOT)/big.s: kernel/app.c
+	@mkdir -p $(LXROOT)
+	@$(CC) $(filter-out -MMD -MP -g,$(CFLAGS)) -S $< -o $@ 2>/dev/null || true
+	@echo "  STAGE   $@ ($$(wc -c < $@) bytes of real assembly for the in-guest assembler)"
 
 $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 	@mkdir -p $(LXROOT)
@@ -294,7 +308,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/.src-staged
+$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \

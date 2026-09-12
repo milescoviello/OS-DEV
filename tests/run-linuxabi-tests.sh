@@ -434,6 +434,14 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # passes cc1 ~25 arguments, and a 16-entry limit silently dropped
     # -ffreestanding, which surfaced as cc1 failing on an #include_next inside
     # GCC's own stdint.h. Nothing about that error named the cause.
+    # Half a megabyte of REAL assembly through the in-guest assembler. Size
+    # matters: it is the input that exercises the write path at a scale a
+    # hello-world never reaches.
+    if grep -aq "\[lxtool\] as(big.s) -> 0" "$SLOG5"; then
+        echo "  ok: the in-guest assembler handled a 496 KB real assembly file"
+    else
+        echo "  FAIL: as could not assemble the large file:"; grep -a "as(big.s)" "$SLOG5" | head -1; f5=1
+    fi
     if grep -aq "\[lxtool\] gcc(kernel/elf.c) -> 0" "$SLOG5"; then
         echo "  ok: the real gcc driver compiled OS-DEV's own kernel/elf.c in-guest"
     else

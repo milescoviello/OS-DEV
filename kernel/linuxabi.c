@@ -232,9 +232,14 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_futex_       202
 #define LXS_gettid_      186
 #define LXS_madvise_      28
+#define LXS_mremap_       25
 #define LXS_chdir_        80
 #define LXS_tgkill_      234
 #define LXS_tkill_       200
+#define LXS_mkdir_        83
+#define LXS_mkdirat_     258
+#define LXS_rmdir_        84
+#define LXS_fchdir_       81
 #define LXS_kill_         62
 
 /* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
@@ -338,7 +343,11 @@ volatile unsigned long lx_syscall_count, lx_unknown_count;
  */
 void linux_syscall_dispatch(struct registers *r) {
     lx_syscall_count++;
-    if (g_lx_systrace) kprintf("[sys] %ld(%lx,%lx,%lx)\n", (long)r->rax, r->rdi, r->rsi, r->rdx);
+    /* Rate-limited: a full trace of a compiler drowns the log, but a SPIN
+     * shows up as the same call repeating, so sampling one in 4096 identifies
+     * it just as well and stays readable. (M1961) */
+    if (g_lx_systrace && (lx_syscall_count & 0xFFF) == 0)
+        kprintf("[sys] %ld(%lx,%lx,%lx)\n", (long)r->rax, r->rdi, r->rsi, r->rdx);
     long a1 = (long)r->rdi, a3 = (long)r->rdx;
     const char *p2 = (const char *)r->rsi;
 
@@ -353,6 +362,12 @@ void linux_syscall_dispatch(struct registers *r) {
             if (a3 < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
             if (a3 && !vmm_user_ok(r->rsi, (uint64_t)a3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             long w = app_fd_write((int)a1, (const void *)r->rsi, (unsigned long)a3);
+            /* A write that reports ZERO bytes for a non-empty buffer is not a
+             * short write, it is NO PROGRESS -- and every caller loops on a
+             * short write, so it spins forever. `as` did exactly that for
+             * twenty minutes on a large object file, burning a core with flat
+             * memory and no diagnostic anywhere. Say so. (M1961) */
+            if (w == 0 && a3 > 0) kprintf("[linuxabi] write(fd %ld, %ld bytes) made NO PROGRESS\n", a1, a3);
             r->rax = (w < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)w;
             break;
         }
@@ -430,6 +445,55 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
         break;
     }
+    case LXS_mkdir_:                        /* (path, mode) */
+    case LXS_mkdirat_: {                    /* (dirfd, path, mode) */
+        uint64_t up = (r->rax == LXS_mkdir_) ? r->rdi : r->rsi;   /* mkdirat shifts right */
+        const char *upath = (const char *)up;
+        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        /* A TRAILING SLASH is legal in mkdir(2) -- `mkdir -p o/kernel/` passes
+         * one straight through -- and our VFS path walker treats it as an
+         * extra empty component and fails. Strip it here rather than in
+         * lx_xlate, where a trailing slash still carries meaning for stat. */
+        { int e = 0; while (xp[e]) e++;
+          while (e > 1 && xp[e - 1] == '/') xp[--e] = 0;
+          if (path == xp) path = xp; }
+        /* A build creates its output tree before compiling anything, so
+         * without this `mkdir -p o/kernel` failed with "Function not
+         * implemented" and the very first object file stopped the build. */
+        if (vfs_mkdir(path) != 0) {
+            /* Already there is SUCCESS for mkdir -p, which retries per
+             * component; reporting EEXIST is what lets it continue. */
+            struct statx ex;
+            if (vfs_stat(path, &ex) == 0) { r->rax = (uint64_t)-(long)LX_EEXIST; break; }
+            kprintf("[linuxabi] mkdir(%s) failed\n", path);
+            r->rax = (uint64_t)-(long)LX_ENOENT;
+            break;
+        }
+        r->rax = 0;
+        break;
+    }
+    case LXS_rmdir_: {                      /* (path) */
+        const char *upath = (const char *)r->rdi;
+        if (!upath || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
+        break;
+    }
+    case LXS_fchdir_: {                     /* (fd) */
+        /* coreutils' `mkdir -p` walks the path with openat+fchdir rather than
+         * building the string itself, so without this the very first
+         * `mkdir -p o/kernel` of a build failed with "Function not
+         * implemented" -- and mkdir's own error message says nothing about
+         * which call it was. The fd table already remembers each FILE fd's
+         * path, which is exactly what chdir needs. (M1961) */
+        const char *fp = app_fd_path((int)a1);
+        if (!fp) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        if (vfs_chdir(fp) != 0) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+        app_chdir_track(fp);
+        r->rax = 0;
+        break;
+    }
     case LXS_chdir_: {                      /* (path) */
         const char *up = (const char *)r->rdi;
         if (!up || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
@@ -460,6 +524,16 @@ void linux_syscall_dispatch(struct registers *r) {
             break;
         }
         r->rax = 0;                          /* other signals: accepted, undelivered */
+        break;
+    }
+    case LXS_mremap_: {                     /* (old, old_len, new_len, flags, new_addr) */
+        /* app_mremap has existed since M1179; it was simply never wired up
+         * here. GCC's allocator grows its heap with mremap, and an ENOSYS
+         * sends glibc down a malloc/copy/free fallback that behaves
+         * differently under memory pressure -- the compiler died on the
+         * largest source file in the tree and nothing named this. (M1961) */
+        uint64_t nb = app_mremap(r->rdi, r->rsi, r->rdx, (int)r->r10);
+        r->rax = (nb == (uint64_t)-1) ? (uint64_t)-(long)LX_ENOMEM : nb;
         break;
     }
     case LXS_madvise_:                      /* (addr, len, advice) */

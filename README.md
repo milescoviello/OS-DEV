@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1960-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1961-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -575,9 +575,20 @@ Landed so far, all on the from-scratch ext2 driver:
   and `fork` inherits `cwd_path` (it previously did not, so every forked child's
   `getcwd` said `/`).
 
-Still ahead: the rest of Phase 5 — `make` driving that toolchain over the whole
-OS-DEV tree — then Node, Claude Code, and Firefox on a from-scratch Wayland
-display path. The honest scale is still months, and the memory subsystem needs
+- **M1961** — **`make` drives the in-guest toolchain over OS-DEV's own kernel
+  source**, compiling file after file correctly (the assembler handles a 497 KB
+  real input). Two serious bugs fell out. The ring-3 **address map overlapped
+  itself** — the heap ran through `0x48000000`, where the dynamic linker was
+  mapped, so any program whose heap passed 64 MiB paged over `ld.so`. And task
+  reaping was a **use-after-free**: `task_exit` sets `TASK_DEAD` before its final
+  `context_switch`, which still writes to its own `task_t`, so a reaper on
+  another core could free a live kernel stack. **Not yet a complete kernel
+  build:** `kernel/app.c`, the largest file, hangs in a userspace loop inside a
+  shared library — measured (no syscalls, frozen fault counters, RIP sampled via
+  the QEMU monitor), not guessed. Everything smaller builds.
+
+Still ahead: finishing Phase 5 — a complete in-guest kernel build — then Node,
+Claude Code, and Firefox on a from-scratch Wayland display path. The honest scale is still months, and the memory subsystem needs
 more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
 recycles addresses, so V8's address-space cage still cannot be expressed).
 

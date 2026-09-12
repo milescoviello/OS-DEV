@@ -71,7 +71,21 @@
 /* Userspace heap: grows up from 1 GiB + 64 MiB (clear of any app image, which
  * loads at 1 GiB and is at most a couple of MiB) toward the stack at 0x50000000.
  * That leaves ~192 MiB of per-process heap virtual space for malloc (sbrk). */
-#define UHEAP_BASE   0x44000000ull
+/* --- the ring-3 address map (M1961) ------------------------------------
+ * Written out because it USED TO OVERLAP and that cost a real bug: the heap
+ * ran 0x44000000..0x50000000 while the dynamic linker was mapped at
+ * 0x48000000, so any program whose heap grew past 64 MiB paged straight over
+ * ld.so's code. Only something big and allocation-hungry reached it -- cc1
+ * compiling a large source file -- and it surfaced as a wild-pointer page
+ * fault deep inside the compiler, naming nothing.
+ *
+ *   0x40000000  executable (ELF_DYN_BASE)      128 MiB
+ *   0x48000000  heap / brk (UHEAP_BASE)        128 MiB
+ *   0x50000000  user stack (USTACK_BASE)       512 KiB + guard
+ *   0x60000000  mmap window                      1 GiB
+ *   0xB0000000  dynamic linker (ELF_INTERP_BASE)
+ */
+#define UHEAP_BASE   0x48000000ull
 #define UHEAP_LIMIT  USTACK_BASE
 
 struct app {
@@ -88,7 +102,7 @@ struct app {
 /* 16 -> 64 (M1936). A dynamically-linked or JIT-ing program wants dozens of
  * regions; 16 was tight even for our own apps once mmap'd thread stacks and
  * file mappings were in play. */
-#define APP_MAXVMA 64
+#define APP_MAXVMA 192   /* 64 -> 192 (M1961): ld.so maps EIGHT shared libraries for cc1, each costing several VMAs once MAP_FIXED carving splits the reservation, plus the executable, its BSS and the allocator */
 #define HUGE_SIZE  0x200000ull           /* 2 MiB hugepage (M1155) */
 /* Zero the next free VMA slot before filling it. Slots are RECYCLED -- the
  * carve compacts the list by swapping the last entry down -- so a field a
@@ -113,6 +127,8 @@ struct app {
      * subpath + the boot-FS (fat32) cwd cluster. The VFS keeps the live cwd in its
      * own globals and syncs them to/from here on each app switch. */
     int      cwd_synth; char cwd_sub[128]; uint32_t cwd_fat;
+    uint64_t last_fault_page, last_fault_err;   /* the same fault repeating is an infinite retry loop, not a race (M1961) */
+    int      fault_repeat;
     char     cwd_path[160];              /* canonical absolute cwd string, for getcwd(2) (M1248) */
 #define APP_NSIG 32
     uint64_t sig_handler[APP_NSIG];      /* ring-3 signal handlers (0 = none) */
@@ -1386,7 +1402,11 @@ static void app_fd_release(struct app *a);   /* close the process's fds/pipes (M
 int app_reap(app_t *a) {
     if (!a) return 1;
     if (a->zombie) return 1;                  /* already reaped to a zombie: resources freed, slot kept for waitpid */
-    if (a->used && a->exited && (!a->task || a->task->state == TASK_DEAD)) {
+    /* off_cpu, not just TASK_DEAD: the state is set BEFORE the dying task's
+     * final context_switch, which still writes to its own task_t. Freeing it
+     * on state alone is a use-after-free of a live kernel stack. (M1961) */
+    if (a->used && a->exited && (!a->task || (a->task->state == TASK_DEAD &&
+                                              __atomic_load_n(&a->task->off_cpu, __ATOMIC_ACQUIRE)))) {
         {
             uint64_t uf = irq_save();      /* pairs with app_uffd_read/app_fault_handle's own lock (M1612) */
             if (g_uffd.active && g_uffd.owner == a) {     /* uffd owner gone: tear down, free any blocked monitor (M1134) */
@@ -1407,7 +1427,10 @@ int app_reap(app_t *a) {
         for (int i = 0; i < APP_MAXTHREAD; i++) {
             task_t *t = a->thr[i];
             if (!t) continue;
-            if (t->state == TASK_DEAD) task_free(t); else task_stop(t);
+            /* Same off_cpu rule as the main task above: a DEAD thread may still
+             * be finishing its final context_switch. (M1961) */
+            if (t->state == TASK_DEAD && __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) task_free(t);
+            else task_stop(t);
             a->thr[i] = 0;
         }
         /* Flush any dirty MAP_SHARED pages back to their files before the
@@ -1889,7 +1912,7 @@ uint64_t app_sbrk(long inc) {
 static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len);
 
 #define MMAP_BASE  0x60000000ull        /* above the 0x50000000 user stack, clear of the heap */
-#define MMAP_TOP   0x70000000ull
+#define MMAP_TOP   0xA0000000ull      /* 256 MiB -> 1 GiB: a compiler's allocator outgrew it (M1961) */
 
 /* ASLR (M1287): pick a per-exec random start for the mmap region, drawn from
  * the CSPRNG (kernel/random.c). 14 bits of entropy => the base lands anywhere
@@ -2958,6 +2981,21 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                 if (err & 0x10) {
                     kprintf("[fault] instruction fetch from a non-executable mapping at %lx (vma prot=%d)\n", page, a->vma[i].prot);
                     return 0;
+                }
+                /* A "race" the first time is plausible: another core mapped
+                 * the page between our fault and this check. The SAME fault
+                 * repeating is not -- it is an infinite retry loop, and the
+                 * instruction will re-execute and fault forever with NO
+                 * syscalls and NO allocation, which looks exactly like a
+                 * program that has hung for no reason. Count them. (M1961) */
+                if (page == a->last_fault_page && err == a->last_fault_err) {
+                    if (++a->fault_repeat > 64) {
+                        kprintf("[fault] UNRESOLVABLE fault looping at %lx err=%lx pte=%lx (vma prot=%d) -- killing\n",
+                                page, err, cpte, a->vma[i].prot);
+                        return 0;
+                    }
+                } else {
+                    a->last_fault_page = page; a->last_fault_err = err; a->fault_repeat = 0;
                 }
                 return 1;                               /* a genuine race: another core mapped it */
             }
@@ -6014,23 +6052,36 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
             if (apps[i].used && apps[i].exited && !apps[i].zombie && apps[i].pid != pid)
                 app_reap(&apps[i]);           /* returns 0 and retries if it is not off-CPU yet */
         task_sleep_ms(5);
+        /* A long in-guest run is worth a heartbeat: free memory plus the fault
+         * counters distinguish "slow" from "stuck" at a glance, which is
+         * exactly the question a stalled build raises. Once a minute. */
+        if ((waited % 60000) == 0 && waited) {
+            int live = 0; unsigned long maj = 0, min = 0;
+            for (int i = 0; i < MAX_APPS; i++)
+                if (apps[i].used) { live++; maj += apps[i].majflt; min += apps[i].minflt; }
+            kprintf("[runsync] t=%ds free=%luK apps=%d majflt=%lu minflt=%lu\n", waited / 1000,
+                    (unsigned long)(pmm_free_bytes() >> 10), live, maj, min);
+        }
     }
     /* Say WHY it timed out instead of just reporting -2. A hang in a threaded
      * program is almost always a lost wakeup, and the one thing that
      * distinguishes it is which tasks are BLOCKED and where. (M1959) */
     {
         uint64_t f = irq_save();
+        /* EVERY live process, not just the one we are waiting on: when a build
+         * stalls, the interesting process is a grandchild. */
         for (int i = 0; i < MAX_APPS; i++) {
-            if (!apps[i].used || apps[i].pid != pid) continue;
-            kprintf("[runsync] pid %d timed out: main task state=%d wchan=%lx\n",
-                    pid, apps[i].task ? (int)apps[i].task->state : -1,
-                    apps[i].task ? apps[i].task->wchan : 0ull);
+            if (!apps[i].used) continue;
+            kprintf("[runsync] pid %d '%s' state=%d wchan=%lx exited=%d zombie=%d\n",
+                    apps[i].pid, apps[i].title ? apps[i].title : "?",
+                    apps[i].task ? (int)apps[i].task->state : -1,
+                    apps[i].task ? (unsigned long)apps[i].task->wchan : 0UL,
+                    apps[i].exited, apps[i].zombie);
             for (int k = 0; k < APP_MAXTHREAD; k++)
                 if (apps[i].thr[k])
                     kprintf("[runsync]   thread %d state=%d wchan=%lx wake_pending=%d\n",
                             apps[i].thr[k]->id, (int)apps[i].thr[k]->state,
-                            apps[i].thr[k]->wchan, apps[i].thr[k]->wake_pending);
-            break;
+                            (unsigned long)apps[i].thr[k]->wchan, apps[i].thr[k]->wake_pending);
         }
         irq_restore(f);
         app_futex_dump();
