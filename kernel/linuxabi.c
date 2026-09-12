@@ -232,6 +232,10 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_futex_       202
 #define LXS_gettid_      186
 #define LXS_madvise_      28
+#define LXS_chdir_        80
+#define LXS_tgkill_      234
+#define LXS_tkill_       200
+#define LXS_kill_         62
 
 /* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
  * 8 here, O_TRUNC 01000 (512) vs 4. Passing them through unmapped would silently
@@ -287,9 +291,29 @@ int g_lx_mmap_trace;                      /* -append lxmmaptrace: log every Linu
 
 /* Translate a Linux path into one the VFS understands. Returns `out`. */
 static const char *lx_xlate(const char *p, char *out, int max) {
-    if (!p || p[0] != '/') return p;                  /* relative: leave alone */
+    if (!p) return p;
     int n = 0;
-    for (const char *r = LX_ROOT; *r && n < max - 1; r++) out[n++] = *r;
+    if (p[0] == '/') {
+        for (const char *r = LX_ROOT; *r && n < max - 1; r++) out[n++] = *r;
+        for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
+        out[n] = 0;
+        return out;
+    }
+    /* RELATIVE. Leaving these alone was wrong: the kernel resolves them against
+     * its own current directory, which for a Linux process is not where the
+     * process thinks it is. gcc writes its intermediate assembly as
+     * "./ccXXXXXX.s" and died with
+     *
+     *     Cannot create temporary file in ./: No such file or directory
+     *
+     * Resolve against the process's OWN cwd, which app_spawn starts at
+     * LX_ROOT. A leading "./" is stripped because it is pure noise that the
+     * VFS's path walker does not recognise. (M1960) */
+    while (p[0] == '.' && p[1] == '/') p += 2;
+    const char *cwd = app_cwd_str(app_current());
+    if (!cwd || !cwd[0]) cwd = LX_ROOT;
+    for (int i = 0; cwd[i] && n < max - 1; i++) out[n++] = cwd[i];
+    if (n && out[n - 1] != '/' && n < max - 1) out[n++] = '/';
     for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
     out[n] = 0;
     return out;
@@ -392,6 +416,52 @@ void linux_syscall_dispatch(struct registers *r) {
          * makes a blocking pthread_join wait forever. (M1959) */
         r->rax = (uint64_t)app_set_tid_address(r->rdi);
         break;
+    case LXS_unlink_:                       /* (path) */
+    case LXS_unlinkat_: {                   /* (dirfd, path, flags) */
+        /* unlinkat shifts its arguments one right, exactly like faccessat. */
+        uint64_t up = (r->rax == LXS_unlink_) ? r->rdi : r->rsi;
+        const char *upath = (const char *)up;
+        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        /* gcc writes its intermediate .s to a mkstemp'd name and unlinks it
+         * when done; without this the driver reported
+         * "gcc: error: ./ccXXXXXX.s: Function not implemented" and stopped
+         * before it ever ran the assembler. (M1960) */
+        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
+        break;
+    }
+    case LXS_chdir_: {                      /* (path) */
+        const char *up = (const char *)r->rdi;
+        if (!up || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
+        if (vfs_chdir(path) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        app_chdir_track(path);              /* keep getcwd's answer in step */
+        r->rax = 0;
+        break;
+    }
+    case LXS_kill_:
+    case LXS_tkill_:
+    case LXS_tgkill_: {                     /* kill(pid,sig) / tkill(tid,sig) / tgkill(tgid,tid,sig) */
+        /* The signal number is the LAST argument, and the three calls have
+         * different arities -- reading the wrong register here turns an abort
+         * into a silent no-op. */
+        int sig = (r->rax == LXS_tgkill_) ? (int)r->rdx : (int)r->rsi;
+        /* glibc's abort() lands here: it raises SIGABRT at itself and, when
+         * nothing handles it, EXPECTS TO DIE. With no delivery at all the
+         * raise returned, abort() fell through to its "kill myself harder"
+         * path and the process took a General Protection Fault instead -- a
+         * confusing crash in place of a clean, reportable abort. Terminating
+         * with 128+signal is the shell's convention and makes the abort
+         * visible for what it is. (M1960) */
+        if (sig == 6 /*SIGABRT*/ || sig == 9 /*SIGKILL*/ || sig == 4 /*SIGILL*/ ||
+            sig == 8 /*SIGFPE*/ || sig == 11 /*SIGSEGV*/) {
+            kprintf("[linuxabi] process raised signal %d at itself -- terminating\n", sig);
+            app_sys_exit(128 + sig);
+            break;
+        }
+        r->rax = 0;                          /* other signals: accepted, undelivered */
+        break;
+    }
     case LXS_madvise_:                      /* (addr, len, advice) */
         /* app_madvise already existed (swap/zram work): it handles
          * DONTNEED/COLD/PAGEOUT/COLLAPSE and treats the rest as an accepted
@@ -878,27 +948,41 @@ void linux_syscall_dispatch(struct registers *r) {
          * through app_exec (which switches CR3 but not the kernel stack), and
          * lx_spawn_stack copies the strings into the new user stack before it
          * returns. ~8 KiB against an app task's 256 KiB kernel stack. */
-        char abuf[16][256]; const char *av[17];
-        char ebuf[16][256]; const char *ev[17];
+        /* 16 -> 64. The gcc DRIVER execs cc1 with about 25 arguments, so a
+         * 16-entry cap silently dropped everything from -mtune onward --
+         * including -ffreestanding. The only symptom was cc1 taking the HOSTED
+         * branch of GCC's own stdint.h and failing on an #include_next, which
+         * looks like a missing header and is nothing of the sort. Silent
+         * truncation of an argument vector is not survivable; it is reported
+         * now as well as being far larger. 64*256*2 = 32 KiB against an app
+         * task's 256 KiB kernel stack. (M1960) */
+#define LX_EXEC_ARGS 64
+        char abuf[LX_EXEC_ARGS][256]; const char *av[LX_EXEC_ARGS + 1];
+        char ebuf[LX_EXEC_ARGS][256]; const char *ev[LX_EXEC_ARGS + 1];
         int na = 0, ne = 0;
         const char *const *uav = (const char *const *)r->rsi;
         const char *const *uev = (const char *const *)r->rdx;
         if (uav && vmm_user_ok(r->rsi, sizeof(char *))) {
-            for (; na < 16 && uav[na]; na++) {
+            for (; na < LX_EXEC_ARGS && uav[na]; na++) {
                 const char *sp = uav[na]; int k = 0;
                 if (!vmm_user_ok((uint64_t)sp, 1)) break;
                 while (sp[k] && k < 255) { abuf[na][k] = sp[k]; k++; }
                 abuf[na][k] = 0; av[na] = abuf[na];
             }
+            if (na == LX_EXEC_ARGS && uav[na])
+                kprintf("[linuxabi] execve(%s): argv TRUNCATED at %d -- the program will see a short command line\n",
+                        path, LX_EXEC_ARGS);
         }
         av[na] = 0;
         if (uev && vmm_user_ok(r->rdx, sizeof(char *))) {
-            for (; ne < 16 && uev[ne]; ne++) {
+            for (; ne < LX_EXEC_ARGS && uev[ne]; ne++) {
                 const char *sp = uev[ne]; int k = 0;
                 if (!vmm_user_ok((uint64_t)sp, 1)) break;
                 while (sp[k] && k < 255) { ebuf[ne][k] = sp[k]; k++; }
                 ebuf[ne][k] = 0; ev[ne] = ebuf[ne];
             }
+            if (ne == LX_EXEC_ARGS && uev[ne])
+                kprintf("[linuxabi] execve(%s): envp TRUNCATED at %d\n", path, LX_EXEC_ARGS);
         }
         ev[ne] = 0;
         char pbuf[VFS_PATH_MAX];

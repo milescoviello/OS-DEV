@@ -57,6 +57,28 @@ void vfs_cwd_forget(app_t *a) { if (cwd_owner == a) cwd_owner = 0; }
 /* fork: the child inherits the parent's LIVE cwd (the globals, which are the parent's). */
 void vfs_cwd_inherit(app_t *child) { app_cwd_save(child, synth_cwd, mount_sub, fat32_get_cwd()); }
 
+static int mount_path(const char *name, int *midx, char *path, int max);   /* fwd */
+
+/* Give a not-yet-running app a starting directory, by absolute path (M1960).
+ *
+ * A Linux process needs this because the ABI CANNOT translate a relative path
+ * -- it has no idea what the program means it to be relative to -- so a
+ * process whose cwd is outside its own root writes relative files into the
+ * wrong volume, or nowhere. gcc hit exactly that: it creates its intermediate
+ * .s as "./ccXXXXXX.s" and died with
+ *
+ *     Cannot create temporary file in ./: No such file or directory
+ *
+ * ...but only on a boot where nothing else had chdir'd first, which made it
+ * look intermittent. Returns 0, or -1 if the path is not inside a mount. */
+int vfs_cwd_set_for(app_t *a, const char *abs) {
+    if (!a || !abs) return -1;
+    int midx; char sub[VFS_PATH_MAX];
+    if (!mount_path(abs, &midx, sub, sizeof sub)) return -1;
+    app_cwd_save(a, 4 + midx, sub[0] ? sub : "/", 0);   /* synth_cwd >= 4 means "inside mount (n-4)" */
+    return 0;
+}
+
 static int veq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
 static int vstarts(const char *s, const char *pre) { while (*pre) { if (*s++ != *pre++) return 0; } return 1; }
 

@@ -59,6 +59,7 @@ void vfs_overlay_mount(const char *lower, const char *upper);
 struct app;
 void vfs_sync_cwd(void);
 void vfs_cwd_inherit(struct app *child);
+int  vfs_cwd_set_for(struct app *a, const char *abs);   /* start a not-yet-running app in `abs`; 0/-1 (M1960) */
 void vfs_cwd_forget(struct app *a);
 
 void vfs_register(struct vfs_ops *ops);

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1959-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1960-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -561,8 +561,22 @@ Landed so far, all on the from-scratch ext2 driver:
   then slept forever. It hung in three runs of four; it now passes four of four.
   This is the shared prerequisite for everything still ahead.
 
-Still ahead: Phase 5 proper, self-hosting — `make` driving that toolchain over
-the OS-DEV tree — then Node, Claude Code, and Firefox on a from-scratch Wayland
+- **M1960** — **OS-DEV compiled its own kernel source, in-guest.** The real gcc
+  *driver* (which forks and execs `cc1` and `as` itself) built `kernel/elf.c` —
+  the actual ELF loader this kernel runs on — freestanding, with the exact
+  `CFLAGS` the host Makefile uses, and `nm` read `elf_load` back out of the
+  object. The blocker was a **silent truncation**: `execve` copied at most 16
+  argv entries and the driver passes `cc1` about twenty-five, so
+  **`-ffreestanding` was dropped**, which surfaced as `cc1` failing on an
+  `#include_next` inside GCC's own `stdint.h`. Truncated vectors are reported
+  now, not silently accepted. Underneath it, **relative paths** were resolved
+  against the *kernel's* directory rather than the process's — a Linux process
+  now starts inside its own root, relative paths resolve against its own cwd,
+  and `fork` inherits `cwd_path` (it previously did not, so every forked child's
+  `getcwd` said `/`).
+
+Still ahead: the rest of Phase 5 — `make` driving that toolchain over the whole
+OS-DEV tree — then Node, Claude Code, and Firefox on a from-scratch Wayland
 display path. The honest scale is still months, and the memory subsystem needs
 more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
 recycles addresses, so V8's address-space cage still cannot be expressed).

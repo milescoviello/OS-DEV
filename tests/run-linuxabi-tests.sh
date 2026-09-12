@@ -398,7 +398,63 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
         echo "  FAIL: make's output did not run:"; grep -aE "MAKEBUILT" "$SLOG4" | head -2; f4=1
     fi
     [ $f4 -eq 0 ] || { echo "FAIL: in-guest toolchain"; exit 1; }
-    echo "PASS: PHASE 4 -- real GCC/as/ld, driven by real GNU make, built and ran a C program inside OS-DEV"
+    echo "PASS: real GCC/as/ld + GNU make build and run programs inside OS-DEV"
+
+    # --- M1960: PHASE 5 -- OS-DEV compiles its OWN kernel source ------------
+    # Its own boot. Compiling a real kernel source file with the real driver is
+    # minutes of TCG work on top of a boot that already runs eleven in-guest
+    # programs; bundling them made a WORKING compile fail for want of
+    # wall-clock, and made one failure indistinguishable from the other.
+    SLOG5=$(mktemp /tmp/osdev_lxgcc.XXXXXX.log)
+    kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; QPID4=""
+    QPID5=""
+    cleanup5() { [ -n "$QPID5" ] && { kill -9 "$QPID5" 2>/dev/null || true; wait "$QPID5" 2>/dev/null || true; }; rm -f "$SLOG5"; }
+    trap 'rc=$?; cleanup5; exit $rc' EXIT
+
+    echo "booting to compile OS-DEV's OWN kernel/elf.c with the in-guest gcc..."
+    timeout -s KILL 600 "$QEMU" -cpu max -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
+        -append "lxgcctest nonetdemo" \
+        -drive file="$DISK",format=raw,if=ide \
+        -drive file="$EXT2",format=raw,if=ide \
+        -display none -serial file:"$SLOG5" >/dev/null 2>&1 &
+    QPID5=$!
+    i=0
+    while [ $i -lt 1150 ]; do
+        grep -aqE "nm\(elf.o\) ->|KERNEL PANIC" "$SLOG5" 2>/dev/null && break
+        sleep 0.5; i=$((i+1))
+    done
+
+    f5=0
+    # --- M1960: PHASE 5 -- the real gcc DRIVER compiling OS-DEV's OWN source --
+    # Not a toy .c: kernel/elf.c, the actual ELF loader this kernel runs on,
+    # built freestanding with the exact CFLAGS the host Makefile uses. The
+    # driver is a step beyond cc1 -- it forks and execs cc1 AND as itself.
+    #
+    # This is also the regression test for the execve argv cap: the driver
+    # passes cc1 ~25 arguments, and a 16-entry limit silently dropped
+    # -ffreestanding, which surfaced as cc1 failing on an #include_next inside
+    # GCC's own stdint.h. Nothing about that error named the cause.
+    if grep -aq "\[lxtool\] gcc(kernel/elf.c) -> 0" "$SLOG5"; then
+        echo "  ok: the real gcc driver compiled OS-DEV's own kernel/elf.c in-guest"
+    else
+        echo "  FAIL: gcc could not compile kernel/elf.c:"
+        grep -aE "\[lxtool\] gcc\(kernel|error:|TRUNCATED" "$SLOG5" | head -4; f5=1
+    fi
+    # Prove the object is REAL by reading its symbol table -- an empty or
+    # truncated file still "exists", and gcc exiting 0 is not the same as gcc
+    # having written a usable object.
+    # NOT anchored with ^...$: the serial console emits CRLF, so every line
+    # carries a trailing \r and an anchored match silently never fires -- which
+    # it did, on output that was demonstrably correct. The pair is the proof:
+    # nm exits 0 only on a readable object, and its output names a real OS-DEV
+    # symbol.
+    if grep -aq "T elf_load" "$SLOG5" && grep -aq "\[lxtool\] nm(elf.o) -> 0" "$SLOG5"; then
+        echo "  ok: nm read elf_load out of the object OS-DEV compiled"
+    else
+        echo "  FAIL: the compiled object has no symbol table:"; grep -aE "nm\(elf.o\)|elf_load" "$SLOG5" | head -3; f5=1
+    fi
+    [ $f5 -eq 0 ] || { echo "FAIL: in-guest compile of OS-DEV's own source"; exit 1; }
+    echo "PASS: PHASE 5 -- OS-DEV compiled its OWN kernel source with the in-guest GCC"
 else
     echo "SKIP: XSAVE/AVX + toolchain tests (this QEMU has no -cpu max)"
 fi

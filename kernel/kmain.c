@@ -243,6 +243,7 @@ static volatile int g_journal_test;           /* -append journalguest: prove the
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
+static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
 static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
 static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
@@ -486,6 +487,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
         if (cmdline_has(cl, "lxsystrace")) g_lxtrace_make = 1;          /* trace every Linux syscall, but only around the make run (M1958) */
         if (cmdline_has(cl, "netcon"))     g_netcon = 1;                 /* network debug console for real-HW bring-up (M1870) */
@@ -844,6 +846,36 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxtool] running what make built...\n");
             rc = app_run_linux_sync("/disk2/mk.elf", 0, 0, 60000);
             kprintf("[lxtool] MAKEBUILT exit -> %d\n", rc);
+
+        }
+        if (g_lxgcc_test) {
+            /* PHASE 5, ON ITS OWN BOOT: the real GCC DRIVER compiling OS-DEV's
+             * OWN SOURCE with OS-DEV's own CFLAGS. Not a toy .c -- kernel/elf.c,
+             * the actual ELF loader this kernel uses, built freestanding exactly
+             * as the host Makefile builds it. The driver is a step beyond cc1:
+             * it forks and execs cc1 AND as itself, by absolute path.
+             *
+             * Separate from lxtooltest deliberately. That boot already runs
+             * eleven in-guest programs, and compiling a real kernel source file
+             * under TCG is minutes more on top -- bundling them made a working
+             * compile fail for want of wall-clock, and made one failure
+             * indistinguishable from the other. (M1960) */
+            int rc;
+            vfs_remove("/disk2/elf.o");
+            static const char *av_gcc[] = {
+                "-std=gnu11", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
+                "-fno-pic", "-fno-pie", "-mno-red-zone", "-mgeneral-regs-only",
+                "-fwrapv", "-fno-omit-frame-pointer", "-Wall", "-Wextra",
+                "-I/src/kernel/include", "-O2", "-c", "/src/kernel/elf.c", "-o", "/elf.o", "-v"
+            };
+            kprintf("[lxtool] COMPILING OS-DEV's OWN kernel/elf.c with the real gcc driver...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 19, 300000);
+            kprintf("[lxtool] gcc(kernel/elf.c) -> %d\n", rc);
+            /* Prove the object is REAL by reading its symbol table with nm --
+             * an empty or truncated file still "exists". */
+            static const char *av_nm[] = { "/elf.o" };
+            rc = app_run_linux_sync("/disk2/usr/bin/nm", av_nm, 1, 60000);
+            kprintf("[lxtool] nm(elf.o) -> %d\n", rc);
         }
     }
 

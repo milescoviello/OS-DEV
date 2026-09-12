@@ -299,7 +299,7 @@ static char g_pend_arg[128];             /* arg for the next app_spawn, copied i
  * g_pend_arg is: app_spawn is called synchronously and spawns are serialised.
  * execve is NOT (it is called concurrently by unrelated processes), which is
  * why its argv lives per-process in exec_argv instead -- see M1952. */
-#define LX_PEND_ARGS   12
+#define LX_PEND_ARGS   28
 #define LX_PEND_ARGLEN 192
 static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
 static int  g_pend_lxargc;
@@ -4118,6 +4118,12 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
      * its stack pages are mapped -- and start it at the frame instead of at a
      * bare stack top. (M1940) */
     if (take_linux) {
+        /* Start it INSIDE its own root. A Linux process sees /disk2 as "/",
+         * and a relative path is the one thing the ABI cannot translate --
+         * so without this, "./out.s" lands on the boot volume or nowhere at
+         * all. gcc creates its intermediate .s exactly that way. (M1960) */
+        vfs_cwd_set_for(a, "/disk2");
+        { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
         static const char *argv0[2 + LX_PEND_ARGS], *envp0[4];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
@@ -5255,6 +5261,13 @@ long app_fork_at(struct registers *r, uint64_t child_rsp) {
     a->pgid = p->pgid; a->sid = p->sid;                 /* fork inherits the parent's group + session (M1176) */
     a->ns_id  = p->ns_id;                               /* inherit the parent's mount namespace (shared; unshare detaches) (M1122) */
     vfs_cwd_inherit(a);                                 /* inherit the parent's current directory (M1144) */
+    /* ...INCLUDING its path string. vfs_cwd_inherit copies the mount-relative
+     * cwd but not cwd_path, so a forked child's getcwd(2) reported "/" -- and
+     * once lx_xlate started resolving relative paths against it, every
+     * relative path in a forked child resolved against the wrong root. cc1 is
+     * forked by the gcc driver and writes "./ccXXXXXX.s". (M1960) */
+    { int ci = 0; for (; p->cwd_path[ci] && ci < (int)sizeof a->cwd_path - 1; ci++) a->cwd_path[ci] = p->cwd_path[ci];
+      a->cwd_path[ci] = 0; }
     app_fd_fork(a, p);                                   /* inherit the parent's open fds/pipes (M1187) */
     a->seccomp_n = p->seccomp_n;                          /* inherit the parent's seccomp filter (M1190) */
     for (int i = 0; i < p->seccomp_n && i < BPF_MAXINSN; i++) a->seccomp_prog[i] = p->seccomp_prog[i];

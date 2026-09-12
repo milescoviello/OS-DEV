@@ -244,6 +244,16 @@ $(LXROOT)/hello.c: tools/lx/hello.c
 	@cp -f $< $@
 	@echo "  STAGE   $@ (source for the in-guest COMPILE demo)"
 
+# OS-DEV's OWN SOURCE, staged into the volume so the in-guest toolchain can
+# compile it. This is Phase 5: the OS building itself. Copied rather than
+# generated -- these are the same files this host Makefile compiles.
+$(LXROOT)/.src-staged: $(wildcard kernel/*.c kernel/include/*.h boot/*.asm kernel/asm/*.asm)
+	@mkdir -p $(LXROOT)/src
+	@cp -r kernel boot $(LXROOT)/src/ 2>/dev/null || true
+	@rm -rf $(LXROOT)/src/kernel/testmod.c
+	@touch $@
+	@echo "  STAGE   $(LXROOT)/src (OS-DEV's own kernel source, for the in-guest build)"
+
 $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 	@mkdir -p $(LXROOT)
 	@cp -f $< $@
@@ -254,6 +264,26 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@tools/stage-linux-tool.sh $(LXROOT) make "$$(command -v gmake || command -v make)"
 	@tools/stage-linux-tool.sh $(LXROOT) cc1  "$$(gcc -print-prog-name=cc1 2>/dev/null)"
+	@tools/stage-linux-tool.sh $(LXROOT) collect2 "$$(gcc -print-prog-name=collect2 2>/dev/null)"
+	@tools/stage-linux-tool.sh $(LXROOT) gcc
+	@# GCC's own FREESTANDING headers (stdint.h, stddef.h, stdarg.h, the
+	@# intrinsics). -ffreestanding still needs these -- they are part of the
+	@# compiler, not of libc -- and cc1 finds them via a path relative to the
+	@# driver, so they have to land at exactly the host's absolute path.
+	@gi="$$(gcc -print-file-name=include 2>/dev/null)"; \
+	 if [ -d "$$gi" ]; then mkdir -p $(LXROOT)$$gi && cp -r "$$gi/." $(LXROOT)$$gi/ && \
+	   echo "  STAGE   gcc freestanding headers <- $$gi"; fi
+	@# ...and AGAIN at /lib/gcc/..., because cc1's include prefix is computed
+	@# from the DRIVER'S argv[0]: exec'd as /usr/bin/gcc it looks in
+	@# /usr/bin/../../../lib/gcc/... which normalises to /lib/gcc/..., not
+	@# /usr/lib/gcc/.... On the host that resolves correctly only because the
+	@# real binary lives three levels deeper.
+	@gi="$$(gcc -print-file-name=include 2>/dev/null)"; \
+	 if [ -d "$$gi" ]; then mkdir -p $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15 && \
+	   cp -r "$$gi" $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15/ && \
+	   echo "  STAGE   gcc freestanding headers (also at /lib/gcc/...)"; fi
+	@for t in mkdir rm cp touch printf nm; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
+	@mkdir -p $(LXROOT)/bin && for t in mkdir rm cp touch printf; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@tools/stage-linux-tool.sh $(LXROOT) bash
 	@for t in echo cat ls; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
@@ -264,7 +294,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest
+$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \
