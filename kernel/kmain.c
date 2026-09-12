@@ -977,6 +977,32 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxnode] running JavaScript that uses the NETWORK (DNS + HTTP)...\n");
             rc = app_run_linux_sync("/disk2/usr/bin/node", av_nn, 2, 900000);
             kprintf("[lxnode] node http -> %d\n", rc);
+
+            /* PHASE 7's first gate (M1968): HTTPS. Node's own bundled OpenSSL
+             * doing a TLS 1.3 handshake over our TCP stack -- a far harder
+             * exercise of it than plain HTTP, because a handshake is a
+             * multi-round-trip conversation where a single lost or truncated
+             * record kills the connection. Claude Code talks to nothing that
+             * is not TLS. */
+            static const char *av_nt[] = { "-e",
+                "const https=require('https');"
+                "https.get('https://example.com/',r=>{let n=0;"
+                "r.on('data',d=>{n+=d.length;});"
+                "r.on('end',()=>console.log('LXNODETLS:',r.statusCode,n));})"
+                ".on('error',e=>console.log('LXNODETLS-ERR:',e.message));" };
+            kprintf("[lxnode] running JavaScript that uses HTTPS (TLS via Node's OpenSSL)...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_nt, 2, 900000);
+            kprintf("[lxnode] node https -> %d\n", rc);
+
+            /* PHASE 7 (M1968): Claude Code itself. A single 214 MB
+             * dynamically-linked ELF -- a Node single-executable app, runtime
+             * and JS in one image -- so it loads the same way node does, only
+             * bigger. --version first: it is the smallest thing that proves
+             * the image loaded, relocated and reached its own JS. */
+            static const char *av_cv[] = { "--version" };
+            kprintf("[lxnode] running CLAUDE CODE (214 MB single-file Node app)...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/claude", av_cv, 1, 900000);
+            kprintf("[lxnode] claude --version -> %d\n", rc);
         }
         if (g_lxgcc_test) {
             /* PHASE 5, ON ITS OWN BOOT: the real GCC DRIVER compiling OS-DEV's

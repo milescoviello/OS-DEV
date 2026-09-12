@@ -1,5 +1,54 @@
 # What's next
 
+> **(M1968-M1969) PHASE 7 BEGINS: Node speaks HTTPS, and the kernel moved to the
+> higher half to make room for Claude Code.**
+>
+> **HTTPS works.** `https.get('https://example.com/')` printed **`LXNODETLS: 200 559`**
+> — Node's own bundled OpenSSL completing a TLS 1.3 handshake over this
+> project's from-scratch TCP stack and NIC driver. A handshake is a much harder
+> exercise of a transport than plain HTTP: it is a multi-round-trip conversation
+> where one lost or truncated record kills the connection. The only thing
+> missing was the **CA bundle** — OpenSSL verifies a chain against a trust store
+> on disk and has no built-in one, so every connection failed at
+> `unable to get local issuer certificate` *after* a complete handshake, which
+> reads like a protocol failure rather than a missing file.
+>
+> **Then Phase 7 hit the wall the plan predicted.** Claude Code ships as a
+> single **214 MB non-PIE `ET_EXEC`** binary linked at fixed addresses
+> `0x200000`–`0xD78F000`. Node is PIE, which is why it loaded: we relocate PIE
+> images to `0x40000000`. A non-PIE image cannot be moved — and the low 1 GiB
+> was identity-mapped as **supervisor** pages shared into every address space,
+> so no user page could exist there at all. The kernel's own code sat inside
+> exactly the range Claude Code demands, and kernel code has to stay mapped in
+> every address space to service a syscall. One fix exists, and the plan named
+> it while deferring it as "a separate campaign": **move the kernel to the top
+> 2 GiB.**
+>
+> It is linked at `0xFFFFFFFF80100000` now, still *loaded* at physical 1 MiB.
+> `boot.asm` builds both views (the identity map, because the early code has to
+> keep executing across the instruction that enables paging, and
+> `PML4[511]`/`PDPT[510]` pointing at the **same** PD so the two cannot drift),
+> far-jumps into long mode at the low alias, then makes one absolute jump into
+> the higher half. Two traps worth naming: `build/kernel32.elf` is the image
+> repackaged as **elf32** because QEMU's multiboot loader refuses ELF64, which
+> truncates every address to 32 bits — load addresses survive but the entry
+> point had to be named as an explicit physical symbol; and the GDT needed a
+> physical pointer for the pre-jump `lgdt`, whose limit had to come from a fixed
+> anchor rather than `$` (which gave the second pointer a limit ten bytes short,
+> covering part of itself).
+>
+> **The bug to remember: a linker symbol is now a VIRTUAL address.** `pmm_init`
+> reserved frames from 0 up to `kernel_end`, and with `kernel_end` suddenly
+> `0xFFFFFFFF8...` that loop had 2^52 iterations to get through. The boot
+> stopped dead — no fault, no panic, no message.
+>
+> Verified end to end: zero faults through ACPI, HPET, **SMP (4 of 4 cores)**,
+> the I/O APIC, W^X, stack guards, preemption, ring-3 memory isolation, PCI, the
+> eBPF JIT and e1000; 113/113 in-guest IPC assertions; full suite green at 139
+> PASS. **What this does not yet do is free the low 1 GiB for user space** —
+> every address space still inherits the identity map. That is the next step,
+> and it is the one that actually loads a non-PIE binary.
+
 > **(M1967) PHASE 6 IS DONE — Node reached the internet from inside OS-DEV.**
 > `node -e "http.get('http://example.com/', ...)"` printed **`LXNODEHTTP: 200 559`**:
 > a DNS lookup and an HTTP request, from JavaScript, over sockets that libuv

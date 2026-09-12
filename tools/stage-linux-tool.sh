@@ -82,6 +82,21 @@ for extra in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
     done
 done
 
+# The CA bundle. OpenSSL verifies a server's chain against a trust store on
+# disk and has no built-in one, so without this every HTTPS connection fails at
+# `unable to get local issuer certificate` -- AFTER a complete TLS handshake,
+# which makes it read like a protocol failure rather than a missing file.
+# Copied to both of OpenSSL's default locations. (M1968)
+for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+          /etc/ssl/cert.pem; do
+    [ -f "$ca" ] || continue
+    mkdir -p "$ROOT/etc/ssl/certs" "$ROOT/etc/pki/tls/certs"
+    cp -f "$ca" "$ROOT/etc/ssl/certs/ca-certificates.crt"
+    cp -f "$ca" "$ROOT/etc/ssl/cert.pem"
+    cp -f "$ca" "$ROOT/etc/pki/tls/certs/ca-bundle.crt"
+    break
+done
+
 # nsswitch.conf itself: with no file, glibc's built-in default has varied
 # across versions, and "hosts: files dns" is the answer we actually want.
 mkdir -p "$ROOT/etc"

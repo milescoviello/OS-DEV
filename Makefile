@@ -74,6 +74,10 @@ DISK      := $(BUILD)/fat.img
 # Built only when host e2fsprogs is present; without it the guest simply has no
 # /disk1 and everything else behaves exactly as before.
 MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
+# Where Claude Code lives on the host. It ships as a versioned binary under
+# ~/.local/share/claude/versions/, with ~/.local/bin/claude a launcher, so
+# `command -v` finds the launcher rather than the image -- resolve it. (M1968)
+CLAUDE_BIN ?= $(shell readlink -f "$$(command -v claude 2>/dev/null)" 2>/dev/null)
 EXT2SIZE  := 1500M   # 512M -> 1500M (M1964): Node is 102 MB plus 21 shared libraries, on top of the 195 MB toolchain+source tree
 ifneq ($(MKE2FS),)
 EXT2IMG   := $(BUILD)/ext2.img
@@ -320,6 +324,14 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 	@tools/stage-linux-tool.sh $(LXROOT) node
 	@for t in echo cat ls; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
+	@# PHASE 7: Claude Code. A single 214 MB dynamically-linked ELF (a Node
+	@# single-executable app -- the runtime and the JS are bundled into one
+	@# image), so it stages exactly like node did and needs no npm tree. Only
+	@# FIVE shared libraries, all glibc core; everything else is inside it.
+	@# Staged from wherever the host has it, and SKIPPED if it is not
+	@# installed -- the build must not depend on the developer's own tooling
+	@# being present.
+	@if [ -n "$(CLAUDE_BIN)" ] && [ -f "$(CLAUDE_BIN)" ]; then 	    tools/stage-linux-tool.sh $(LXROOT) claude "$(CLAUDE_BIN)"; 	 else echo "  SKIP    claude (not installed; set CLAUDE_BIN=/path to stage it)"; fi
 	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
 	@touch $@
 

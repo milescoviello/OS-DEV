@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1967-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1969-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -669,8 +669,20 @@ Landed so far, all on the from-scratch ext2 driver:
   once AF_INET existed. Plus a bug of mine from M1965: the `statx` handler had
   every field **eight bytes too far**, so Node read `stx_ino` as the file size.
 
-Still ahead: Claude Code, and Firefox on a from-scratch Wayland display path.
-The honest scale is still months.
+- **M1968-M1969** — **PHASE 7 BEGINS: HTTPS from Node, and the kernel moved to
+  the higher half.** `https.get` printed `LXNODETLS: 200 559` — Node's bundled
+  OpenSSL doing a TLS 1.3 handshake over this project's own TCP stack (the only
+  thing missing was a CA bundle on disk). Then Phase 7 hit the wall the plan
+  predicted: Claude Code is a single **214 MB non-PIE `ET_EXEC`** linked at
+  `0x200000`, and the low 1 GiB was identity-mapped as *supervisor* pages shared
+  into every address space — with the kernel's own code inside exactly that
+  range. The kernel is now linked at `0xFFFFFFFF80100000` (still loaded at
+  physical 1 MiB). Boots with zero faults through SMP, the I/O APIC, W^X,
+  preemption and ring-3 isolation; full suite green. Freeing the low 1 GiB for
+  user space is the next step.
+
+Still ahead: Claude Code itself, and Firefox on a from-scratch Wayland display
+path. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the
