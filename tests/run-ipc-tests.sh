@@ -28,7 +28,7 @@ cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait
 trap cleanup EXIT
 
 echo "booting kernel headless and running the POSIX IPC self-test (COM1 capture)..."
-timeout -s KILL 90 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 90 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

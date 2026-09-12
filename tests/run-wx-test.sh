@@ -23,7 +23,7 @@ if ! command -v "$QEMU" >/dev/null 2>&1; then
 fi
 
 echo "booting with -append wxtest (deliberate execute-from-no-execute-data)..."
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append wxtest \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

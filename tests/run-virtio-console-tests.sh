@@ -32,7 +32,7 @@ fi
 echo "booting kernel headless under QEMU with a virtio-console (host sink = file)..."
 # The additions vs run-boot-tests.sh are the virtio-serial bus + a console port
 # whose host end is $VCON (a file). The guest's transmit-queue writes land there.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -device virtio-serial-pci,disable-modern=on,disable-legacy=off \
     -chardev file,id=vcon,path="$VCON" \

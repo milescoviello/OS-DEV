@@ -24,7 +24,7 @@ if ! command -v "$QEMU" >/dev/null 2>&1; then echo "SKIP: fatjournal test ($QEMU
 cp build/fat.img "$DISK"
 
 echo "booting with -append fatjournaltest (live FAT32 create crash-atomicity)..."
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append fatjournaltest \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

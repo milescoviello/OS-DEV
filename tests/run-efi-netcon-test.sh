@@ -49,7 +49,7 @@ cp build/BOOTX64-bringup.EFI "$TMP/esp/EFI/BOOT/BOOTX64.EFI"
 cp "$VARS" "$TMP/vars.fd"
 
 echo "booting through GRUB (multiboot2) under OVMF, host->guest :$HPORT -> :2323..."
-timeout -s KILL 90 "$QEMU" -machine q35 -m 256M -no-reboot -no-shutdown \
+timeout -s KILL 90 "$QEMU" -machine q35 -m 256M -snapshot -no-reboot -no-shutdown \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
     -drive if=pflash,format=raw,file="$TMP/vars.fd" \
     -drive file=fat:rw:"$TMP/esp",format=raw \

@@ -58,7 +58,7 @@ echo "booting kernel headless under QEMU with a VMware SVGA-II device (COM1 capt
 # default `-vga std` with NO vmware device, so the std-VGA screenshot path is
 # byte-identical there. The 30s timeout is a generous safety net (the boot does a
 # real TLS handshake under TCG before the desktop); we poll + stop early.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

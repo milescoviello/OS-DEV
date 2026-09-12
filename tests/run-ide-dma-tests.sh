@@ -39,7 +39,7 @@ fi
 echo "booting kernel headless under QEMU (boot disk on the PIIX3 IDE controller; COM1 capture)..."
 # Identical device set to run-boot-tests.sh: the boot disk on if=ide (the PIIX3
 # IDE controller, which is bus-master capable). The DMA self-test reads it.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

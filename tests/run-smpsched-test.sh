@@ -31,7 +31,7 @@ if ! command -v "$QEMU" >/dev/null 2>&1; then
 fi
 
 echo "booting with -append smpschedtest (8 ordinary tasks across -smp 4 cores, general scheduler)..."
-timeout -s KILL 60 "$QEMU" -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+timeout -s KILL 60 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append smpschedtest \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

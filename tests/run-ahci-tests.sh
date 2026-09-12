@@ -37,7 +37,7 @@ fi
 truncate -s 8M "$SATA"          # 8 MiB = 16384 sectors of 512 bytes
 
 echo "booting kernel headless with a known-size (16384-sector) SATA disk on an AHCI HBA (COM1 capture)..."
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -device ahci,id=ahci0 \
     -drive if=none,id=sata0,file="$SATA",format=raw -device ide-hd,bus=ahci0.0,drive=sata0 \

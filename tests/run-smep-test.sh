@@ -24,7 +24,7 @@ echo "booting with -append smeptest (kernel executes a user page)..."
 # SMEP is CPUID-gated: cpu_harden only sets CR4.SMEP if the CPU advertises it, and
 # the default TCG CPU does NOT -- so we must request a SMEP-capable model (TCG
 # emulates SMEP enforcement for it). This mirrors real hardware, where SMEP is on.
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -cpu qemu64,+smep \
     -append smeptest \

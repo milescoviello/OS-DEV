@@ -65,7 +65,7 @@ PY
 echo "booting kernel headless under QEMU with an NVMe second disk (COM1 capture)..."
 # The ONLY additions vs run-boot-tests.sh are the second drive + an nvme
 # controller. Boot still uses the IDE/ATA disk; NVMe is additional.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -drive id=nvme0,file="$IMG",format=raw,if=none \
     -device nvme,serial=deadbeef,drive=nvme0 \

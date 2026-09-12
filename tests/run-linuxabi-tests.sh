@@ -30,7 +30,7 @@ trap cleanup EXIT
 echo "booting headless and running a host-built static-PIE Linux binary..."
 # The guest's init runs `run /disk2/hellofree` via the boot command line, so no
 # keyboard driving is needed -- this stays a pure COM1 assertion.
-timeout -s KILL 120 "$QEMU" -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+timeout -s KILL 120 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
     -append "lxabitest" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \
@@ -89,7 +89,7 @@ cleanup2() { [ -n "$QPID2" ] && { kill -9 "$QPID2" 2>/dev/null || true; wait "$Q
 trap 'rc=$?; cleanup2; exit $rc' EXIT
 
 echo "booting with a deliberately-faulting Linux binary (console-lock deadlock regression)..."
-timeout -s KILL 120 "$QEMU" -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+timeout -s KILL 120 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
     -append "lxfaulttest" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \
@@ -143,7 +143,7 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # nonetdemo: -cpu max under TCG has to EMULATE AVX and is far slower, and the
     # boot network self-test does a real TLS handshake (bignum RSA/ECDSA) on top
     # of that. Skipping it keeps this boot to the part being tested.
-    timeout -s KILL 300 "$QEMU" -cpu max -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+    timeout -s KILL 300 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
         -append "lxfulltest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
@@ -361,7 +361,7 @@ LXTHREAD: 4 threads
     # -m 2G: cc1 is a 42 MB image with five shared libraries, and it is a
     # compiler -- it allocates. Demand paging means only what it touches is
     # resident, but the headroom has to exist.
-    timeout -s KILL 420 "$QEMU" -cpu max -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
+    timeout -s KILL 420 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
         -append "lxtooltest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
@@ -467,7 +467,7 @@ LXTHREAD: 4 threads
     trap 'rc=$?; cleanup5; exit $rc' EXIT
 
     echo "booting to compile OS-DEV's OWN kernel/elf.c with the in-guest gcc..."
-    timeout -s KILL 600 "$QEMU" -cpu max -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
+    timeout -s KILL 600 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
         -append "lxgcctest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \

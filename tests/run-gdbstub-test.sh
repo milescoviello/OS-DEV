@@ -18,7 +18,7 @@ trap cleanup EXIT
 command -v gdb              >/dev/null 2>&1 || { echo "gdbstubtest: SKIP (no host gdb)";  exit 0; }
 command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "gdbstubtest: SKIP (no qemu)"; exit 0; }
 
-qemu-system-x86_64 -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+qemu-system-x86_64 -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -append gdbstub -serial file:"$LOG" -serial tcp::$PORT,server,nowait -display none >/dev/null 2>&1 &
 QP=$!
 

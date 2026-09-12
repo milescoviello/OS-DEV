@@ -186,7 +186,7 @@ PY
 echo "booting kernel headless under QEMU with a virtio-blk FAT32 second disk (COM1 capture)..."
 # The ONLY additions vs run-boot-tests.sh are the second drive + virtio-blk-pci
 # (legacy mode). Boot still uses the IDE/ATA disk; virtio-blk is additional.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -drive id=vd1,file="$IMG",format=raw,if=none \
     -device virtio-blk-pci,drive=vd1,disable-modern=on,disable-legacy=off \

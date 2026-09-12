@@ -27,7 +27,7 @@ fi
 
 echo "booting kernel headless under QEMU with an RTL8139 NIC (COM1 capture)..."
 # The ONLY difference from run-boot-tests.sh is the NIC device: rtl8139, no e1000.
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device rtl8139,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

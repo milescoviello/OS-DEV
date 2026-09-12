@@ -34,7 +34,7 @@ for t in "$QEMU" python3; do
 done
 
 echo "booting kernel headless with -append netcon and a host->guest :$HPORT -> :2323 forward..."
-timeout -s KILL 240 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 240 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -append netcon \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0,hostfwd=tcp::$HPORT-:2323 -device e1000,netdev=net0 \

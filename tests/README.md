@@ -7,6 +7,36 @@ access is silent kernel memory corruption. Each suite compiles the *real* kernel
 source on the host under **ASan + UBSan** and exercises it with crafted edge
 cases + deterministic fuzzing.
 
+## Runtime
+
+`make check` runs its suites CONCURRENTLY and takes about **4 minutes** (it was
+~20 serially). There is no KVM on the usual host -- no nested virt -- so every
+guest suite is TCG, roughly 75x slower than native, and the whole cost is QEMU:
+rebuilding the kernel, the FAT volume and the 1.5 GB ext2 image together takes
+about **two seconds**.
+
+What had forced serialisation was that all 37 guest suites open the same
+`build/fat.img` read-write, so a suite that wrote to it could corrupt another
+suite's disk mid-read. They now boot with QEMU's `-snapshot`, which sends guest
+writes to a throwaway overlay and leaves the backing image untouched. Scratch
+images, monitor sockets and forwarded host ports were already per-suite.
+
+Two deliberate exceptions:
+
+- `run-selfhost-test.sh` is **not** snapshotted. It builds a kernel *inside* the
+  guest and `debugfs` pulls it back out of the image afterwards, so discarding
+  the guest's writes would discard the artefact under test.
+- Six suites run **serially, after the pool drains**: `gfxtest`, `browsertest`,
+  `layoutrendertest`, `desktoptest`, `httpdtest`, `usbkbdtest`. They drive the
+  guest through the QEMU monitor (screendump / sendkey / mouse) and wait with
+  fixed `sleep`s rather than by polling for a condition. A fixed sleep is an
+  assumption about how fast the host is, and under six concurrent TCG guests
+  that assumption is wrong -- `layoutrendertest` failed with "no framebuffer
+  dump produced" in the pool and passes alone. The honest fix is to make those
+  suites wait on a condition; until then they are simply not parallel.
+
+`CHECKJOBS=1 make check` serialises everything if a failure needs isolating.
+
 ## Running
 
 ```sh

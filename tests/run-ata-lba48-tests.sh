@@ -35,7 +35,7 @@ fi
 truncate -s 160G "$BIG"          # sparse 160 GiB > the 128 GiB (2^28-sector) LBA28 ceiling
 
 echo "booting kernel headless with a 160 GiB sparse ATA disk (primary slave) for the LBA48 test..."
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide,index=0 \
     -drive file="$BIG",format=raw,if=ide,index=1 \
     -netdev user,id=net0 -device e1000,netdev=net0 \

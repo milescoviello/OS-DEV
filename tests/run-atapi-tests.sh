@@ -59,7 +59,7 @@ open(sys.argv[1], "wb").write(img)
 PY
 
 echo "booting kernel headless with an ATAPI CD-ROM attached (COM1 capture)..."
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -cdrom "$ISO" \
     -netdev user,id=net0 -device e1000,netdev=net0 \

@@ -31,7 +31,7 @@ echo "booting kernel headless under QEMU with intel-hda (COM1 capture)..."
 # Same launch as boottest but swapping AC97 for the HDA controller pair. The 25s
 # timeout is a generous safety net (the boot does a real TLS handshake under TCG
 # before the desktop); we poll for the desktop hand-off and stop early.
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

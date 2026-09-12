@@ -32,7 +32,7 @@ fi
 echo "booting kernel headless under QEMU with a virtio-rng device (COM1 capture)..."
 # The ONLY addition vs run-boot-tests.sh is -device virtio-rng-pci. The default
 # QEMU rng backend feeds host entropy; boot still uses the IDE/ATA disk.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -object rng-random,filename=/dev/urandom,id=rng0 \
     -device virtio-rng-pci,rng=rng0,vectors=2 \

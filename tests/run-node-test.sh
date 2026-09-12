@@ -35,7 +35,7 @@ cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait
 trap cleanup EXIT
 
 echo "booting and running real Node.js in-guest (minutes: V8 under TCG)..."
-timeout -s KILL 1800 "$QEMU" -cpu max -no-reboot -no-shutdown -m 3G -smp 4 -kernel "$KERNEL" \
+timeout -s KILL 1800 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 3G -smp 4 -kernel "$KERNEL" \
     -append "lxnodetest nonetdemo" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \

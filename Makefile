@@ -118,7 +118,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -1437,8 +1437,43 @@ browsertest: $(KERNEL) $(DISK)
 
 # Run every host-side regression/fuzz/KAT suite, then the in-guest boot assertions.
 # ('test' above is the human-readable headless boot; 'boottest'/'gfxtest' are asserted.)
+#
+# PARALLEL (M1965). There is no KVM on the usual host -- no nested virt -- so
+# every guest suite is TCG, ~75x slower than native, and the suite was running
+# them one at a time on a 24-core machine. The whole cost is QEMU: a full
+# rebuild of the kernel, the FAT volume and the 1.5 GB ext2 image together take
+# about two seconds.
+#
+# What made serialisation necessary was that all 37 guest suites open the SAME
+# build/fat.img read-write, so any suite that wrote to it could corrupt another
+# suite's disk mid-read. They now boot with QEMU's -snapshot, which sends guest
+# writes to a throwaway overlay and leaves the backing image untouched -- a
+# correctness improvement on its own, and what makes concurrency safe. Scratch
+# images, monitor sockets and forwarded host ports were already per-suite.
+# (run-selfhost-test.sh is deliberately NOT snapshotted: it builds a kernel
+# INSIDE the guest and debugfs pulls it back out of the image afterwards, so
+# discarding the guest's writes would discard the artefact under test.)
+#
+# -Otarget keeps each suite's output together instead of interleaving it, so a
+# failure is still readable. Override the width with CHECKJOBS=1 to serialise.
+#
+# SIX suites stay SERIAL, and not out of caution: gfxtest, browsertest,
+# layoutrendertest, desktoptest, httpdtest and usbkbdtest drive the guest
+# through the QEMU monitor (screendump / sendkey / mouse) and wait with FIXED
+# `sleep`s rather than by polling for a condition. A fixed sleep is an
+# assumption about how fast the host is, and under six concurrent TCG guests
+# that assumption is simply wrong -- layoutrendertest failed with "no
+# framebuffer dump produced" at -j6 and passes alone. The honest fix is to make
+# those suites wait on a condition; until then they run after the pool drains,
+# which costs a couple of minutes and keeps them meaningful.
+CHECKJOBS ?= 6
+CHECK_SERIAL := gfxtest browsertest layoutrendertest desktoptest httpdtest usbkbdtest
+check:
+	@$(MAKE) --no-print-directory -j$(CHECKJOBS) -Otarget check-all
+	@$(MAKE) --no-print-directory $(CHECK_SERIAL)
+	@echo "ALL TESTS PASSED (parallel pool + $(CHECK_SERIAL) serially)"
 
-check: jstest imgtest x509test tlsfuzztest nettest tcpreliabletest fstest ext2test xattrtest iso9660test kattest bignumfuzztest barrettfuzztest stringtest svgtest deflatetest pngenctest ziptest tartest heaptest journaltest wavtest acpiamltest webptest elftest httptest kheaptest jsonfuzztest regexfuzztest jssrcfuzztest htmlentfuzztest htmlattrtest urltest colortest csstest csseltest readertest shgreptest shsedtest shmathtest shsplittest shbracetest shexpandtest shquotetest shtesttest lsfmttest shsorttest shtxttest wsframetest wsclienttest usbbottest layouttest sha1test calctest sheettest plottest jsoncoretest difftest mdtest editortest arctest hashtest normpathtest completetest boottest kstacktest ustacktest wxtest smeptest smpthreadtest smpschedtest journalguesttest fatjournaltest netcontest gdbstubtest rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest hdatest httpdtest gfxtest browsertest layoutrendertest desktoptest ipctest linuxabitest
+check-all: jstest imgtest x509test tlsfuzztest nettest tcpreliabletest fstest ext2test xattrtest iso9660test kattest bignumfuzztest barrettfuzztest stringtest svgtest deflatetest pngenctest ziptest tartest heaptest journaltest wavtest acpiamltest webptest elftest httptest kheaptest jsonfuzztest regexfuzztest jssrcfuzztest htmlentfuzztest htmlattrtest urltest colortest csstest csseltest readertest shgreptest shsedtest shmathtest shsplittest shbracetest shexpandtest shquotetest shtesttest lsfmttest shsorttest shtxttest wsframetest wsclienttest usbbottest layouttest sha1test calctest sheettest plottest jsoncoretest difftest mdtest editortest arctest hashtest normpathtest completetest boottest kstacktest ustacktest wxtest smeptest smpthreadtest smpschedtest journalguesttest fatjournaltest netcontest gdbstubtest rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest ehcitest xhcitest hdatest ipctest linuxabitest
 	@echo "ALL TESTS PASSED (jstest + imgtest + x509test + tlsfuzztest + nettest + tcpreliabletest + fstest + ext2test + xattrtest + iso9660test + kattest + bignumfuzztest + barrettfuzztest + stringtest + svgtest + deflatetest + pngenctest + ziptest + tartest + heaptest + journaltest + wavtest + acpiamltest + webptest + elftest + httptest + kheaptest + jsonfuzztest + regexfuzztest + jssrcfuzztest + htmlentfuzztest + htmlattrtest + urltest + colortest + csstest + csseltest + readertest + shgreptest + shsedtest + shmathtest + shsplittest + shbracetest + shexpandtest + shquotetest + shtesttest + lsfmttest + shsorttest + shtxttest + wsframetest + wsclienttest + usbbottest + layouttest + sha1test + calctest + sheettest + plottest + jsoncoretest + difftest + mdtest + editortest + arctest + hashtest + normpathtest + completetest + boottest + kstacktest + ustacktest + wxtest + smeptest + smpthreadtest + smpschedtest + journalguesttest + fatjournaltest + netcontest + gdbstubtest + rtl8139test + virtionettest + virtioblktest + virtiorngtest + virtioconsoletest + nvmetest + floppytest + parttest + blockdevtest + raidtest + ahcitest + atapitest + atalba48test + idedmatest + virtiogputest + svgatest + usbstoragetest + usbkbdtest + ehcitest + xhcitest + hdatest + httpdtest + gfxtest + browsertest + layoutrendertest + ipctest + linuxabitest)"
 
 clean:

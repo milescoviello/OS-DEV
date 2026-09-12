@@ -219,7 +219,7 @@ echo "booting kernel headless under QEMU with an MBR (primary slave) + GPT (seco
 #   index 0 = primary master   (the boot disk, bare FAT32, untouched)
 #   index 1 = primary slave    (our MBR disk)
 #   index 2 = secondary master (our GPT disk)
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide,index=0 \
     -drive file="$MBRIMG",format=raw,if=ide,index=1 \
     -drive file="$GPTIMG",format=raw,if=ide,index=2 \

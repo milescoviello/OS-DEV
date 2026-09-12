@@ -75,7 +75,7 @@ echo "booting kernel headless under QEMU with a usb-ehci controller + a usb-stor
 # + its tablet stay (the EHCI host is a SEPARATE, additional USB controller); boot
 # still uses the IDE/ATA disk. The 40s timeout matches the usb-storage test (the
 # boot does a real TLS handshake under TCG before the desktop); we poll + stop early.
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

@@ -74,7 +74,7 @@ echo "booting kernel headless under QEMU with a 1.44 MB floppy attached (COM1 ca
 # The ONLY addition vs run-boot-tests.sh is the floppy drive (if=floppy). Boot
 # still uses the IDE/ATA disk; the floppy is additional. The floppy bring-up
 # includes a ~500 ms motor spin-up + seeks, so allow a touch more time.
-timeout -s KILL 35 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 35 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$IMG",format=raw,if=floppy \
     -netdev user,id=net0 -device e1000,netdev=net0 \

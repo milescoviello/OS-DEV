@@ -24,7 +24,7 @@ fi
 
 echo "booting with -append ustackover (deliberate ring-3 user-stack overflow)..."
 # The app is killed mid-boot; the KERNEL must boot on, so poll for the desktop.
-timeout -s KILL 30 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append ustackover \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

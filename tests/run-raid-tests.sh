@@ -36,7 +36,7 @@ fi
 for f in "$D0" "$D1" "$D2"; do truncate -s 8M "$f"; done
 
 echo "booting kernel headless with 3 SATA disks on an AHCI HBA (COM1 capture)..."
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -device ahci,id=ahci0 \
     -drive if=none,id=r0,file="$D0",format=raw -device ide-hd,bus=ahci0.0,drive=r0 \

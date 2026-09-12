@@ -51,7 +51,7 @@ echo "booting kernel headless under QEMU with a usb-kbd on the uhci bus (COM1 ca
 # explicit ports QEMU inserts a USB hub and puts the second device behind it,
 # which a minimal UHCI driver (no hub class driver) can't reach. Pinning both to
 # the two root ports keeps the topology flat -- exactly what the driver supports.
-timeout -s KILL 50 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 50 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0,port=1 \

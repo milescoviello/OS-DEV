@@ -21,7 +21,7 @@ trap cleanup EXIT
 if ! command -v "$QEMU" >/dev/null 2>&1; then echo "SKIP: journalguest test ($QEMU not found)"; exit 0; fi
 
 echo "booting with -append journalguest (journal + crash recovery on real ata)..."
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append journalguest \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

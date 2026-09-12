@@ -26,7 +26,7 @@ fi
 echo "booting kernel with -append kstackover (deliberate guarded-stack overflow)..."
 # The overflow task faults (a #DF on IST1) shortly after full bring-up and halts
 # the kernel, so we poll for the overflow marker rather than the desktop hand-off.
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append kstackover \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

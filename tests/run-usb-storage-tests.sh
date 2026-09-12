@@ -80,7 +80,7 @@ echo "booting kernel headless under QEMU with a usb-storage flash disk on the uh
 # explicit ports QEMU inserts a USB hub and puts the MSD behind it (Port 2.1),
 # which a minimal UHCI driver (no hub class driver) can't reach. Pinning both to
 # the two root ports keeps the topology flat — exactly what the driver supports.
-timeout -s KILL 40 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 40 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0,port=1 \

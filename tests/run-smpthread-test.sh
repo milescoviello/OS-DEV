@@ -25,7 +25,7 @@ if ! command -v "$QEMU" >/dev/null 2>&1; then
 fi
 
 echo "booting with -append smpthreadtest (4 real kernel threads across -smp 4 cores)..."
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append smpthreadtest \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &

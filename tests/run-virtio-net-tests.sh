@@ -32,7 +32,7 @@ echo "booting kernel headless under QEMU with a legacy virtio-net NIC (COM1 capt
 # The ONLY difference from run-boot-tests.sh is the NIC device: a legacy
 # virtio-net-pci, no e1000. disable-modern=on forces the legacy I/O-port
 # transport the driver speaks.
-timeout -s KILL 25 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 25 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on,disable-legacy=off \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \

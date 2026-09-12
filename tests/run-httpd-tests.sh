@@ -34,7 +34,7 @@ echo "booting kernel headless with a host->guest :$HPORT -> :80 forward..."
 # a suite that tests httpd should test it on the machine users get. An earlier
 # hypothesis blamed the flakiness on that self-test starving ring-3 and this suite
 # booted with `-append nonetdemo`; measurement rejected it (6/6 with the demo on).
-timeout -s KILL 360 "$QEMU" -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+timeout -s KILL 360 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0,hostfwd=tcp::$HPORT-:80 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \
