@@ -185,6 +185,7 @@ void isr_dispatch(struct registers *r) {
      * out of its idle hlt (the work-drain happens in its idle loop after iret);
      * the LAPIC spurious vector needs no EOI. Both just acknowledge + return. */
     if (r->int_no == 0x40) { lapic_eoi(); return; }
+    if (r->int_no == 0x41) { vmm_tlb_shootdown_ack(); lapic_eoi(); return; }   /* TLB shootdown (M1963) */
     /* This core's own local LAPIC timer (M1532): the real per-core preemption
      * source, armed by lapic_timer_start_this_cpu() on every AP (never the
      * BSP, which keeps its own working PIT-driven tick_handler). EOI FIRST,

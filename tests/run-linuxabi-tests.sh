@@ -44,6 +44,16 @@ while [ $i -lt 220 ]; do
 done
 
 fail=0
+# 0. M1963: this boot is -smp 4, so the TLB-shootdown IPI must actually be
+#    ACKNOWLEDGED by the other three cores. Asserting the ack, not merely that
+#    we tried: the first version spun 15.9 SECONDS waiting for acks that never
+#    came, which would have stalled every mprotect on a threaded process.
+if grep -aqE "TLB shootdown IPI: [0-9]+ core\(s\) acked" "$SLOG" && ! grep -aq "TLB shootdown timed out" "$SLOG"; then
+    echo "  ok: the TLB-shootdown IPI round-tripped ($(grep -ao 'core(s) acked in [0-9]*ms' "$SLOG" | head -1))"
+else
+    echo "  FAIL: the TLB-shootdown IPI was not acknowledged -- other cores keep stale translations:"
+    grep -a "TLB shootdown" "$SLOG" | head -2; fail=1
+fi
 # 1. the binary's OWN output, produced by a Linux write(2) through our dispatcher
 if grep -aq "hello from a freestanding static-PIE Linux binary" "$SLOG"; then
     echo "  ok: a host-built Linux static-PIE binary ran and printed via Linux write(2)"

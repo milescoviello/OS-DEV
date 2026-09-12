@@ -2309,6 +2309,23 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
     return 0;
 }
 
+/* Make other cores drop cached translations for this process, if it can
+ * actually be running on one (M1963).
+ *
+ * Only a MULTI-TASK address space can be live on two cores at once: a
+ * single-threaded process is on exactly one core, and after fork the parent
+ * and child have different CR3s. So this is free for the common case and only
+ * pays the IPI where it is genuinely needed -- which, now that real threads
+ * exist, it is.
+ *
+ * Called AFTER the mapping change and OUTSIDE the vmm lock: a core spinning
+ * for that lock with interrupts off could never ack. */
+static void app_tlb_sync(struct app *a) {
+    if (!a) return;
+    for (int i = 0; i < APP_MAXTHREAD; i++)
+        if (a->thr[i] && a->thr[i]->state != TASK_DEAD) { vmm_tlb_shootdown(); return; }
+}
+
 /* Remove [addr, addr+len) from this process's VMA list, splitting any VMA it
  * partially covers and freeing the frames inside the range (M1954).
  *
@@ -2393,6 +2410,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
         }
         i++;
     }
+    app_tlb_sync(a);                    /* the pages are gone; no core may keep a translation (M1963) */
     return 0;
 }
 
@@ -2838,11 +2856,13 @@ int app_mprotect(uint64_t addr, uint64_t len, int prot) {
         }
         for (uint64_t p = a0; p < end; p += PAGE_SIZE)
             if (vmm_translate(p)) { if (vmm_protect(p, flags) < 0) return -1; }
+        app_tlb_sync(a);                /* a tightened mapping another core still caches is a write-after-revoke (M1963) */
         return 0;
     }
     if (!vmm_user_ok(a0, end - a0)) return -1;   /* must be the caller's mapped user pages */
     for (uint64_t p = a0; p < end; p += PAGE_SIZE)
         if (vmm_protect(p, flags) < 0) return -1;
+    app_tlb_sync(a);                    /* same reason as the covered path above (M1963) */
     return 0;
 }
 

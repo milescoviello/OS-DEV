@@ -75,3 +75,10 @@ uint64_t vmm_pte_raw(uint64_t virt);
 void     vmm_set_raw(uint64_t virt, uint64_t pte);
 
 static inline void *hhdm(uint64_t phys) { return (void *)(HHDM_BASE + phys); }
+
+/* TLB shootdown (M1963): make every OTHER core drop its cached translations
+ * after this one removed or tightened a mapping. Call AFTER releasing the vmm
+ * lock -- a core spinning for that lock with interrupts off cannot ack. */
+void     vmm_tlb_shootdown(void);
+void     vmm_tlb_shootdown_ack(void);   /* the IPI handler's side */
+unsigned long vmm_tlb_shootdown_count(void);   /* how many have actually fired -- lets a test prove the mechanism runs */

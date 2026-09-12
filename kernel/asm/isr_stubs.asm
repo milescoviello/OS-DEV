@@ -89,6 +89,12 @@ isr64:
     push 64
     jmp isr_common
 
+global isr65          ; 0x41 = TLB shootdown (M1963)
+isr65:
+    push 0
+    push 65
+    jmp isr_common
+
 global isr66
 isr66:
     push 0

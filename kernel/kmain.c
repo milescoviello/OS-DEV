@@ -600,6 +600,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
 
     kprintf("OS-DEV  -  x86_64 kernel  (graphical console)\n");
     kprintf("=============================================\n\n");
+    /* Late, not during smp_init: the APs have to be running their idle loops
+     * with interrupts on before any of them can ack. Doing it at bring-up
+     * caught the first version spinning 15.9 SECONDS for acks that were never
+     * coming, which is exactly the failure this is here to make obvious. */
+    smp_tlb_shootdown_selftest();
     kprintf("[ ok ] full bring-up complete (%lu MiB RAM).\n\n",
             pmm_total_bytes() / (1024 * 1024));
 
@@ -770,6 +775,10 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             int trc = app_run_linux_sync("/disk2/lxthread", 0, 0, 120000);
             g_lx_systrace = 0;
             kprintf("[lxabi] LXTHREAD exit -> %d\n", trc);
+            /* A stale-TLB test would be timing-dependent and therefore flaky;
+             * this proves the MECHANISM fires on a genuinely multi-threaded
+             * process, which is the part that can be asserted reliably. */
+            kprintf("[lxabi] TLB shootdowns performed: %lu\n", vmm_tlb_shootdown_count());
         }
         if (g_lxtool_test) {
             /* PHASE 4 (M1955): drive the BORROWED host toolchain inside OS-DEV.

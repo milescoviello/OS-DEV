@@ -112,6 +112,16 @@ require_either() {
     fi
 }
 require "full bring-up complete"             "core bring-up (PMM/VMM/IDT)"
+# M1963: the TLB-shootdown IPI must round-trip. Asserting the ACK, not merely
+# that we tried: the first version of this spun 15.9 SECONDS waiting for acks
+# that never came, which would have stalled every mprotect on a threaded
+# process. "timed out" in that line is the failure mode, so reject it.
+require "TLB shootdown"                      "TLB shootdown self-test ran (M1963)"   # this boot is single-core, so it reports "nothing to shoot down"; the ACK is asserted on the 4-core linuxabi boot
+if grep -aq "TLB shootdown timed out" "$LOG"; then
+    echo "  FAIL: TLB shootdown IPI was not acknowledged -- other cores keep stale translations"
+    grep -a "TLB shootdown" "$LOG" | head -2
+    fail=1
+fi
 require "preemption works"                   "preemptive scheduler"
 require "each process has its own address"   "per-process address-space isolation"
 require "PCI devices on the bus"             "PCI enumeration"

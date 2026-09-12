@@ -18,6 +18,7 @@
  * the LAPIC's ICR, independent of the PIC. Verified on QEMU with -smp N (see the
  * [smp] lines in the boot log).
  */
+#include "timer.h"
 #include "smp.h"
 #include "linuxabi.h"
 #include "smpthread.h"  /* smpthread_ap_tick — real kernel threads pinned per-core (M1530) */
@@ -186,6 +187,32 @@ static int smp_run_one(void) {
 /* Wake every AP (all-but-self shorthand) with a fixed IPI at vector 0x40. Also
  * used by smpthread.c (M1530) to nudge a freshly-spawned thread's target core
  * out of hlt promptly, the same signal smp_parallel_for already relies on. */
+/* Fire the TLB-shootdown IPI at every other core (M1963). The LAPIC registers
+ * are private to this file, so the send lives here and the waiting/acking
+ * lives in vmm.c where the mapping change happens. */
+void smp_send_tlb_shootdown_ipi(void) {
+    lapic_wr(LAPIC_ICRLO, 0x41 | (1u << 14) | (3u << 18));     /* fixed, assert, all-but-self */
+}
+
+/* Prove the shootdown IPI round-trip works at boot (M1963).
+ *
+ * The mechanism is only NEEDED when a multi-threaded process changes its own
+ * mappings, which no boot path does -- but the risky part of it is the IPI
+ * itself: a vector that is never delivered, or an ack that never arrives,
+ * turns into a multi-second stall or a hang the first time a real workload
+ * triggers it. Firing one here means that path is exercised on every boot,
+ * where a failure is obvious instead of rare. */
+void smp_tlb_shootdown_selftest(void) {
+    if (smp_cpu_count <= 1) { kprintf("[ ok ] TLB shootdown: 1 core, nothing to shoot down\n"); return; }
+    unsigned long before = vmm_tlb_shootdown_count();
+    uint64_t t0 = timer_ms();
+    vmm_tlb_shootdown();
+    uint64_t took = timer_ms() - t0;
+    unsigned long after = vmm_tlb_shootdown_count();
+    kprintf("[ ok ] TLB shootdown IPI: %lu core(s) acked in %lums (count %lu -> %lu)\n",
+            (unsigned long)(smp_cpu_count - 1), (unsigned long)took, before, after);
+}
+
 void smp_wake_aps(void) {
     if (!lapic) return;
     lapic_wr(LAPIC_ICRLO, 0x40 | (1u << 14) | (3u << 18));     /* fixed, assert, all-but-self */

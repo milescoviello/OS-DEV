@@ -15,6 +15,7 @@
  * physical address doubles as a usable virtual address. (Once we have the
  * HHDM we could use that instead; identity is simplest while it covers RAM.)
  */
+#include "smp.h"    /* TLB shootdown IPI (M1963) */
 #include "vmm.h"
 #include "pmm.h"
 #include "string.h"
@@ -460,6 +461,67 @@ uint64_t vmm_pt_phys_in(uint64_t cr3, uint64_t virt) {
 /* Rewrite the access flags of an already-mapped 4 KiB page, keeping its frame
  * (for mprotect / W^X). `flags` are the new low bits (e.g. PTE_USER, plus maybe
  * PTE_WRITABLE / PTE_NX); PTE_PRESENT is always set. Returns 0/-1. M1090. */
+/* --- TLB shootdown (M1963) -------------------------------------------------
+ *
+ * invlpg only invalidates the TLB of the core that runs it. Once an address
+ * space can be live on more than one core at a time -- which is exactly what
+ * real threads brought (M1959) -- unmapping or write-protecting a page leaves
+ * every OTHER core free to keep using its cached translation: writing through
+ * a mapping that was just removed, or into a page that was just handed to
+ * someone else. It is a silent memory-corruption bug, and it is why the plan
+ * listed this as "a live correctness bug once real threads run on -smp 4".
+ *
+ * Implementation notes, both deliberate:
+ *
+ *  - A FULL local flush (CR3 reload) on the target, not a per-page invlpg.
+ *    Coarser and slower, but it needs no argument marshalling and cannot be
+ *    wrong about which page; shootdowns are rare next to ordinary faults.
+ *
+ *  - The wait for acknowledgement is BOUNDED, and gives up rather than
+ *    spinning forever. An unbounded wait here is a deadlock waiting to
+ *    happen: a core that is spinning on a lock with interrupts off can never
+ *    ack, and this kernel takes locks with IF=0 in many places. Giving up is
+ *    survivable -- the target flushes anyway the next time it enters this
+ *    address space -- and it is reported, once, rather than hidden. */
+static volatile int g_tlb_pending;
+static volatile int g_tlb_gaveup;
+static volatile unsigned long g_tlb_shootdowns;   /* how many we have actually performed */
+
+unsigned long vmm_tlb_shootdown_count(void) { return g_tlb_shootdowns; }
+
+void vmm_tlb_shootdown_ack(void) {
+    uint64_t c = read_cr3();
+    __asm__ volatile("mov %0, %%cr3" : : "r"(c) : "memory");   /* full local flush */
+    __atomic_sub_fetch(&g_tlb_pending, 1, __ATOMIC_RELEASE);
+}
+
+void vmm_tlb_shootdown(void) {
+    if (smp_cpu_count <= 1) return;             /* uniprocessor: invlpg was enough */
+    int others = smp_cpu_count - 1;
+    /* One shootdown at a time: the pending counter is global. A second caller
+     * simply waits its turn, which is fine -- these are rare. */
+    static volatile int lock;
+    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    __atomic_store_n(&g_tlb_pending, others, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_tlb_shootdowns, 1, __ATOMIC_RELAXED);
+    smp_send_tlb_shootdown_ipi();
+    /* A few milliseconds, not seconds. The first version spun 20 million times
+     * and a boot-time self-test measured the giving-up path at 15.9 SECONDS --
+     * which would have stalled every mprotect on a threaded process for that
+     * long the first time a core was slow to ack. An ack is an interrupt on an
+     * already-running core: if it has not arrived in this many spins it is not
+     * coming, and waiting longer buys nothing. (M1963) */
+    for (int spin = 0; spin < 200000 && __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) > 0; spin++)
+        __asm__ volatile("pause");
+    if (__atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) > 0 && !g_tlb_gaveup) {
+        g_tlb_gaveup = 1;
+        kprintf("[vmm] TLB shootdown timed out waiting for %d core(s) -- they will flush on next entry\n",
+                __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE));
+    }
+    __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+}
+
 int vmm_protect(uint64_t virt, uint64_t flags) {
     uint64_t f = vmm_lock_take();
     uint64_t *pml4 = phys_to_table(read_cr3() & ADDR_MASK);

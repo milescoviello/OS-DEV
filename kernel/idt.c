@@ -72,8 +72,9 @@ void idt_init(void) {
      * preemption source once lapic_timer_start_this_cpu has run for it —
      * every AP), and 0xFF = the LAPIC spurious-interrupt vector (must have a
      * gate or a stray spurious IRQ would #GP). All kernel-only gates. */
-    extern void isr64(void), isr66(void), isr255(void);
+    extern void isr64(void), isr65(void), isr66(void), isr255(void);
     set_gate(0x40, (uint64_t)isr64,  0, 0x8E);
+    set_gate(0x41, (uint64_t)isr65,  0, 0x8E);   /* TLB shootdown (M1963) */
     set_gate(0x42, (uint64_t)isr66,  0, 0x8E);
     set_gate(0xFF, (uint64_t)isr255, 0, 0x8E);
 

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1962-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1963-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -601,6 +601,15 @@ Landed so far, all on the from-scratch ext2 driver:
   directory listings at 64 entries (so `$(wildcard)` saw 62 of 136 sources).
   `make selfhosttest` proves it end to end — not part of `make check`, since
   compiling 136 real files under emulation takes fifteen minutes.
+
+- **M1963** — **TLB shootdown.** `invlpg` only invalidates the local core, so
+  once an address space could be live on several cores at once (M1959's
+  threads), unmapping or write-protecting a page left other cores using stale
+  translations — writing through a mapping that had just been revoked. A
+  dedicated IPI now flushes them, for multi-task address spaces only, with a
+  **bounded** wait (an unbounded one deadlocks against a core spinning on a lock
+  with interrupts off). A boot-time self-test caught the first version waiting
+  **15.9 seconds** for acks that were never coming; it now acks in 0 ms.
 
 Still ahead: Node, Claude Code, and Firefox on a from-scratch Wayland display
 path. The honest scale is still months, and the memory subsystem needs
