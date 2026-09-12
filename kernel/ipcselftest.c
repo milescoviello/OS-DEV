@@ -284,6 +284,59 @@ static void test_unixsock(void) {
     ck(unix_close(b) == 0, "unix_close closed endpoint B");
     ck(unix_recv(a, buf, sizeof buf) == 0, "unix_recv reports EOF once the peer closed");
     unix_close(a);
+
+    /* --- M1965: the behaviours the Linux ABI layer depends on ---------------
+     * Each of these was found by running real Node.js, and each presented as
+     * something other than what it was. They are asserted here so a regression
+     * costs a `make check`, not a twenty-minute guest run. */
+
+    /* HALF-CLOSE. shutdown(SHUT_WR) ends ONE direction: the peer reads EOF
+     * while this side can still receive. Accepting it and doing nothing (what
+     * we did until M1965) makes a finished connection look permanently open,
+     * so an event loop with no work left still cannot exit -- a hang with no
+     * error message anywhere. */
+    int c = -1, d = -1;
+    ck(unix_socketpair(&c, &d) == 0, "unix socketpair for the half-close test");
+    ck(unix_send(c, "hi", 2) == 2, "unix_send queued 2 bytes before the shutdown");
+    ck(unix_shutdown(c, 1 /*SHUT_WR*/) == 0, "unix_shutdown(SHUT_WR) accepted");
+    memset(buf, 0, sizeof buf);
+    ck(unix_recv(d, buf, sizeof buf) == 2 && buf[0] == 'h',
+       "bytes already queued survive the shutdown");
+    /* Gate every recv on unix_readable first. This file's rule is that a
+     * boot-path self-test must never call a blocking operation, and a
+     * half-close regression is exactly the case that would block: with
+     * unix_shutdown reverted to the no-op it used to be, this recv waits
+     * forever for an EOF that never comes, and the boot WEDGES instead of
+     * reporting a failure. Proven by reverting it. (M1965) */
+    int d_eof = unix_readable(d);
+    ck(d_eof, "the peer sees the connection as readable after SHUT_WR (a pending EOF)");
+    ck(d_eof && unix_recv(d, buf, sizeof buf) == 0, "the peer then reads EOF after SHUT_WR");
+    ck(unix_send(c, "x", 1) == -1, "sending on a shut-down write side fails");
+    ck(unix_send(d, "yo", 2) == 2, "the peer may still write back (HALF-close)");
+    memset(buf, 0, sizeof buf);
+    int c_rd = unix_readable(c);
+    ck(c_rd && unix_recv(c, buf, sizeof buf) == 2 && buf[0] == 'y',
+       "and the shut-down side may still read: the reverse direction stays open");
+    unix_close(c); unix_close(d);
+
+    /* A LISTENER'S NAME IS RELEASED when its socket closes. Without this a
+     * server that restarts finds its own path still bound, and a table of 32
+     * names is exhausted by a handful of restarts. */
+    int l1 = unix_listen("/run/ipcself");
+    ck(l1 >= 0, "unix_listen bound a name");
+    ck(unix_unlisten(l1) == 0, "unix_unlisten released it");
+    ck(unix_connect("/run/ipcself") == -1, "connecting to the released name fails");
+    int l2 = unix_listen("/run/ipcself");
+    ck(l2 >= 0, "the released name can be bound again");
+    if (l2 >= 0) unix_unlisten(l2);
+
+    /* An over-long name is REFUSED, not silently truncated. A truncated bind
+     * succeeds and then no connect ever matches it, which presents as "the
+     * server isn't running". */
+    char big[200]; big[0] = '/';
+    for (int i = 1; i < 199; i++) big[i] = 'n';
+    big[199] = 0;
+    ck(unix_listen(big) == -1, "unix_listen refuses a name too long to store");
 }
 
 /* --- System V IPC (semaphores + message queues) ---------------------------- */
@@ -350,6 +403,38 @@ static void test_procfs(void) {
     static vfs_dirent ents[64];
     int cnt = procfs_list("/proc", ents, 64);
     ck(cnt > 0, "procfs_list enumerated /proc");
+
+    /* --- M1965: synthetic FILES are stat-able and read-able through the VFS --
+     * procfs_read has generated these since M1216, but vfs_stat only ever knew
+     * about the /proc and /dev DIRECTORIES -- so stat said "no such file" for
+     * every node inside them and open() refused all of them. Node's probes of
+     * /proc/meminfo, /proc/stat and /dev/null therefore all failed against
+     * files that were right there. */
+    int chardev = -1;
+    ck(procfs_exists("/proc/meminfo", &chardev) == 1 && chardev == 0,
+       "procfs_exists finds /proc/meminfo and calls it a regular file");
+    ck(procfs_exists("/dev/null", &chardev) == 1 && chardev == 1,
+       "procfs_exists finds /dev/null and calls it a character device");
+    ck(procfs_exists("/dev/definitely_not_here", &chardev) == 0,
+       "procfs_exists rejects a /dev node that does not exist");
+
+    struct statx st;
+    ck(vfs_stat("/proc/meminfo", &st) == 0 && (st.stx_mode & S_IFMT) == S_IFREG,
+       "vfs_stat resolves /proc/meminfo as a regular file");
+    ck(vfs_stat("/dev/null", &st) == 0 && (st.stx_mode & S_IFMT) == S_IFCHR,
+       "vfs_stat resolves /dev/null as a character device");
+    ck(vfs_stat("/dev/definitely_not_here", &st) != 0,
+       "vfs_stat still reports a missing /dev node as absent");
+
+    memset(buf, 0, sizeof buf);
+    ck(vfs_pread("/proc/meminfo", buf, sizeof buf - 1, 0) > 0,
+       "vfs_pread served /proc/meminfo -- this is what open()+read() goes through");
+    ck(vfs_pread("/dev/null", buf, sizeof buf - 1, 0) == 0, "/dev/null reads as immediate EOF");
+    /* A character device is a STREAM. Applying a file's offset logic to it
+     * would report EOF on the second read of /dev/urandom. */
+    ck(vfs_pread("/dev/urandom", buf, 16, 0) == 16, "/dev/urandom yielded 16 bytes");
+    ck(vfs_pread("/dev/urandom", buf, 16, 4096) == 16,
+       "/dev/urandom yields more at a large offset: a char device is a stream, not a file");
 }
 
 void ipc_selftest(void) {

@@ -284,6 +284,8 @@ long sys_unix_send(int ep, const void *buf, unsigned long len) { return do_sysca
 long sys_unix_recv(int ep, void *buf, unsigned long max) { return do_syscall(SYS_unix_recv, ep, (long)buf, (long)max); }
 int  sys_unix_close(int ep) { return (int)do_syscall(SYS_unix_close, ep, 0, 0); }
 int  sys_unix_wait_any(const int *eps, int n) { return (int)do_syscall(SYS_unix_wait_any, (long)eps, n, 0); }
+int  sys_unix_shutdown(int ep, int how)      { return (int)do_syscall(SYS_unix_shutdown, ep, how, 0); }
+int  sys_unix_unlisten(int lid)              { return (int)do_syscall(SYS_unix_unlisten, lid, 0, 0); }
 int  sys_socketpair(int *sv) { return (int)do_syscall(SYS_socketpair, (long)sv, 0, 0); }
 int  sys_nice(int nice) { return (int)do_syscall(SYS_nice, nice, 0, 0); }
 int  sys_sched_setscheduler(int policy, int rt_priority) { return (int)do_syscall(SYS_sched_setscheduler, policy, rt_priority, 0); }

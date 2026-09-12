@@ -2777,6 +2777,86 @@ static int run_command(char *line, char *cwd) {
                 if (!ok) g_status = 1;
                 sys_munmap(region, SZ);
             }
+        } else if (streq(line, "sockabitest")) {
+            /* The socket behaviours the Linux ABI layer depends on (M1965).
+             *
+             * Every one of these was found by running real Node.js, and every
+             * one of them presented as something other than what it was: a
+             * half-close that did nothing became "the program hangs at exit",
+             * a listener name that outlived its socket became "the table is
+             * full", and an epoll_ctl that answered EINVAL instead of EEXIST
+             * became an abort() inside libuv. They are asserted here against
+             * the NATIVE syscalls so a regression is caught by `make check`
+             * rather than by a 20-minute Node run. */
+            int ok = 1;
+            { /* (A) HALF-CLOSE. After a's shutdown(SHUT_WR): b reads EOF, a can
+               *     still RECEIVE, and a's own sends now fail. */
+                int sv[2];
+                if (sys_socketpair(sv) != 0) { ok = 0; }
+                else {
+                    if (sys_unix_send(sv[0], "hi", 2) != 2) ok = 0;
+                    if (sys_unix_shutdown(sv[0], 1 /*SHUT_WR*/) != 0) ok = 0;
+                    char b[8];
+                    if (sys_unix_recv(sv[1], b, sizeof b) != 2) ok = 0;   /* buffered bytes survive the shutdown */
+                    if (sys_unix_recv(sv[1], b, sizeof b) != 0) ok = 0;   /* THEN EOF -- the whole point */
+                    if (sys_unix_send(sv[0], "x", 1) != -1) ok = 0;       /* our write side is closed */
+                    if (sys_unix_send(sv[1], "yo", 2) != 2) ok = 0;       /* the peer may still write to us */
+                    if (sys_unix_recv(sv[0], b, sizeof b) != 2) ok = 0;   /* and we may still read: HALF, not full */
+                    sys_unix_close(sv[0]); sys_unix_close(sv[1]);
+                }
+            }
+            { /* (B) A LISTENER'S NAME IS RELEASED on unlisten, and re-bindable. */
+                int lid = sys_unix_listen("/run/sabi");
+                if (lid < 0) ok = 0;
+                else {
+                    if (sys_unix_unlisten(lid) != 0) ok = 0;
+                    if (sys_unix_connect("/run/sabi") != -1) ok = 0;   /* nobody is listening any more */
+                    int l2 = sys_unix_listen("/run/sabi");             /* the name is free for reuse */
+                    if (l2 < 0) ok = 0; else sys_unix_unlisten(l2);
+                }
+            }
+            { /* (C) AN OVER-LONG NAME IS REFUSED, not silently truncated -- a
+               *     truncated bind succeeds and then no connect ever matches. */
+                char big[200]; int i = 0;
+                big[i++] = '/'; while (i < 199) big[i++] = 'n'; big[i] = 0;
+                if (sys_unix_listen(big) != -1) ok = 0;
+            }
+            { /* (D) epoll_ctl reports WHICH error. libuv treats EEXIST as
+               *     "already watching, MOD it" and aborts on anything else. */
+                int fds[2]; int ep = sys_epoll_create1(0);
+                if (ep < 3 || sys_pipe(fds) != 0) ok = 0;
+                else {
+                    struct epoll_event ev = { POLLIN, 1 };
+                    if (sys_epoll_ctl(ep, EPOLL_CTL_ADD, fds[0], &ev) != 0) ok = 0;
+                    if (sys_epoll_ctl(ep, EPOLL_CTL_ADD, fds[0], &ev) != -17) ok = 0;  /* -EEXIST */
+                    if (sys_epoll_ctl(ep, EPOLL_CTL_MOD, fds[1], &ev) != -2)  ok = 0;  /* -ENOENT */
+                    if (sys_epoll_ctl(ep, EPOLL_CTL_DEL, fds[1], 0)   != -2)  ok = 0;  /* -ENOENT */
+                    sys_fdclose(ep); sys_fdclose(fds[0]); sys_fdclose(fds[1]);
+                }
+            }
+            { /* (E) /dev and /proc FILES can be opened and read. The
+               *     directories always stat'd; their contents never did, so
+               *     open() refused every synthetic file in the tree. */
+                char b[64];
+                int dn = sys_open("/dev/null");
+                if (dn < 0) ok = 0;
+                else { if (sys_fdread(dn, b, sizeof b) != 0) ok = 0; sys_fdclose(dn); }   /* /dev/null: immediate EOF */
+                int mi = sys_open("/proc/meminfo");
+                if (mi < 0) ok = 0;
+                else { if (sys_fdread(mi, b, sizeof b) <= 0) ok = 0; sys_fdclose(mi); }   /* generated content */
+                int ur = sys_open("/dev/urandom");
+                if (ur < 0) ok = 0;
+                else {
+                    /* A char device is a STREAM: a second read must produce
+                     * more bytes, not the EOF a file's offset logic would give. */
+                    if (sys_fdread(ur, b, 16) != 16) ok = 0;
+                    if (sys_fdread(ur, b, 16) != 16) ok = 0;
+                    sys_fdclose(ur);
+                }
+            }
+            print(ok ? "sockabi: half-close(peer EOF, reverse still open) + listener name released/rebindable + long name refused + epoll_ctl EEXIST/ENOENT + /dev,/proc files open (urandom streams) -- OK\n"
+                     : "sockabitest: VERIFY FAILED\n");
+            if (!ok) g_status = 1;
         } else if (streq(line, "unixtest")) {   /* AF_UNIX path-keyed stream sockets: cross-fork byte round-trip (M1169) */
             int lid = sys_unix_listen("/run/ut");           /* bind BEFORE forking so the child can connect */
             if (lid < 0) { perr("unixtest: listen failed\n"); g_status = 1; }

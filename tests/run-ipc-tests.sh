@@ -85,6 +85,22 @@ require "sysv msgrcv selected mtype 9, skipping 7"                "SysV msgrcv s
 require "procfs does NOT claim a real disk path"                  "procfs_owns does not over-claim"
 require "procfs_read fails for a nonexistent node"                "procfs rejects unknown nodes"
 
+# M1965: the socket + synthetic-filesystem behaviours the Linux ABI layer needs.
+# Every one of these was found by running real Node.js, and every one presented
+# as something other than what it was -- a half-close that did nothing looked
+# like "the program hangs at exit", not like a missing shutdown().
+require "the peer then reads EOF after SHUT_WR"                   "AF_UNIX half-close delivers EOF to the peer"
+require "and the shut-down side may still read: the reverse direction stays open" "half-close is HALF: the reverse direction survives"
+require "sending on a shut-down write side fails"                 "a shut-down write side refuses further sends"
+require "connecting to the released name fails"                   "close() releases a listener's bound name"
+require "the released name can be bound again"                    "a released name is rebindable (a restart works)"
+require "unix_listen refuses a name too long to store"            "an over-long socket name is refused, not truncated"
+require "vfs_stat resolves /proc/meminfo as a regular file"       "/proc FILES are stat-able (open() needs this)"
+require "vfs_stat resolves /dev/null as a character device"       "/dev nodes report S_IFCHR"
+require "vfs_stat still reports a missing /dev node as absent"    "the /dev existence check does not over-claim"
+require "vfs_pread served /proc/meminfo -- this is what open()+read() goes through" "/proc files are readable through the VFS"
+require "/dev/urandom yields more at a large offset: a char device is a stream, not a file" "char devices stream instead of hitting EOF"
+
 # And the summary must report zero failures.
 if grep -qE "ipc self-test: [0-9]+ passed, 0 failed" "$SLOG"; then
     n=$(grep -oE "ipc self-test: [0-9]+ passed" "$SLOG" | grep -oE "[0-9]+" | head -1)
@@ -96,7 +112,7 @@ else
 fi
 
 if [ "$fail" -eq 0 ]; then
-    echo "PASS: in-guest POSIX IPC (mqueue priority order, sem O_CREAT/O_EXCL + non-blocking trywait, shm frame sharing + size cap, pty data path, flock exclusion/sharing/pid-release, inotify filtering, eventfd accumulate+drain, tmpfs pread/truncate/symlink, unixsock bidirectional + EOF, SysV IPC_NOWAIT + all-or-nothing semop + mtype selection, procfs ownership + unknown-node rejection)"
+    echo "PASS: in-guest POSIX IPC (mqueue priority order, sem O_CREAT/O_EXCL + non-blocking trywait, shm frame sharing + size cap, pty data path, flock exclusion/sharing/pid-release, inotify filtering, eventfd accumulate+drain, tmpfs pread/truncate/symlink, unixsock bidirectional + EOF + half-close + name release, SysV IPC_NOWAIT + all-or-nothing semop + mtype selection, procfs ownership + unknown-node rejection + synthetic files stat/read through the VFS)"
 else
     echo "FAIL: in-guest POSIX IPC self-test"; exit 1
 fi

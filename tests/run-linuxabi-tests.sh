@@ -156,9 +156,43 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # expired before the boot even got there and the test failed with glibc
     # having neither reached brk nor faulted. Waiting on either real outcome
     # makes it terminate as soon as the answer exists, pass or fail.
+    #
+    # M1965: wait for EVERY marker this boot asserts, not just one.
+    #
+    # The loop used to break on "LXTHREAD exit ->" alone and kill the VM 0.3s
+    # later -- but this boot launches EIGHT glibc processes CONCURRENTLY, and
+    # the threaded one is not reliably the last to finish. Whichever process
+    # had not printed yet lost its assertion, so the suite failed on a
+    # DIFFERENT line each run (the pipeline once, the dynamic binary's exit
+    # status the next) while a clean manual boot showed every marker present
+    # and correct. That is a harness race, not an ABI regression, and it was
+    # indistinguishable from one from the outside.
+    #
+    # Keep the early break for a panic or a #UD: those mean the remaining
+    # markers are never coming, and waiting the full timeout for them wastes
+    # five minutes per run.
+    lxfull_markers="XSAVE+AVX enabled
+static-PIE LIBC binary: argc=1 argv0=/hellolibc
+LXIO: wrote+read 200 lines
+LXBOX: pipeline wc=4 writer=0
+LXMMAP: MAP_FIXED honoured
+LXFMAP: file-backed mmap at offset 8192 read the right page
+LXVMAGAP: a 2MiB mmap next to an unaligned gap
+LXDYN: a dynamically-linked binary ran
+guest exited with status 11
+LXTHREAD: 4 threads
+[lxabi] LXTHREAD exit -> 17"
     i=0
     while [ $i -lt 560 ]; do
-        grep -aqE "LXTHREAD exit ->|Invalid Opcode|KERNEL PANIC" "$SLOG3" 2>/dev/null && break
+        grep -aqE "Invalid Opcode|KERNEL PANIC" "$SLOG3" 2>/dev/null && break
+        missing=0
+        IFS='
+'
+        for m in $lxfull_markers; do
+            grep -aqF "$m" "$SLOG3" 2>/dev/null || { missing=1; break; }
+        done
+        unset IFS
+        [ "$missing" -eq 0 ] && break
         sleep 0.5; i=$((i+1))
     done
 
@@ -245,6 +279,17 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # argc/argv0 is the assertion, not just "it ran": a program whose argv is
     # wrong got a stack the loader built by accident. ld.so is passed the
     # EXECUTABLE's argv, and getting that wrong makes it try to load itself.
+    # M1965. A mapping >= 2 MiB used to be aligned up to 2 MiB AFTER its gap was
+    # chosen, which could place it on top of the VMA that followed -- two VMAs
+    # owning the same pages, and the first munmap freeing the frames out from
+    # under the other. The assertion is on the DATA (the neighbouring region's
+    # contents survive), not on addresses: an overlap that happened to do no
+    # damage is not the thing being guarded against.
+    if grep -aq "LXVMAGAP: a 2MiB mmap next to an unaligned gap did not alias" "$SLOG3"; then
+        echo "  ok: a big anonymous mmap next to an unaligned gap did not alias its neighbour"
+    else
+        echo "  FAIL: a big mmap overlapped an existing mapping:"; grep -a "LXVMAGAP" "$SLOG3" | head -2; f3=1
+    fi
     if grep -aq "LXDYN: a dynamically-linked binary ran, argc=1 argv0=/lxdyn" "$SLOG3"; then
         echo "  ok: ld-linux-x86-64.so.2 ran, mapped libc.so.6 and started a dynamic binary"
     else

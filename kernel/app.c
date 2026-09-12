@@ -21,6 +21,7 @@
 #include "timer.h"
 #include "interrupts.h"   /* struct registers, for ring-3 signal delivery */
 #include "vmm.h"
+#include "unixsock.h"   /* AF_UNIX sockets live in the fd table now (M1965) */
 #include "pmm.h"
 #include "vdso.h"
 #include "elf.h"
@@ -262,7 +263,7 @@ struct app {
      * refcounting to free safely -- exactly the use-after-free shape the M1926
      * review found. A real 4096-byte PATH_MAX therefore wants an interned path
      * pool, which is its own milestone rather than a constant bump. */
-    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; } fd[APP_NFD];   /* cloexec at END to keep the positional initializers valid (M1218) */
+    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; } fd[APP_NFD];   /* cloexec/nonblock at END to keep the positional initializers valid (M1218/M1965) */
     /* seccomp-BPF self-filter (M1190): a process installs a bpf.c program that
      * vets its own syscalls. Zero on spawn/fork; inherited across fork; once set
      * it's permanent (privilege drop is one-way). Empty => no filtering overhead. */
@@ -2109,9 +2110,25 @@ uint64_t app_mmap(uint64_t len) {
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (a->nvma >= APP_MAXVMA) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    uint64_t addr = vma_find_gap(a, len, 0);
+    /* Ask for the alignment UP FRONT. This used to find an unaligned gap and
+     * then round the result up to 2 MiB afterwards (M1168, so MADV_COLLAPSE
+     * could fold big regions) -- which walks the mapping up to 2 MiB - 4 KiB
+     * PAST the gap that was just verified, onto whatever VMA follows it, and
+     * nothing re-checked. Two VMAs then owned the same pages, and the first
+     * munmap of either freed the frames out from under the other.
+     *
+     * It presented as Node intermittently dying AFTER a successful socket
+     * round-trip, reading a pointer out of a region it still owned:
+     *   [fault] UNMAPPED 700000000 err=4: no VMA (nearest below 160021000-164000000)
+     * Only mappings >= 2 MiB were affected, and only when a VMA happened to
+     * sit right after the chosen gap, which is why it came and went. V8
+     * allocates many multi-MiB regions, so Node reproduced it in roughly one
+     * run in three; smaller allocations never could. (M1965)
+     *
+     * vma_find_gap has always taken an `align` argument -- it was simply never
+     * passed one. */
+    uint64_t addr = vma_find_gap(a, len, len >= HUGE_SIZE ? HUGE_SIZE : 0);
     if (!addr) return 0;
-    if (len >= HUGE_SIZE) addr = (addr + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);   /* 2 MiB-align big anon regions so MADV_COLLAPSE can fold them (M1168) */
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
     VMA_NEW(a);
     a->vma[a->nvma].start = addr;
@@ -2860,19 +2877,24 @@ int app_mprotect(uint64_t addr, uint64_t len, int prot) {
             if (!in) covered = 0;
         }
     }
-    if (covered) {
-        /* PROT_NONE records as READ, because we have no "reserved but
-         * inaccessible" state -- which is exactly what the old code did too
-         * (PTE_USER|PTE_NX), so this changes nothing. 0 is reserved for
-         * "never recorded". */
+    /* Record the protection on the VMA REGARDLESS of whether every page of the
+     * range is currently inside one. The VMA is what app_fault_handle consults
+     * for pages that are not resident yet, so skipping this leaves a
+     * later-faulted page with the OLD protection -- which is fatal for a JIT:
+     * V8 maps a code region RW, writes into it, mprotects it RX, and then
+     * EXECUTES pages that had never been touched. They faulted in read-only
+     * and Node died with "instruction fetch from a non-executable mapping".
+     * (M1965) */
+    {
         uint8_t np = (uint8_t)((prot & 0x7) ? (prot & 0x7) : VMA_PROT_READ);
-        /* Make a0 and end VMA boundaries first, so only fully-covered VMAs
-         * take the new protection. */
-        if (app_vma_split_at(a, a0) != 0 || app_vma_split_at(a, end) != 0) return -1;
-        for (int i = 0; i < a->nvma; i++) {
-            uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
-            if (s0 >= a0 && e0 <= end) a->vma[i].prot = np;
-        }
+        if (a && app_vma_split_at(a, a0) == 0 && app_vma_split_at(a, end) == 0)
+            for (int i = 0; i < a->nvma; i++) {
+                uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+                if (s0 >= a0 && e0 <= end) a->vma[i].prot = np;
+            }
+    }
+    if (covered) {
+        /* (the VMA prot was already recorded above, for both paths) */
         for (uint64_t p = a0; p < end; p += PAGE_SIZE)
             if (vmm_translate(p)) { if (vmm_protect(p, flags) < 0) return -1; }
         app_tlb_sync(a);                /* a tightened mapping another core still caches is a write-after-revoke (M1963) */
@@ -3234,6 +3256,20 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
             return 1;
         }
+    }
+    /* Falling out of the VMA walk means NOTHING maps this address. The caller
+     * only says "terminating it", which cannot distinguish a wild jump from a
+     * mapping we failed to create -- and those need opposite fixes. Name the
+     * two neighbours so the gap is visible. (M1965) */
+    {
+        uint64_t below = 0, below_end = 0, above = ~0ull;
+        for (int i = 0; i < a->nvma; i++) {
+            uint64_t st = a->vma[i].start, en = st + a->vma[i].len;
+            if (en <= fpage && en > below_end) { below = st; below_end = en; }
+            if (st > fpage && st < above)      { above = st; }
+        }
+        kprintf("[fault] UNMAPPED %lx err=%lx: no VMA (nearest below %lx-%lx, next above %lx, %d vmas)\n",
+                fpage, err, below, below_end, above == ~0ull ? 0 : above, a->nvma);
     }
     return 0;
 }
@@ -4585,6 +4621,16 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: read through the line discipline (M1274) */
         return pty_read(a->fd[fd].obj, buf, max);
     }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 12) {  /* AF_UNIX endpoint: recv (M1965) */
+        if (a->fd[fd].obj < 0) return -1;                                     /* socket() but never connected */
+        /* unix_recv BLOCKS. An event loop reads until EAGAIN, so on a
+         * non-blocking socket "no data" must come back as EAGAIN and not as a
+         * task_block() that never returns -- that would hang the loop with the
+         * one thread that was supposed to service it. */
+        if (app_fd_nonblock(fd) && !unix_readable(a->fd[fd].obj)) return APP_FD_EAGAIN;
+        return unix_recv(a->fd[fd].obj, buf, max);
+    }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 13) return -1;  /* a listener is not readable */
     int idx = fd_pipe_idx(a, fd, 0); if (idx < 0) return -1;
     return pipe_read(idx, buf, max);
 }
@@ -4674,6 +4720,16 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: master write feeds the ldisc, slave write -> master output (M1274) */
         return pty_write(a->fd[fd].obj, buf, len);
     }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 12) {  /* AF_UNIX endpoint: send (M1965) */
+        if (a->fd[fd].obj < 0) return -1;
+        long w = unix_send(a->fd[fd].obj, buf, len);
+        /* A dead peer is EPIPE, not EBADF. Node reported "write EBADF" on a
+         * connection that was fine, because this whole case was MISSING and
+         * the write fell through to fd_pipe_idx() -- which of course found no
+         * pipe behind a socket fd and returned -1. Every socket call in the
+         * trace had succeeded; the byte path simply did not exist. */
+        return (w < 0) ? APP_FD_EPIPE : w;
+    }
     int idx = fd_pipe_idx(a, fd, 1); if (idx < 0) return -1;
     long pw = pipe_write(idx, buf, len);
     if (pw == -1) app_request_signal(a, SIGPIPE);   /* no readers left (EPIPE) -> also SIGPIPE, like real POSIX (M1581) */
@@ -4696,6 +4752,24 @@ long app_pwrite(int fd, const void *buf, unsigned long len, long off) {
 }
 static void epoll_ref(int idx);    /* defined with the epoll table below (M1220) */
 static void epoll_unref(int idx);
+/* O_NONBLOCK as a real per-fd property (M1965). fcntl(F_SETFL) used to be a
+ * no-op that returned 0, which is the worst of both worlds: the caller
+ * believes the fd is non-blocking and then a read blocks its event loop
+ * forever. */
+int app_fd_nonblock(int fd) {
+    struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return 0;
+    return a->fd[fd].nonblock ? 1 : 0;
+}
+int app_fd_set_nonblock(int fd, int on) {
+    struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    a->fd[fd].nonblock = on ? 1 : 0;
+    return 0;
+}
+int app_fd_type(int fd) {
+    struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    return a->fd[fd].type;
+}
+
 int app_fd_close(int fd) {
     struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
     if (a->fd[fd].type == 1) pipe_close_end(a->fd[fd].obj, a->fd[fd].write_end);
@@ -4704,6 +4778,8 @@ int app_fd_close(int fd) {
     else if (a->fd[fd].type == 8) inotify_free(a->fd[fd].obj);  /* free the inotify instance (M1266) */
     else if (a->fd[fd].type == 10) net_tcp_sock_close(a->fd[fd].obj);  /* close the TCP connection (M1268) */
     else if (a->fd[fd].type == 11) pty_close(a->fd[fd].obj);    /* close this pty end, waking the peer (M1274) */
+    else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
+    else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
     a->fd[fd].used = 0; a->fd[fd].type = 0;
     return 0;
 }
@@ -4977,19 +5053,110 @@ int app_inotify_rm(int fd, int wd) {
 static uint16_t g_ephemeral = 49152;
 int app_socket(int domain, int type) {
     struct app *a = cur(); if (!a) return -1;
-    if (domain != 2 /*AF_INET*/) return -1;
+    /* SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC (0x80000) ride in the type
+     * argument on Linux -- libuv always passes both, so `type` arrives as
+     * 0x80801 for SOCK_STREAM. Masking them off without RECORDING them is how
+     * a socket ends up blocking despite the caller having asked for the
+     * opposite. (M1965) */
+    int nb = (type & 0x800) ? 1 : 0, coe = (type & 0x80000) ? 1 : 0;
+    type &= 0xF;
+    if (domain != 2 /*AF_INET*/ && domain != 1 /*AF_UNIX*/) return -1;
     if (type != 2 /*SOCK_DGRAM*/ && type != 1 /*SOCK_STREAM*/) return -1;
     int fd = -1;
     if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
+    if (domain == 1) {
+        /* AF_UNIX (M1965). unixsock.c has been a complete implementation since
+         * M1169, but its endpoints were bare integers OUTSIDE the fd table --
+         * so they could not be read(), written(), closed() or POLLED like
+         * anything else, which is exactly what a program expects of a socket.
+         * obj = -1 means created but neither bound nor connected yet; bind
+         * records the path on the fdent, listen turns it into type 13. */
+        a->fd[fd] = (struct fdent){ 1, 12, 0, -1, {0}, 0, 0, 0 };
+        a->fd[fd].nonblock = (uint8_t)nb; a->fd[fd].cloexec = (uint8_t)coe;
+        return fd;
+    }
     if (type == 1) {                                       /* SOCK_STREAM: a TCP client socket (M1268) */
         int idx = net_tcp_sock_open(); if (idx < 0) return -1;
         a->fd[fd] = (struct fdent){ 1, 10, 0, idx, {0}, 0, 0 };  /* type=AF_INET stream, obj=TCB slot */
     } else {
         a->fd[fd] = (struct fdent){ 1, 9, 0, 0, {0}, 0, 0 };     /* type=AF_INET dgram, off=0 (unbound) */
     }
+    a->fd[fd].nonblock = (uint8_t)nb; a->fd[fd].cloexec = (uint8_t)coe;
     return fd;
 }
+/* --- AF_UNIX over the fd table (M1965) -------------------------------------
+ * Thin adapters: all the real work has existed in unixsock.c since M1169.
+ * fd type 12 = a connected endpoint (obj = ep id), 13 = a listener
+ * (obj = listener id). Linux splits naming across bind() and listen(), so
+ * bind just records the path on the fdent (which already has a 256-byte path
+ * field) and listen is what actually claims the name. */
+int app_unix_bind(int fd, const char *path) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 12) return -1;
+    int i = 0; for (; path[i] && i < (int)sizeof a->fd[fd].path - 1; i++) a->fd[fd].path[i] = path[i];
+    a->fd[fd].path[i] = 0;
+    return path[i] ? -1 : 0;                  /* refuse a truncated name rather than bind the wrong one */
+}
+int app_unix_listen(int fd) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 12) return -1;
+    if (!a->fd[fd].path[0]) return -1;         /* listen() before bind() */
+    int lid = unix_listen(a->fd[fd].path);
+    if (lid < 0) return -1;
+    a->fd[fd].type = 13; a->fd[fd].obj = lid;
+    return 0;
+}
+int app_unix_accept(int fd) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 13) return -1;
+    int ep = unix_accept_nb(a->fd[fd].obj);    /* never block: a server polls first */
+    /* "No connection waiting" is EAGAIN, not a bad descriptor. libuv calls
+     * accept in a loop until it gets EAGAIN; any other error makes it tear the
+     * listener down. */
+    if (ep < 0) return APP_FD_EAGAIN;
+    int nf = -1;
+    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
+    if (nf < 0) { unix_close(ep); return -1; } /* no fd for it: don't leak the endpoint */
+    a->fd[nf] = (struct fdent){ 1, 12, 0, ep, {0}, 0, 0 };
+    a->fd[nf].nonblock = a->fd[fd].nonblock;   /* accept4 flags override this at the ABI layer */
+    return nf;
+}
+int app_unix_connect(int fd, const char *path) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 12) return -1;
+    int ep = unix_connect(path);
+    if (ep < 0) return -1;
+    a->fd[fd].obj = ep;
+    return 0;
+}
+/* shutdown(2) on an AF_UNIX fd (M1965): end this side's write direction so the
+ * peer reads EOF. */
+int app_unix_shutdown(int fd, int how) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 12) return -1;
+    if (a->fd[fd].obj < 0) return -1;
+    return unix_shutdown(a->fd[fd].obj, how);
+}
+/* socketpair(2): two already-connected endpoints, each in its own fd. */
+int app_unix_socketpair(int *out) {
+    struct app *a = cur(); if (!a || !out) return -1;
+    int x = -1, y = -1;
+    if (unix_socketpair(&x, &y) != 0) return -1;
+    int f0 = -1, f1 = -1;
+    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { f0 = i; break; }
+    if (f0 >= 0) { a->fd[f0] = (struct fdent){ 1, 12, 0, x, {0}, 0, 0 }; }
+    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { f1 = i; break; }
+    if (f0 < 0 || f1 < 0) {                    /* unwind: never hand back half a pair */
+        if (f0 >= 0) { a->fd[f0].used = 0; }
+        unix_close(x); unix_close(y);
+        return -1;
+    }
+    a->fd[f1] = (struct fdent){ 1, 12, 0, y, {0}, 0, 0 };
+    out[0] = f0; out[1] = f1;
+    return 0;
+}
+
 /* connect(2) for a TCP socket fd (M1268): active-open to ip:port. */
 int app_connect(int fd, const uint8_t ip[4], int port) {
     struct app *a = cur(); if (!a) return -1;
@@ -5119,8 +5286,12 @@ long app_sendfile(int out_fd, int in_fd, long *off, unsigned long count) {
  * A small global table of interest sets, referenced by the fd table as type 6.
  * epoll_wait reuses the per-type readiness ladder (app_fd_ready) the poll(2)
  * loop already drives; refcounted across fork/dup2 like a memfd/pipe. */
-#define NEPOLL 8
-#define EP_MAX 32
+#define NEPOLL 32                /* concurrent epoll instances; Node makes one per loop, plus libuv internals (M1965) */
+/* M1965: 32 watched fds per epoll instance was sized for the in-tree shell
+ * test. A Node event loop registers every socket, pipe, timerfd and signalfd
+ * it owns in ONE instance, so 32 is an arbitrary ceiling on how much a program
+ * may do at once -- and hitting it looked like a random socket failure. */
+#define EP_MAX 256
 static struct epollobj { int used, refs, n; struct { int fd, events, last_ready; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
 static void epoll_ref(int idx)   { if (idx >= 0 && idx < NEPOLL && epolls[idx].used) epolls[idx].refs++; }
 static void epoll_unref(int idx) { if (idx >= 0 && idx < NEPOLL && epolls[idx].used && --epolls[idx].refs <= 0) epolls[idx].used = 0; }
@@ -5135,14 +5306,23 @@ int app_epoll_create(void) {
     a->fd[fd] = (struct fdent){ 1, 6, 0, idx, {0}, 0, 0 };   /* used, type=epoll, obj=idx */
     return fd;
 }
+/* Returns 0, or a NEGATIVE LINUX ERRNO (M1965).
+ *
+ * It used to return a bare -1 for every failure, and that is not a detail an
+ * epoll caller can shrug off: libuv ADDs a descriptor it may already be
+ * watching and treats EEXIST as "fine, MOD it instead" -- while any OTHER
+ * error is a hard abort(). Node died on
+ *   uv__io_poll: Assertion `errno == EEXIST' failed
+ * because we answered EINVAL. Callers of the native path only ever test
+ * != 0, so widening the contract costs them nothing. */
 int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data) {
     struct app *a = cur();
-    if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -1;
-    if (fd < 0 || fd >= APP_NFD) return -1;
+    if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -9;   /* EBADF */
+    if (fd < 0 || fd >= APP_NFD) return -9;                                                           /* EBADF */
     struct epollobj *e = &epolls[a->fd[epfd].obj];
     if (op == EPOLL_CTL_ADD) {
-        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) return -1;   /* already registered */
-        if (e->n >= EP_MAX) return -1;
+        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) return -17;   /* EEXIST: already registered */
+        if (e->n >= EP_MAX) return -28;                                        /* ENOSPC: instance full */
         e->items[e->n].fd = fd; e->items[e->n].events = (int)events; e->items[e->n].data = data;
         e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
         e->n++;
@@ -5154,13 +5334,13 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
             e->items[i].last_ready = 0;   /* M1545: a changed interest set re-arms the edge, same spirit as a fresh ADD */
             return 0;
         }
-        return -1;
+        return -2;                                                             /* ENOENT: not registered */
     }
     if (op == EPOLL_CTL_DEL) {
         for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { e->items[i] = e->items[--e->n]; return 0; }
-        return -1;
+        return -2;                                                             /* ENOENT */
     }
-    return -1;
+    return -22;                                                                /* EINVAL: unknown op */
 }
 /* One non-blocking pass: fill `out` with the ready members. Returns the count,
  * or -1 for a bad epfd. The SYS_epoll_wait dispatch wraps this in the poll
@@ -5238,6 +5418,17 @@ int app_fd_ready(app_t *ap, int fd, int events) {
     } else if (a->fd[fd].type == 11) {                     /* pty: POLLIN when readable, always writable (M1274) */
         if ((events & POLLIN) && pty_ready(a->fd[fd].obj)) re |= POLLIN;
         if (events & POLLOUT) re |= POLLOUT;
+    } else if (a->fd[fd].type == 12) {                     /* AF_UNIX endpoint (M1965) */
+        /* This is the whole point of putting AF_UNIX in the fd table: an event
+         * loop has to be able to POLL a socket, and POLLNVAL made that
+         * impossible. unix_readable is the same predicate unix_wait_any uses,
+         * exported so it can be asked without blocking. */
+        if ((events & POLLIN) && a->fd[fd].obj >= 0 && unix_readable(a->fd[fd].obj)) re |= POLLIN;
+        if (events & POLLOUT) re |= POLLOUT;               /* the ring drains quickly; a blocked send is brief */
+    } else if (a->fd[fd].type == 13) {                     /* AF_UNIX listener (M1965) */
+        /* POLLIN on a listening socket means "accept() would not block", which
+         * is exactly what a server's event loop waits for. */
+        if ((events & POLLIN) && unix_pending(a->fd[fd].obj)) re |= POLLIN;
     } else {
         return POLLNVAL;
     }

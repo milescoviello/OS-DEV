@@ -97,7 +97,13 @@ int    app_eventfd_create(unsigned int initval, int flags);  /* pollable u64-cou
 int    app_inotify_init(void);                       /* a pollable filesystem-watch fd (M1266) */
 int    app_inotify_add(int fd, const char *path, unsigned int mask);  /* register a watch; wd/-1 (M1266) */
 int    app_inotify_rm(int fd, int wd);                /* unregister a watch by wd; 0/-1 (M1568) */
-int    app_socket(int domain, int type);             /* AF_INET SOCK_DGRAM socket fd; fd/-1 (M1267) */
+int    app_socket(int domain, int type);
+int    app_unix_bind(int fd, const char *path);   /* AF_UNIX: record the name (M1965) */
+int    app_unix_listen(int fd);                   /* AF_UNIX: claim the name, fd becomes a listener */
+int    app_unix_accept(int fd);                   /* AF_UNIX: non-blocking accept -> new fd; -1 if none */
+int    app_unix_connect(int fd, const char *path);/* AF_UNIX: connect to a listener */
+int    app_unix_shutdown(int fd, int how); /* AF_UNIX: half-close (SHUT_WR -> peer EOF) (M1965) */
+int    app_unix_socketpair(int *out);             /* AF_UNIX: two connected fds; 0/-1 */             /* AF_INET SOCK_DGRAM socket fd; fd/-1 (M1267) */
 int    app_sock_bind(int fd, int port);              /* bind a datagram socket to a local port; 0/-1 (M1267) */
 long   app_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len);  /* bytes/-1 (M1267) */
 long   app_recvfrom(int fd, void *buf, int max, unsigned char srcip[4], unsigned short *srcport);  /* bytes/-1 (M1267) */
@@ -193,8 +199,18 @@ int  app_tcsetpgrp(int pgid);          /* set the console's foreground process g
 int  app_tcgetpgrp(void);              /* the console's foreground process group (0 = none) */
 int  app_killpg(int pgid, int signo);  /* deliver signo to every app in pgid (killpg); count/-1 */
 int  app_pipe(int *out);               /* pipe(): out[0]=read fd, out[1]=write fd; 0/-1 (M1187) */
+/* Negative returns from app_fd_read/app_fd_write. Historically every failure
+ * was a bare -1, which the Linux ABI layer had no choice but to report as
+ * EBADF -- and "EBADF" on a healthy socket sends the caller looking for a
+ * descriptor bug that isn't there. A socket needs two failures told apart from
+ * a bad fd: "nothing right now" and "the peer is gone". (M1965) */
+#define APP_FD_EAGAIN (-11)   /* would block; the value is Linux's EAGAIN */
+#define APP_FD_EPIPE  (-32)   /* peer closed;  the value is Linux's EPIPE  */
 long app_fd_read(int fd, void *buf, unsigned long max);        /* read a pipe fd; bytes/0 EOF/-1 (M1187) */
 long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe fd; bytes/-1 EPIPE (M1187) */
+int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
+int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
+int  app_fd_type(int fd);                                      /* fd-table type, or -1 if not open (M1965) */
 long app_pread(int fd, void *buf, unsigned long max, long off);        /* read a FILE fd without moving its cursor; bytes/0 EOF/-1 (M1572) */
 long app_pwrite(int fd, const void *buf, unsigned long len, long off); /* write a FILE fd without moving its cursor; bytes/-1 (M1572) */
 int  app_fd_close(int fd);             /* close an fd; 0/-1 (M1187) */
@@ -224,7 +240,7 @@ uint64_t app_aslr_base(int pid);                           /* the ASLR-randomize
 long app_getdents64(void *buf, unsigned long max, int start); /* packed dirent64 of the cwd; bytes/0/-1 (M1223) */
 struct epoll_event;                                        /* full definition in syscall.h (M1220) */
 int  app_epoll_create(void);                               /* an epoll fd (>=3); -1 (M1220) */
-int  app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data); /* ADD/MOD/DEL; 0/-1 (M1220) */
+int  app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data); /* ADD/MOD/DEL; 0 or a NEGATIVE LINUX ERRNO (M1220/M1965) */
 int  app_epoll_check(int epfd, struct epoll_event *out, int maxevents);  /* one non-blocking readiness pass; count/-1 (M1220) */
 int  app_open(const char *path, int flags);   /* open a FILE fd (O_RDONLY default; O_WRONLY/APPEND/TRUNC/CREAT); fd(>=3)/-1 (M1193/M1195) */
 long app_pts_number(int fd);                   /* ptsname: the /dev/pts/<n> index for a /dev/ptmx master fd, or -1 (M1274) */

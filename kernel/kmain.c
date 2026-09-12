@@ -756,6 +756,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             app_spawn_linux_from_file("/disk2/lxmmap");
             kprintf("[lxabi] launching the file-backed mmap (offset) test...\n");
             app_spawn_linux_from_file("/disk2/lxfmap");
+            /* A big anonymous mmap must not land on top of an existing
+             * mapping. app_mmap used to align the result to 2 MiB AFTER
+             * finding its gap, walking it onto the next VMA -- see
+             * tools/lx/lxvmagap.c. (M1965) */
+            kprintf("[lxabi] launching the big-mmap VMA overlap test...\n");
+            app_spawn_linux_from_file("/disk2/lxvmagap");
             /* The Phase 4 gate: a DYNAMICALLY-LINKED binary, which needs
              * PT_INTERP + ld.so + libc.so.6 all working. */
             kprintf("[lxabi] launching a DYNAMICALLY-LINKED binary...\n");
@@ -891,6 +897,22 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxnode] running JavaScript that does FILE I/O...\n");
             rc = app_run_linux_sync("/disk2/usr/bin/node", av_nf, 2, 600000);
             kprintf("[lxnode] node fs -> %d\n", rc);
+
+            /* REAL SOCKETS: a server and a client over AF_UNIX, driven by
+             * Node's own event loop. This is the assertion that matters for
+             * Phase 6 -- it exercises socket/bind/listen/accept/connect plus
+             * epoll readiness and read/write, all through the fd table. */
+            vfs_remove("/disk2/nodesock");
+            static const char *av_ns[] = { "-e",
+                "const net=require('net');"
+                "const s=net.createServer(c=>c.on('data',d=>c.write('echo:'+d)));"
+                "s.listen('/nodesock',()=>{const k=net.connect('/nodesock',()=>k.write('ping'));"
+                "k.on('data',d=>{console.log('LXNODESOCK:',d.toString());k.end();s.close();});});" };
+            kprintf("[lxnode] running JavaScript that uses SOCKETS...\n");
+            if (g_lxtrace_make) g_lx_systrace = 1;
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_ns, 2, 600000);
+            g_lx_systrace = 0;
+            kprintf("[lxnode] node net -> %d\n", rc);
         }
         if (g_lxgcc_test) {
             /* PHASE 5, ON ITS OWN BOOT: the real GCC DRIVER compiling OS-DEV's

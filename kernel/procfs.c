@@ -454,11 +454,41 @@ static const char *dev_files[] = { "null", "zero", "random", "urandom", "full", 
 #define NPROC (int)(sizeof(proc_files)/sizeof(proc_files[0]))
 #define NDEV  (int)(sizeof(dev_files)/sizeof(dev_files[0]))
 
+static int proc_pid_path(const char *abs, int *pid, const char **file);   /* defined below (M1965) */
 int procfs_is_dir(const char *abs) {
     return peq(abs, "/proc") || peq(abs, "/proc/") || peq(abs, "/dev") || peq(abs, "/dev/");
 }
 int procfs_owns(const char *abs) {
     return startswith(abs, "/proc/") || startswith(abs, "/dev/") || procfs_is_dir(abs);
+}
+
+/* Does this synthetic node actually EXIST, and is it a character device?
+ * (M1965)
+ *
+ * procfs_owns() answers "is this path ours", which is a different question:
+ * /dev/wumpus is ours and is not there. Until now nothing could tell the two
+ * apart, so vfs_stat reported every /proc and /dev file as absent, open()
+ * refused them, and Node's probes of /proc/meminfo, /proc/stat and /dev/null
+ * all failed against files procfs.c has generated since M1216.
+ *
+ * chardev matters separately: a runtime that opens /dev/null checks S_IFCHR
+ * before trusting it to swallow output. */
+int procfs_exists(const char *abs, int *chardev) {
+    if (chardev) *chardev = 0;
+    if (procfs_is_dir(abs)) return 1;
+    if (startswith(abs, "/dev/")) {
+        const char *f = abs + 5;
+        for (int i = 0; i < NDEV; i++) if (peq(f, dev_files[i])) { if (chardev) *chardev = 1; return 1; }
+        return 0;
+    }
+    if (startswith(abs, "/proc/")) {
+        const char *f = abs + 6;
+        for (int i = 0; i < NPROC; i++) if (peq(f, proc_files[i].name)) return 1;
+        int pid; const char *sub;                 /* /proc/<pid>/... and /proc/self/... */
+        if (proc_pid_path(abs, &pid, &sub)) return 1;
+        return 0;
+    }
+    return 0;
 }
 
 /* --- per-process /proc/<pid>/{status,cmdline,ctl} (Plan 9 / Linux style) --- */

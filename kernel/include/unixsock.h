@@ -21,4 +21,9 @@ int  unix_close(int ep);                                       /* close one endp
 int  unix_wait_any(const int *eps, int n);                     /* poll/epoll: index of first readable ep (blocks once); -1 (M1170) */
 int  unix_socketpair(int *a, int *b);                          /* socketpair(2): a pre-connected endpoint pair, no path; 0/-1 (M1254) */
 int  unix_ep_conn(int ep);                                     /* connection index behind an endpoint (SCM_RIGHTS key); -1 invalid (M1265) */
+int  unix_readable(int ep);      /* non-blocking: is there data (or a closed peer)? for poll/epoll (M1965) */
+int  unix_pending(int lid);      /* non-blocking: would accept() succeed? (M1965) */
+int  unix_accept_nb(int lid);    /* accept without blocking; -1 if nothing pending (M1965) */
+int  unix_unlisten(int lid);     /* release a listener's name on close(); 0/-1 (M1965) */
+int  unix_shutdown(int ep, int how);  /* half-close: SHUT_WR gives the peer EOF; 0/-1 (M1965) */
 int  unix_format(char *b, int max);                            /* /proc/unix table */

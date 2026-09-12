@@ -19,6 +19,16 @@ make nettest     # TCP/IP stack   — tests/net/net_test.c   (packet parse + rea
 # gained its -cpu max boot (M1942). That is not overhead to tune away -- TCG has
 # to EMULATE AVX, and without a CPU that has AVX the XSAVE path would never
 # execute in the whole suite, so a green run would prove nothing about it.
+make nodetest    # NODE.JS — PHASE 6. Boots OS-DEV and runs the real, unmodified
+                 #                102 MB `node` binary (21 shared libraries) off the ext2
+                 #                volume: --version, then JavaScript, then the fs module,
+                 #                then a `net` SERVER AND CLIENT over a real AF_UNIX
+                 #                socket -- listen/connect/accept/echo/half-close and a
+                 #                clean exit 0. Each step is strictly harder than the
+                 #                last, and the exit status is asserted separately from
+                 #                the echo: a missing half-close still echoes and then
+                 #                hangs forever (M1965). NOT part of `make check`: each
+                 #                Node start is minutes under TCG.
 make selfhosttest # SELF-HOSTING — PHASE 5. Boots OS-DEV, has GNU make drive the
                  #                in-guest gcc/as/ld over all 136 kernel sources, then
                  #                pulls the resulting kernel32.elf out of the ext2 image

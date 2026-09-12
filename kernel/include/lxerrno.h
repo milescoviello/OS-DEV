@@ -64,3 +64,7 @@ static inline long lx_ret(long native, int fallback) {
     return native < 0 ? -(long)fallback : native;
 }
 #define LX_ETIMEDOUT 110  /* futex wait hit its deadline (M1959) */
+#define LX_EAFNOSUPPORT 97
+#define LX_ENOTCONN    107
+#define LX_EADDRINUSE 98
+#define LX_ECONNREFUSED 111

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1964-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1965-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -622,10 +622,39 @@ Landed so far, all on the from-scratch ext2 driver:
   256 GiB** — free, since reserving address space costs one VMA and only
   touched pages cost memory. Plus `epoll`/`poll`/`eventfd2`/`uname` and friends.
 
-Still ahead: Node networking (sockets are not yet pollable), Claude Code, and
-Firefox on a from-scratch Wayland display path. The honest scale is still months, and the memory subsystem needs
-more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
-recycles addresses, so V8's address-space cage still cannot be expressed).
+- **M1965** — **Node opened a socket, and something answered.** A Node `net`
+  server and client, over a real AF_UNIX socket, inside OS-DEV: listen,
+  connect, accept, `echo:ping` back, half-close, clean exit 0. `unixsock.c` has
+  been a complete AF_UNIX implementation since M1169, but its endpoints were
+  bare integers **outside the fd table** — they could not be read, written,
+  closed or polled like anything else, which is precisely what a program
+  expects of a socket. They are fd types now, and libuv's event loop drives
+  them. Four bugs, each of which lied about itself: `getsockopt`'s **`optval`
+  and `optlen` arguments were swapped**, so the length `4` was written into the
+  value buffer and libuv read `SO_ERROR = 4` — reporting `connect EINTR` on a
+  connection that had succeeded. `epoll_ctl` answered `EINVAL` where Linux
+  answers **`EEXIST`**, and libuv `abort()`s on anything else — it now returns
+  real errnos. `write` on a socket fd fell through to the pipe path and
+  returned **`EBADF`** on a perfectly valid descriptor, because the byte path
+  did not exist. And `shutdown(SHUT_WR)` was **accepted and ignored**, so
+  `socket.end()` did nothing, the server never saw its client finish, and a
+  completed exchange hung forever with no error anywhere — AF_UNIX has a real
+  half-close now. Also: `/proc` and `/dev` were being rewritten into the disk
+  root by the compat layer and then reported missing, so Node's probes of
+  `/proc/meminfo` and `/dev/null` failed against files this kernel has
+  generated since M1216 — they resolve to the kernel's own synthetic
+  filesystems again, and are stat-able and readable through the VFS
+  (a character device streams; it does not hit EOF at an offset).
+  And the crash that came *after* the success: `app_mmap` found a free gap and
+  then rounded the address up to 2 MiB, walking the mapping past the gap it had
+  just verified and onto the next VMA — **two VMAs owning the same pages**, so
+  the first `munmap` freed the frames out from under the other. Only mappings
+  ≥ 2 MiB, only when a VMA sat right after the gap; V8 allocates many, so Node
+  hit it about one run in three.
+
+Still ahead: Node over the **network** (AF_INET sockets still are not pollable —
+that needs a real RX demux in the TCP stack), Claude Code, and
+Firefox on a from-scratch Wayland display path. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

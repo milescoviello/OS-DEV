@@ -377,6 +377,8 @@ struct mq_attr { long mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs; };
 #define SYS_ws_exchange  343   /* (id, sendbuf, sendtot, out, outmax, nrecv*) -> send queue + read reply frames; bytes / -1 (M1846) */
 #define SYS_sha1         344   /* (name, hexbuf) -> SHA-1 of a file as 40 hex chars; 0/-1 (M1848) */
 #define SYS_ws_serve     345   /* (port, lastmsg, lastmax, nframes*) -> accept 1 WS client + echo its frames; frames/-1 (M1849) */
+#define SYS_unix_shutdown 346  /* (ep, how) -> half-close: SHUT_WR gives the peer EOF; 0/-1 (M1965) */
+#define SYS_unix_unlisten 347  /* (lid) -> release a listener's bound name; 0/-1 (M1965) */
 
 /* select(2) (M1584): a from-scratch fd_set, now a BIT ARRAY rather than a
  * single word (M1936). It was one `unsigned long` with FD_SETSIZE 32, which was
@@ -596,6 +598,7 @@ struct statx {                /* unsigned/unsigned long to match the other share
 #define S_IFREG  0x8000
 #define S_IFDIR  0x4000
 #define S_IFLNK  0xA000
+#define S_IFCHR  0x2000    /* character device: /dev/null and friends report this (M1965) */
 
 /* sched_setscheduler policies (M1172), shared by the kernel + ulib. SCHED_OTHER
  * is the M1171 CFS/nice class; FIFO/RR are real-time classes that preempt it. */

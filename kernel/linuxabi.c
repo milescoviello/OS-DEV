@@ -236,7 +236,23 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_mremap_       25
 #define LXS_prctl_       157
 #define LXS_capget_      125
+#define LXS_socket_       41
+#define LXS_connect_      42
+#define LXS_accept_       43
+#define LXS_accept4_     288
+#define LXS_bind_         49
+#define LXS_listen_       50
+#define LXS_socketpair_   53
+#define LXS_getsockname_  51
+#define LXS_setsockopt_   54
+#define LXS_getsockopt_   55
+#define LXS_shutdown_     48
+#define LXS_statx_       332
 #define LXS_sched_getaffinity_ 204
+#define LXS_sched_setparam_    142
+#define LXS_sched_getparam_    143
+#define LXS_sched_setscheduler_ 144
+#define LXS_sched_getscheduler_ 145
 #define LXS_clock_getres_ 229
 #define LXS_epoll_create1_ 291
 #define LXS_epoll_ctl_   233
@@ -302,15 +318,49 @@ void linux_abi_init_this_cpu(void) {
  * toolchain installed later needs /usr/lib and /usr/include to mean something,
  * and this is how they come to. Relative paths pass through untouched. */
 int g_lx_systrace;                        /* -append lxsystrace: log EVERY Linux syscall (very noisy; for finding where a program blocks) */
+
+/* Translate a negative app_fd_* return into a Linux errno (M1965).
+ *
+ * Collapsing every failure to EBADF cost real debugging time: Node reported
+ * "write EBADF" on a socket whose fd was perfectly valid, because the byte
+ * path for that fd type did not exist. EBADF sends you looking at descriptor
+ * bookkeeping; EPIPE/EAGAIN name what actually happened. */
+static long lx_fd_err(long rc) {
+    if (rc == APP_FD_EAGAIN) return -(long)LX_EAGAIN;
+    if (rc == APP_FD_EPIPE)  return -(long)LX_EPIPE;
+    return -(long)LX_EBADF;
+}
 int g_lx_mmap_trace;                      /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
 #define LX_ROOT     "/disk2"
 #define LX_ROOT_LEN 6
 
 /* Translate a Linux path into one the VFS understands. Returns `out`. */
+/* Paths the kernel serves itself. /sys is included because procfs_owns() does
+ * not claim it -- the probes that go there (cpu/online, cgroup limits) are
+ * better answered with a clean ENOENT than with a lookup in a disk root that
+ * has no /sys either, and keeping them here documents the boundary. */
+static int lx_is_synth(const char *p) {
+    const char *pre[] = { "/proc/", "/dev/", "/sys/", 0 };
+    for (int i = 0; pre[i]; i++) {
+        int j = 0; while (pre[i][j] && p[j] == pre[i][j]) j++;
+        if (!pre[i][j]) return 1;
+    }
+    return 0;
+}
+
 static const char *lx_xlate(const char *p, char *out, int max) {
     if (!p) return p;
     int n = 0;
     if (p[0] == '/') {
+        /* /proc and /dev are the KERNEL'S OWN synthetic filesystems and must
+         * not be rewritten into the ext2 root -- there is nothing there. This
+         * layer had been prefixing them like any other path, so Node's probes
+         * of /proc/meminfo, /proc/stat, /sys/devices/system/cpu/online and
+         * /dev/null all resolved to /disk2/... and came back ENOENT, even
+         * though procfs.c has generated every one of those files since M1216.
+         * A missing /dev/null in particular is not cosmetic: it is where a
+         * runtime sends output it means to discard. (M1965) */
+        if (lx_is_synth(p)) return p;
         for (const char *r = LX_ROOT; *r && n < max - 1; r++) out[n++] = *r;
         for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
         out[n] = 0;
@@ -379,8 +429,14 @@ void linux_syscall_dispatch(struct registers *r) {
              * short write, so it spins forever. `as` did exactly that for
              * twenty minutes on a large object file, burning a core with flat
              * memory and no diagnostic anywhere. Say so. (M1961) */
-            if (w == 0 && a3 > 0) kprintf("[linuxabi] write(fd %ld, %ld bytes) made NO PROGRESS\n", a1, a3);
-            r->rax = (w < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)w;
+            if (w == 0 && a3 > 0 && app_fd_type((int)a1) != 12)
+                kprintf("[linuxabi] write(fd %ld, %ld bytes) made NO PROGRESS\n", a1, a3);
+            /* A socket whose ring is full wrote zero bytes and that is EAGAIN,
+             * not an error and not progress -- returning 0 would make the
+             * caller loop forever on a buffer that only drains when it goes
+             * back to poll. (M1965) */
+            if (w == 0 && a3 > 0 && app_fd_type((int)a1) == 12) w = APP_FD_EAGAIN;
+            r->rax = (w < 0) ? (uint64_t)lx_fd_err(w) : (uint64_t)w;
             break;
         }
         /* Validate before dereferencing -- the native path routes every ring-3
@@ -417,8 +473,16 @@ void linux_syscall_dispatch(struct registers *r) {
             if (!b || !vmm_user_ok((uint64_t)b, n)) { r->rax = (uint64_t)-(long)LX_EFAULT; goto done; }
             if (fd_tab) {
                 long w = app_fd_write((int)a1, b, n);
-                if (w < 0) { r->rax = (uint64_t)-(long)LX_EPIPE; goto done; }
+                if (w == 0 && app_fd_type((int)a1) == 12) w = APP_FD_EAGAIN;
+                /* A partial writev is a SUCCESS with a short count. Only
+                 * report the error when nothing at all got through, or a
+                 * caller that already sent 8 KiB is told it sent none. */
+                if (w < 0) {
+                    if (total > 0) { r->rax = (uint64_t)total; goto done; }
+                    r->rax = (uint64_t)lx_fd_err(w); goto done;
+                }
                 total += w;
+                if ((unsigned long)w < n) { r->rax = (uint64_t)total; goto done; }   /* short: stop, don't skip a gap */
             } else {
                 console_write_n(b, n);                /* lock once: no splicing (M1952) */
                 total += (long)n;
@@ -560,6 +624,125 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = 0;
         break;
     }
+    /* --- sockets (M1965) ---------------------------------------------------
+     * AF_UNIX only for now, and deliberately so: unixsock.c is a complete
+     * local-socket implementation and needed nothing but an fd. AF_INET is a
+     * separate problem -- net.c has no per-socket receive queue, so nothing
+     * can answer "is there data?" without pulling frames off the NIC and
+     * stealing them from other sockets. That is its own milestone. */
+    case LXS_statx_: {                      /* (dirfd, path, flags, mask, struct statx *) */
+        /* Linux's statx buffer is 256 bytes with its own field offsets, quite
+         * unlike struct stat. Node stats constantly, and an ENOSYS here makes
+         * libuv fall back -- but reporting the size correctly is cheap. */
+        const char *up = (const char *)r->rsi;
+        if (!up || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
+        struct statx sx;
+        if (vfs_stat(path, &sx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        uint8_t *o = (uint8_t *)r->r8;
+        for (int i = 0; i < 256; i++) o[i] = 0;
+        int isdir = (sx.stx_mode & 0170000u) == 0040000u;
+        *(uint32_t *)(o + 0)  = 0x7ff;                     /* stx_mask: what we filled in */
+        *(uint32_t *)(o + 4)  = 4096;                      /* stx_blksize */
+        *(uint32_t *)(o + 24) = 1;                         /* stx_nlink */
+        *(uint16_t *)(o + 32) = (uint16_t)(isdir ? (0040000u | 0755u) : (0100000u | 0644u));  /* stx_mode */
+        *(uint64_t *)(o + 40) = sx.stx_ino;                /* stx_ino */
+        *(uint64_t *)(o + 48) = sx.stx_size;               /* stx_size */
+        *(uint64_t *)(o + 56) = (sx.stx_size + 511) / 512; /* stx_blocks */
+        r->rax = 0;
+        break;
+    }
+    case LXS_socket_: {                     /* (domain, type, protocol) */
+        int dom = (int)a1, typ = (int)r->rsi & 0xF;   /* mask SOCK_NONBLOCK/SOCK_CLOEXEC */
+        int sfd = app_socket(dom, typ);
+        if (g_lx_systrace) kprintf("[sock] socket(dom %d, type %lx) -> %d\n", dom, r->rsi, sfd);
+        r->rax = (sfd < 0) ? (uint64_t)-(long)LX_EAFNOSUPPORT : (uint64_t)sfd;
+        break;
+    }
+    case LXS_bind_:
+    case LXS_connect_: {                    /* (fd, struct sockaddr *, addrlen) */
+        /* struct sockaddr_un { uint16_t sun_family; char sun_path[108]; } --
+         * the family is the first two bytes on both sides. */
+        if (!vmm_user_ok(r->rsi, 2)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint16_t fam = *(const uint16_t *)r->rsi;
+        if (fam != 1 /*AF_UNIX*/) { r->rax = (uint64_t)-(long)LX_EAFNOSUPPORT; break; }
+        if (!vmm_user_ok(r->rsi, 3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const char *sun = (const char *)(r->rsi + 2);
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(sun, xp, sizeof xp);
+        int is_bind = (r->rax == LXS_bind_);
+        int rc2 = is_bind ? app_unix_bind((int)a1, path) : app_unix_connect((int)a1, path);
+        if (g_lx_systrace || rc2 != 0)
+            kprintf("[sock] %s(fd %ld, %s) -> %d\n", is_bind ? "bind" : "connect", a1, path, rc2);
+        r->rax = (rc2 == 0) ? 0 : (uint64_t)-(long)(is_bind ? LX_EADDRINUSE : LX_ECONNREFUSED);
+        break;
+    }
+    case LXS_listen_: {
+        int lrc = app_unix_listen((int)a1);
+        if (g_lx_systrace) kprintf("[sock] listen(fd %ld) -> %d\n", a1, lrc);
+        if (lrc != 0) kprintf("[linuxabi] listen(fd %ld) FAILED\n", a1);
+        r->rax = (uint64_t)(lrc == 0 ? 0 : -(long)LX_EADDRINUSE);
+        break;
+    }
+    case LXS_accept_:
+    case LXS_accept4_: {                    /* (fd, sockaddr *, addrlen *[, flags]) */
+        int is4 = (r->rax == LXS_accept4_);          /* rax still holds the syscall number here */
+        int nf = app_unix_accept((int)a1);
+        if (g_lx_systrace) kprintf("[sock] accept(fd %ld) -> %d\n", a1, nf);
+        /* Non-blocking by construction: a server polls POLLIN first. Reporting
+         * EAGAIN rather than blocking is what a non-blocking socket does, and
+         * every event loop handles it. "Out of descriptors" is NOT EAGAIN --
+         * a loop that retries on EAGAIN would spin on it forever. */
+        if (nf < 0) { r->rax = (uint64_t)lx_fd_err(nf); break; }
+        /* accept4's SOCK_NONBLOCK applies to the ACCEPTED fd, not the listener. */
+        if (is4) app_fd_set_nonblock(nf, (r->r10 & 0x800) ? 1 : 0);
+        if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 2;   /* addrlen: just the family */
+        r->rax = (uint64_t)nf;
+        break;
+    }
+    case LXS_socketpair_: {                 /* (domain, type, protocol, int sv[2]) */
+        if ((int)a1 != 1 /*AF_UNIX*/) { r->rax = (uint64_t)-(long)LX_EAFNOSUPPORT; break; }
+        if (!vmm_user_ok(r->r10, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int sv[2];
+        if (app_unix_socketpair(sv) != 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        ((int *)r->r10)[0] = sv[0]; ((int *)r->r10)[1] = sv[1];
+        r->rax = 0;
+        break;
+    }
+    case LXS_getsockname_: {                /* (fd, sockaddr *, addrlen *) */
+        if (r->rsi && vmm_user_ok(r->rsi, 2)) *(uint16_t *)r->rsi = 1 /*AF_UNIX*/;
+        if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 2;
+        r->rax = 0;
+        break;
+    }
+    case LXS_setsockopt_:
+        r->rax = 0;                          /* accepted; no option changes local-socket behaviour */
+        break;
+    case LXS_getsockopt_:
+        /* SO_ERROR (4) in particular: an event loop reads it after connect to
+         * decide whether the connection succeeded, and a nonzero answer would
+         * make it give up on a socket that is fine. */
+        /* ARGUMENT ORDER: getsockopt(fd, level, optname, optval, optlen) --
+         * optval is r10 and optlen is r8. Having them the other way round
+         * wrote the LENGTH (4) into the value buffer, so libuv read
+         * SO_ERROR == 4 and reported "connect EINTR" on a connection that had
+         * succeeded: socket, bind, listen, connect and accept had all
+         * returned cleanly. Nothing in the error named the real call. */
+        if (r->r10 && vmm_user_ok(r->r10, 4)) *(uint32_t *)r->r10 = 0;   /* optval: no error */
+        if (r->r8  && vmm_user_ok(r->r8, 4))  *(uint32_t *)r->r8  = 4;   /* optlen: bytes written */
+        r->rax = 0;
+        break;
+    case LXS_shutdown_: {                   /* (fd, how) */
+        /* Was: accepted and ignored, on the reasoning that a local socket has
+         * no half-close. It does, and it is load-bearing -- Node's
+         * socket.end() is a shutdown(SHUT_WR), and the peer's "the other side
+         * is finished" event never fired, so a finished connection kept the
+         * event loop alive forever. See unix_shutdown. (M1965) */
+        int sr = app_unix_shutdown((int)a1, (int)r->rsi);
+        if (g_lx_systrace) kprintf("[sock] shutdown(fd %ld, how %ld) -> %d\n", a1, (long)r->rsi, sr);
+        r->rax = (sr == 0) ? 0 : (uint64_t)-(long)LX_ENOTCONN;
+        break;
+    }
     case LXS_capget_:
         /* (hdrp, datap). Single-user, everything runs as root, so there are no
          * capability sets to report -- but ENOSYS made Node ask hundreds of
@@ -584,6 +767,29 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)sz;              /* Linux returns the size written */
         break;
     }
+    case LXS_sched_getparam_:                /* (pid, struct sched_param *) */
+        /* struct sched_param is a single int, the priority. SCHED_OTHER
+         * threads have priority 0, which is what we run everything at.
+         * Returning ENOSYS instead made V8's own mutex code log
+         *   [mutex.cc : 956] RAW: pthread_getschedparam failed: 1
+         * on every thread it created -- glibc's pthread_getschedparam is
+         * exactly sched_getparam + sched_getscheduler. (M1965) */
+        if (r->rsi) {
+            if (!vmm_user_ok(r->rsi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            *(int32_t *)r->rsi = 0;
+        }
+        r->rax = 0;
+        break;
+    case LXS_sched_getscheduler_:            /* (pid) -> policy */
+        r->rax = 0;                          /* SCHED_OTHER: the CFS class everything runs in */
+        break;
+    case LXS_sched_setparam_:
+    case LXS_sched_setscheduler_:
+        /* Accepted. A single-user desktop OS has no privilege boundary to
+         * enforce here, and a runtime that cannot set a policy it did not
+         * need is a runtime that refuses to start. */
+        r->rax = 0;
+        break;
     case LXS_prctl_:
         /* Node calls PR_SET_NAME(15) for its threads and PR_SET_VMA
          * (0x53564d41, "AMVS") to label V8's heap regions for /proc/maps.
@@ -624,8 +830,10 @@ void linux_syscall_dispatch(struct registers *r) {
             ev   = *(const uint32_t *)(p + 0);
             data = *(const uint64_t *)(p + 4);
         }
+        /* app_epoll_ctl returns a negative Linux errno directly -- EEXIST is
+         * load-bearing for libuv, see the note on its definition. */
         int rc2 = app_epoll_ctl((int)a1, (int)r->rsi, (int)r->rdx, ev, data);
-        r->rax = (rc2 == 0) ? 0 : (uint64_t)-(long)LX_EINVAL;
+        r->rax = (uint64_t)(long)rc2;
         break;
     }
     case LXS_epoll_wait_:
@@ -987,7 +1195,7 @@ void linux_syscall_dispatch(struct registers *r) {
         if (n < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (n && !vmm_user_ok(r->rsi, (uint64_t)n)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         long got = app_fd_read((int)a1, (void *)r->rsi, (unsigned long)n);
-        r->rax = (got < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)got;
+        r->rax = (got < 0) ? (uint64_t)lx_fd_err(got) : (uint64_t)got;
         break;
     }
     case LXS_close_:
@@ -1318,14 +1526,25 @@ void linux_syscall_dispatch(struct registers *r) {
          * stream's access mode. */
         long cmd = (long)r->rsi, arg = (long)r->rdx;
         if (cmd == 3) {                     /* F_GETFL */
-            /* O_RDWR. We do not record per-fd access modes, and claiming
-             * read-write is the permissive answer -- an fd we handed out is
-             * usable, and stdio only uses this to reject an impossible
-             * operation it was never going to attempt. */
-            r->rax = 2;
+            /* O_RDWR, plus O_NONBLOCK if it is actually set. We do not record
+             * per-fd access modes, and claiming read-write is the permissive
+             * answer -- an fd we handed out is usable, and stdio only uses this
+             * to reject an impossible operation it was never going to attempt.
+             * The O_NONBLOCK bit, though, must be TRUE: libuv does the
+             * read-modify-write F_GETFL/F_SETFL dance and then trusts the
+             * result. (M1965) */
+            r->rax = 2 | (app_fd_nonblock((int)a1) ? 04000u : 0u);
             break;
         }
-        if (cmd == 4) { r->rax = 0; break; } /* F_SETFL: accepted; we have no O_NONBLOCK on files */
+        if (cmd == 4) {                     /* F_SETFL */
+            /* Was: accepted and DISCARDED. That is a lie the caller cannot
+             * detect until its event loop blocks in a read it was promised
+             * would return EAGAIN. Record it for real; on fd types that have
+             * no notion of blocking it is simply unused. (M1965) */
+            if (app_fd_set_nonblock((int)a1, (arg & 04000) ? 1 : 0) != 0) { r->rax = 0; break; }
+            r->rax = 0;
+            break;
+        }
         long fr = app_fcntl((int)a1, (int)cmd, arg);
         r->rax = (fr < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)fr;
         break;

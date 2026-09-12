@@ -1,5 +1,91 @@
 # What's next
 
+> **(M1965) Node opened a socket, and something answered.** A Node `net` server
+> and a client, in one process, over a real AF_UNIX socket **inside OS-DEV**:
+> `listen` → `connect` → `accept` → write → **`LXNODESOCK: echo:ping`** → half-close
+> → **exit 0**. Every one of those steps runs through libuv's event loop, which
+> polls before it does anything, so a socket that is not pollable never reaches
+> the first byte. **`kernel/unixsock.c` has been a complete AF_UNIX
+> implementation since M1169** — the gap was that its endpoints were bare
+> integers living *outside* the fd table, so they could not be read, written,
+> closed or polled like anything else, which is exactly what a program expects
+> of a socket. They are fd types now (12 = endpoint, 13 = listener), with
+> `socket`/`bind`/`listen`/`accept`/`accept4`/`connect`/`socketpair`/`getsockname`/
+> `shutdown`/`setsockopt`/`getsockopt` wired to them.
+>
+> **Four bugs, and not one of them said what it was.** (1) `getsockopt`'s
+> **`optval` and `optlen` arguments were swapped** — `optval` is `r10` and
+> `optlen` is `r8`, and having them the other way round wrote the *length* `4`
+> into the value buffer, so libuv read `SO_ERROR == 4` and reported
+> **`connect EINTR`** on a connection that had succeeded. The trace showed
+> `socket`, `bind`, `listen`, `connect` and `accept` all returning cleanly and
+> the program failing anyway; nothing in the error named the real call.
+> (2) `write` on a socket fd **fell through to the pipe path**, found no pipe
+> behind it and returned **`EBADF`** — a bad-descriptor error on a descriptor
+> that was fine, because the byte path simply did not exist. Failure codes are
+> now told apart: `EAGAIN` for "nothing right now", `EPIPE` for "the peer is
+> gone". (3) `epoll_ctl` answered `EINVAL` where Linux answers **`EEXIST`**, and
+> libuv treats `EEXIST` as "already watching, switch to `MOD`" while **any other
+> error is an `abort()`** — Node died on
+> `uv__io_poll: Assertion 'errno == EEXIST' failed`. It returns real errnos now.
+> (4) `shutdown(SHUT_WR)` was **accepted and ignored** on the reasoning that a
+> local socket has no half-close. It does, and it is load-bearing: `socket.end()`
+> is a `shutdown(SHUT_WR)`, so the server never learned its client had finished,
+> kept the connection handle open, and the event loop sat with nothing to do and
+> no way to exit — a hang, after a completed exchange, with no error anywhere.
+> AF_UNIX has a real half-close now, and closing a listener **releases its bound
+> name** so a server can restart.
+>
+> **And `/proc` and `/dev` had been made unreachable.** The compat layer
+> rewrites absolute paths into the Linux root on the ext2 volume — including
+> `/proc/meminfo`, `/proc/stat` and `/dev/null`, which are the *kernel's own*
+> synthetic filesystems and are not on any disk. Node's probes of all of them
+> came back `ENOENT` against files this kernel has generated since M1216. They
+> are excluded from the rewrite now; separately, `vfs_stat` only ever knew about
+> the `/proc` and `/dev` **directories**, never their contents, so `open()`
+> refused every node inside them. Both are fixed, and a character device
+> **streams** — a second read of `/dev/urandom` returns more bytes rather than
+> the EOF a file's offset logic would give it.
+>
+> Table limits raised where they were sized for one in-tree demo: 8 → 32
+> listeners, 16 → 128 connections, 4 KiB → 16 KiB per direction, 64 → 128-byte
+> paths (Linux's `sun_path` is 108), 32 → 256 watched fds per epoll instance and
+> 8 → 32 epoll instances. An over-long socket name is now **refused** rather
+> than silently truncated — a truncated bind succeeds and then no `connect` ever
+> matches it, which presents as "the server isn't running".
+>
+> **13 new assertions** in the boot-time IPC self-test, each proven to fail when
+> its fix is reverted. Three separate reverts were run: dropping `unix_shutdown`
+> fails exactly the five half-close/name-release/truncation checks, dropping
+> `vfs_stat`'s synthetic branch fails exactly the three stat/stream checks, and
+> dropping `vfs_pread`'s fails exactly the four read checks — nothing else moves.
+> The first revert also **wedged the boot** rather than failing, because
+> `unix_recv` blocked forever on an EOF that never came; the assertions now gate
+> every receive on `unix_readable` first, which is this file's own stated rule.
+> **And the crash that came after the success.** The socket test passed and then
+> segfaulted about one run in three. A diagnostic added for it printed
+> `[fault] UNMAPPED 700000000 err=4: no VMA (nearest below 160021000-164000000)`
+> — a read of a pointer in a process whose highest mapping ended at 5.6 GiB.
+> `app_mmap` found a free gap and **then** rounded the address up to 2 MiB (so
+> `MADV_COLLAPSE` could fold big regions), walking the mapping up to 2 MiB − 4 KiB
+> **past the gap it had just verified**, onto whatever VMA followed — and nothing
+> re-checked. Two VMAs owned the same pages, and the first `munmap` of either
+> freed the frames out from under the other. Only mappings ≥ 2 MiB, and only when
+> a VMA happened to sit right after the chosen gap, which is why it came and
+> went; V8 allocates many multi-MiB regions, so Node reproduced it constantly
+> while smaller allocations never could. `vma_find_gap` has always taken an
+> `align` argument — it was simply never passed one. `tools/lx/lxvmagap.c` makes
+> it deterministic rather than probable, and asserts on the **data** (the
+> neighbour's contents survive) rather than on addresses; reverted, it reports
+> `OVERLAP -- B+0x603000 was overwritten`, which is exactly the first byte past
+> the punched hole.
+>
+> Also fixed a **harness race** that had nothing to do with the ABI: the
+> `lxfulltest` runner broke its wait loop on one process's marker while seven
+> other glibc processes were still running concurrently, then killed the VM —
+> so a *different* assertion failed each run while a clean manual boot showed
+> every marker present and correct. It waits for all of them now.
+
 > **(M1964) PHASE 6 BEGINS: real Node.js runs JavaScript and does file I/O inside OS-DEV.** `node` is an unmodified **102 MB** host binary with **21 shared libraries** — libuv, c-ares, OpenSSL, ICU, nghttp2, simdjson, sqlite3 — staged whole and executed through the compatibility shim. Three things now work, each strictly harder than the last: `node --version` prints **`v26.3.0`** (the whole image loads, `ld.so` resolves all 21 libraries, V8 initialises); `node -e` prints **`LXNODE: 2 linux x64`**, which only a working engine can produce because V8 has to parse, compile and JIT the arithmetic; and `node -e` with the **`fs` module** prints **`LXNODEFS: 25 26 true`** — it wrote a file, read it back as a 25-character string, `statSync`'d it at 26 bytes and listed a directory, all through libuv onto **OS-DEV's own from-scratch ext2 driver**. *We do not port Node; we run it. Everything it runs on — kernel, scheduler, filesystem, memory manager — is this project's own code.* **The blocker was V8's cage.** Node died at startup with `Fatal process out of memory: SegmentedTable::InitializeTable (subspace allocation)`: V8 reserves an enormous contiguous region for pointer compression — gigabytes of `PROT_NONE` it then commits into piecemeal — and our mmap window was 1 GiB. There was never a reason to keep user mappings inside the first 4 GiB beyond our own constants; this is 4-level paging with a 48-bit address space. The window moved **above 4 GiB and grew to 256 GiB**, which costs nothing: everything from 4 GiB to 256 GiB lives in `PML4[0]`, whose PDPT is allocated per address space, and reserving address space costs one VMA while only touched pages cost memory. Syscalls added: `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait` — **noting that Linux's `struct epoll_event` is PACKED at 12 bytes while ours is 16 with padding**, so the handler unpacks by hand; that is the same class of bug as `struct stat`'s field offsets — plus `poll`/`ppoll`, `eventfd2`, `uname` (which was *defined but had no case*, so it silently fell through to `ENOSYS` while libuv was parsing a kernel version out of it), `prctl`, `clock_getres`, `capget` and `sched_getaffinity`. `io_uring_setup` deliberately still returns `ENOSYS`, which is the honest answer and makes libuv fall back to epoll. And one more silent truncation of my own making: `node -e '<script>'` puts an entire program in a **single argument**, and the launch-argument buffer was **192 characters** — Node reported a `SyntaxError` about source it had never been given. It is 1024 now and reports when it truncates. `make nodetest` asserts all three; not part of `make check`, because each Node start is minutes under TCG.
 
 > **(M1963) TLB shootdown — the correctness bug real threads created.** `invlpg` only invalidates the TLB of the core that runs it. Once an address space can be live on more than one core at a time — which is exactly what M1959's threads brought — unmapping or write-protecting a page left every *other* core free to keep using its cached translation: writing through a mapping that was just removed, or into a page that had already been handed to someone else. Silent memory corruption, and the plan called it out in advance as "a live correctness bug once real threads run on `-smp 4`". There is now a dedicated IPI (vector `0x41`) whose handler reloads `CR3` and acknowledges, fired from `munmap`/`MAP_FIXED` carving and from `mprotect` — but **only for a multi-task address space**, since a single-threaded process is on exactly one core and a forked child has its own `CR3`, so the common case pays nothing. Two deliberate choices. The target does a **full flush rather than a per-page `invlpg`**: coarser, but it needs no argument marshalling and cannot be wrong about which page, and shootdowns are rare next to ordinary faults. And the wait for acknowledgement is **bounded, and gives up** rather than spinning forever — an unbounded wait here is a deadlock waiting to happen, because a core spinning on a lock with interrupts off can never ack and this kernel takes locks with `IF=0` in many places; giving up is survivable, since the target flushes anyway the next time it enters the address space. **A boot-time self-test paid for itself immediately.** The mechanism is only *needed* when a threaded process changes its own mappings, which no boot path does — so firing one at boot is the only way the IPI round-trip gets exercised every time. The first run reported `TLB shootdown timed out waiting for 3 core(s)` after **15.9 seconds**: the self-test was running inside `smp_init`, before the APs were servicing interrupts, and the spin bound was 20 million iterations. Both were wrong, and both would have been invisible until the first real threaded `mprotect` stalled for sixteen seconds. It runs after full bring-up now and the bound is ~40 ms; all three cores ack in **0 ms**. The 4-core boot asserts the acknowledgement specifically, not merely that a shootdown was attempted — removing the ack reproduces the timeout and fails the suite.

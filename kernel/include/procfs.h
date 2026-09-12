@@ -12,6 +12,8 @@
 int  procfs_owns(const char *abs);
 /* "/proc" or "/dev" themselves (the directories)? */
 int  procfs_is_dir(const char *abs);
+/* Does this synthetic node exist? *chardev is set for /dev char devices (M1965). */
+int  procfs_exists(const char *abs, int *chardev);
 /* Read a synthetic file. Returns bytes produced (>=0) or -1 if not ours. */
 long procfs_read(const char *abs, void *buf, unsigned long max);
 /* Write to a synthetic file (e.g. /dev/null discards). len/-1, or -2 if not ours. */

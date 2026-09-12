@@ -115,6 +115,8 @@ long sys_unix_send(int ep, const void *buf, unsigned long len);   /* bytes writt
 long sys_unix_recv(int ep, void *buf, unsigned long max);         /* bytes read; 0 EOF; -1 bad ep */
 int  sys_unix_close(int ep);                           /* 0/-1 */
 int  sys_unix_wait_any(const int *eps, int n);         /* poll: index of first readable ep (blocks once); -1 (M1170) */
+int  sys_unix_shutdown(int ep, int how);              /* half-close: SHUT_WR(1) gives the peer EOF; 0/-1 (M1965) */
+int  sys_unix_unlisten(int lid);                      /* release a listener's bound name; 0/-1 (M1965) */
 int  sys_socketpair(int *sv);                          /* socketpair(2): sv[0]/sv[1] = pre-connected AF_UNIX pair; 0/-1 (M1254) */
 int  sys_nice(int nice);                               /* set current task's CFS nice (-20..19); returns clamped (M1171) */
 int  sys_sched_setscheduler(int policy, int rt_priority);  /* SCHED_OTHER/FIFO/RR; rt_priority 1..99 for RT; 0/-1 (M1172) */

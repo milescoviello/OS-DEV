@@ -7,12 +7,16 @@
 # runs ON -- the kernel, the scheduler, the ext2 driver, the memory manager --
 # is OS-DEV's own from-scratch code.
 #
-# Three checks, each strictly harder than the last:
+# Four checks, each strictly harder than the last:
 #   1. node --version        -- the 102 MB image loads, ld.so resolves 21
 #                               libraries, V8 initialises
 #   2. node -e '...'         -- V8 parses, compiles and JITs JavaScript
 #   3. node -e 'fs...'       -- the fs module writes, reads, stats and lists,
 #                               through libuv onto our ext2 driver
+#   4. node -e 'net...'      -- a SERVER and a CLIENT over a real socket: listen,
+#                               connect, accept, echo, half-close, and a clean
+#                               exit. This is libuv's event loop driving our
+#                               epoll and our AF_UNIX sockets end to end.
 #
 # NOT part of `make check`: each Node start is minutes under TCG emulation.
 set -e
@@ -39,7 +43,7 @@ timeout -s KILL 1800 "$QEMU" -cpu max -no-reboot -no-shutdown -m 3G -smp 4 -kern
 QPID=$!
 i=0
 while [ $i -lt 3600 ]; do
-    grep -aqE "node fs ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "node net ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     sleep 0.5; i=$((i+1))
 done
 
@@ -68,5 +72,25 @@ if grep -aq "LXNODEFS: 25 26 true" "$SLOG" && grep -aq "\[lxnode\] node fs -> 0"
 else
     echo "  FAIL: Node file I/O wrong:"; grep -aE "LXNODEFS|node fs ->|Error" "$SLOG" | head -3; f=1
 fi
+# 4. SOCKETS (M1965). A Node net server and client, in one process, over a real
+#    AF_UNIX socket in the fd table. "echo:ping" can only appear if socket,
+#    bind, listen, connect, accept, write, epoll-driven read and write all
+#    worked -- libuv polls before every one of them, so a socket that is not
+#    pollable never gets as far as the first byte.
+#
+#    The EXIT STATUS is asserted separately and is not a formality: with
+#    shutdown(SHUT_WR) accepted-and-ignored, the echo still worked and the
+#    process then hung forever, because the server never saw its client
+#    finish and the event loop had a handle it could not release.
+if grep -aq "LXNODESOCK: echo:ping" "$SLOG"; then
+    echo "  ok: Node net -- server listened, client connected, accept + echo round-tripped over a real socket"
+else
+    echo "  FAIL: the socket round-trip did not happen:"; grep -aE "LXNODESOCK|node net ->|Error" "$SLOG" | head -3; f=1
+fi
+if grep -aq "\[lxnode\] node net -> 0" "$SLOG"; then
+    echo "  ok: and it EXITED CLEANLY -- half-close released the connection and drained the event loop"
+else
+    echo "  FAIL: Node did not exit cleanly after the socket test:"; grep -aE "node net ->|assert|Error" "$SLOG" | head -3; f=1
+fi
 [ $f -eq 0 ] || { echo "FAIL: Node.js in-guest"; exit 1; }
-echo "PASS: PHASE 6 (partial) -- real Node.js runs JavaScript and does file I/O inside OS-DEV"
+echo "PASS: PHASE 6 (partial) -- real Node.js runs JavaScript, file I/O and SOCKETS inside OS-DEV"

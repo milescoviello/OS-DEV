@@ -498,6 +498,39 @@ long vfs_pread(const char *name, void *buf, unsigned long max, uint64_t off) {
     char rb[VFS_PATH_MAX]; const char *rn = bind_resolve(name, rb, sizeof rb);
     if (!rn) return -1;                            /* path too long to represent (M1937) */
     const char *tb;
+    { /* /proc and /dev (M1965). Without this an open()ed synthetic file became
+       * a FILE fd whose reads all went to the boot filesystem and returned -1;
+       * the node existed, the open succeeded, and every read failed.
+       * procfs_read generates the WHOLE file each call and has no notion of an
+       * offset, so generate and slice. These files are small (a few hundred
+       * bytes); a reader at a non-zero offset is on its second read and is
+       * about to be told EOF. */
+        char ap[VFS_PATH_MAX];
+        if (synth_path(rn, ap, sizeof ap)) {
+            int chardev = 0;
+            if (!procfs_exists(ap, &chardev)) return -1;
+            /* A character device is a STREAM, not a file with an end: reading
+             * /dev/urandom at offset 4096 must produce more random bytes, not
+             * EOF. Only the /proc files -- which are a snapshot with a
+             * definite length -- get the offset applied. */
+            if (chardev) return procfs_read(ap, buf, max);
+            char *tmp = (char *)kmalloc(65536);      /* off the kernel stack; /proc/kallsyms is large */
+            if (!tmp) return -1;
+            long got = procfs_read(ap, tmp, 65536);
+            long out = -1;
+            if (got >= 0) {
+                if (off >= (uint64_t)got) out = 0;                   /* EOF */
+                else {
+                    unsigned long n = (unsigned long)got - (unsigned long)off;
+                    if (n > max) n = max;
+                    for (unsigned long i = 0; i < n; i++) ((char *)buf)[i] = tmp[off + i];
+                    out = (long)n;
+                }
+            }
+            kfree(tmp);
+            return out;
+        }
+    }
     if (tmp_path(rn, &tb)) return tmpfs_pread(tb, buf, max, (unsigned long)off);   /* tmpfs native (M1196) */
     int midx; char fpath[VFS_PATH_MAX];
     if (mount_path(rn, &midx, fpath, sizeof fpath))
@@ -596,6 +629,20 @@ int vfs_stat(const char *path, struct statx *st) {
     if (veq(path, "/") || veq(path, "/tmp") || veq(path, "/tmp/") || veq(path, "/proc") || veq(path, "/proc/") ||
         veq(path, "/dev") || veq(path, "/dev/") || veq(path, "/snap") || veq(path, "/snap/")) {
         st->stx_mode = S_IFDIR | 0755u; st->stx_ino = path_ino(path); return 0;
+    }
+    { /* /proc and /dev FILES (M1965). The directories were already handled
+       * above; their contents were not, so stat said "no such file" for every
+       * one of them and open() therefore refused to open any. Size is reported
+       * as 0, exactly as Linux does for a generated /proc file -- the content
+       * does not exist until it is read. */
+        char ap[VFS_PATH_MAX];
+        if (synth_path(path, ap, sizeof ap)) {
+            int chardev = 0;
+            if (!procfs_exists(ap, &chardev)) return -1;
+            st->stx_mode = (unsigned)(chardev ? S_IFCHR : S_IFREG) | (chardev ? 0666u : 0444u);
+            st->stx_ino = path_ino(ap);
+            return 0;
+        }
     }
     if (tmp_path(path, &tb)) {                          /* RAM /tmp: full metadata */
         int islink = 0; unsigned long sz = 0, mt = 0;

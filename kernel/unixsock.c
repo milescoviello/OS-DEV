@@ -35,10 +35,16 @@ static inline void usock_irq_restore(uint64_t fl) {
     __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
 }
 
-#define U_LISTEN  8               /* concurrent listeners */
-#define U_CONN    16              /* concurrent connections (each = 2 endpoints) */
-#define U_RING    4096            /* bytes buffered per direction */
-#define U_PATH    64
+/* M1965 raised all four. The old numbers were sized for one in-tree demo
+ * talking to itself; a real event-loop program (Node, and later a Wayland
+ * compositor) opens a listener per service and a connection per client, and
+ * 64 bytes of path could not even hold a name under /run. A 4 KiB ring also
+ * makes every sizeable message a short write, which is legal but forces the
+ * sender back through poll for each 4 KiB. */
+#define U_LISTEN  32              /* concurrent listeners */
+#define U_CONN    128             /* concurrent connections (each = 2 endpoints) */
+#define U_RING    16384           /* bytes buffered per direction */
+#define U_PATH    128             /* Linux sun_path is 108 (M1965) */
 
 struct uring { unsigned char buf[U_RING]; int head, tail; };   /* empty when head==tail */
 static int rcount(struct uring *r) { return (r->head - r->tail + U_RING) % U_RING; }
@@ -58,6 +64,12 @@ struct uconn {
     int used;
     struct uring a2b, b2a;        /* A(client)->B(server) stream, and B->A stream */
     int a_closed, b_closed;
+    /* HALF-CLOSE (M1965). shutdown(fd, SHUT_WR) ends one DIRECTION: the peer
+     * must read EOF while this side can still read the peer's reply. Without
+     * it, Node's socket.end() was accepted and did nothing, the server never
+     * saw EOF, its connection handle stayed open, and the event loop had
+     * nothing left to do but could not exit -- a hang with no error. */
+    int a_wr_closed, b_wr_closed;
     task_t *a_waiter, *b_waiter;  /* side A blocked reading b2a; side B blocked reading a2b */
 };
 static struct uconn conns[U_CONN];
@@ -79,12 +91,37 @@ int unix_listen(const char *path) {
     for (int i = 0; i < U_LISTEN; i++) if (lis[i].used && peq(lis[i].path, path)) { usock_irq_restore(fl); return i; }   /* already bound: idempotent re-listen (single-user OS) */
     for (int i = 0; i < U_LISTEN; i++) if (!lis[i].used) {
         int j = 0; while (path[j] && j < U_PATH - 1) { lis[i].path[j] = path[j]; j++; } lis[i].path[j] = 0;
+        /* Refuse an over-long name instead of listening on a PREFIX of it --
+         * a truncated bind succeeds and then no connect ever matches, which
+         * looks like "the server is not running". Same rule as the VMA path
+         * table (M1955). */
+        if (path[j]) { usock_irq_restore(fl); return -1; }
         lis[i].used = 1; lis[i].np = 0; lis[i].waiter = 0;
         usock_irq_restore(fl);
         return i;
     }
     usock_irq_restore(fl);
     return -1;                                    /* listener table full */
+}
+
+/* Release a listener's name (M1965). close(listen_fd) must free the path, or
+ * a server that restarts finds its own socket still bound -- and with a table
+ * of 32, a few restarts exhaust it. Pending-but-unaccepted connections are
+ * closed on the server side so a client blocked in connect() sees EOF rather
+ * than waiting on a server that is gone. */
+int unix_unlisten(int lid) {
+    if (lid < 0 || lid >= U_LISTEN) return -1;
+    uint64_t fl = usock_irq_save();
+    if (!lis[lid].used) { usock_irq_restore(fl); return -1; }
+    for (int i = 0; i < lis[lid].np; i++) {
+        struct uconn *c = &conns[lis[lid].pend[i]];
+        c->b_closed = 1;
+        if (c->a_waiter) { task_wake(c->a_waiter); c->a_waiter = 0; }
+    }
+    lis[lid].np = 0; lis[lid].used = 0; lis[lid].path[0] = 0;
+    if (lis[lid].waiter) { task_wake(lis[lid].waiter); lis[lid].waiter = 0; }
+    usock_irq_restore(fl);
+    return 0;
 }
 
 int unix_connect(const char *path) {
@@ -97,7 +134,7 @@ int unix_connect(const char *path) {
     if (ci < 0) { usock_irq_restore(fl); return -1; }   /* connection table full */
     struct uconn *c = &conns[ci];
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
-    c->a_closed = c->b_closed = 0; c->a_waiter = c->b_waiter = 0;
+    c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
     lis[li].pend[lis[li].np++] = ci;               /* enqueue for the server to accept */
     if (lis[li].waiter) { task_wake(lis[li].waiter); lis[li].waiter = 0; }
     usock_irq_restore(fl);
@@ -137,7 +174,8 @@ long unix_send(int ep, const void *buf, unsigned long len) {
     uint64_t fl = usock_irq_save();
     int s; struct uconn *c = ep_conn(ep, &s); if (!c) { usock_irq_restore(fl); return -1; }
     int peer_closed = s ? c->a_closed : c->b_closed;
-    if (peer_closed) { usock_irq_restore(fl); return -1; }       /* peer is gone */
+    int self_wr = s ? c->b_wr_closed : c->a_wr_closed;
+    if (peer_closed || self_wr) { usock_irq_restore(fl); return -1; }   /* peer is gone, or we shut our write side */
     struct uring *tx = s ? &c->b2a : &c->a2b;                    /* B writes b2a, A writes a2b */
     int n = rput(tx, (const unsigned char *)buf, (int)len);
     task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer's blocked reader */
@@ -153,8 +191,8 @@ long unix_recv(int ep, void *buf, unsigned long max) {
     int self_closed = s ? c->b_closed : c->a_closed;
     if (self_closed) { usock_irq_restore(fl); return -1; }       /* we closed our own end */
     if (rcount(rx) == 0) {
-        int peer_closed = s ? c->a_closed : c->b_closed;
-        if (peer_closed) { usock_irq_restore(fl); return 0; }    /* EOF: peer closed and ring drained */
+        int peer_closed = (s ? c->a_closed : c->b_closed) || (s ? c->a_wr_closed : c->b_wr_closed);
+        if (peer_closed) { usock_irq_restore(fl); return 0; }    /* EOF: peer closed (or shut down writing) and ring drained */
         task_t **mw = s ? &c->b_waiter : &c->a_waiter;
         *mw = task_self();
         usock_irq_restore(fl);
@@ -166,6 +204,20 @@ long unix_recv(int ep, void *buf, unsigned long max) {
     int got = rget(rx, (unsigned char *)buf, (int)max);
     usock_irq_restore(fl);
     return got;
+}
+
+/* shutdown(2). how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR. Only the write
+ * direction is modelled -- SHUT_RD has no observable effect on a local ring
+ * beyond discarding what is already buffered, and no caller depends on it. */
+int unix_shutdown(int ep, int how) {
+    if (how != 1 && how != 2) return 0;                          /* SHUT_RD: accepted, nothing to do */
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s); if (!c) { usock_irq_restore(fl); return -1; }
+    if (s) c->b_wr_closed = 1; else c->a_wr_closed = 1;
+    task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer so its recv returns EOF */
+    if (*pw) { task_wake(*pw); *pw = 0; }
+    usock_irq_restore(fl);
+    return 0;
 }
 
 int unix_close(int ep) {
@@ -184,8 +236,35 @@ int unix_close(int ep) {
 static int ep_readable(int ep) {
     int s; struct uconn *c = ep_conn(ep, &s); if (!c) return 0;
     struct uring *rx = s ? &c->a2b : &c->b2a;
-    int peer_closed = s ? c->a_closed : c->b_closed;
-    return rcount(rx) > 0 || peer_closed;
+    int peer_closed = (s ? c->a_closed : c->b_closed) || (s ? c->a_wr_closed : c->b_wr_closed);
+    return rcount(rx) > 0 || peer_closed;      /* pending EOF counts as readable -- that is how a poller learns of it */
+}
+
+/* Non-blocking readiness predicates, for the fd table's poll/epoll ladder
+ * (M1965). `ep_readable` already existed as exactly the right test -- it was
+ * simply static, usable only by unix_wait_any's own blocking multiplexer.
+ * app_fd_ready is called in a loop over many fds and must never block, so it
+ * needs these instead. */
+int unix_readable(int ep) {
+    uint64_t fl = usock_irq_save();
+    int r = ep_readable(ep);
+    usock_irq_restore(fl);
+    return r;
+}
+/* Does this listener have a connection waiting? POLLIN on a listening socket
+ * means "accept would not block", which is what a server's event loop polls. */
+int unix_pending(int lid) {
+    if (lid < 0 || lid >= U_LISTEN) return 0;
+    uint64_t fl = usock_irq_save();
+    int n = lis[lid].used ? lis[lid].np : 0;
+    usock_irq_restore(fl);
+    return n > 0;
+}
+/* accept without blocking: -1 when nothing is pending. unix_accept blocks, and
+ * a non-blocking accept(2) after a readable poll must not. */
+int unix_accept_nb(int lid) {
+    if (!unix_pending(lid)) return -1;
+    return unix_accept(lid);
 }
 
 /* wait_any: the poll/epoll-style readiness multiplexer. Given up to 16 endpoint
@@ -235,7 +314,7 @@ int unix_socketpair(int *a, int *b) {
     if (ci < 0) { usock_irq_restore(fl); return -1; }   /* connection table full */
     struct uconn *c = &conns[ci];
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
-    c->a_closed = c->b_closed = 0; c->a_waiter = c->b_waiter = 0;
+    c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
     *a = (ci << 1) | 0;                             /* side A */
     *b = (ci << 1) | 1;                             /* side B */
     usock_irq_restore(fl);

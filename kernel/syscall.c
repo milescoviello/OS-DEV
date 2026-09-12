@@ -299,6 +299,7 @@ static uint32_t syscall_class(uint64_t nr) {
     case SYS_msgget: case SYS_msgsnd: case SYS_msgrcv: case SYS_msgctl:
     case SYS_unix_listen: case SYS_unix_connect: case SYS_unix_accept:
     case SYS_unix_send: case SYS_unix_recv: case SYS_unix_close: case SYS_unix_wait_any: case SYS_socketpair:
+    case SYS_unix_shutdown: case SYS_unix_unlisten:
     case SYS_sendfd: case SYS_recvfd:
     case SYS_pty_open: case SYS_pty_read: case SYS_pty_write: case SYS_pty_close: case SYS_pty_ctl:
     case SYS_pipe: case SYS_pipe2: case SYS_eventfd: case SYS_fdread: case SYS_fdwrite: case SYS_fdclose: case SYS_dup2: case SYS_dup:
@@ -1339,6 +1340,12 @@ void syscall_dispatch(struct registers *r) {
     case SYS_unix_wait_any:                /* (int*eps, n) -> index of first readable ep, blocks once (M1170) */
         if ((int)r->rsi <= 0 || (int)r->rsi > 16 || !ubuf(r->rdi, (uint64_t)(int)r->rsi * sizeof(int))) { r->rax = (uint64_t)-1; break; }
         r->rax = (uint64_t)(int64_t)unix_wait_any((const int *)r->rdi, (int)r->rsi);
+        break;
+    case SYS_unix_shutdown:                /* (ep, how) -> half-close this side's write direction (M1965) */
+        r->rax = (uint64_t)(int64_t)unix_shutdown((int)r->rdi, (int)r->rsi);
+        break;
+    case SYS_unix_unlisten:                /* (lid) -> release a listener's bound name (M1965) */
+        r->rax = (uint64_t)(int64_t)unix_unlisten((int)r->rdi);
         break;
     case SYS_socketpair: {                 /* (int sv[2]) -> a pre-connected AF_UNIX endpoint pair (M1254) */
         if (!ubuf(r->rdi, 2 * sizeof(int))) { r->rax = (uint64_t)-1; break; }
