@@ -21,6 +21,10 @@ set -e
 ROOT=$1; NAME=$2; BIN=$3
 [ -n "$ROOT" ] && [ -n "$NAME" ] || { echo "usage: $0 <lxroot> <name> [binary]" >&2; exit 2; }
 [ -n "$BIN" ] || BIN=$(command -v "$NAME" 2>/dev/null || true)
+# `command -v echo` prints "echo" -- the SHELL BUILTIN, not a file. readlink -f
+# then happily resolves it against the cwd and we stage a path that does not
+# exist. Anything that is not already absolute is not a binary we can copy.
+case "$BIN" in /*) ;; *) BIN=$(command -v "/usr/bin/$NAME" 2>/dev/null || true) ;; esac
 [ -n "$BIN" ] || { echo "  SKIP    $NAME (not installed on the host)"; exit 0; }
 BIN=$(readlink -f "$BIN")
 [ -f "$BIN" ] || { echo "  SKIP    $NAME ($BIN missing)"; exit 0; }

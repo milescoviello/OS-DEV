@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1957-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1958-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -539,8 +539,17 @@ Landed so far, all on the from-scratch ext2 driver:
   freestanding `.c` with `cc1`, assembles it with `as`, links it with `ld` and
   runs the result, which exits with its own status.
 
-Still ahead: Phase 5, self-hosting — `make` driving that toolchain over the
-OS-DEV tree. The honest scale is still months, and the memory subsystem needs
+- **M1958** — **GNU make builds a program inside OS-DEV.** It forks a child per
+  recipe line, `execve`s a dynamically-linked binary in it, and `wait4`s — and
+  all three were gaps. `execve` could not load a dynamically-linked image at all
+  (the `PT_INTERP` work was spawn-only), `posix_spawn`'s
+  `clone(CLONE_VM|CLONE_VFORK, stack)` was refused, and then `make` **hung in
+  `wait4`** because `app_reap` is driven only by the desktop's window loop —
+  which had not started yet. `cc1` → `as` → `ld` → `echo` now runs in dependency
+  order and make exits 0.
+
+Still ahead: Phase 5 proper, self-hosting — `make` driving that toolchain over
+the OS-DEV tree. The honest scale is still months, and the memory subsystem needs
 more work before Node (`MMAP_TOP` is 256 MiB and the mmap allocator never
 recycles addresses, so V8's address-space cage still cannot be expressed).
 

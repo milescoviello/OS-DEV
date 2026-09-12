@@ -243,6 +243,7 @@ static volatile int g_journal_test;           /* -append journalguest: prove the
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
+static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
 static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
 static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
 static volatile int g_netcon;                 /* -append netcon: start the network debug console on TCP 2323 (M1870, real-HW bring-up) */
@@ -486,6 +487,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
+        if (cmdline_has(cl, "lxsystrace")) g_lxtrace_make = 1;          /* trace every Linux syscall, but only around the make run (M1958) */
         if (cmdline_has(cl, "netcon"))     g_netcon = 1;                 /* network debug console for real-HW bring-up (M1870) */
         if (cmdline_has(cl, "nodisk"))     g_nodisk = 1;                 /* skip disk-write self-tests + FS mount — safe on a machine with real disks (M1872) */
         if (cmdline_has(cl, "watchdog"))   g_watchdog = 1;              /* HW watchdog + panic-auto-reboot for the autonomous PXE loop (M1881) */
@@ -808,6 +810,23 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxtool] running the C program OS-DEV just compiled...\n");
             rc = app_run_linux_sync("/disk2/tc.elf", 0, 0, 60000);
             kprintf("[lxtool] CCSELF exit -> %d\n", rc);
+
+            /* PHASE 5's first step: GNU make, driving that toolchain. make is
+             * a different kind of demand on the ABI from a compiler -- it
+             * stats targets, compares timestamps, forks a SHELL per recipe
+             * line and waits for it. /bin/sh is a real bash. (M1958) */
+            vfs_remove("/disk2/mk.s");
+            vfs_remove("/disk2/mk.o");
+            vfs_remove("/disk2/mk.elf");
+            static const char *av_make[] = { "-f", "/Makefile.guest" };
+            kprintf("[lxtool] running GNU make inside OS-DEV...\n");
+            if (g_lxtrace_make) g_lx_systrace = 1;
+            rc = app_run_linux_sync("/disk2/usr/bin/make", av_make, 2, 240000);
+            g_lx_systrace = 0;
+            kprintf("[lxtool] make -> %d\n", rc);
+            kprintf("[lxtool] running what make built...\n");
+            rc = app_run_linux_sync("/disk2/mk.elf", 0, 0, 60000);
+            kprintf("[lxtool] MAKEBUILT exit -> %d\n", rc);
         }
     }
 

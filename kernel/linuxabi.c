@@ -41,6 +41,7 @@
 #include "random.h"
 #include "vfs.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
 #include "timer.h"
+#include "pmm.h"    /* sysinfo reports real memory totals (M1958) */
 #include "syscall.h"   /* AT_PAGESZ/AT_ENTRY/AT_UID/... -- the auxv types we share with /proc/<pid>/auxv */
 #include <stdint.h>
 
@@ -220,6 +221,12 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_fcntl_        72
 #define LXS_getrusage_    98
 #define LXS_time_        201
+#define LXS_getcwd_       79
+#define LXS_chmod_        90
+#define LXS_umask_        95
+#define LXS_clone3_      435
+#define LXS_sysinfo_      99
+#define LXS_gettimeofday_ 96
 
 /* Linux's O_* are OCTAL and do NOT match ours -- O_CREAT is 0100 (64) there and
  * 8 here, O_TRUNC 01000 (512) vs 4. Passing them through unmapped would silently
@@ -268,6 +275,7 @@ void linux_abi_init_this_cpu(void) {
  * the ext2 volume. It is the right abstraction rather than a workaround: a
  * toolchain installed later needs /usr/lib and /usr/include to mean something,
  * and this is how they come to. Relative paths pass through untouched. */
+int g_lx_systrace;                        /* -append lxsystrace: log EVERY Linux syscall (very noisy; for finding where a program blocks) */
 int g_lx_mmap_trace;                      /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
 #define LX_ROOT     "/disk2"
 #define LX_ROOT_LEN 6
@@ -301,6 +309,7 @@ volatile unsigned long lx_syscall_count, lx_unknown_count;
  */
 void linux_syscall_dispatch(struct registers *r) {
     lx_syscall_count++;
+    if (g_lx_systrace) kprintf("[sys] %ld(%lx,%lx,%lx)\n", (long)r->rax, r->rdi, r->rsi, r->rdx);
     long a1 = (long)r->rdi, a3 = (long)r->rdx;
     const char *p2 = (const char *)r->rsi;
 
@@ -605,7 +614,13 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_close_:
-        r->rax = (uint64_t)(app_fd_close((int)a1) == 0 ? 0 : -(long)LX_EBADF);
+        if (app_fd_close((int)a1) == 0) { r->rax = 0; break; }
+        /* fd 0/1/2 are the console when they are not fd-table entries -- they
+         * ARE open, so closing them succeeds; there is simply nothing to free.
+         * Returning EBADF made coreutils' close_stdout report
+         * "echo: write error: Bad file descriptor" AFTER printing correctly,
+         * which then failed the make recipe that ran it. */
+        r->rax = (a1 >= 0 && a1 <= 2) ? 0 : (uint64_t)-(long)LX_EBADF;
         break;
     case LXS_lseek_: {                      /* (fd, offset, whence) -- SET/CUR/END match */
         long off = app_lseek((int)a1, (long)r->rsi, (int)r->rdx);
@@ -687,7 +702,88 @@ void linux_syscall_dispatch(struct registers *r) {
          * quietly turned into a process -- silently forking where a caller
          * expected a shared address space would corrupt it. */
         if (!(r->rdi & LX_CLONE_VM) && r->rsi == 0) { r->rax = (uint64_t)app_fork(r); break; }
+        /* CLONE_VM with a child stack is what glibc's posix_spawn uses, and
+         * therefore what GNU make needs to run a recipe. Served by a COW fork
+         * with the child's rsp overridden -- see app_fork_at for why sharing
+         * the address space for real would be worse than this. (M1958) */
+        if (r->rsi) { r->rax = (uint64_t)app_fork_at(r, r->rsi); break; }
         r->rax = (uint64_t)-(long)LX_ENOSYS;
+        break;
+    case LXS_clone3_: {                     /* (struct clone_args *, size) */
+        /* glibc tries clone3 first and falls back to clone(2) on ENOSYS, so
+         * this is optional -- but the fallback then hits the CLONE_VM case
+         * above anyway, and serving clone3 directly keeps the flags in one
+         * place. Layout: flags, pidfd, child_tid, parent_tid, exit_signal,
+         * stack, stack_size, tls -- all __aligned_u64.
+         * NOTE stack is the LOW end here and the stack pointer is
+         * stack+stack_size; clone(2) passes the top directly. Getting that
+         * backwards puts the child's rsp below its own stack. */
+        if ((long)r->rsi < 64 || !vmm_user_ok(r->rdi, 64)) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        const uint64_t *ca = (const uint64_t *)r->rdi;
+        uint64_t cflags = ca[0], cstack = ca[5], cssize = ca[6];
+        if (!(cflags & LX_CLONE_VM) && !cstack) { r->rax = (uint64_t)app_fork(r); break; }
+        if (cstack) { r->rax = (uint64_t)app_fork_at(r, cstack + cssize); break; }
+        r->rax = (uint64_t)-(long)LX_ENOSYS;
+        break;
+    }
+    case LXS_getcwd_: {                     /* (buf, size) -> the LENGTH incl. NUL, and fills buf */
+        long cap = (long)r->rsi;
+        if (cap <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (!vmm_user_ok(r->rdi, (uint64_t)cap)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char cw[VFS_PATH_MAX];
+        long n = app_getcwd(cw, sizeof cw);
+        if (n < 0) { cw[0] = '/'; cw[1] = 0; n = 1; }
+        /* Strip the /disk2 mount prefix: inside a Linux process that volume IS
+         * the root, exactly as lx_xlate adds it on the way in. A cwd of
+         * "/disk2/x" would make every relative path resolve to /disk2/disk2/x. */
+        const char *cp = cw;
+        { const char *pre = LX_ROOT; int k = 0;
+          while (pre[k] && cw[k] == pre[k]) k++;
+          if (!pre[k]) { cp = (cw[k] == '/') ? cw + k : "/"; } }
+        long len = 0; while (cp[len]) len++;
+        if (len + 1 > cap) { r->rax = (uint64_t)-(long)LX_ERANGE; break; }
+        char *out = (char *)r->rdi;
+        for (long i = 0; i <= len; i++) out[i] = cp[i];
+        r->rax = (uint64_t)(len + 1);       /* Linux returns the length INCLUDING the NUL */
+        break;
+    }
+    case LXS_sysinfo_: {                    /* (struct sysinfo *) */
+        /* 112 bytes of longs. cc1 reads it to size its garbage-collector
+         * heuristics; zeros would make it think there is no memory at all, so
+         * report the real totals from the physical allocator. */
+        if (!vmm_user_ok(r->rdi, 112)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint8_t *si = (uint8_t *)r->rdi;
+        for (int i = 0; i < 112; i++) si[i] = 0;
+        *(int64_t  *)(si + 0)  = (int64_t)(timer_ms() / 1000);      /* uptime  */
+        *(uint64_t *)(si + 24) = pmm_total_bytes();       /* totalram */
+        *(uint64_t *)(si + 32) = pmm_free_bytes();        /* freeram  */
+        *(uint16_t *)(si + 88) = 1;                                  /* procs    */
+        *(uint32_t *)(si + 104) = 1;                                 /* mem_unit */
+        r->rax = 0;
+        break;
+    }
+    case LXS_gettimeofday_: {               /* (struct timeval *, struct timezone *) */
+        if (r->rdi) {
+            if (!vmm_user_ok(r->rdi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            int64_t *tv = (int64_t *)r->rdi;
+            uint64_t ms = timer_ms();
+            tv[0] = (int64_t)rtc_unix();
+            tv[1] = (int64_t)((ms % 1000) * 1000);   /* microseconds */
+        }
+        r->rax = 0;                          /* the timezone arg is obsolete; Linux ignores it too */
+        break;
+    }
+    case LXS_umask_:
+        /* We have no mode bits to mask. Report the conventional 022 as the
+         * PREVIOUS mask and accept the new one: umask's return value is the
+         * old mask, and an error here makes a shell think it cannot set one. */
+        r->rax = 022;
+        break;
+    case LXS_chmod_:
+        /* Accepted and ignored. Everything runs as root on a volume with no
+         * enforced permission bits, so refusing would fail `as`'s attempt to
+         * chmod the object file it just wrote for no gain. */
+        r->rax = 0;
         break;
     case LXS_fork_:
     case LXS_vfork_:

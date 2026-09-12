@@ -33,3 +33,4 @@ uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
                         const char *const *argv, const char *const *envp);
 
 extern int g_lx_mmap_trace;    /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
+extern int g_lx_systrace;      /* -append lxsystrace: log EVERY Linux syscall */

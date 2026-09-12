@@ -1,0 +1,26 @@
+# A Makefile that GNU make executes INSIDE OS-DEV (M1958).
+#
+# Nothing here is special. It is an ordinary Makefile with a multi-step
+# dependency chain, run by the real gmake binary through the Linux ABI shim,
+# driving the real cc1, as and ld. The point is that `make` works: it stats
+# targets, compares timestamps, forks a shell per recipe line, and waits.
+#
+# The output's exit status (31) is this file's own, so it cannot be produced
+# by anything except this chain actually running.
+CC1 = /usr/bin/cc1
+AS  = /usr/bin/as
+LD  = /usr/bin/ld
+
+# /bin/echo, not the shell builtin: make execs a recipe line directly when it
+# has no shell metacharacters, and our execve does not search PATH.
+all: /mk.elf
+	/bin/echo MKDONE
+
+/mk.s: /hello.c
+	$(CC1) -quiet -nostdinc $< -o $@
+
+/mk.o: /mk.s
+	$(AS) -o $@ $<
+
+/mk.elf: /mk.o
+	$(LD) --no-dynamic-linker -pie -e _start -o $@ $<

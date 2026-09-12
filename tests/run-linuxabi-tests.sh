@@ -290,7 +290,7 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     QPID4=$!
     i=0
     while [ $i -lt 800 ]; do
-        grep -aqE "CCSELF exit|KERNEL PANIC" "$SLOG4" 2>/dev/null && break
+        grep -aqE "MAKEBUILT exit|KERNEL PANIC" "$SLOG4" 2>/dev/null && break
         sleep 0.5; i=$((i+1))
     done
 
@@ -352,8 +352,29 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     else
         echo "  FAIL: the compiled C program did not run:"; grep -aE "CCSELF" "$SLOG4" | head -2; f4=1
     fi
+    # --- M1958: GNU make drives that toolchain -- PHASE 5's foundation ------
+    # A different kind of demand from a compiler: make stats targets, compares
+    # timestamps, forks a child per recipe line, execs a DYNAMICALLY LINKED
+    # binary in it, and wait4()s. Every one of those was a gap.
+    #
+    # `make -> 0` is the assertion, not just MKDONE: a recipe that fails still
+    # prints everything before it, and make's own exit status is the only thing
+    # that reports the build as a whole succeeded.
+    if grep -aq "MKDONE" "$SLOG4" && grep -aq "\[lxtool\] make -> 0" "$SLOG4"; then
+        echo "  ok: GNU make ran cc1 + as + ld in dependency order and exited 0"
+    else
+        echo "  FAIL: make did not complete the build:"
+        grep -aE "\[lxtool\] make ->|^make:|MKDONE" "$SLOG4" | head -4; f4=1
+    fi
+    # And run what MAKE built (not what the earlier hand-driven steps built --
+    # different output paths, same source, so the 29 here is make's own chain).
+    if grep -aq "\[lxtool\] MAKEBUILT exit -> 29" "$SLOG4"; then
+        echo "  ok: OS-DEV RAN THE PROGRAM ITS OWN make BUILT (exit 29)"
+    else
+        echo "  FAIL: make's output did not run:"; grep -aE "MAKEBUILT" "$SLOG4" | head -2; f4=1
+    fi
     [ $f4 -eq 0 ] || { echo "FAIL: in-guest toolchain"; exit 1; }
-    echo "PASS: PHASE 4 -- real GCC compiled, as assembled, ld linked and OS-DEV ran a C program, in-guest"
+    echo "PASS: PHASE 4 -- real GCC/as/ld, driven by real GNU make, built and ran a C program inside OS-DEV"
 else
     echo "SKIP: XSAVE/AVX + toolchain tests (this QEMU has no -cpu max)"
 fi

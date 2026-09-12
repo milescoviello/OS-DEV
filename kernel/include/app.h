@@ -139,6 +139,7 @@ long     app_futex(uint64_t uaddr, int op, int val, long timeout_ms);  /* FUTEX_
 int      app_fault_handle(uint64_t cr2, uint64_t err); /* #PF hook: COW copy / swap-in / lazily map an mmap page; 1 if handled */
 struct registers;                                   /* (interrupts.h) */
 long     app_fork(struct registers *r);             /* COW fork: child returns 0, parent returns child pid; -1 fail (M1116) */
+long     app_fork_at(struct registers *r, uint64_t child_rsp);  /* ... and with the CHILD's rsp overridden: clone(CLONE_VM|CLONE_VFORK, stack), what posix_spawn uses (M1958) */
 long     app_process_vm_read(int pid, uint64_t raddr, void *local, uint64_t len);  /* read another (same-tree) process's memory; bytes/-1 (M1162) */
 long     app_process_vm_write(int pid, uint64_t raddr, const void *local, uint64_t len);  /* write another (same-tree) process's memory (COW-safe); bytes/-1 (M1165) */
 int      app_setrlimit(int resource, uint64_t val);   /* set a resource limit (RLIMIT_NPROC); 0/-1 (M1163) */

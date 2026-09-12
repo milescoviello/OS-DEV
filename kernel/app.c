@@ -312,6 +312,8 @@ static int  g_last_spawn_pid;            /* pid of the last successful app_spawn
  * has to place the segments. That is what makes a 42 MB cc1 loadable at all:
  * app_spawn_from_file's whole-image kmalloc has a 16 MB ceiling. (M1956) */
 static char g_pend_mappath[VFS_PATH_MAX];
+static int  lx_stage_interp(const char *path);   /* fwd: defined with the spawn path, used by execve too (M1958) */
+static void lx_drop_interp(void);
 static uint64_t g_pend_mapsize;          /* and its real on-disk size: segment offsets are validated against THAT, not against the header buffer */
 static int  g_have_pend;
 /* A pending "jail" for the next app_spawn (M1088): pledge promises + an optional
@@ -5155,7 +5157,21 @@ static void app_fd_release(struct app *a) {
  * window, a copy-on-write clone of the address space (vmm_fork_cow), and a child
  * task that resumes at the parent's instruction after `int 0x80` with rax = 0.
  * The parent returns the child's pid. `r` is the parent's live trap frame. */
-long app_fork(struct registers *r) {
+/* COW fork, optionally giving the CHILD a different stack pointer (M1958).
+ *
+ * child_rsp != 0 serves clone(CLONE_VM|CLONE_VFORK, stack) -- the shape
+ * glibc's posix_spawn uses, and therefore the one GNU make needs to run a
+ * recipe. We deliberately do NOT share the address space: the child gets a COW
+ * copy and resumes at the same RIP with rax=0 and rsp=stack, which is exactly
+ * what glibc's clone wrapper expects (it pops the function pointer off that
+ * stack and calls it). Honouring CLONE_VM literally would mean the child's
+ * execve tears down the address space its PARENT is still running in.
+ *
+ * The one real divergence: with CLONE_VM the child reports an exec failure by
+ * writing an errno into memory the parent can see, and a COW copy loses that
+ * write. The child still _exit(127)s, so a failed exec surfaces in the wait
+ * status -- which is what make actually reports on. */
+long app_fork_at(struct registers *r, uint64_t child_rsp) {
     struct app *p = cur();
     if (!p || !r) return -1;
 
@@ -5216,6 +5232,7 @@ long app_fork(struct registers *r) {
     /* The child's resume context: the parent's trap frame, but returning 0. */
     a->fork_frame = *r;
     a->fork_frame.rax = 0;
+    if (child_rsp) a->fork_frame.rsp = child_rsp;       /* clone() with a caller-supplied child stack */
     a->fork_frame.rflags |= 0x200;                      /* ensure IF is set in ring 3 */
 
     a->task = task_create_stack(fork_child_trampoline, a->cr3, a, 256 * 1024);
@@ -5229,6 +5246,8 @@ long app_fork(struct registers *r) {
     if (n != pend_t) { pending[pend_h] = a; pend_h = n; }
     return a->pid;
 }
+
+long app_fork(struct registers *r) { return app_fork_at(r, 0); }
 
 /* clone (M1138): create a THREAD — a task sharing this process's address space
  * (same CR3, same app_t) that begins in ring 3 at fn(arg) on `stack`. Unlike
@@ -5335,6 +5354,15 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     if (a->exec_img) { elf = a->exec_img; img_sz = a->exec_imgsz; title = name; }   /* execve (M1948/M1952) */
     if (!elf) return -1;                                /* no such program */
 
+    /* Consume the mapped-load / interpreter one-shots here, before anything
+     * can re-enter. app_execve_linux still owns the interpreter buffer and
+     * frees it when we return, so this only borrows it. (M1958) */
+    char exec_mappath[VFS_PATH_MAX];
+    { int mi = 0; while (g_pend_mappath[mi] && mi < VFS_PATH_MAX - 1) { exec_mappath[mi] = g_pend_mappath[mi]; mi++; }
+      exec_mappath[mi] = 0; }
+    uint64_t exec_mapsize = g_pend_mapsize;
+    void *exec_interp = g_pend_interp; unsigned long exec_interp_sz = g_pend_interp_sz;
+
     uint64_t new_cr3 = vmm_create_address_space();
     if (!new_cr3) return -1;
     vdso_map(new_cr3);
@@ -5350,8 +5378,28 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");   /* become the new space */
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
-    uint64_t entry = elf_load(elf, img_sz, lazy, 4, &nlazy);
-    if (!entry) goto fail;
+    /* A mapped load registers VMAs as it goes, so a->nvma has to be reset
+     * BEFORE it runs -- the reset further down would otherwise wipe the
+     * segments it just mapped. Snapshotted so the fail path, which leaves the
+     * caller running in its OLD address space, restores its VMA list. */
+    int saved_nvma = a->nvma;
+    uint64_t entry;
+    if (exec_mappath[0]) {
+        a->nvma = 0;
+        entry = app_load_mapped(a, exec_mappath, elf, img_sz, exec_mapsize);
+    } else {
+        entry = elf_load(elf, img_sz, lazy, 4, &nlazy);
+    }
+    if (!entry) { a->nvma = saved_nvma; goto fail; }
+    uint64_t prog_entry = entry, interp_base = 0;
+    if (exec_interp) {
+        /* Dynamically linked: map the interpreter too and enter IT. The
+         * program's own entry still goes in the auxv as AT_ENTRY. (M1958) */
+        uint64_t ie = elf_load_at(exec_interp, exec_interp_sz, ELF_INTERP_BASE);
+        if (!ie) { a->nvma = saved_nvma; goto fail; }
+        interp_base = ELF_INTERP_BASE;
+        entry = ie;
+    }
     for (int i = 1; i < USTACK_PAGES; i++) {   /* i=0 = unmapped guard page below the user stack (M1499) */
         uint64_t frame = pmm_alloc_frame();
         if (!frame) goto fail;
@@ -5370,8 +5418,9 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * same frame app_spawn builds, but with the caller's argv rather than a
      * synthesised one. (M1948) */
     if (a->exec_argv) {
-        uint64_t rsp = lx_spawn_stack(elf, ELF_DYN_BASE, entry, a->ustack,
-                                      USTACK_BASE + PAGE_SIZE, a->exec_argv, a->exec_envp);
+        uint64_t rsp = lx_spawn_stack_dyn(elf, ELF_DYN_BASE, prog_entry, interp_base,
+                                          a->ustack, USTACK_BASE + PAGE_SIZE,
+                                          a->exec_argv, a->exec_envp);
         /* A failure here must be FATAL, not a fallback. The old code kept the
          * bare stack top on failure -- but that address is USTACK_BASE +
          * USTACK_PAGES*PAGE_SIZE, i.e. one page PAST the last mapped stack
@@ -5383,7 +5432,11 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     }
 
     /* reset per-program state (the new image starts clean); keep pid/parent/pledge */
-    a->heap_end = 0; a->nvma = 0; a->mlock_future = 0;   /* mlockall(MCL_FUTURE) does not survive exec (M1283) */
+    a->heap_end = 0; a->mlock_future = 0;   /* mlockall(MCL_FUTURE) does not survive exec (M1283) */
+    /* NOT unconditional any more: a mapped load already reset nvma and then
+     * FILLED it with the new image's segments, so zeroing here would throw
+     * them away and every page of the new program would fault unbacked. */
+    if (!exec_mappath[0]) a->nvma = 0;
     /* Register the NEW image's deferred whole-BSS range(s) (see app_spawn) —
      * done here, after a->nvma was just reset above, not right after elf_load
      * ran (which is before this reset would wipe them back out). */
@@ -5677,22 +5730,31 @@ long app_ptrace(long req, int pid, uint64_t addr, uint64_t data) {
 long app_execve_linux(struct registers *r, const char *path,
                       const char *const *argv, const char *const *envp) {
     if (!r || !path) return -1;
+    /* Dynamically linked? Stage its interpreter and switch to a mapped load,
+     * exactly as the spawn path does -- this used to be spawn-only, so
+     * execve of any dynamically-linked binary simply failed, which is what
+     * `make` hit forking and exec'ing /usr/bin/cc1. (M1958) */
+    if (lx_stage_interp(path) < 0) return -1;
+    int exec_mapped = g_pend_mappath[0] != 0;
+
     /* Read the image BEFORE touching any process state: a failed read must
      * leave the caller running, which is what execve promises. */
     struct statx xst;
     unsigned long CAP = (vfs_stat(path, &xst) == 0 && xst.stx_size) ? (unsigned long)xst.stx_size : (1u << 20);
-    if (CAP > (16u << 20)) return -1;                    /* see app_spawn_from_file (M1952) */
+    if (exec_mapped && CAP > 8192) CAP = 8192;           /* headers only: the segments are mapped */
+    if (CAP > (16u << 20)) { lx_drop_interp(); return -1; }   /* see app_spawn_from_file (M1952) */
     uint8_t *buf = kmalloc(CAP);
-    if (!buf) return -1;
-    long n = vfs_read(path, buf, CAP);
-    if (n <= 0) { kfree(buf); return -1; }
+    if (!buf) { lx_drop_interp(); return -1; }
+    long n = exec_mapped ? vfs_pread(path, buf, CAP, 0) : vfs_read(path, buf, CAP);
+    if (n <= 0) { kfree(buf); lx_drop_interp(); return -1; }
 
     struct app *me = cur();
-    if (!me) { kfree(buf); return -1; }
+    if (!me) { kfree(buf); lx_drop_interp(); return -1; }
     me->exec_img = buf; me->exec_imgsz = (uint64_t)n;
     me->exec_argv = argv; me->exec_envp = envp;
     long rc = app_exec(r, path, 0);
     me->exec_img = 0; me->exec_imgsz = 0; me->exec_argv = 0; me->exec_envp = 0;
+    lx_drop_interp();                       /* app_exec consumed it (or the exec failed) */
 
     /* Safe either way: app_exec copies the segments into the new address space
      * synchronously, so the image buffer is dead by the time it returns. */
@@ -5710,57 +5772,73 @@ int app_spawn_linux_from_file_arg(const char *path, const char *arg) {
     return rc;
 }
 
+/* Is `path` dynamically linked? If so, read its interpreter into g_pend_interp
+ * NOW and arrange for its segments to be mapped from the file.
+ *
+ * "NOW" is the point: app_spawn and app_exec both do their loading with
+ * interrupts off and a foreign CR3 loaded, which is no place to start disk
+ * I/O. Both call this first. Returns 1 dynamic, 0 static, -1 error (the
+ * interpreter is named but missing, or out of memory). (M1954, shared M1958)
+ *
+ * Factoring this out is what made execve work for a dynamically-linked
+ * binary: it lived inside the SPAWN path only, so `make` forking and exec'ing
+ * /usr/bin/cc1 produced a bare _exit(127) with no diagnostic at all. */
+static int lx_stage_interp(const char *path) {
+    g_pend_interp = 0; g_pend_interp_sz = 0;
+    g_pend_mappath[0] = 0; g_pend_mapsize = 0;
+    /* vfs_pread, not vfs_read: this is a deliberate PARTIAL read of the first
+     * pages, and some read paths refuse a buffer smaller than the file rather
+     * than returning a short count. */
+    uint8_t hdr[2048];
+    long hn = vfs_pread(path, hdr, sizeof hdr, 0);
+    char interp[192];
+    if (hn <= 64 || !elf_interp_path(hdr, (uint64_t)hn, interp, sizeof interp)) return 0;
+
+    /* The interpreter path is absolute in the LINUX process's world
+     * (/lib64/...), so it needs the same /disk2 root prefix the ABI applies to
+     * every other path. (M1954) */
+    char ipath[256];
+    { int k = 0; const char *pre = "/disk2";
+      while (pre[k]) { ipath[k] = pre[k]; k++; }
+      for (int j = 0; interp[j] && k < (int)sizeof ipath - 1; j++) ipath[k++] = interp[j];
+      ipath[k] = 0; }
+    struct statx ist;
+    unsigned long isz = (vfs_stat(ipath, &ist) == 0 && ist.stx_size) ? (unsigned long)ist.stx_size : 0;
+    if (!isz || isz > (16u << 20)) {
+        kprintf("[linuxabi] %s needs interpreter %s (%s), which is missing\n", path, interp, ipath);
+        return -1;                   /* refuse rather than enter a program that cannot start */
+    }
+    void *ib = kmalloc(isz);
+    if (!ib) return -1;
+    if (vfs_read(ipath, ib, isz) <= 0) { kfree(ib); return -1; }
+    g_pend_interp = ib; g_pend_interp_sz = isz;
+
+    /* ld.so does the relocating, so the kernel only has to PLACE the segments
+     * -- map them from the file instead of buffering the whole image. (M1956) */
+    struct statx mst;
+    if (vfs_stat(path, &mst) == 0 && mst.stx_size) {
+        int mi = 0; while (path[mi] && mi < VFS_PATH_MAX - 1) { g_pend_mappath[mi] = path[mi]; mi++; }
+        g_pend_mappath[mi] = 0;
+        g_pend_mapsize = (uint64_t)mst.stx_size;
+    }
+    kprintf("[linuxabi] %s is dynamically linked; loading %s\n", path, interp);
+    return 1;
+}
+
+/* Release whatever lx_stage_interp reserved. Safe to call twice. */
+static void lx_drop_interp(void) {
+    if (g_pend_interp) kfree(g_pend_interp);
+    g_pend_interp = 0; g_pend_interp_sz = 0;
+    g_pend_mappath[0] = 0; g_pend_mapsize = 0;
+}
+
 static int lx_spawn_file(const char *path) {
     int i = 0; while (path[i] && i < (int)sizeof g_pend_lxpath - 1) { g_pend_lxpath[i] = path[i]; i++; }
     g_pend_lxpath[i] = 0;
 
-    /* Peek at the image to see whether it is dynamically linked, and if so read
-     * the interpreter NOW -- app_spawn runs with interrupts off and a foreign
-     * CR3 loaded, which is no place to start disk I/O. (M1954) */
-    g_pend_interp = 0; g_pend_interp_sz = 0;
-    {
-        /* vfs_pread, not vfs_read: this is a deliberate PARTIAL read of the
-         * first pages, and some read paths refuse a buffer smaller than the
-         * file rather than returning a short count. */
-        uint8_t hdr[2048];
-        long hn = vfs_pread(path, hdr, sizeof hdr, 0);
-        char interp[192];
-        if (hn > 64 && elf_interp_path(hdr, (uint64_t)hn, interp, sizeof interp)) {
-            /* The interpreter path is absolute in the LINUX process's world
-             * (/lib64/...), so it needs the same /disk2 root prefix the ABI
-             * applies to every other path. (M1954) */
-            char ipath[256];
-            { int k = 0; const char *pre = "/disk2";
-              while (pre[k]) { ipath[k] = pre[k]; k++; }
-              for (int j = 0; interp[j] && k < (int)sizeof ipath - 1; j++) ipath[k++] = interp[j];
-              ipath[k] = 0; }
-            struct statx ist;
-            unsigned long isz = (vfs_stat(ipath, &ist) == 0 && ist.stx_size) ? (unsigned long)ist.stx_size : 0;
-            if (!isz || isz > (16u << 20)) {
-                kprintf("[linuxabi] %s needs interpreter %s (%s), which is missing\n", path, interp, ipath);
-                return -1;                   /* refuse rather than enter a program that cannot start */
-            }
-            void *ib = kmalloc(isz);
-            if (!ib) return -1;
-            if (vfs_read(ipath, ib, isz) <= 0) { kfree(ib); return -1; }
-            g_pend_interp = ib; g_pend_interp_sz = isz;
-            kprintf("[linuxabi] %s is dynamically linked; loading %s\n", path, interp);
-        }
-    }
+    if (lx_stage_interp(path) < 0) return -1;
 
     g_pend_linux = 1;
-    /* Dynamically linked? Then ld.so does the relocating and the kernel only
-     * has to PLACE the segments -- so map them from the file instead of
-     * buffering the whole image. cc1 is 42 MB; the buffered path caps at 16.
-     * A static PIE still goes through elf_load, which has to apply its
-     * R_X86_64_RELATIVE relocations. (M1956) */
-    if (g_pend_interp) {
-        struct statx mst;
-        int mi = 0; while (path[mi] && mi < VFS_PATH_MAX - 1) { g_pend_mappath[mi] = path[mi]; mi++; }
-        g_pend_mappath[mi] = 0;
-        g_pend_mapsize = (vfs_stat(path, &mst) == 0) ? (uint64_t)mst.stx_size : 0;
-        if (!g_pend_mapsize) g_pend_mappath[0] = 0;    /* unknown size: fall back to the buffered path */
-    }
     int rc = app_spawn_from_file(path);
     g_pend_linux = 0;                       /* never leak the flag to a later spawn */
     g_pend_mappath[0] = 0;                  /* and never leak the map request either */
@@ -5821,6 +5899,16 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
             return code;
         }
         irq_restore(f);
+        /* Drive reaping ourselves. app_reap is otherwise called ONLY from the
+         * desktop's window loop -- and this runner blocks the boot task before
+         * the desktop has started, so during these demos nothing reaps at all.
+         * A child that exits therefore never becomes a zombie, and a parent
+         * blocked in wait4() is never woken: GNU make forked cc1, cc1 compiled
+         * and exited cleanly, and make then waited forever. Grandchildren, not
+         * just our own child, which is why this scans every slot. (M1958) */
+        for (int i = 0; i < MAX_APPS; i++)
+            if (apps[i].used && apps[i].exited && !apps[i].zombie && apps[i].pid != pid)
+                app_reap(&apps[i]);           /* returns 0 and retries if it is not off-CPU yet */
         task_sleep_ms(5);
     }
     return -2;

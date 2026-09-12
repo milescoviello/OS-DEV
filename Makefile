@@ -235,18 +235,27 @@ $(LXROOT)/hello.c: tools/lx/hello.c
 	@cp -f $< $@
 	@echo "  STAGE   $@ (source for the in-guest COMPILE demo)"
 
+$(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
+	@mkdir -p $(LXROOT)
+	@cp -f $< $@
+	@echo "  STAGE   $@ (the Makefile GNU make runs INSIDE OS-DEV)"
+
 $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 	@mkdir -p $(LXROOT)
 	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@tools/stage-linux-tool.sh $(LXROOT) make "$$(command -v gmake || command -v make)"
 	@tools/stage-linux-tool.sh $(LXROOT) cc1  "$$(gcc -print-prog-name=cc1 2>/dev/null)"
+	@tools/stage-linux-tool.sh $(LXROOT) bash
+	@for t in echo cat ls; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
+	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
+	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
 	@touch $@
 
 
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c
+$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \
