@@ -539,12 +539,12 @@ static int ata_dma_setup(void) {
         if (bnc_f)  pmm_free_frame(bnc_f);
         return 0;
     }
-    memset((void *)(uintptr_t)prdt_f, 0, PAGE_SIZE);
-    memset((void *)(uintptr_t)bnc_f,  0, PAGE_SIZE);
+    memset(hhdm(prdt_f), 0, PAGE_SIZE);
+    memset(hhdm(bnc_f),  0, PAGE_SIZE);
 
-    g_bm.prdt       = (struct ata_prd *)(uintptr_t)prdt_f;
+    g_bm.prdt       = (struct ata_prd *)hhdm(prdt_f);
     g_bm.prdt_phys  = prdt_f;
-    g_bm.bounce     = (uint8_t *)(uintptr_t)bnc_f;
+    g_bm.bounce     = (uint8_t *)hhdm(bnc_f);
     g_bm.bounce_phys = bnc_f;
     g_bm.bmide_base = (uint16_t)bar4;
     g_bm.present    = 1;

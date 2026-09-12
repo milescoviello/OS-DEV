@@ -23,8 +23,18 @@
 extern char kernel_end[];
 
 static uint8_t  *bitmap;          /* one bit per frame */
-static uint64_t  total_frames;
+static uint64_t  total_frames;   /* frames the bitmap SPANS: highest address / 4 KiB */
 static uint64_t  used_frames;
+/* Frames actually backed by RAM (M1970).
+ *
+ * total_frames is the address SPAN, not the memory. On a 4 GiB machine QEMU
+ * puts RAM at 0..3 GiB and 4..5 GiB with the PCI/MMIO hole between, so the
+ * highest address is 5 GiB and the bitmap spans 5 GiB -- while only 4 GiB is
+ * real. The bitmap handles that correctly (the hole is simply never freed),
+ * but pmm_total_bytes reported the span, so the kernel announced
+ * "5120 MiB RAM" on a 4 GiB box and sysinfo told every Linux program the same.
+ * A runtime that sizes its heap from that number is being lied to. */
+static uint64_t  ram_frames;
 static uint64_t  bitmap_bytes;
 static uint64_t  next_hint;       /* where to start the next allocation scan */
 
@@ -113,6 +123,7 @@ void pmm_init(uint64_t mb_info_phys) {
     }
 
     total_frames = highest / PAGE_SIZE;
+    ram_frames   = 0;
     bitmap_bytes = align_up(total_frames / 8, PAGE_SIZE);
 
     /* Park the bitmap right after the kernel image. `kernel_end` is a VIRTUAL
@@ -134,14 +145,18 @@ void pmm_init(uint64_t mb_info_phys) {
             if (e->type == MULTIBOOT_MEM_AVAILABLE) {
                 uint64_t start = align_up(e->addr, PAGE_SIZE);
                 uint64_t end   = e->addr + e->len;
-                for (uint64_t a = start; a + PAGE_SIZE <= end; a += PAGE_SIZE)
+                for (uint64_t a = start; a + PAGE_SIZE <= end; a += PAGE_SIZE) {
+                    if (a / PAGE_SIZE < total_frames) ram_frames++;   /* count REAL memory, not the span (M1970) */
                     mark_free(a / PAGE_SIZE);
+                }
             }
             cur += e->size + 4;
         }
     } else {
-        for (uint64_t a = 0x100000; a + PAGE_SIZE <= highest; a += PAGE_SIZE)
+        for (uint64_t a = 0x100000; a + PAGE_SIZE <= highest; a += PAGE_SIZE) {
+            if (a / PAGE_SIZE < total_frames) ram_frames++;
             mark_free(a / PAGE_SIZE);
+        }
     }
 
     /* Re-reserve everything from address 0 through the end of our bitmap:
@@ -251,5 +266,8 @@ int pmm_refcountable(uint64_t phys) {
     return (phys / PAGE_SIZE) < PMM_MAXREFS;
 }
 
-uint64_t pmm_total_bytes(void) { return total_frames * PAGE_SIZE; }
+/* REAL RAM, not the address span the bitmap covers -- see ram_frames. Falls
+ * back to the span only if the firmware gave us no usable map to count from,
+ * which is the same answer as before and better than reporting zero. */
+uint64_t pmm_total_bytes(void) { return (ram_frames ? ram_frames : total_frames) * PAGE_SIZE; }
 uint64_t pmm_free_bytes(void)  { return (total_frames - used_frames) * PAGE_SIZE; }

@@ -166,7 +166,7 @@ static void     port_write(volatile uint8_t *p, uint32_t off, uint32_t v){ *(vol
  * way to get the physical address rather than assuming the identity. */
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;   /* identity-map fallback */
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 /* Stop the port's command engine: clear ST + FRE, then wait for the HBA to
@@ -218,9 +218,9 @@ static int port_init(int pi_index) {
         if (ct)  pmm_free_frame(ct);
         return -1;
     }
-    memset((void *)(uintptr_t)clb, 0, PAGE_SIZE);
-    memset((void *)(uintptr_t)fb,  0, PAGE_SIZE);
-    memset((void *)(uintptr_t)ct,  0, PAGE_SIZE);
+    memset(hhdm(clb), 0, PAGE_SIZE);
+    memset(hhdm(fb),  0, PAGE_SIZE);
+    memset(hhdm(ct),  0, PAGE_SIZE);
 
     port_write(p, PxCLB,  (uint32_t)clb);
     port_write(p, PxCLBU, (uint32_t)(clb >> 32));
@@ -234,9 +234,9 @@ static int port_init(int pi_index) {
 
     int idx = ndisks;
     disks[idx].port      = p;
-    disks[idx].cmd_list  = (struct hba_cmd_header *)(uintptr_t)clb;
-    disks[idx].fis       = (void *)(uintptr_t)fb;
-    disks[idx].cmd_table = (struct hba_cmd_table *)(uintptr_t)ct;
+    disks[idx].cmd_list  = (struct hba_cmd_header *)hhdm(clb);
+    disks[idx].fis       = hhdm(fb);
+    disks[idx].cmd_table = (struct hba_cmd_table *)hhdm(ct);
     disks[idx].sectors   = 0;
     ndisks++;
     disks[idx].sectors = ahci_identify(idx);   /* now the port runs: ask it its capacity */

@@ -95,10 +95,25 @@ struct tx_desc {
 static volatile uint8_t *mmio;
 static uint8_t  mac[6];
 
-static struct rx_desc *rx_ring;
-static struct tx_desc *tx_ring;
-static uint64_t rx_buf[RX_COUNT];
-static uint64_t tx_buf[TX_COUNT];
+/* DMA memory has TWO addresses (M1970).
+ *
+ * The device is given the PHYSICAL address; the CPU must reach the same bytes
+ * through a virtual one. Those used to be identical -- the low 1 GiB was
+ * identity-mapped -- so a PMM frame could be cast straight to a pointer. Since
+ * M1969 the low 1 GiB belongs to the PROCESS, not the kernel, and that cast
+ * dereferences whatever the current user program has mapped there instead:
+ *
+ *   KERNEL PANIC: Page Fault, CR2=0x04c74000
+ *     memcpy <- arp_resolve <- net_udp_send <- app_sendto
+ *
+ * -- a DNS query from a Linux binary, writing an ARP frame into a buffer that
+ * exists only in the kernel's own address space. The frames are unchanged; the
+ * CPU-side accesses go through hhdm(), which is mapped in every address space. */
+static uint64_t rx_ring_phys, tx_ring_phys;
+static struct rx_desc *rx_ring;        /* hhdm(rx_ring_phys) */
+static struct tx_desc *tx_ring;        /* hhdm(tx_ring_phys) */
+static uint64_t rx_buf[RX_COUNT];      /* PHYSICAL: handed to the device */
+static uint64_t tx_buf[TX_COUNT];      /* PHYSICAL: handed to the device */
 static uint32_t rx_cur, tx_cur;
 
 static uint32_t reg_read(uint32_t off)            { return *(volatile uint32_t *)(mmio + off); }
@@ -197,15 +212,16 @@ int e1000_init(void) {
         reg_write(REG_MTA + i * 4, 0);
 
     /* RX ring + buffers. */
-    rx_ring = (struct rx_desc *)(uintptr_t)pmm_alloc_frame();
+    rx_ring_phys = pmm_alloc_frame();
+    rx_ring = (struct rx_desc *)hhdm(rx_ring_phys);
     memset(rx_ring, 0, RX_COUNT * sizeof(struct rx_desc));
     for (int i = 0; i < RX_COUNT; i++) {
         rx_buf[i] = pmm_alloc_frame();
         rx_ring[i].addr = rx_buf[i];
         rx_ring[i].status = 0;
     }
-    reg_write(REG_RDBAL, (uint32_t)(uintptr_t)rx_ring);
-    reg_write(REG_RDBAH, (uint32_t)((uint64_t)(uintptr_t)rx_ring >> 32));
+    reg_write(REG_RDBAL, (uint32_t)rx_ring_phys);                /* the DEVICE gets the physical address */
+    reg_write(REG_RDBAH, (uint32_t)(rx_ring_phys >> 32));
     reg_write(REG_RDLEN, RX_COUNT * sizeof(struct rx_desc));
     reg_write(REG_RDH, 0);
     reg_write(REG_RDT, RX_COUNT - 1);
@@ -213,14 +229,15 @@ int e1000_init(void) {
     rx_cur = 0;
 
     /* TX ring + buffers. */
-    tx_ring = (struct tx_desc *)(uintptr_t)pmm_alloc_frame();
+    tx_ring_phys = pmm_alloc_frame();
+    tx_ring = (struct tx_desc *)hhdm(tx_ring_phys);
     memset(tx_ring, 0, TX_COUNT * sizeof(struct tx_desc));
     for (int i = 0; i < TX_COUNT; i++) {
         tx_buf[i] = pmm_alloc_frame();
         tx_ring[i].status = TXSTAT_DD;   /* mark free */
     }
-    reg_write(REG_TDBAL, (uint32_t)(uintptr_t)tx_ring);
-    reg_write(REG_TDBAH, (uint32_t)((uint64_t)(uintptr_t)tx_ring >> 32));
+    reg_write(REG_TDBAL, (uint32_t)tx_ring_phys);                /* the DEVICE gets the physical address */
+    reg_write(REG_TDBAH, (uint32_t)(tx_ring_phys >> 32));
     reg_write(REG_TDLEN, TX_COUNT * sizeof(struct tx_desc));
     reg_write(REG_TDH, 0);
     reg_write(REG_TDT, 0);
@@ -252,7 +269,7 @@ int e1000_init(void) {
 int e1000_send(const void *frame, uint16_t len) {
     if (len > BUF_SIZE) return -1;      /* every tx_buf[] slot is one BUF_SIZE-capacity buffer -- no caller needs more today, but nothing stopped a future one overrunning it */
     uint32_t i = tx_cur;
-    memcpy((void *)(uintptr_t)tx_buf[i], frame, len);
+    memcpy(hhdm(tx_buf[i]), frame, len);                          /* CPU side: through the HHDM */
     tx_ring[i].addr = tx_buf[i];
     tx_ring[i].length = len;
     tx_ring[i].cmd = TXCMD_EOP | TXCMD_IFCS | TXCMD_RS;
@@ -275,7 +292,7 @@ int e1000_receive(void *out, uint16_t max) {
 
     uint16_t len = rx_ring[i].length;
     if (len > max) len = max;
-    memcpy(out, (void *)(uintptr_t)rx_buf[i], len);
+    memcpy(out, hhdm(rx_buf[i]), len);                            /* CPU side: through the HHDM (M1970) */
 
     rx_ring[i].status = 0;
     reg_write(REG_RDT, i);              /* return the buffer to the card */

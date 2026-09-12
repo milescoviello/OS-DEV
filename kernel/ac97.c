@@ -17,6 +17,7 @@
 #include "pci.h"
 #include "io.h"
 #include "pmm.h"
+#include "vmm.h"   /* hhdm(): CPU access to DMA memory (M1970) */
 #include "timer.h"
 #include "console.h"
 #include "kheap.h"
@@ -177,7 +178,7 @@ void ac97_stream_start(void) {
     outb(nabm + PO_CR, CR_RR);
     for (int i = 0; i < 100000 && (inb(nabm + PO_CR) & CR_RR); i++) { }
     for (int i = 0; i < NUM_BUF; i++) {                 /* all buffers silent + full */
-        memset((void *)(uintptr_t)buf_phys[i], 0, BUF_FRAMES * 4);
+        memset(hhdm(buf_phys[i]), 0, BUF_FRAMES * 4);
         bdl[i].addr = (uint32_t)buf_phys[i];
         bdl[i].samples = BUF_FRAMES * 2;
         bdl[i].ctrl = 0;

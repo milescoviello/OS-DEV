@@ -204,6 +204,11 @@ $(LXROOT)/lxmmap: tools/lx/lxmmap.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (MAP_FIXED mmap)"
 
+$(LXROOT)/lxnopie: tools/lx/lxnopie.c
+	@mkdir -p $(LXROOT)
+	$(CC) -no-pie -static -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (NON-PIE ET_EXEC: needs the low 1 GiB to belong to the process)"
+
 $(LXROOT)/lxinet: tools/lx/lxinet.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -239,7 +244,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

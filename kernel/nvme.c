@@ -166,7 +166,7 @@ static void     reg_wr64(uint32_t off, uint64_t v){ *(volatile uint64_t *)(nv.re
  * virt), but translating is the correct general way — exactly as ahci.c does. */
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;   /* identity-map fallback */
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 /* The doorbell registers march at a stride of (4 << CAP.DSTRD) bytes; for queue
@@ -232,11 +232,11 @@ static int queue_alloc(struct nvme_queue *q, uint16_t qid, uint16_t depth) {
         if (cqf) pmm_free_frame(cqf);
         return -1;
     }
-    memset((void *)(uintptr_t)sqf, 0, PAGE_SIZE);
-    memset((void *)(uintptr_t)cqf, 0, PAGE_SIZE);
+    memset(hhdm(sqf), 0, PAGE_SIZE);
+    memset(hhdm(cqf), 0, PAGE_SIZE);
 
-    q->sq    = (struct nvme_sqe *)(uintptr_t)sqf;
-    q->cq    = (struct nvme_cqe *)(uintptr_t)cqf;
+    q->sq    = (struct nvme_sqe *)hhdm(sqf);
+    q->cq    = (struct nvme_cqe *)hhdm(cqf);
     q->sq_db = sq_doorbell(qid);
     q->cq_db = cq_doorbell(qid);
     q->depth = depth;
@@ -252,7 +252,7 @@ static void *nvme_identify(uint32_t cns, uint32_t nsid) {
     uint64_t f = pmm_alloc_frame();
     if (!f)
         return NULL;
-    memset((void *)(uintptr_t)f, 0, PAGE_SIZE);
+    memset(hhdm(f), 0, PAGE_SIZE);
 
     struct nvme_sqe cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -265,7 +265,7 @@ static void *nvme_identify(uint32_t cns, uint32_t nsid) {
         pmm_free_frame(f);
         return NULL;
     }
-    return (void *)(uintptr_t)f;
+    return hhdm(f);
 }
 
 /* Identify namespace 1 and compute its capacity. The identify-namespace struct
@@ -285,7 +285,7 @@ static int nvme_setup_namespace(void) {
     memcpy(&lbaf, ns + 128 + (uint32_t)flbas * 4, sizeof(lbaf));
     uint32_t lbads = (lbaf >> 16) & 0xFF;
 
-    pmm_free_frame((uint64_t)(uintptr_t)ns);
+    pmm_free_frame(hhdm_phys(ns));   /* ns is an HHDM pointer now -- freeing the pointer itself would release the wrong frame (M1970) */
 
     if (nsze == 0 || lbads < 9 || lbads > 16)   /* sane LBA size: 512 B .. 64 KiB */
         return -1;
@@ -438,7 +438,7 @@ int nvme_init(void) {
         nv.bounce_pages = 1;
     }
     nv.bounce_phys = b0;
-    nv.bounce = (uint8_t *)(uintptr_t)b0;
+    nv.bounce = (uint8_t *)hhdm(b0);
 
     nv.present = 1;
     return 0;

@@ -132,7 +132,7 @@ static void vr_add_status(uint8_t bits) {
 
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 int virtio_rng_init(void) {
@@ -177,15 +177,15 @@ int virtio_rng_init(void) {
         if (!f || f != prev + PAGE_SIZE) { vr_add_status(VIRTIO_STATUS_FAILED); return -1; }
         prev = f;
     }
-    memset((void *)(uintptr_t)base, 0, (size_t)frames * PAGE_SIZE);
+    memset(hhdm(base), 0, (size_t)frames * PAGE_SIZE);
 
     vr.queue_phys = base;
-    vr.desc  = (struct vring_desc *)(uintptr_t)base;
-    vr.avail = (struct vring_avail *)(uintptr_t)(base + qsz * sizeof(struct vring_desc));
+    vr.desc  = (struct vring_desc *)hhdm(base);
+    vr.avail = (struct vring_avail *)hhdm(base + qsz * sizeof(struct vring_desc));
     uint64_t used_off = (uint64_t)qsz * sizeof(struct vring_desc)
                       + sizeof(uint16_t) * (2 + qsz);
     used_off = (used_off + (VIRTIO_QUEUE_ALIGN - 1)) & ~(uint64_t)(VIRTIO_QUEUE_ALIGN - 1);
-    vr.used  = (struct vring_used *)(uintptr_t)(base + used_off);
+    vr.used  = (struct vring_used *)hhdm(base + used_off);
     vr.used_seen = 0;
 
     vcfg_w32(VIRTIO_PCI_QUEUE_PFN, (uint32_t)(base >> 12));

@@ -50,6 +50,9 @@ uint64_t elf_image_size(const void *image, uint64_t maxsz);
  * clear of the executable it will load. */
 int      elf_interp_path(const void *image, uint64_t maxsz, char *out, int max);
 uint64_t elf_load_at(const void *image, uint64_t maxsz, uint64_t base);
+/* The load bias an image will be given: ELF_DYN_BASE for a PIE, 0 for ET_EXEC.
+ * Callers building the SysV auxv need the SAME answer the loader used (M1970). */
+uint64_t elf_image_bias(const void *hdr);
 
 /* Where the dynamic linker is mapped: clear of ELF_DYN_BASE (the executable)
  * and of the mmap window, so the three cannot collide. */

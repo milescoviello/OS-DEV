@@ -117,7 +117,7 @@ static void vc_add_status(uint8_t bits) {
 
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 /* Select queue `idx`, allocate its contiguous split-vring, hand the device the
@@ -139,14 +139,14 @@ static int setup_vq(uint16_t idx, struct vq *q) {
         if (!f || f != prev + PAGE_SIZE) return -1;   /* need a contiguous run */
         prev = f;
     }
-    memset((void *)(uintptr_t)base, 0, (size_t)frames * PAGE_SIZE);
+    memset(hhdm(base), 0, (size_t)frames * PAGE_SIZE);
 
-    q->desc  = (struct vring_desc *)(uintptr_t)base;
-    q->avail = (struct vring_avail *)(uintptr_t)(base + qsz * sizeof(struct vring_desc));
+    q->desc  = (struct vring_desc *)hhdm(base);
+    q->avail = (struct vring_avail *)hhdm(base + qsz * sizeof(struct vring_desc));
     uint64_t used_off = (uint64_t)qsz * sizeof(struct vring_desc)
                       + sizeof(uint16_t) * (2 + qsz);
     used_off = (used_off + (VIRTIO_QUEUE_ALIGN - 1)) & ~(uint64_t)(VIRTIO_QUEUE_ALIGN - 1);
-    q->used  = (struct vring_used *)(uintptr_t)(base + used_off);
+    q->used  = (struct vring_used *)hhdm(base + used_off);
     q->used_seen = 0;
 
     vcfg_w32(VIRTIO_PCI_QUEUE_PFN, (uint32_t)(base >> 12));

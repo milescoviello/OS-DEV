@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1969-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1970-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -681,8 +681,27 @@ Landed so far, all on the from-scratch ext2 driver:
   preemption and ring-3 isolation; full suite green. Freeing the low 1 GiB for
   user space is the next step.
 
-Still ahead: Claude Code itself, and Firefox on a from-scratch Wayland display
-path. The honest scale is still months.
+- **M1970** — **the low 1 GiB now belongs to the process, and a non-PIE Linux
+  binary runs.** `LXNOPIE: ET_EXEC ran below 1 GiB — main=402800, 2048 KiB of
+  .data verified`. With the kernel out of the way (M1968), address spaces stop
+  inheriting the boot identity map, so a binary linked at a fixed low address
+  loads where it was linked. The cost was real: every DMA driver had been using
+  a PMM frame's **physical address directly as a pointer**, which only worked
+  because the two were the same number. The first user program to send a DNS
+  query panicked the kernel in `memcpy ← arp_resolve ← net_udp_send ←
+  app_sendto`, writing an ARP frame into a buffer that existed only in the
+  kernel's own address space. Fifteen drivers moved their CPU-side access to
+  the HHDM; the devices still get physical addresses. Also: `ET_EXEC` images
+  now get the right auxv (`AT_PHDR` resolved through the `PT_LOAD` that
+  contains the headers, as Linux does), `/proc/self/exe`, `open`/`sigaltstack`/
+  `close_range`, nested `/proc/sys` and `/sys` nodes, and a **syscall ring +
+  user backtrace** dumped when a process aborts. And the PMM was reporting the
+  address *span* as RAM — 5120 MiB on a 4 GiB machine, a number `sysinfo`
+  passed straight to every Linux program.
+
+Still ahead: Claude Code itself (it loads and runs now, but aborts during its
+own startup), and Firefox on a from-scratch Wayland display path. The honest
+scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

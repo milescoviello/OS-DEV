@@ -185,8 +185,26 @@ uint64_t vmm_create_address_space(void) {
     uint64_t newpdpt = pmm_alloc_frame();
     if (!newpdpt) { pmm_free_frame(newp); return 0; }   /* OOM — undo the PML4 */
     uint64_t *npdpt = phys_to_table(newpdpt);
-    for (int i = 0; i < 512; i++)          /* share kernel identity + MMIO PDs */
+    for (int i = 0; i < 512; i++)          /* share the kernel's MMIO/device PDs */
         npdpt[i] = bpdpt[i];
+    /* ...but NOT the low 1 GiB (M1969).
+     *
+     * PDPT[0] is the boot identity map: 512 supervisor 2 MiB pages covering
+     * physical 0..1 GiB. Inheriting it into every address space is what made
+     * the first gigabyte permanently unavailable to user programs -- the
+     * entries are present and supervisor-only, so no user page could be mapped
+     * underneath them. That was survivable while everything we ran was
+     * position-independent and could be relocated to 0x40000000. A non-PIE
+     * ET_EXEC binary is linked at a fixed low address and cannot move: Claude
+     * Code is a 214 MB image at 0x200000.
+     *
+     * Dropping it is only safe because the kernel no longer LIVES there: since
+     * M1968 it is linked at 0xFFFFFFFF80100000, reached through PML4[511],
+     * which IS shared. Physical memory is reached through the HHDM
+     * (PML4[256..511], also shared). The kernel address space keeps its own
+     * identity map, so boot-time code that still uses low physical addresses
+     * directly is unaffected -- it runs before any process exists. */
+    npdpt[0] = 0;
 
     npml4[0] = newpdpt | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     return newp;

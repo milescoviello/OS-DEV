@@ -317,7 +317,7 @@ void hda_stream_start(void) {
 
     /* all buffers silent + linked into the BDL */
     for (int i = 0; i < NUM_BDL; i++) {
-        memset((void *)(uintptr_t)buf_phys[i], 0, BUF_BYTES);
+        memset(hhdm(buf_phys[i]), 0, BUF_BYTES);
         bdl[i].addr_lo = (uint32_t)buf_phys[i];
         bdl[i].addr_hi = (uint32_t)(buf_phys[i] >> 32);
         bdl[i].len     = BUF_BYTES;
@@ -363,7 +363,7 @@ void hda_pump(void) {
     if (!stream_on) return;
     uint32_t cur = cur_buf();
     while (last_buf != cur) {                            /* buffers the engine finished */
-        int16_t *dst = (int16_t *)(uintptr_t)buf_phys[last_buf];
+        int16_t *dst = (int16_t *)hhdm(buf_phys[last_buf]);
         for (int f = 0; f < (int)BUF_FRAMES; f++) {
             if (s_tail != s_head) {
                 dst[f * 2]     = sbuf[s_tail * 2];
@@ -460,7 +460,7 @@ int hda_init(void) {
      *    their physical address is also a usable virtual one). */
     bdl_phys = pmm_alloc_frame();
     if (!bdl_phys) { kprintf("[hda] OOM (BDL)\n"); return -1; }
-    bdl = (bdl_entry_t *)(uintptr_t)bdl_phys;
+    bdl = (bdl_entry_t *)hhdm(bdl_phys);
     memset(bdl, 0, NUM_BDL * sizeof(bdl_entry_t));
     for (int i = 0; i < NUM_BDL; i++) {
         buf_phys[i] = pmm_alloc_frame();

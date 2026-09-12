@@ -29,6 +29,7 @@
 #include "rtl8139.h"
 #include "pci.h"
 #include "pmm.h"
+#include "vmm.h"   /* hhdm(): CPU access to DMA memory (M1970) */
 #include "io.h"
 #include "string.h"
 
@@ -147,7 +148,7 @@ int rtl8139_init(void) {
             return -1;
         expect = f + PAGE_SIZE;
     }
-    rx_buf = (uint8_t *)(uintptr_t)rx_buf_phys;
+    rx_buf = (uint8_t *)hhdm(rx_buf_phys);
     memset(rx_buf, 0, RX_BUF_TOTAL);
     /* RBSTART is a 32-bit register: the ring's physical address must fit in
      * 32 bits (it does — low RAM under this kernel's identity map). */
@@ -159,7 +160,7 @@ int rtl8139_init(void) {
         tx_buf_phys[i] = pmm_alloc_frame();
         if (!tx_buf_phys[i])
             return -1;
-        tx_buf[i] = (uint8_t *)(uintptr_t)tx_buf_phys[i];
+        tx_buf[i] = (uint8_t *)hhdm(tx_buf_phys[i]);
     }
     tx_cur = 0;
 

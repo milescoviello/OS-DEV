@@ -276,7 +276,7 @@ static inline void     cc_w64(uint16_t o, uint64_t v){ *(volatile uint64_t *)(vg
  * translate is the correct general way, same as virtio_blk.c). */
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 /* ---- modern-PCI capability walk ------------------------------------------- */
@@ -394,11 +394,11 @@ static int setup_queue(void) {
             return -1;
         prev = f;
     }
-    memset((void *)(uintptr_t)base, 0, (size_t)frames * PAGE_SIZE);
+    memset(hhdm(base), 0, (size_t)frames * PAGE_SIZE);
 
-    vg.desc  = (struct vring_desc  *)(uintptr_t)base;
-    vg.avail = (struct vring_avail *)(uintptr_t)(base + avail_off);
-    vg.used  = (struct vring_used  *)(uintptr_t)(base + used_off);
+    vg.desc  = (struct vring_desc  *)hhdm(base);
+    vg.avail = (struct vring_avail *)hhdm(base + avail_off);
+    vg.used  = (struct vring_used  *)hhdm(base + used_off);
     vg.used_seen = 0;
 
     /* Program the three ring addresses + size, then enable the queue. */
@@ -664,7 +664,7 @@ int virtio_gpu_init(void) {
         bprev = f;
     }
     vg.backing_phys  = bbase;
-    vg.backing       = (uint32_t *)(uintptr_t)bbase;
+    vg.backing       = (uint32_t *)hhdm(bbase);
     vg.backing_bytes = bframes * PAGE_SIZE;            /* rounded-up mapped size */
     memset(vg.backing, 0, vg.backing_bytes);
 

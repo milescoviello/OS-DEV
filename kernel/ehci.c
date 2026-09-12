@@ -749,9 +749,9 @@ int ehci_init(void) {
      * 32-byte boundary (sizeof(struct ehci_qh)=48, ehci_qtd=32; we lay them out at
      * explicit 64-byte-aligned offsets so every structure is 32-byte aligned with
      * room to spare). A second frame holds the SETUP + data bounce buffers. */
-    uint8_t *sched = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    uint8_t *bufs  = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    uint8_t *bbuf  = (uint8_t *)(uintptr_t)pmm_alloc_frame();   /* bulk bounce (STRETCH) */
+    uint8_t *sched = (uint8_t *)dma_alloc_page();
+    uint8_t *bufs  = (uint8_t *)dma_alloc_page();
+    uint8_t *bbuf  = (uint8_t *)dma_alloc_page();   /* bulk bounce (STRETCH) */
     if (!sched || !bufs || !bbuf)
         return -1;
     memset(sched, 0, PAGE_SIZE);

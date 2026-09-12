@@ -198,6 +198,9 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_fstat          5
 #define LXS_getrandom_    318
 #define LXS_openat_      257
+#define LXS_open_          2      /* the pre-openat form; still emitted by plenty of real code (M1970) */
+#define LXS_sigaltstack_ 131
+#define LXS_close_range_ 436
 #define LXS_read_          0
 #define LXS_close_         3
 #define LXS_lseek_         8
@@ -400,6 +403,62 @@ struct lx_iovec { void *iov_base; unsigned long iov_len; };
  * than inferring it from a value that could have come from anywhere. */
 volatile unsigned long lx_syscall_count, lx_unknown_count;
 
+/* The last LXRING_N Linux syscalls, for post-mortem on a process that dies
+ * without saying anything. (M1970) */
+#define LXRING_N 64
+struct lxring_ent { uint32_t nr; uint64_t a1, a2, a3; char path[56]; };
+static struct lxring_ent g_lxring[LXRING_N];
+static unsigned long g_lxring_i;
+
+/* Which argument of a syscall is a pathname, if any: 1 = rdi, 2 = rsi, 0 = none.
+ * Captured AT RECORD TIME, not at dump time -- by the time a process aborts,
+ * a string it opened forty calls ago may well have been freed, and a dump that
+ * prints whatever is at that address now is worse than printing nothing. */
+static int lx_path_arg(uint32_t nr) {
+    switch (nr) {
+        case 2: case 4: case 6: case 21: case 59: case 83: case 84: case 87:
+        case 89: case 90: case 133: case 161:
+            return 1;                       /* open/stat/unlink/access/execve/mkdir/rmdir/readlink/chmod/chroot */
+        case 257: case 258: case 262: case 263: case 269: case 267: case 332:
+            return 2;                       /* the *at forms: dirfd first, path second */
+        default: return 0;
+    }
+}
+
+/* Walk the user frame chain and print return addresses (M1970).
+ *
+ * A process that calls abort() leaves no fault address and, if it never got as
+ * far as writing to stderr, no message either -- the syscall ring says WHAT it
+ * did and still not WHERE it was. These addresses do: the image is ET_EXEC, so
+ * they are its link-time addresses, and `addr2line -e <binary>` on the host
+ * resolves them directly.
+ *
+ * -fno-omit-frame-pointer is not something we can impose on a foreign binary,
+ * so this is best-effort: it stops at the first RBP that is not a plausible,
+ * increasing user address rather than chasing garbage. */
+static void lx_user_backtrace(struct registers *r) {
+    kprintf("[linuxabi] user backtrace: rip=%lx rsp=%lx rbp=%lx\n", r->rip, r->rsp, r->rbp);
+    uint64_t rbp = r->rbp, prev = 0;
+    for (int f = 0; f < 16; f++) {
+        if (rbp <= prev || (rbp & 7) || !vmm_user_ok(rbp, 16)) break;
+        uint64_t ret = ((const uint64_t *)rbp)[1];
+        if (!ret) break;
+        kprintf("    [%d] %lx\n", f, ret);
+        prev = rbp;
+        rbp = ((const uint64_t *)rbp)[0];
+    }
+}
+
+void lx_trace_dump(const char *why) {
+    unsigned long n = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
+    kprintf("[linuxabi] last %lu syscalls before %s (oldest first):\n", n, why);
+    for (unsigned long k = 0; k < n; k++) {
+        struct lxring_ent *e = &g_lxring[(g_lxring_i - n + k) & (LXRING_N - 1)];
+        if (e->path[0]) kprintf("    %3u(%lx, %lx, %lx)  \"%s\"\n", e->nr, e->a1, e->a2, e->a3, e->path);
+        else            kprintf("    %3u(%lx, %lx, %lx)\n", e->nr, e->a1, e->a2, e->a3);
+    }
+}
+
 /*
  * The Linux dispatcher. Mirrors syscall_dispatch's shape (it mutates the same
  * struct registers in place, and the return value goes in r->rax) but reads
@@ -412,9 +471,30 @@ volatile unsigned long lx_syscall_count, lx_unknown_count;
  */
 void linux_syscall_dispatch(struct registers *r) {
     lx_syscall_count++;
-    /* Rate-limited: a full trace of a compiler drowns the log, but a SPIN
-     * shows up as the same call repeating, so sampling one in 4096 identifies
-     * it just as well and stays readable. (M1961) */
+    /* Always record; print only on demand. The rate-limited trace below is for
+     * finding a SPIN (the same call repeating), and deliberately samples one in
+     * 4096 so a compiler does not drown the log -- but that makes it useless for
+     * the opposite question, "what were the last things this process did before
+     * it died?". A program that calls abort() on itself prints nothing and
+     * leaves no fault address; without a history there is simply no evidence.
+     * The ring costs one store per syscall and is dumped by lx_trace_dump on an
+     * abnormal exit. (M1970) */
+    {
+        struct lxring_ent *re = &g_lxring[g_lxring_i & (LXRING_N - 1)];
+        re->nr = (uint32_t)r->rax; re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
+        re->path[0] = 0;
+        int pa = lx_path_arg(re->nr);
+        if (pa) {
+            uint64_t up = (pa == 1) ? r->rdi : r->rsi;
+            if (up && vmm_user_ok(up, 1)) {
+                const char *sp = (const char *)up;
+                int ci = 0;
+                while (ci < (int)sizeof re->path - 1 && sp[ci]) { re->path[ci] = sp[ci]; ci++; }
+                re->path[ci] = 0;
+            }
+        }
+        g_lxring_i++;
+    }
     if (g_lx_systrace && (lx_syscall_count & 0xFFF) == 0)
         kprintf("[sys] %ld(%lx,%lx,%lx)\n", (long)r->rax, r->rdi, r->rsi, r->rdx);
     long a1 = (long)r->rdi, a3 = (long)r->rdx;
@@ -603,6 +683,9 @@ void linux_syscall_dispatch(struct registers *r) {
         if (sig == 6 /*SIGABRT*/ || sig == 9 /*SIGKILL*/ || sig == 4 /*SIGILL*/ ||
             sig == 8 /*SIGFPE*/ || sig == 11 /*SIGSEGV*/) {
             kprintf("[linuxabi] process raised signal %d at itself -- terminating\n", sig);
+            /* abort() prints nothing of its own and leaves no fault address, so
+             * without this the only evidence is the exit status. (M1970) */
+            if (sig == 6) { lx_trace_dump("abort()"); lx_user_backtrace(r); }
             app_sys_exit(128 + sig);
             break;
         }
@@ -1412,13 +1495,74 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_readlinkat:
-    case LXS_readlink:
-        /* glibc probes /proc/self/exe here. ENOENT is the honest answer while
-         * that node does not exist, and glibc falls back on argv[0] -- which
-         * the M1940 stack supplies. */
-        r->rax = (uint64_t)-(long)LX_ENOENT;
+    case LXS_readlink: {
+        /* /proc/self/exe is REAL now (M1970).
+         *
+         * Returning ENOENT was defensible while the only caller was glibc
+         * probing it and falling back on argv[0]. It is not defensible for a
+         * Node single-executable application: the runtime and the JS are one
+         * image, and it finds its own embedded payload by reading
+         * /proc/self/exe and opening the result. With no answer, Claude Code
+         * called abort() during startup -- printing nothing, leaving no fault
+         * address, and naming nothing. The syscall ring is what showed
+         * gettid/getpid/tgkill(SIGABRT) right after the probe.
+         *
+         * The path has to be translated back OUT of the compat root: the
+         * process believes it is /usr/bin/claude, not /disk2/usr/bin/claude. */
+        uint64_t up  = (r->rax == LXS_readlinkat) ? r->rsi : r->rdi;
+        uint64_t ub  = (r->rax == LXS_readlinkat) ? r->rdx : r->rsi;
+        uint64_t usz = (r->rax == LXS_readlinkat) ? r->r10 : r->rdx;
+        const char *upath = (const char *)up;
+        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int is_exe = 0;
+        { const char *a_ = "/proc/self/exe"; int k = 0;
+          while (a_[k] && upath[k] == a_[k]) k++;
+          is_exe = (!a_[k] && !upath[k]); }
+        if (!is_exe) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        const char *ep = app_exe_str(app_current());
+        if (!ep || ep[0] != '/') { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        /* Strip LX_ROOT if it is there, so the answer is in the process's own
+         * view of the filesystem. */
+        int rl = 0; while (LX_ROOT[rl]) rl++;
+        int match = 1; for (int k = 0; k < rl; k++) if (ep[k] != LX_ROOT[k]) { match = 0; break; }
+        const char *vis = (match && ep[rl] == '/') ? ep + rl : ep;
+        long vn = 0; while (vis[vn]) vn++;
+        if ((long)usz < vn) vn = (long)usz;          /* readlink TRUNCATES, it does not NUL-terminate */
+        if (vn < 0 || !vmm_user_ok(ub, (uint64_t)vn)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        for (long k = 0; k < vn; k++) ((char *)ub)[k] = vis[k];
+        r->rax = (uint64_t)vn;
         break;
+    }
+    case LXS_sigaltstack_:
+        /* (ss, old_ss). An alternate signal stack only matters for delivering a
+         * signal ON it -- most often SIGSEGV for stack-overflow recovery. We
+         * deliver signals on the normal stack, so there is nothing to install;
+         * refusing, though, is fatal to a runtime that treats the failure as
+         * "this kernel is broken". Report "no alternate stack installed"
+         * (ss_flags = SS_DISABLE) if asked for the old one. */
+        if (r->rsi && vmm_user_ok(r->rsi, 24)) {
+            uint8_t *o = (uint8_t *)r->rsi;
+            for (int i = 0; i < 24; i++) o[i] = 0;
+            *(int32_t *)(o + 8) = 2;        /* SS_DISABLE */
+        }
+        r->rax = 0;
+        break;
+    case LXS_close_range_: {                /* (first, last, flags) */
+        long crc = app_close_range((unsigned)a1, (unsigned)r->rsi, (int)r->rdx);
+        r->rax = (uint64_t)(crc == 0 ? 0 : -(long)LX_EINVAL);
+        break;
+    }
+    case LXS_open_:                         /* (path, flags, mode) -- openat's arguments shifted one LEFT */
     case LXS_openat_: {                     /* (dirfd, path, flags, mode) */
+        /* open() predates openat() and is still emitted by plenty of real code;
+         * ENOSYS here made Claude Code abort during startup. Normalise it into
+         * the openat path by shifting the register reads rather than
+         * duplicating the body -- the two differ only in the leading dirfd,
+         * which we ignore anyway (everything resolves against the process cwd). */
+        if (r->rax == LXS_open_) {
+            uint64_t p_ = r->rdi, f_ = r->rsi;   /* read BOTH before overwriting either */
+            r->rsi = p_; r->rdx = f_;
+        }
         const char *upath = (const char *)r->rsi;
         if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
@@ -2046,9 +2190,14 @@ uint64_t lx_build_stack(uint64_t stack_top, uint64_t stack_bottom,
  * stack for it. Keeps ELF field decoding out of app.c, which only knows it is
  * spawning "a Linux binary". Returns the entry RSP, or 0.
  *
- * AT_PHDR is computed as base + e_phoff, which is correct when the program
- * headers fall inside a PT_LOAD that maps file offset 0 at vaddr 0 -- true for
- * every normal static-PIE image, and the only shape we load. */
+ * AT_PHDR used to be computed as base + e_phoff, which is correct only when
+ * the program headers fall inside a PT_LOAD that maps file offset 0 at vaddr 0.
+ * That holds for every normal PIE -- and not for an ET_EXEC image, whose first
+ * PT_LOAD is at a fixed vaddr (0x200000 for Claude Code) while e_phoff is still
+ * 0x40. ld.so then went looking for an ELF header at address 0x40 and faulted,
+ * with the segments correctly mapped the whole time. Resolve the headers
+ * through the PT_LOAD that actually contains them, exactly as Linux's
+ * fs/binfmt_elf.c does. (M1970) */
 uint64_t lx_spawn_stack_dyn(const void *image, uint64_t base, uint64_t entry,
                             uint64_t interp_base,
                             uint64_t stack_top, uint64_t stack_bottom,
@@ -2057,13 +2206,27 @@ uint64_t lx_spawn_stack_dyn(const void *image, uint64_t base, uint64_t entry,
     uint64_t phoff   = *(const uint64_t *)(e + 32);   /* e_phoff */
     uint16_t phent   = *(const uint16_t *)(e + 54);   /* e_phentsize */
     uint16_t phnum   = *(const uint16_t *)(e + 56);   /* e_phnum */
+
+    /* Find the PT_LOAD whose FILE range covers e_phoff; the headers' virtual
+     * address is then p_vaddr + (e_phoff - p_offset). Falls back to phoff (the
+     * old behaviour) if no segment claims them, which is what a PIE mapping
+     * file offset 0 at vaddr 0 yields anyway. */
+    uint64_t phdr_va = phoff;
+    for (uint16_t i = 0; i < phnum; i++) {
+        const uint8_t *ph = e + phoff + (uint64_t)i * phent;
+        if (*(const uint32_t *)(ph + 0) != 1) continue;            /* PT_LOAD */
+        uint64_t p_off = *(const uint64_t *)(ph + 8);
+        uint64_t p_va  = *(const uint64_t *)(ph + 16);
+        uint64_t p_fsz = *(const uint64_t *)(ph + 32);
+        if (phoff >= p_off && phoff < p_off + p_fsz) { phdr_va = p_va + (phoff - p_off); break; }
+    }
     /* AT_BASE names the INTERPRETER's load bias when there is one -- that is
      * how ld.so finds itself to self-relocate. AT_PHDR and AT_ENTRY must still
      * describe the EXECUTABLE, because that is the program ld.so is being
      * asked to start. Getting these crossed makes the linker relocate itself
      * against the wrong bias. (M1954) */
     struct lx_stack_info si = {
-        .phdr = base + phoff, .entry = entry,
+        .phdr = base + phdr_va, .entry = entry,
         .base = interp_base ? interp_base : base,
         .phent = phent, .phnum = phnum,
     };

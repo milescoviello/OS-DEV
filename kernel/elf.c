@@ -58,6 +58,20 @@ typedef struct {
  * handle here. Kept in a separate path so the ET_EXEC loader (and the host
  * elf_test that #includes this file) stay byte-for-byte unchanged. */
 #define ET_DYN            3
+
+/* Where an image's segments land, from its TYPE alone.
+ *
+ * A position-independent image (ET_DYN) is relocated to ELF_DYN_BASE; an
+ * ET_EXEC image is linked at fixed addresses and must be loaded exactly there
+ * -- that is what "not position independent" means. Exposed because the
+ * caller has to agree with the loader: the SysV auxv carries AT_PHDR and
+ * AT_BASE, and ld.so reads the program headers through them. Passing
+ * ELF_DYN_BASE for an ET_EXEC image sent ld.so to read an ELF header at
+ * 0x40000000 while the image sat at 0x200000, which faulted at CR2=0x40000040
+ * with the segments correctly mapped the whole time. (M1970) */
+uint64_t elf_image_bias(const void *hdr) {
+    return (((const Elf64_Ehdr *)hdr)->e_type == ET_DYN) ? ELF_DYN_BASE : 0;
+}
 #define PT_DYNAMIC        2
 #define DT_NULL           0
 #define DT_RELA           7
@@ -270,7 +284,7 @@ int elf_pt_loads(const void *hdr, unsigned long hdrsz, unsigned long imgsz,
     if (!elf_check_header(hdr, hdrsz, &phoff, &phnum, &phentsize, &entry)) return -1;
     /* The bias is decided HERE, not by the caller, so validation and placement
      * cannot disagree about where the image lands. */
-    uint64_t bias = (((const Elf64_Ehdr *)hdr)->e_type == ET_DYN) ? ELF_DYN_BASE : 0;
+    uint64_t bias = elf_image_bias(hdr);
     if (out_entry) *out_entry = (unsigned long)entry;
     if (out_bias)  *out_bias  = (unsigned long)bias;
     if (out_phoff) *out_phoff = (unsigned long)phoff;

@@ -451,6 +451,67 @@ static const struct pf proc_files[] = {
     { "notify", gen_notify }, { "swaps", gen_swaps }, { "shm", gen_shm }, { "events", gen_events }, { "bpf", gen_bpf }, { "syscalls", gen_syscalls },
 };
 static const char *dev_files[] = { "null", "zero", "random", "urandom", "full", "clipboard", "kmsg" };
+
+/* --- NESTED /proc/sys and /sys nodes (M1970) --------------------------------
+ *
+ * The table above is keyed on a flat name directly under /proc, which cannot
+ * express /proc/sys/vm/overcommit_memory or /sys/kernel/mm/... -- and those are
+ * exactly the paths a large runtime reads on startup to size itself. Claude
+ * Code probed six of them and got ENOENT for every one.
+ *
+ * These are honest answers about THIS kernel, not placeholders: we do not
+ * overcommit, we have no transparent hugepage daemon (MADV_COLLAPSE is
+ * explicit, M1155/M1168), and the CPU list comes from the live SMP count. */
+struct sf { const char *path; const char *text; };
+static const struct sf sys_files[] = {
+    { "/proc/sys/vm/overcommit_memory",              "0\n" },
+    { "/proc/sys/vm/overcommit_ratio",               "50\n" },
+    { "/proc/sys/vm/mmap_min_addr",                  "65536\n" },
+    { "/proc/sys/vm/max_map_count",                  "65530\n" },
+    { "/proc/sys/kernel/pid_max",                    "32768\n" },
+    { "/proc/sys/kernel/osrelease",                  "6.1.0-osdev\n" },
+    { "/proc/sys/fs/pipe-max-size",                  "1048576\n" },
+    /* "[never]" is the SELECTED value in this format, and it is the truth: a
+     * hugepage here is something a program asks for, never something the
+     * kernel folds in behind its back. */
+    { "/sys/kernel/mm/transparent_hugepage/enabled", "always madvise [never]\n" },
+    { "/sys/kernel/mm/transparent_hugepage/defrag",  "always defer madvise [never]\n" },
+};
+#define NSYSF (int)(sizeof(sys_files)/sizeof(sys_files[0]))
+
+/* /sys/devices/system/cpu/online is generated, not constant: it reports the
+ * cores that are actually up, which is what a runtime sizes its thread pool
+ * from. Format is a range list, "0" for one core and "0-3" for four. */
+static long gen_cpu_online(char *b, int max) {
+    int n = smp_cpu_count > 0 ? smp_cpu_count : 1;
+    int p = 0;
+    p = sapp(b, p, max, "0");
+    if (n > 1) { p = sapp(b, p, max, "-"); p = sdec(b, p, max, (uint64_t)(n - 1)); }
+    p = sapp(b, p, max, "\n");
+    b[p] = 0; return p;
+}
+
+/* Serve a nested node. Returns bytes, or -1 if this path is not one of ours. */
+static long sysfs_read(const char *abs, char *b, int max) {
+    if (peq(abs, "/sys/devices/system/cpu/online") ||
+        peq(abs, "/sys/devices/system/cpu/possible") ||
+        peq(abs, "/sys/devices/system/cpu/present"))
+        return gen_cpu_online(b, max);
+    for (int i = 0; i < NSYSF; i++)
+        if (peq(abs, sys_files[i].path)) {
+            int p = 0;
+            p = sapp(b, p, max, sys_files[i].text);
+            b[p] = 0; return p;
+        }
+    return -1;
+}
+static int sysfs_has(const char *abs) {
+    if (peq(abs, "/sys/devices/system/cpu/online") ||
+        peq(abs, "/sys/devices/system/cpu/possible") ||
+        peq(abs, "/sys/devices/system/cpu/present")) return 1;
+    for (int i = 0; i < NSYSF; i++) if (peq(abs, sys_files[i].path)) return 1;
+    return 0;
+}
 #define NPROC (int)(sizeof(proc_files)/sizeof(proc_files[0]))
 #define NDEV  (int)(sizeof(dev_files)/sizeof(dev_files[0]))
 
@@ -459,7 +520,9 @@ int procfs_is_dir(const char *abs) {
     return peq(abs, "/proc") || peq(abs, "/proc/") || peq(abs, "/dev") || peq(abs, "/dev/");
 }
 int procfs_owns(const char *abs) {
-    return startswith(abs, "/proc/") || startswith(abs, "/dev/") || procfs_is_dir(abs);
+    return startswith(abs, "/proc/") || startswith(abs, "/dev/") ||
+           startswith(abs, "/sys/") ||                      /* nested sysfs nodes (M1970) */
+           procfs_is_dir(abs);
 }
 
 /* Does this synthetic node actually EXIST, and is it a character device?
@@ -476,6 +539,7 @@ int procfs_owns(const char *abs) {
 int procfs_exists(const char *abs, int *chardev) {
     if (chardev) *chardev = 0;
     if (procfs_is_dir(abs)) return 1;
+    if (sysfs_has(abs)) return 1;                            /* nested /proc/sys and /sys (M1970) */
     if (startswith(abs, "/dev/")) {
         const char *f = abs + 5;
         for (int i = 0; i < NDEV; i++) if (peq(f, dev_files[i])) { if (chardev) *chardev = 1; return 1; }
@@ -786,6 +850,7 @@ long procfs_read(const char *abs, void *buf, unsigned long max) {
             if (peq(f, proc_files[i].name)) return proc_files[i].gen((char *)buf, (int)max);
         return -1;
     }
+    { long sn = sysfs_read(abs, (char *)buf, (int)max); if (sn >= 0) return sn; }   /* nested nodes first (M1970) */
     if (startswith(abs, "/dev/")) {
         const char *f = abs + 5;
         if (peq(f, "null"))   return 0;                         /* EOF */

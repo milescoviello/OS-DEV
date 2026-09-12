@@ -161,7 +161,7 @@ static void vb_add_status(uint8_t bits) {
  * physical address — exactly as kernel/ahci.c does. */
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;   /* identity-map fallback */
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 int virtio_blk_init(void) {
@@ -242,17 +242,17 @@ int virtio_blk_init(void) {
         }
         prev = f;
     }
-    memset((void *)(uintptr_t)base, 0, (size_t)frames * PAGE_SIZE);
+    memset(hhdm(base), 0, (size_t)frames * PAGE_SIZE);
 
     vb.queue_phys = base;
-    vb.desc  = (struct vring_desc *)(uintptr_t)base;
-    vb.avail = (struct vring_avail *)(uintptr_t)(base + qsz * sizeof(struct vring_desc));
+    vb.desc  = (struct vring_desc *)hhdm(base);
+    vb.avail = (struct vring_avail *)hhdm(base + qsz * sizeof(struct vring_desc));
     /* The used ring starts at the next VIRTIO_QUEUE_ALIGN boundary after the
      * descriptor table + available ring (legacy layout). */
     uint64_t used_off = (uint64_t)qsz * sizeof(struct vring_desc)
                       + sizeof(uint16_t) * (2 + qsz);
     used_off = (used_off + (VIRTIO_QUEUE_ALIGN - 1)) & ~(uint64_t)(VIRTIO_QUEUE_ALIGN - 1);
-    vb.used  = (struct vring_used *)(uintptr_t)(base + used_off);
+    vb.used  = (struct vring_used *)hhdm(base + used_off);
     vb.used_seen = 0;
 
     /* Hand the device the queue by page-frame number (legacy: PFN = phys >> 12).

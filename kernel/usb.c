@@ -34,6 +34,7 @@
 #include "usb.h"
 #include "pci.h"
 #include "pmm.h"
+#include "vmm.h"   /* hhdm(): CPU access to DMA memory (M1970) */
 #include "mouse.h"
 #include "fb.h"
 #include "console.h"
@@ -105,7 +106,7 @@ static int tablet_port = -1;       /* root-port index (0/1) the tablet owns */
 static uint16_t rd(uint16_t o)            { return inw(io + o); }
 static void     wr(uint16_t o, uint16_t v){ outw(io + o, v); }
 
-static uint32_t phys(void *p) { return (uint32_t)(uintptr_t)p; }
+static uint32_t phys(void *p) { return (uint32_t)hhdm_phys(p); }   /* UHCI is 32-bit DMA; PMM frames are low (M1970) */
 
 /* Build a TD. mlen is the data length (0 allowed). */
 static void make_td(struct uhci_td *td, uint32_t next, uint8_t pid,
@@ -366,10 +367,10 @@ int usb_uhci_init(void) {
      * interrupt TD share one frame; the bulk QH + its (larger) TD pool get
      * their own frame; control/setup/report buffers share one frame; the bulk
      * bounce buffer gets its own frame(s). */
-    framelist = (uint32_t *)(uintptr_t)pmm_alloc_frame();
-    uint8_t *pool  = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    uint8_t *bpool = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    uint8_t *bufs  = (uint8_t *)(uintptr_t)pmm_alloc_frame();
+    framelist = (uint32_t *)dma_alloc_page();
+    uint8_t *pool  = (uint8_t *)dma_alloc_page();
+    uint8_t *bpool = (uint8_t *)dma_alloc_page();
+    uint8_t *bufs  = (uint8_t *)dma_alloc_page();
     if (!framelist || !pool || !bpool || !bufs) { kprintf("[usb] DMA alloc failed\n"); return -1; }
     qh_int  = (struct uhci_qh *)(pool + 0);
     qh_ctrl = (struct uhci_qh *)(pool + 16);
@@ -383,7 +384,7 @@ int usb_uhci_init(void) {
     data_buf   = bufs + 16;                        /* 304 bytes of control data stage */
     report_buf = bufs + 320;                       /* tablet HID report               */
     intx_buf   = bufs + 384;                       /* generic interrupt-IN bounce buf (64B) */
-    bulk_buf   = (uint8_t *)(uintptr_t)pmm_alloc_frame();   /* USB_BULK_MAX bounce buf */
+    bulk_buf   = (uint8_t *)dma_alloc_page();   /* USB_BULK_MAX bounce buf */
     /* USB_BULK_MAX may exceed one frame; grab the rest contiguously (the PMM is a
      * simple bump allocator, so a fresh run is contiguous — verified, not assumed). */
     {

@@ -264,7 +264,7 @@ static void     portsc_wr(int p, uint32_t v) { op_wr(portsc_off(p), v); }
  * 64-bit, so we keep the full address. */
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 /* A short, finite busy-wait on a bit condition in an operational register.
@@ -572,8 +572,8 @@ static int enumerate_device(void) {
     xh.slot_id = slot;
 
     /* --- allocate the device context + EP0 transfer ring --------------------- */
-    xh.dev_ctx = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    struct trb *ep0frame = (struct trb *)(uintptr_t)pmm_alloc_frame();
+    xh.dev_ctx = (uint8_t *)dma_alloc_page();
+    struct trb *ep0frame = (struct trb *)dma_alloc_page();
     if (!xh.dev_ctx || !ep0frame)
         return -1;
     memset(xh.dev_ctx, 0, PAGE_SIZE);
@@ -708,8 +708,8 @@ static int ep_dci(uint8_t epnum, int in) { return (int)(2 * epnum) + (in ? 1 : 0
 /* Build a CONFIGURE ENDPOINT input context adding the bulk IN + OUT endpoints,
  * each with its own transfer ring, and issue the command. Returns 0 on success. */
 static int configure_bulk_endpoints(void) {
-    struct trb *binf = (struct trb *)(uintptr_t)pmm_alloc_frame();
-    struct trb *boutf = (struct trb *)(uintptr_t)pmm_alloc_frame();
+    struct trb *binf = (struct trb *)dma_alloc_page();
+    struct trb *boutf = (struct trb *)dma_alloc_page();
     if (!binf || !boutf)
         return -1;
     ring_init(&xh.ep_bin, binf);
@@ -936,14 +936,14 @@ int xhci_init(void) {
     op_wr(OP_CONFIG, (op_rd(OP_CONFIG) & ~0xFFu) | (uint32_t)max_slots);
 
     /* --- DCBAA (one frame) ------------------------------------------------- */
-    xh.dcbaa = (uint64_t *)(uintptr_t)pmm_alloc_frame();
+    xh.dcbaa = (uint64_t *)dma_alloc_page();
     if (!xh.dcbaa)
         return -1;
     memset(xh.dcbaa, 0, PAGE_SIZE);
     op_wr64(OP_DCBAAP, phys_of(xh.dcbaa));
 
     /* --- command ring (one frame) ------------------------------------------ */
-    struct trb *cmdframe = (struct trb *)(uintptr_t)pmm_alloc_frame();
+    struct trb *cmdframe = (struct trb *)dma_alloc_page();
     if (!cmdframe)
         return -1;
     ring_init(&xh.cmd, cmdframe);
@@ -951,8 +951,8 @@ int xhci_init(void) {
     op_wr64(OP_CRCR, phys_of(cmdframe) | CRCR_RCS);
 
     /* --- event ring: ERST (one frame) -> event-ring segment (one frame) ----- */
-    xh.erst = (struct trb *)(uintptr_t)pmm_alloc_frame();   /* one ERST entry fits */
-    struct trb *evtframe = (struct trb *)(uintptr_t)pmm_alloc_frame();
+    xh.erst = (struct trb *)dma_alloc_page();   /* one ERST entry fits */
+    struct trb *evtframe = (struct trb *)dma_alloc_page();
     if (!xh.erst || !evtframe)
         return -1;
     memset(xh.erst, 0, PAGE_SIZE);
@@ -981,9 +981,9 @@ int xhci_init(void) {
     rt_wr(RT_IR0 + IR_IMAN, IMAN_IE);              /* interrupt enable (we poll) */
 
     /* --- contexts + bounce buffers ----------------------------------------- */
-    xh.in_ctx    = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    uint8_t *bufs = (uint8_t *)(uintptr_t)pmm_alloc_frame();
-    xh.bulk_buf  = (uint8_t *)(uintptr_t)pmm_alloc_frame();
+    xh.in_ctx    = (uint8_t *)dma_alloc_page();
+    uint8_t *bufs = (uint8_t *)dma_alloc_page();
+    xh.bulk_buf  = (uint8_t *)dma_alloc_page();
     if (!xh.in_ctx || !bufs || !xh.bulk_buf)
         return -1;
     memset(xh.in_ctx, 0, PAGE_SIZE);

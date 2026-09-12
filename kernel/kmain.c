@@ -245,6 +245,7 @@ static volatile int g_lxfull_test;            /* -append lxfulltest: the whole L
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
+static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
@@ -492,6 +493,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
+        if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
@@ -801,6 +803,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * tools/lx/lxvmagap.c. (M1965) */
             kprintf("[lxabi] launching the big-mmap VMA overlap test...\n");
             app_spawn_linux_from_file("/disk2/lxvmagap");
+            /* A NON-PIE (ET_EXEC) binary: linked at a fixed low address and
+             * therefore impossible to run until the kernel left the low 1 GiB
+             * (M1968) and stopped inheriting the identity map into every
+             * address space (M1969). Synchronous, because the assertion is on
+             * its exit status as much as its output. */
+            kprintf("[lxabi] launching a NON-PIE (ET_EXEC) binary...\n");
+            int nprc = app_run_linux_sync("/disk2/lxnopie", 0, 0, 120000);
+            kprintf("[lxabi] LXNOPIE exit -> %d\n", nprc);
             /* The Phase 4 gate: a DYNAMICALLY-LINKED binary, which needs
              * PT_INTERP + ld.so + libc.so.6 all working. */
             kprintf("[lxabi] launching a DYNAMICALLY-LINKED binary...\n");
@@ -826,6 +836,18 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * this proves the MECHANISM fires on a genuinely multi-threaded
              * process, which is the part that can be asserted reliably. */
             kprintf("[lxabi] TLB shootdowns performed: %lu\n", vmm_tlb_shootdown_count());
+        }
+        if (g_lxclaude_test) {
+            /* Claude Code on its own boot. It is a 214 MB non-PIE ET_EXEC
+             * image linked at 0x200000, so it is the first thing this OS has
+             * ever run that needs the low 1 GiB to belong to the process
+             * rather than to the kernel. */
+            static const char *av_cv1[] = { "--version" };
+            kprintf("[lxclaude] running CLAUDE CODE (214 MB non-PIE ET_EXEC at 0x200000)...\n");
+            if (g_lxtrace_make) g_lx_systrace = 1;
+            int crc1 = app_run_linux_sync("/disk2/usr/bin/claude", av_cv1, 1, 900000);
+            g_lx_systrace = 0;
+            kprintf("[lxclaude] claude --version -> %d\n", crc1);
         }
         if (g_lxinet_test) {
             /* AF_INET through the ABI (M1967): a DNS lookup over UDP and an

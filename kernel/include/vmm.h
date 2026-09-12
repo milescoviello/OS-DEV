@@ -8,6 +8,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include "pmm.h"   /* pmm_alloc_frame, for dma_alloc_page below (M1970) */
 
 /* Page-table entry flag bits. */
 #define PTE_PRESENT   (1ull << 0)
@@ -85,6 +86,25 @@ uint64_t vmm_pte_raw(uint64_t virt);
 void     vmm_set_raw(uint64_t virt, uint64_t pte);
 
 static inline void *hhdm(uint64_t phys) { return (void *)(HHDM_BASE + phys); }
+/* The inverse: the PHYSICAL address behind an HHDM pointer -- what a device
+ * must be given for DMA. Drivers used to write `(uint64_t)(uintptr_t)ptr`
+ * because the identity map made a pointer and a physical address the same
+ * number; since M1969 they are not, and that cast would hand the NIC a
+ * 0xFFFF8000_00000000-shaped address. (M1970) */
+static inline uint64_t hhdm_phys(const void *v) { return (uint64_t)(uintptr_t)v - HHDM_BASE; }
+
+/* One zeroed DMA page, as a CPU pointer, or NULL when out of memory.
+ *
+ * The NULL part is the point. Drivers wrote
+ *     p = (T *)pmm_alloc_frame();  if (!p) ...
+ * which worked because the identity map made frame 0 the pointer 0. Written as
+ * `hhdm(pmm_alloc_frame())` that check SILENTLY STOPS WORKING -- hhdm(0) is
+ * HHDM_BASE, a perfectly non-NULL pointer to physical page zero -- so an
+ * out-of-memory would be handed to a device as a valid buffer. (M1970) */
+static inline void *dma_alloc_page(void) {
+    uint64_t f = pmm_alloc_frame();
+    return f ? hhdm(f) : 0;
+}
 
 /* TLB shootdown (M1963): make every OTHER core drop its cached translations
  * after this one removed or tightened a mapping. Call AFTER releasing the vmm

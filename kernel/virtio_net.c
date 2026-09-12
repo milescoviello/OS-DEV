@@ -192,7 +192,7 @@ static void vn_add_status(uint8_t bits) {
  * is the correct general way to obtain the physical address — as virtio_blk.c. */
 static uint64_t phys_of(const void *p) {
     uint64_t t = vmm_translate((uint64_t)(uintptr_t)p);
-    return t ? t : (uint64_t)(uintptr_t)p;   /* identity-map fallback */
+    return t ? t : hhdm_phys(p);   /* no translation: it is an HHDM pointer, so subtract the base (M1970) */
 }
 
 /* Allocate one physically-contiguous, page-aligned region of `frames` PMM frames
@@ -213,7 +213,7 @@ static uint64_t alloc_contig(uint32_t frames) {
             return 0;       /* non-contiguous / OOM: bail (partial leak is harmless) */
         prev = f;
     }
-    memset((void *)(uintptr_t)base, 0, (size_t)frames * PAGE_SIZE);
+    memset(hhdm(base), 0, (size_t)frames * PAGE_SIZE);
     return base;
 }
 
@@ -239,9 +239,9 @@ static int virtq_setup(struct virtq *q, uint16_t queue_index, uint16_t qsz) {
 
     q->qsz        = qsz;
     q->queue_phys = base;
-    q->desc       = (struct vring_desc  *)(uintptr_t)base;
-    q->avail      = (struct vring_avail *)(uintptr_t)(base + (uint64_t)qsz * sizeof(struct vring_desc));
-    q->used       = (struct vring_used  *)(uintptr_t)(base + used_off);
+    q->desc       = (struct vring_desc  *)hhdm(base);
+    q->avail      = (struct vring_avail *)hhdm(base + (uint64_t)qsz * sizeof(struct vring_desc));
+    q->used       = (struct vring_used  *)hhdm(base + used_off);
     q->used_seen  = 0;
 
     /* Select the queue and hand the device its region by page-frame number
@@ -360,13 +360,13 @@ int virtio_net_init(void) {
     for (uint16_t i = 0; i < rx_bufs; i++) {
         uint64_t f = pmm_alloc_frame();
         if (!f) { vn_add_status(VIRTIO_STATUS_FAILED); return -1; }
-        vn.rx_buf[i] = (uint8_t *)(uintptr_t)f;
+        vn.rx_buf[i] = (uint8_t *)hhdm(f);
     }
     vn.rx_count = rx_bufs;
     for (uint16_t i = 0; i < tx_bufs; i++) {
         uint64_t f = pmm_alloc_frame();
         if (!f) { vn_add_status(VIRTIO_STATUS_FAILED); return -1; }
-        vn.tx_buf[i] = (uint8_t *)(uintptr_t)f;
+        vn.tx_buf[i] = (uint8_t *)hhdm(f);
     }
     vn.tx_count = tx_bufs;
     vn.tx_next  = 0;

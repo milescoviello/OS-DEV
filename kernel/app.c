@@ -97,7 +97,13 @@ struct app {
     task_t     *thr[APP_MAXTHREAD];      /* worker threads (M1138/M1139); 0 = free slot */
     const char *title;
     char        titlebuf[24];            /* persistent copy of the title */
-    char        exe_path[64];            /* the spawn/exec file path, for /proc/<pid>/exe — NOT changed by prctl (M1250) */
+    /* The spawn/exec file path, for /proc/<pid>/exe -- NOT changed by prctl
+     * (M1250). 64 bytes truncated a path like
+     * /disk2/usr/lib/gcc/x86_64-pc-linux-gnu/15/cc1 well before the end, and a
+     * truncated exe path is not a cosmetic problem: a Node single-executable
+     * app finds its own embedded payload by reading /proc/self/exe and opening
+     * the result. (M1970) */
+    char        exe_path[VFS_PATH_MAX];
     uint64_t cr3, entry, ustack;
     uint64_t heap_end;                   /* current program break (0 = not yet started) */
 /* 16 -> 64 (M1936). A dynamically-linked or JIT-ing program wants dozens of
@@ -4284,7 +4290,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     int ti = 0; if (title) while (title[ti] && ti < 23) { a->titlebuf[ti] = title[ti]; ti++; }
     a->titlebuf[ti] = 0;
     a->title = a->titlebuf;
-    int ei = 0; if (title) while (title[ei] && ei < 63) { a->exe_path[ei] = title[ei]; ei++; }  /* untruncated exe path (M1250) */
+    int ei = 0; if (title) while (title[ei] && ei < (int)sizeof a->exe_path - 1) { a->exe_path[ei] = title[ei]; ei++; }  /* untruncated exe path (M1250/M1970) */
     a->exe_path[ei] = 0;
     /* Measured boot (M1096): fold this app's exact ELF image into PCR1 + the
      * event log, in launch order. `elf` is kernel-accessible here (embedded
@@ -4396,7 +4402,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
             interp_base = ELF_INTERP_BASE;
             a->entry = ie;                   /* the INTERPRETER runs first */
         }
-        uint64_t rsp = lx_spawn_stack_dyn(elf, ELF_DYN_BASE, prog_entry, interp_base,
+        uint64_t rsp = lx_spawn_stack_dyn(elf, elf_image_bias(elf), prog_entry, interp_base,
                                           a->ustack, USTACK_BASE + PAGE_SIZE, argv0, envp0);
         if (!rsp) goto fail_in_space;        /* stack too small for the frame */
         a->ustack = rsp;
@@ -5987,7 +5993,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * same frame app_spawn builds, but with the caller's argv rather than a
      * synthesised one. (M1948) */
     if (a->exec_argv) {
-        uint64_t rsp = lx_spawn_stack_dyn(elf, ELF_DYN_BASE, prog_entry, interp_base,
+        uint64_t rsp = lx_spawn_stack_dyn(elf, elf_image_bias(elf), prog_entry, interp_base,
                                           a->ustack, USTACK_BASE + PAGE_SIZE,
                                           a->exec_argv, a->exec_envp);
         /* A failure here must be FATAL, not a fallback. The old code kept the
@@ -6025,7 +6031,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     if (a->gfx) { kfree(a->gfx); a->gfx = 0; a->gfx_w = a->gfx_h = 0; }
     int ti = 0; if (title) while (title[ti] && ti < 23) { a->titlebuf[ti] = title[ti]; ti++; }
     a->titlebuf[ti] = 0; a->title = a->titlebuf;
-    int ei = 0; if (name) while (name[ei] && ei < 63) { a->exe_path[ei] = name[ei]; ei++; }   /* exec'd path, for /proc/<pid>/exe (M1250) */
+    int ei = 0; if (name) while (name[ei] && ei < (int)sizeof a->exe_path - 1) { a->exe_path[ei] = name[ei]; ei++; }   /* exec'd path, for /proc/<pid>/exe (M1250/M1970) */
     a->exe_path[ei] = 0;
     int li = 0; if (arg) while (arg[li] && li < 127) { a->launch_arg[li] = arg[li]; li++; }
     a->launch_arg[li] = 0;
