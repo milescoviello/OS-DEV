@@ -57,4 +57,34 @@ for so in $(ldd "$BIN" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
     cp -f "$r" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
     n=$((n+1))
 done
+
+# --- the libraries ldd CANNOT tell you about (M1967) -------------------------
+#
+# glibc resolves hostnames through NSS, and the NSS backends are dlopen'd at
+# RUNTIME from a name built out of /etc/nsswitch.conf -- they are not linked
+# against, so they never appear in ldd output and were never staged. The
+# result was that getaddrinfo failed for every hostname with EAI_AGAIN, an
+# error meaning "try again later" about a lookup that had no way to happen:
+# Node reported `getaddrinfo EAI_AGAIN example.com` with a correct
+# /etc/resolv.conf sitting right there and a working resolver underneath it.
+#
+# Anything else dlopen'd by a program we stage will have the same shape of
+# problem, and the same fix: name it here, because no tool can derive it.
+for extra in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
+    for d in /lib64 /usr/lib64 /lib/x86_64-linux-gnu; do
+        [ -f "$d/$extra" ] || continue
+        r=$(readlink -f "$d/$extra") || continue
+        mkdir -p "$ROOT/lib64" "$ROOT/usr/lib64"
+        cp -f "$r" "$ROOT/lib64/$extra"     2>/dev/null || true
+        cp -f "$r" "$ROOT/usr/lib64/$extra" 2>/dev/null || true
+        n=$((n+1))
+        break
+    done
+done
+
+# nsswitch.conf itself: with no file, glibc's built-in default has varied
+# across versions, and "hosts: files dns" is the answer we actually want.
+mkdir -p "$ROOT/etc"
+printf 'hosts:\tfiles dns\npasswd:\tfiles\ngroup:\tfiles\n' > "$ROOT/etc/nsswitch.conf"
+
 echo "  STAGE   $NAME <- $BIN (+ $n shared libs)"

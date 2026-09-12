@@ -263,7 +263,12 @@ struct app {
      * refcounting to free safely -- exactly the use-after-free shape the M1926
      * review found. A real 4096-byte PATH_MAX therefore wants an interned path
      * pool, which is its own milestone rather than a constant bump. */
-    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; } fd[APP_NFD];   /* cloexec/nonblock at END to keep the positional initializers valid (M1218/M1965) */
+    /* peer_ip/peer_port: a CONNECTED datagram socket (M1967). glibc's resolver
+     * does not use sendto/recvfrom -- it connect()s the UDP socket and then
+     * send()/recv()s on it, so a connect that only understood TCP made every
+     * getaddrinfo fail with EAI_AGAIN, an error meaning "try later" about a
+     * lookup that was never going to happen. */
+    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; uint8_t peer_ip[4]; uint16_t peer_port; } fd[APP_NFD];   /* cloexec/nonblock/peer at END to keep the positional initializers valid (M1218/M1965/M1967) */
     /* seccomp-BPF self-filter (M1190): a process installs a bpf.c program that
      * vets its own syscalls. Zero on spawn/fork; inherited across fork; once set
      * it's permanent (privilege drop is one-way). Empty => no filtering overhead. */
@@ -4615,8 +4620,14 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 8) {   /* inotify: drain queued events (M1266) */
         return inotify_read(a->fd[fd].obj, buf, max);
     }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 9) {   /* connected UDP socket: recv (M1967) */
+        if (!a->fd[fd].peer_port) return -1;                                  /* ENOTCONN */
+        return app_recvfrom(fd, buf, (int)max, 0, 0);
+    }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 10) {  /* TCP socket: recv (M1268) */
-        return net_tcp_sock_recv(a->fd[fd].obj, buf, max);
+        net_tcp_sock_set_nonblock(a->fd[fd].obj, a->fd[fd].nonblock);   /* O_NONBLOCK is a per-FD property (M1967) */
+        long n = net_tcp_sock_recv(a->fd[fd].obj, buf, max);
+        return (n == NET_SOCK_EAGAIN) ? APP_FD_EAGAIN : n;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: read through the line discipline (M1274) */
         return pty_read(a->fd[fd].obj, buf, max);
@@ -4713,6 +4724,10 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
             }
         irq_restore(f);
         return 8;
+    }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 9) {   /* connected UDP socket: send (M1967) */
+        if (!a->fd[fd].peer_port) return -1;                                  /* ENOTCONN: no default peer */
+        return app_sendto(fd, a->fd[fd].peer_ip, a->fd[fd].peer_port, buf, (int)len);
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 10) {  /* TCP socket: send (M1268) */
         return net_tcp_sock_send(a->fd[fd].obj, buf, (int)len);
@@ -5157,10 +5172,44 @@ int app_unix_socketpair(int *out) {
     return 0;
 }
 
-/* connect(2) for a TCP socket fd (M1268): active-open to ip:port. */
+/* getsockname(2) for an AF_INET fd (M1967): the local address a packet from
+ * this socket would carry. Single-homed, so the IP is always the interface's;
+ * only the port varies, and it is 0 until something assigns one. */
+int app_sock_localaddr(int fd, uint8_t ip[4], uint16_t *port) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    const uint8_t *me = net_ip();
+    for (int i = 0; i < 4; i++) ip[i] = me[i];
+    if (a->fd[fd].type == 9) { *port = (uint16_t)a->fd[fd].off; return 0; }
+    if (a->fd[fd].type == 10) {
+        uint8_t na[6];
+        if (net_tcp_sock_getname(a->fd[fd].obj, na) == 0) {
+            for (int i = 0; i < 4; i++) ip[i] = na[i];
+            *port = (uint16_t)(na[4] | (na[5] << 8));
+            return 0;
+        }
+        *port = 0; return 0;
+    }
+    return -1;
+}
+
+/* connect(2) for a TCP socket fd (M1268): active-open to ip:port.
+ * For a DATAGRAM socket connect() sets a default peer, it does not handshake --
+ * subsequent send()/recv() behave like sendto()/recvfrom() to that address.
+ * That is the shape glibc's resolver uses. (M1967) */
 int app_connect(int fd, const uint8_t ip[4], int port) {
     struct app *a = cur(); if (!a) return -1;
-    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 10) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    if (a->fd[fd].type == 9) {
+        for (int i = 0; i < 4; i++) a->fd[fd].peer_ip[i] = ip[i];
+        a->fd[fd].peer_port = (uint16_t)port;
+        if (a->fd[fd].off == 0) {                 /* bind a source port now, so recv has one to match */
+            a->fd[fd].off = g_ephemeral++;
+            if (g_ephemeral == 0) g_ephemeral = 49152;
+        }
+        return 0;
+    }
+    if (a->fd[fd].type != 10) return -1;
     return net_tcp_sock_connect(a->fd[fd].obj, ip, (uint16_t)port);
 }
 /* setsockopt/getsockopt (M1554): TCP client sockets (type 10) only -- these
@@ -5204,7 +5253,13 @@ long app_recvfrom(int fd, void *buf, int max, uint8_t srcip[4], uint16_t *srcpor
     struct app *a = cur(); if (!a) return -1;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 9) return -1;
     if (a->fd[fd].off == 0) return -1;                     /* unbound -> nothing to receive on */
-    return net_udp_recv((uint16_t)a->fd[fd].off, buf, max, srcip, srcport, 2000);
+    /* O_NONBLOCK means 0 ms: take a queued datagram or say EAGAIN. An event
+     * loop polls first and then reads, and a 2-second wait inside the read
+     * would stall every other socket it owns. (M1967) */
+    int tmo = a->fd[fd].nonblock ? 0 : 2000;
+    long n = net_udp_recv((uint16_t)a->fd[fd].off, buf, max, srcip, srcport, tmo);
+    if (n < 0 && a->fd[fd].nonblock) return APP_FD_EAGAIN;
+    return n;
 }
 /* fd hygiene (M1218): fcntl(F_GETFD/F_SETFD/F_DUPFD/F_DUPFD_CLOEXEC), dup3,
  * close_range — over the per-fd FD_CLOEXEC bit (honored by app_exec above; fork
@@ -5429,6 +5484,20 @@ int app_fd_ready(app_t *ap, int fd, int events) {
         /* POLLIN on a listening socket means "accept() would not block", which
          * is exactly what a server's event loop waits for. */
         if ((events & POLLIN) && unix_pending(a->fd[fd].obj)) re |= POLLIN;
+    } else if (a->fd[fd].type == 9) {                      /* AF_INET datagram socket (M1967) */
+        /* An unbound socket has no port to receive on, so it is never readable;
+         * it is always writable (sendto binds one on first use). */
+        if ((events & POLLIN) && a->fd[fd].off != 0 && net_udp_readable((uint16_t)a->fd[fd].off)) re |= POLLIN;
+        if (events & POLLOUT) re |= POLLOUT;
+    } else if (a->fd[fd].type == 10) {                     /* AF_INET stream socket (M1967) */
+        /* The last POLLNVAL. tcp_read pulls frames straight off the NIC, so
+         * until M1967 there was no way to answer this question without
+         * CONSUMING the answer -- and an event loop asks it about every socket
+         * it owns before reading any of them. net_tcp_sock_readable pumps the
+         * NIC into the socket's own receive ring and reports on the ring, so
+         * asking is now free of side effects the caller can observe. */
+        if ((events & POLLIN)  && net_tcp_sock_readable(a->fd[fd].obj)) re |= POLLIN;
+        if ((events & POLLOUT) && net_tcp_sock_writable(a->fd[fd].obj)) re |= POLLOUT;
     } else {
         return POLLNVAL;
     }

@@ -244,6 +244,7 @@ static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
+static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
@@ -490,6 +491,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
+        if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
@@ -709,6 +711,43 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * Linux write(2) lands on the kernel console, which is mirrored to serial,
      * unlike ring-3 print() from our own apps. */
     if (g_lxabi_test) {
+        /* /etc/resolv.conf, written from the address DHCP actually leased
+         * (M1967).
+         *
+         * glibc's getaddrinfo reads this file and nothing else; with no
+         * resolver configured it returns EAI_AGAIN, which is what Node
+         * reported for every hostname -- an error that says "try later" about
+         * a lookup that was never going to happen. Our own resolver had the
+         * right server the whole time: net_dns() holds what the DHCP lease
+         * carried.
+         *
+         * Generated at boot rather than staged into the image on purpose. A
+         * baked-in nameserver is correct only on the network it was baked for,
+         * and this kernel boots on real hardware too. */
+        {
+            const uint8_t *ns = net_dns();
+            if (ns && (ns[0] | ns[1] | ns[2] | ns[3])) {
+                char rc_buf[64]; int n = 0;
+                const char *pfx = "nameserver ";
+                for (int i = 0; pfx[i]; i++) rc_buf[n++] = pfx[i];
+                for (int o = 0; o < 4; o++) {
+                    int v = ns[o];
+                    if (v >= 100) rc_buf[n++] = (char)('0' + v / 100);
+                    if (v >= 10)  rc_buf[n++] = (char)('0' + (v / 10) % 10);
+                    rc_buf[n++] = (char)('0' + v % 10);
+                    rc_buf[n++] = (o == 3) ? '\n' : '.';
+                }
+                rc_buf[n] = 0;
+                vfs_mkdir("/disk2/etc");
+                if (vfs_write("/disk2/etc/resolv.conf", rc_buf, (unsigned long)n) >= 0)
+                    kprintf("[lxabi] /etc/resolv.conf -> nameserver %u.%u.%u.%u (from the DHCP lease)\n",
+                            ns[0], ns[1], ns[2], ns[3]);
+                else
+                    kprintf("[lxabi] could not write /etc/resolv.conf -- getaddrinfo will report EAI_AGAIN\n");
+            } else {
+                kprintf("[lxabi] no DNS server in the lease; getaddrinfo will report EAI_AGAIN\n");
+            }
+        }
         kprintf("[lxabi] launching a host-built static-PIE Linux binary from /disk2...\n");
         if (app_spawn_linux_from_file("/disk2/hellofree") < 0)
             kprintf("[FAIL] lxabi: could not load /disk2/hellofree\n");
@@ -787,6 +826,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * this proves the MECHANISM fires on a genuinely multi-threaded
              * process, which is the part that can be asserted reliably. */
             kprintf("[lxabi] TLB shootdowns performed: %lu\n", vmm_tlb_shootdown_count());
+        }
+        if (g_lxinet_test) {
+            /* AF_INET through the ABI (M1967): a DNS lookup over UDP and an
+             * HTTP request over TCP, both driven by poll(). Its OWN boot --
+             * it needs a working NIC and the real internet, and running it
+             * beside eight other glibc processes on a 256 MiB machine would
+             * make it a test of the host's network rather than of ours. */
+            kprintf("[lxabi] launching the AF_INET socket test (DNS + HTTP over poll)...\n");
+            int inetrc = app_run_linux_sync("/disk2/lxinet", 0, 0, 60000);
+            kprintf("[lxabi] lxinet exit -> %d\n", inetrc);
         }
         if (g_lxtool_test) {
             /* PHASE 4 (M1955): drive the BORROWED host toolchain inside OS-DEV.
@@ -913,6 +962,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             rc = app_run_linux_sync("/disk2/usr/bin/node", av_ns, 2, 600000);
             g_lx_systrace = 0;
             kprintf("[lxnode] node net -> %d\n", rc);
+
+            /* PHASE 6'S ACTUAL GATE (M1967): "do not claim the phase until a
+             * script that touches the network runs." A DNS lookup and an HTTP
+             * request, from Node, over AF_INET sockets that libuv polls --
+             * which needed a per-socket receive ring and a non-blocking pump
+             * before poll() could answer for them at all. */
+            static const char *av_nn[] = { "-e",
+                "const http=require('http');"
+                "http.get('http://example.com/',r=>{let n=0;"
+                "r.on('data',d=>{n+=d.length;});"
+                "r.on('end',()=>console.log('LXNODEHTTP:',r.statusCode,n));})"
+                ".on('error',e=>console.log('LXNODEHTTP-ERR:',e.message));" };
+            kprintf("[lxnode] running JavaScript that uses the NETWORK (DNS + HTTP)...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_nn, 2, 900000);
+            kprintf("[lxnode] node http -> %d\n", rc);
         }
         if (g_lxgcc_test) {
             /* PHASE 5, ON ITS OWN BOOT: the real GCC DRIVER compiling OS-DEV's

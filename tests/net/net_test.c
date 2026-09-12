@@ -31,6 +31,12 @@ const char *nic_name(void) { return "fuzz"; }
 static const uint8_t g_mac[6] = { 2, 0, 0, 0, 0, 1 };
 const uint8_t *nic_mac(void) { return g_mac; }
 int nic_send(const void *frame, uint16_t len) { (void)frame; return len; }
+/* net_udp_recv's blocking path yields between NIC polls rather than spinning a
+ * core (M1967). timer_ticks already advances on every call, so the deadline
+ * loop terminates without this doing anything -- it only has to exist. Every
+ * kernel seam net.c touches is stubbed here for the same reason; a new call
+ * into task.c/kheap.c/etc. breaks this link until it is. */
+void task_sleep_ms(uint64_t ms) { (void)ms; }
 void kprintf(const char *fmt, ...) { (void)fmt; }
 /* net.c's net_demo() calls into tls.c for the boot HTTPS self-test; stub it out
  * here (this suite fuzzes the packet/reassembly path, not TLS). */

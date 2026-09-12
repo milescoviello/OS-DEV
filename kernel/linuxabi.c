@@ -247,6 +247,13 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_setsockopt_   54
 #define LXS_getsockopt_   55
 #define LXS_shutdown_     48
+#define LXS_sendto_       44
+#define LXS_recvfrom_     45
+#define LXS_sendmsg_      46
+#define LXS_recvmsg_      47
+#define LXS_recvmmsg_    299
+#define LXS_sendmmsg_    307
+#define LXS_clock_nanosleep_ 230
 #define LXS_statx_       332
 #define LXS_sched_getaffinity_ 204
 #define LXS_sched_setparam_    142
@@ -625,11 +632,11 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     /* --- sockets (M1965) ---------------------------------------------------
-     * AF_UNIX only for now, and deliberately so: unixsock.c is a complete
-     * local-socket implementation and needed nothing but an fd. AF_INET is a
-     * separate problem -- net.c has no per-socket receive queue, so nothing
-     * can answer "is there data?" without pulling frames off the NIC and
-     * stealing them from other sockets. That is its own milestone. */
+     * AF_UNIX came first (M1965) because unixsock.c was a complete local-socket
+     * implementation that needed nothing but an fd. AF_INET took a per-socket
+     * receive ring and a non-blocking pump before anything could answer "is
+     * there data?" without pulling frames off the NIC and stealing them from
+     * other sockets -- that is M1967, and both families are here now. */
     case LXS_statx_: {                      /* (dirfd, path, flags, mask, struct statx *) */
         /* Linux's statx buffer is 256 bytes with its own field offsets, quite
          * unlike struct stat. Node stats constantly, and an ENOSYS here makes
@@ -642,20 +649,44 @@ void linux_syscall_dispatch(struct registers *r) {
         if (vfs_stat(path, &sx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
         uint8_t *o = (uint8_t *)r->r8;
         for (int i = 0; i < 256; i++) o[i] = 0;
+        /* FIELD OFFSETS, and they are not negotiable (fixed M1967).
+         *
+         * The first version of this had every field EIGHT BYTES TOO FAR --
+         * nlink at 24 instead of 16, mode at 32 instead of 28, ino at 40
+         * instead of 32, size at 48 instead of 40. Nothing failed loudly: the
+         * call returned 0 and the buffer was full of plausible numbers. Node's
+         * statSync read stx_size out of offset 40, where we had written
+         * stx_ino, and reported a 26-byte file as 2675 bytes -- a size that
+         * changed run to run because it was the real ext2 inode number. The
+         * content read back correctly the whole time, which is what made it
+         * look like anything other than a stat bug.
+         *
+         *   0  stx_mask(u32)   4  stx_blksize(u32)   8  stx_attributes(u64)
+         *  16  stx_nlink(u32) 20  stx_uid(u32)      24  stx_gid(u32)
+         *  28  stx_mode(u16)  30  spare(u16)        32  stx_ino(u64)
+         *  40  stx_size(u64)  48  stx_blocks(u64)   56  attributes_mask(u64)
+         *  64  atime          80  btime             96  ctime      112  mtime
+         *      (each timestamp: s64 sec, u32 nsec, u32 pad)
+         */
         int isdir = (sx.stx_mode & 0170000u) == 0040000u;
         *(uint32_t *)(o + 0)  = 0x7ff;                     /* stx_mask: what we filled in */
         *(uint32_t *)(o + 4)  = 4096;                      /* stx_blksize */
-        *(uint32_t *)(o + 24) = 1;                         /* stx_nlink */
-        *(uint16_t *)(o + 32) = (uint16_t)(isdir ? (0040000u | 0755u) : (0100000u | 0644u));  /* stx_mode */
-        *(uint64_t *)(o + 40) = sx.stx_ino;                /* stx_ino */
-        *(uint64_t *)(o + 48) = sx.stx_size;               /* stx_size */
-        *(uint64_t *)(o + 56) = (sx.stx_size + 511) / 512; /* stx_blocks */
+        *(uint32_t *)(o + 16) = 1;                         /* stx_nlink */
+        *(uint16_t *)(o + 28) = (uint16_t)(isdir ? (0040000u | 0755u) : (0100000u | 0644u));  /* stx_mode */
+        *(uint64_t *)(o + 32) = sx.stx_ino;                /* stx_ino */
+        *(uint64_t *)(o + 40) = sx.stx_size;               /* stx_size */
+        *(uint64_t *)(o + 48) = (sx.stx_size + 511) / 512; /* stx_blocks */
+        for (int t = 64; t <= 112; t += 16)                /* atime/btime/ctime/mtime */
+            *(uint64_t *)(o + t) = sx.stx_mtime;
         r->rax = 0;
         break;
     }
     case LXS_socket_: {                     /* (domain, type, protocol) */
-        int dom = (int)a1, typ = (int)r->rsi & 0xF;   /* mask SOCK_NONBLOCK/SOCK_CLOEXEC */
-        int sfd = app_socket(dom, typ);
+        /* Pass `type` THROUGH with its flag bits: app_socket records
+         * SOCK_NONBLOCK/SOCK_CLOEXEC and masks them itself. Masking here threw
+         * the caller's non-blocking request away silently (M1965). */
+        int dom = (int)a1;
+        int sfd = app_socket(dom, (int)r->rsi);
         if (g_lx_systrace) kprintf("[sock] socket(dom %d, type %lx) -> %d\n", dom, r->rsi, sfd);
         r->rax = (sfd < 0) ? (uint64_t)-(long)LX_EAFNOSUPPORT : (uint64_t)sfd;
         break;
@@ -666,6 +697,29 @@ void linux_syscall_dispatch(struct registers *r) {
          * the family is the first two bytes on both sides. */
         if (!vmm_user_ok(r->rsi, 2)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         uint16_t fam = *(const uint16_t *)r->rsi;
+        if (fam == 2 /*AF_INET*/) {
+            /* struct sockaddr_in { u16 family; u16 port (BIG-endian); u32 addr
+             * (network order); u8 zero[8] }. The port is the field that bites:
+             * it is big-endian ON THE WIRE AND IN THE STRUCT, so a caller's
+             * htons() must not be undone twice. (M1967) */
+            if (!vmm_user_ok(r->rsi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            const uint8_t *sa = (const uint8_t *)r->rsi;
+            uint16_t port = (uint16_t)((sa[2] << 8) | sa[3]);
+            uint8_t ip[4] = { sa[4], sa[5], sa[6], sa[7] };
+            if (r->rax == LXS_bind_) {
+                /* bind() on a client socket names a local port. We are
+                 * single-homed with ephemeral source ports, and no caller here
+                 * depends on a specific one, so accept it rather than fail a
+                 * program that binds out of habit. */
+                r->rax = 0; break;
+            }
+            int crc = app_connect((int)a1, ip, port);
+            if (g_lx_systrace || crc != 0)
+                kprintf("[sock] connect(fd %ld, %u.%u.%u.%u:%u) -> %d\n",
+                        a1, ip[0], ip[1], ip[2], ip[3], port, crc);
+            r->rax = (crc == 0) ? 0 : (uint64_t)-(long)LX_ECONNREFUSED;
+            break;
+        }
         if (fam != 1 /*AF_UNIX*/) { r->rax = (uint64_t)-(long)LX_EAFNOSUPPORT; break; }
         if (!vmm_user_ok(r->rsi, 3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         const char *sun = (const char *)(r->rsi + 2);
@@ -710,6 +764,29 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_getsockname_: {                /* (fd, sockaddr *, addrlen *) */
+        /* Report the REAL family and address. Hardcoding AF_UNIX was fine
+         * while AF_UNIX was the only family in the fd table (M1965) and is a
+         * correctness bug the moment AF_INET joins it: glibc's getaddrinfo
+         * learns which local address would be used for each candidate
+         * destination by connect()ing a UDP socket and calling getsockname on
+         * it, and an AF_UNIX answer made it abort outright --
+         *   Fatal glibc error: rfc3484_sort: assertion failed:
+         *     a1->source_addr.sin6_family == PF_INET
+         * after the DNS lookup had already succeeded. (M1967) */
+        int ty = app_fd_type((int)a1);
+        if (ty == 9 || ty == 10) {
+            if (!r->rsi || !vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            uint8_t lip[4] = {0,0,0,0}; uint16_t lport = 0;
+            app_sock_localaddr((int)a1, lip, &lport);
+            uint8_t *o = (uint8_t *)r->rsi;
+            for (int i = 0; i < 16; i++) o[i] = 0;
+            *(uint16_t *)o = 2;                                  /* AF_INET */
+            o[2] = (uint8_t)(lport >> 8); o[3] = (uint8_t)(lport & 0xFF);   /* big-endian in the struct */
+            for (int i = 0; i < 4; i++) o[4 + i] = lip[i];
+            if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 16;
+            r->rax = 0;
+            break;
+        }
         if (r->rsi && vmm_user_ok(r->rsi, 2)) *(uint16_t *)r->rsi = 1 /*AF_UNIX*/;
         if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 2;
         r->rax = 0;
@@ -732,13 +809,194 @@ void linux_syscall_dispatch(struct registers *r) {
         if (r->r8  && vmm_user_ok(r->r8, 4))  *(uint32_t *)r->r8  = 4;   /* optlen: bytes written */
         r->rax = 0;
         break;
+    case LXS_sendto_: {                     /* (fd, buf, len, flags, dest_addr, addrlen) */
+        long slen = (long)r->rdx;
+        if (slen < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (slen && !vmm_user_ok(r->rsi, (uint64_t)slen)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* A NULL dest_addr means "already connected" -- for a stream socket
+         * that is just write(). */
+        if (!r->r8) {
+            long w = app_fd_write((int)a1, (const void *)r->rsi, (unsigned long)slen);
+            r->rax = (w < 0) ? (uint64_t)lx_fd_err(w) : (uint64_t)w;
+            break;
+        }
+        if (!vmm_user_ok(r->r8, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const uint8_t *sa = (const uint8_t *)r->r8;
+        if (*(const uint16_t *)sa != 2 /*AF_INET*/) { r->rax = (uint64_t)-(long)LX_EAFNOSUPPORT; break; }
+        uint16_t dport = (uint16_t)((sa[2] << 8) | sa[3]);       /* big-endian in the struct */
+        uint8_t dip[4] = { sa[4], sa[5], sa[6], sa[7] };
+        long sn = app_sendto((int)a1, dip, dport, (const void *)r->rsi, (int)slen);
+        if (g_lx_systrace)
+            kprintf("[sock] sendto(fd %ld, %u.%u.%u.%u:%u, %ld) -> %ld\n",
+                    a1, dip[0], dip[1], dip[2], dip[3], dport, slen, sn);
+        r->rax = (sn < 0) ? (uint64_t)-(long)LX_ENETUNREACH : (uint64_t)sn;
+        break;
+    }
+    case LXS_recvfrom_: {                   /* (fd, buf, len, flags, src_addr, addrlen *) */
+        long rlen = (long)r->rdx;
+        if (rlen < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (rlen && !vmm_user_ok(r->rsi, (uint64_t)rlen)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (app_fd_type((int)a1) != 9) {                          /* stream socket: plain read */
+            long got = app_fd_read((int)a1, (void *)r->rsi, (unsigned long)rlen);
+            r->rax = (got < 0) ? (uint64_t)lx_fd_err(got) : (uint64_t)got;
+            break;
+        }
+        uint8_t sip[4] = {0,0,0,0}; uint16_t sp = 0;
+        long gn = app_recvfrom((int)a1, (void *)r->rsi, (int)rlen, sip, &sp);
+        if (gn == APP_FD_EAGAIN) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }
+        if (gn < 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }
+        /* Fill in src_addr only if the caller asked for it AND told us how much
+         * room there is -- writing 16 bytes into a smaller buffer is exactly
+         * the kind of silent overrun this layer exists to prevent. */
+        if (r->r8 && r->r9 && vmm_user_ok(r->r9, 4)) {
+            uint32_t cap = *(const uint32_t *)r->r9;
+            if (cap >= 16 && vmm_user_ok(r->r8, 16)) {
+                uint8_t *o = (uint8_t *)r->r8;
+                for (int i = 0; i < 16; i++) o[i] = 0;
+                *(uint16_t *)o = 2;                               /* AF_INET */
+                o[2] = (uint8_t)(sp >> 8); o[3] = (uint8_t)(sp & 0xFF);
+                for (int i = 0; i < 4; i++) o[4 + i] = sip[i];
+                *(uint32_t *)r->r9 = 16;
+            }
+        }
+        r->rax = (uint64_t)gn;
+        break;
+    }
+    /* --- the message-vector calls (M1967) ------------------------------------
+     *
+     * glibc's RESOLVER needs these. It sends the A and AAAA queries for a name
+     * in ONE sendmmsg, and with that call returning ENOSYS it gave up on the
+     * lookup entirely: every hostname failed with EAI_AGAIN -- "try again
+     * later" -- with a correct /etc/resolv.conf in place and a working
+     * resolver underneath. Nothing in the error mentioned sendmmsg.
+     *
+     *   struct msghdr  { void *name; u32 namelen; iovec *iov; u64 iovlen;
+     *                    void *control; u64 controllen; int flags; }   56 bytes
+     *   struct mmsghdr { struct msghdr hdr; u32 len; }                 64 bytes
+     */
+    case LXS_sendmsg_:
+    case LXS_sendmmsg_: {                   /* (fd, msg[vec], vlen, flags) */
+        int is_mm = (r->rax == LXS_sendmmsg_);
+        unsigned long vlen = is_mm ? (unsigned long)r->rdx : 1;
+        if (vlen > 64) vlen = 64;
+        unsigned long stride = is_mm ? 64 : 56;
+        if (!vlen || !vmm_user_ok(r->rsi, vlen * stride)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        long done = 0, first = -1;
+        for (unsigned long m = 0; m < vlen; m++) {
+            const uint8_t *h = (const uint8_t *)(r->rsi + m * stride);
+            uint64_t nameptr = *(const uint64_t *)(h + 0);
+            uint32_t namelen = *(const uint32_t *)(h + 8);
+            uint64_t iovptr  = *(const uint64_t *)(h + 16);
+            uint64_t iovlen  = *(const uint64_t *)(h + 24);
+            if (iovlen > 16) break;
+            if (iovlen && !vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) break;
+            /* Gather the iovecs. A datagram is ONE packet, so they have to be
+             * concatenated before it goes out -- sending them separately would
+             * turn one query into several. */
+            static uint8_t gbuf[2048];
+            unsigned long tot = 0;
+            const struct lx_iovec *v = (const struct lx_iovec *)iovptr;
+            int bad = 0;
+            for (uint64_t i = 0; i < iovlen; i++) {
+                unsigned long n = v[i].iov_len;
+                if (!n) continue;
+                if (!v[i].iov_base || !vmm_user_ok((uint64_t)v[i].iov_base, n)) { bad = 1; break; }
+                if (tot + n > sizeof gbuf) n = sizeof gbuf - tot;
+                for (unsigned long k = 0; k < n; k++) gbuf[tot + k] = ((const uint8_t *)v[i].iov_base)[k];
+                tot += n;
+                if (tot >= sizeof gbuf) break;
+            }
+            if (bad) break;
+            long sn;
+            if (nameptr && namelen >= 8 && vmm_user_ok(nameptr, 8)) {
+                const uint8_t *sa = (const uint8_t *)nameptr;
+                uint16_t dport = (uint16_t)((sa[2] << 8) | sa[3]);
+                uint8_t dip[4] = { sa[4], sa[5], sa[6], sa[7] };
+                sn = app_sendto((int)a1, dip, dport, gbuf, (int)tot);
+            } else {
+                sn = app_fd_write((int)a1, gbuf, tot);   /* connected socket */
+            }
+            if (sn < 0) break;
+            if (first < 0) first = sn;
+            if (is_mm) *(uint32_t *)(h + 56) = (uint32_t)sn;   /* msg_len, per message */
+            done++;
+        }
+        if (done == 0) { r->rax = (uint64_t)-(long)LX_ENETUNREACH; break; }
+        r->rax = is_mm ? (uint64_t)done : (uint64_t)first;
+        break;
+    }
+    case LXS_recvmsg_:
+    case LXS_recvmmsg_: {                   /* (fd, msg[vec], vlen, flags[, timeout]) */
+        int is_mm = (r->rax == LXS_recvmmsg_);
+        unsigned long vlen = is_mm ? (unsigned long)r->rdx : 1;
+        if (vlen > 64) vlen = 64;
+        unsigned long stride = is_mm ? 64 : 56;
+        if (!vlen || !vmm_user_ok(r->rsi, vlen * stride)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        long done = 0, first = -1;
+        for (unsigned long m = 0; m < vlen; m++) {
+            uint8_t *h = (uint8_t *)(r->rsi + m * stride);
+            uint64_t nameptr = *(const uint64_t *)(h + 0);
+            uint64_t iovptr  = *(const uint64_t *)(h + 16);
+            uint64_t iovlen  = *(const uint64_t *)(h + 24);
+            if (!iovlen || iovlen > 16) break;
+            if (!vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) break;
+            const struct lx_iovec *v = (const struct lx_iovec *)iovptr;
+            /* Receive into a staging buffer and SCATTER: a datagram arrives
+             * whole and then fills the iovecs in order. */
+            static uint8_t sbuf[2048];
+            uint8_t sip[4] = {0,0,0,0}; uint16_t sp = 0;
+            long gn;
+            if (app_fd_type((int)a1) == 9) gn = app_recvfrom((int)a1, sbuf, (int)sizeof sbuf, sip, &sp);
+            else                            gn = app_fd_read((int)a1, sbuf, sizeof sbuf);
+            if (gn == APP_FD_EAGAIN) { if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; goto msgdone; } break; }
+            if (gn < 0) break;
+            unsigned long off = 0;
+            for (uint64_t i = 0; i < iovlen && off < (unsigned long)gn; i++) {
+                unsigned long n = v[i].iov_len;
+                if (!n) continue;
+                if (!v[i].iov_base || !vmm_user_ok((uint64_t)v[i].iov_base, n)) break;
+                if (n > (unsigned long)gn - off) n = (unsigned long)gn - off;
+                for (unsigned long k = 0; k < n; k++) ((uint8_t *)v[i].iov_base)[k] = sbuf[off + k];
+                off += n;
+            }
+            if (nameptr && vmm_user_ok(nameptr, 16)) {
+                uint8_t *o = (uint8_t *)nameptr;
+                for (int i = 0; i < 16; i++) o[i] = 0;
+                *(uint16_t *)o = 2;                       /* AF_INET */
+                o[2] = (uint8_t)(sp >> 8); o[3] = (uint8_t)(sp & 0xFF);
+                for (int i = 0; i < 4; i++) o[4 + i] = sip[i];
+                *(uint32_t *)(h + 8) = 16;                /* msg_namelen */
+            }
+            *(uint32_t *)(h + 48) = 0;                    /* msg_flags: nothing truncated */
+            if (first < 0) first = (long)off;
+            if (is_mm) *(uint32_t *)(h + 56) = (uint32_t)off;
+            done++;
+        }
+        if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }
+        r->rax = is_mm ? (uint64_t)done : (uint64_t)first;
+        msgdone: break;
+    }
+    case LXS_clock_nanosleep_: {            /* (clockid, flags, req, rem) */
+        /* Node polls with this. ENOSYS made it a busy-wait. */
+        if (!r->rdx || !vmm_user_ok(r->rdx, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const uint64_t *ts = (const uint64_t *)r->rdx;
+        uint64_t ms = ts[0] * 1000ull + ts[1] / 1000000ull;
+        if (r->rsi & 1) ms = 1;             /* TIMER_ABSTIME: we have no absolute clock to compare against */
+        if (ms > 60000) ms = 60000;
+        __asm__ volatile("sti");
+        task_sleep_ms((int)ms);
+        __asm__ volatile("cli");
+        if (r->r10 && vmm_user_ok(r->r10, 16)) { ((uint64_t *)r->r10)[0] = 0; ((uint64_t *)r->r10)[1] = 0; }
+        r->rax = 0;
+        break;
+    }
     case LXS_shutdown_: {                   /* (fd, how) */
         /* Was: accepted and ignored, on the reasoning that a local socket has
          * no half-close. It does, and it is load-bearing -- Node's
          * socket.end() is a shutdown(SHUT_WR), and the peer's "the other side
          * is finished" event never fired, so a finished connection kept the
          * event loop alive forever. See unix_shutdown. (M1965) */
-        int sr = app_unix_shutdown((int)a1, (int)r->rsi);
+        int sr = (app_fd_type((int)a1) == 12) ? app_unix_shutdown((int)a1, (int)r->rsi) : 0;
         if (g_lx_systrace) kprintf("[sock] shutdown(fd %ld, how %ld) -> %d\n", a1, (long)r->rsi, sr);
         r->rax = (sr == 0) ? 0 : (uint64_t)-(long)LX_ENOTCONN;
         break;

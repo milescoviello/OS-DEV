@@ -1,5 +1,62 @@
 # What's next
 
+> **(M1967) PHASE 6 IS DONE — Node reached the internet from inside OS-DEV.**
+> `node -e "http.get('http://example.com/', ...)"` printed **`LXNODEHTTP: 200 559`**:
+> a DNS lookup and an HTTP request, from JavaScript, over sockets that libuv
+> polls, on a from-scratch kernel, TCP stack and NIC driver. The plan's rule for
+> this phase was *"do not claim the phase until a script that touches the network
+> runs"* — this is that script.
+>
+> **The blocker was that AF_INET sockets were not pollable.** `tcp_read` pulls
+> frames straight off the NIC, so nothing could answer "is there data on this
+> socket?" without **consuming the answer** — and an event loop asks exactly that,
+> about every socket it owns, before it reads any of them. `poll()` therefore
+> reported `POLLNVAL` for socket fds and libuv could not drive them at all. Each
+> socket now has its own receive ring, filled by a **non-blocking pump** that
+> drains the NIC (parking other connections' frames, M1908) and queues UDP
+> datagrams by port; readiness is "is the ring non-empty", and a read drains the
+> ring. The TCP logic itself is untouched — this is a buffer in front of it, not a
+> second implementation. `TCPSOCK_N` went from **2** (a demo limit: the stack could
+> hold one connection and nothing else) to 64.
+>
+> `net_udp_recv` had a second bug of the same shape and worse consequence: it
+> **dropped every frame that was not its own**, including TCP segments belonging
+> to live connections. A resolver running alongside an HTTP fetch silently ate
+> that fetch's data. TCP retransmits, so it looked like a slow network rather
+> than a bug — which is exactly why it survived.
+>
+> **Then four things that each hid behind an error naming something else:**
+> glibc's resolver sends the A and AAAA queries in **one `sendmmsg`**, and that
+> returning `ENOSYS` made every hostname fail with `EAI_AGAIN` — "try again
+> later" about a lookup that had no way to happen. `getaddrinfo` reads
+> `/etc/resolv.conf` and nothing else, and there wasn't one; it is now written at
+> boot from the address **DHCP actually leased**, rather than baked into the image
+> (a baked-in nameserver is right only on the network it was baked for, and this
+> kernel boots on real hardware too). glibc's DNS backend is **`libnss_dns.so.2`,
+> which is `dlopen`'d** — so it never appears in `ldd` output and was never
+> staged; no tool can derive that dependency, so the staging script now names it.
+> And `getsockname` **hardcoded `AF_UNIX`**, which was fine while AF_UNIX was the
+> only family in the fd table and became fatal the moment AF_INET joined it:
+> glibc learns each destination's source address by `connect`ing a UDP socket and
+> calling `getsockname`, and an AF_UNIX answer aborted the process outright with
+> `rfc3484_sort: assertion failed` — *after* the DNS lookup had already succeeded.
+>
+> **And a bug of my own from M1965, caught by an exact-value assertion.** The
+> `statx` handler had **every field eight bytes too far** — `nlink` at 24 instead
+> of 16, `mode` at 32 instead of 28, `ino` at 32→40, `size` at 40→48. Nothing
+> failed loudly: the call returned 0 and the buffer held plausible numbers. Node
+> read `stx_size` out of the offset holding `stx_ino` and reported a 26-byte file
+> as **2675 bytes** — a size that changed run to run because it was the real ext2
+> inode number — while the content read back perfectly every time. The test
+> asserts the exact size, which is the only reason it was caught.
+>
+> New: `sendmsg`/`recvmsg`/`sendmmsg`/`recvmmsg` (gather/scatter for datagrams),
+> `sendto`/`recvfrom`, AF_INET `connect`, `connect` on a **datagram** socket
+> (glibc's resolver connects then `send`/`recv`s rather than using `sendto`),
+> `clock_nanosleep`. `tools/lx/lxinet.c` exercises the same path as a plain
+> static-PIE binary — DNS over UDP and HTTP over TCP, both poll-driven — so a
+> failure here is diagnosable in three minutes instead of inside a V8 run.
+
 > **(M1965) Node opened a socket, and something answered.** A Node `net` server
 > and a client, in one process, over a real AF_UNIX socket **inside OS-DEV**:
 > `listen` → `connect` → `accept` → write → **`LXNODESOCK: echo:ping`** → half-close

@@ -25,6 +25,7 @@
 #include "kheap.h"      /* kmalloc/kfree — WebSocket transport working buffers (M1846) */
 #include "wsframe.h"    /* RFC 6455 frame codec (M1843) */
 #include "wsclient.h"   /* RFC 6455 client handshake helpers (M1845) */
+#include "task.h"       /* task_sleep_ms -- a blocking UDP recv yields instead of spinning (M1967) */
 #include "sha1.h"       /* SHA-1 — WebSocket server accept-key digest (M1849) */
 #include <stdint.h>
 
@@ -554,32 +555,136 @@ int net_udp_send(const uint8_t dstip[4], uint16_t dport, uint16_t sport,
 /* Wait up to timeout_ms for a UDP datagram addressed to our local port `sport`.
  * Copies up to `max` payload bytes into buf; fills srcip[4] / *srcport (if
  * non-NULL) with the sender. Returns payload bytes (>=0) or -1 on timeout. */
+/* --- received datagrams, queued per local port (M1967) ----------------------
+ *
+ * net_udp_recv used to pull frames straight off the NIC and DROP everything
+ * that was not a UDP datagram for the port it was asked about. Two consequences
+ * it could not avoid:
+ *
+ *  - Nothing could answer "does this socket have a datagram?" without
+ *    CONSUMING it, so a UDP fd could not be polled -- and DNS is a UDP socket
+ *    inside an event loop.
+ *  - It destroyed TCP segments belonging to LIVE CONNECTIONS. A resolver
+ *    running alongside an HTTP fetch silently ate that fetch's data. TCP
+ *    retransmits, so this looked like "the network is slow" rather than like a
+ *    bug, which is exactly why it survived.
+ *
+ * Now a pump parks TCP frames (the M1908 ring) and queues UDP datagrams by
+ * destination port, and both recv and poll read the queue. */
+#define UDPQ_N    16
+#define UDPQ_MAX  1500
+#define UDPQ_TTL  500                  /* ticks (~5s): a datagram nobody claims must not hold a slot */
+static struct {
+    uint8_t  buf[UDPQ_MAX];
+    int      len;                      /* 0 = free */
+    uint16_t dport;                    /* OUR local port -- what recv matches on */
+    uint8_t  srcip[4];
+    uint16_t srcport;
+    uint64_t at;
+} g_udpq[UDPQ_N];
+
+static void park_put(const uint8_t *f, int len);   /* defined with the TCP demux below */
+
+static void udpq_put(const uint8_t *f, int len) {
+    int ihl = (f[14] & 0x0F) * 4;
+    if (ihl < 20 || len < 14 + ihl + 8) return;
+    const uint8_t *udp = f + 14 + ihl;
+    int plen = (int)get16(udp + 4) - 8;
+    int avail = len - (14 + ihl + 8);
+    if (plen < 0) plen = 0;
+    if (plen > avail) plen = avail;                /* never trust the length field over what arrived */
+    if (plen > UDPQ_MAX) plen = UDPQ_MAX;
+    uint64_t now = timer_ticks();
+    int slot = -1;
+    for (int i = 0; i < UDPQ_N; i++) {
+        if (g_udpq[i].len && now - g_udpq[i].at > UDPQ_TTL) g_udpq[i].len = 0;
+        if (!g_udpq[i].len && slot < 0) slot = i;
+    }
+    if (slot < 0) {                                /* full: evict the oldest */
+        uint64_t oldest = ~0ull; slot = 0;
+        for (int i = 0; i < UDPQ_N; i++) if (g_udpq[i].at < oldest) { oldest = g_udpq[i].at; slot = i; }
+    }
+    for (int i = 0; i < plen; i++) g_udpq[slot].buf[i] = udp[8 + i];
+    /* len == 0 is this table's "slot free" marker, so a zero-length datagram
+     * cannot be represented and is dropped rather than queued as something it
+     * is not. Nothing sends them here; saying so beats a silent quirk. */
+    if (plen == 0) return;
+    g_udpq[slot].len = plen;
+    g_udpq[slot].dport   = get16(udp + 2);
+    g_udpq[slot].srcport = get16(udp + 0);
+    for (int i = 0; i < 4; i++) g_udpq[slot].srcip[i] = f[14 + 12 + i];
+    g_udpq[slot].at      = now;
+}
+
+/* Dequeue a datagram for `sport`. Returns its length, or -1 if none. */
+static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport) {
+    uint64_t now = timer_ticks();
+    for (int i = 0; i < UDPQ_N; i++) {
+        if (!g_udpq[i].len) continue;
+        if (now - g_udpq[i].at > UDPQ_TTL) { g_udpq[i].len = 0; continue; }
+        if (g_udpq[i].dport != sport) continue;
+        int n = g_udpq[i].len; if (n > max) n = max;
+        for (int k = 0; k < n; k++) ((uint8_t *)buf)[k] = g_udpq[i].buf[k];
+        if (srcip)   for (int k = 0; k < 4; k++) srcip[k] = g_udpq[i].srcip[k];
+        if (srcport) *srcport = g_udpq[i].srcport;
+        g_udpq[i].len = 0;
+        return n;
+    }
+    return -1;
+}
+
+/* Drain the NIC once: UDP datagrams to the queue, TCP frames to the park ring,
+ * everything else discarded. Returns 1 if a datagram for `want` arrived. */
+static int udp_pump_once(uint16_t want) {
+    uint8_t rb[1600];
+    int got = 0;
+    for (;;) {
+        int len = nic_receive(rb, sizeof rb);
+        if (len < 14) break;
+        if (get16(rb + 12) != 0x0800) continue;                 /* not IPv4 */
+        if (rb[14 + 9] == 17 && len >= 14 + 20 + 8) {           /* UDP */
+            int ihl = (rb[14] & 0x0F) * 4;
+            if (ihl >= 20 && len >= 14 + ihl + 8) {
+                uint16_t d = get16(rb + 14 + ihl + 2);
+                udpq_put(rb, len);
+                if (d == want) got = 1;
+            }
+        } else if (rb[14 + 9] == 6) {                           /* TCP: someone else's, park it */
+            park_put(rb, len);
+        }
+    }
+    return got;
+}
+
 int net_udp_recv(uint16_t sport, void *buf, int max,
                  uint8_t srcip[4], uint16_t *srcport, int timeout_ms) {
     if (!buf || max <= 0) return -1;
     if (timeout_ms < 0) timeout_ms = 0;
-    uint8_t rb[1600];
+    int n = udpq_take(sport, buf, max, srcip, srcport);
+    if (n >= 0) return n;
+    udp_pump_once(sport);
+    n = udpq_take(sport, buf, max, srcip, srcport);
+    if (n >= 0) return n;
+    if (timeout_ms == 0) return -1;                             /* non-blocking: nothing waiting */
     uint64_t deadline = timer_ticks() + (uint64_t)timeout_ms / 10 + 1;
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(rb, sizeof(rb), 20);
-        if (len < 14 + 20 + 8 || get16(rb + 12) != 0x0800 || rb[14 + 9] != 17) continue;  /* IPv4 + UDP */
-        int ihl = (rb[14] & 0x0F) * 4;
-        if (ihl < 20) continue;
-        uint8_t *udp = rb + 14 + ihl;
-        if (len < 14 + ihl + 8) continue;
-        if (get16(udp + 2) != sport) continue;                /* UDP dest port = our local port? */
-        int plen = (int)get16(udp + 4) - 8;                   /* UDP length field - 8-byte header */
-        int avail = len - (14 + ihl + 8);
-        if (plen < 0) plen = 0;
-        if (plen > avail) plen = avail;                       /* never read past what arrived */
-        if (plen > max) plen = max;
-        const uint8_t *pl = udp + 8;
-        for (int i = 0; i < plen; i++) ((uint8_t *)buf)[i] = pl[i];
-        if (srcip)   memcpy(srcip, rb + 14 + 12, 4);          /* source IPv4 */
-        if (srcport) *srcport = get16(udp + 0);               /* source port */
-        return plen;
+        udp_pump_once(sport);
+        n = udpq_take(sport, buf, max, srcip, srcport);
+        if (n >= 0) return n;
+        task_sleep_ms(2);                                       /* let the NIC refill; do not spin a core */
     }
     return -1;
+}
+
+/* poll/epoll: is a datagram waiting for this local port? Never consumes it. */
+int net_udp_readable(uint16_t sport) {
+    uint64_t now = timer_ticks();
+    for (int i = 0; i < UDPQ_N; i++)
+        if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL && g_udpq[i].dport == sport) return 1;
+    udp_pump_once(sport);
+    for (int i = 0; i < UDPQ_N; i++)
+        if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL + 1 && g_udpq[i].dport == sport) return 1;
+    return 0;
 }
 
 /* ===================================================================== *
@@ -621,7 +726,10 @@ int net_raw_recv(void *buf, int max, int timeout_ms) {
  *  close. A multi-connection server (listen/accept over N TCBs) is the L
  *  follow-on. read/write on the fd map to tcp_read/tcp_write.
  * ===================================================================== */
-#define TCPSOCK_N 2
+/* 2 concurrent TCP sockets was a demo limit: the stack could open a connection
+ * and nothing else. An event loop opens one per request. (M1967) */
+#define TCPSOCK_N 64
+#define TCPSOCK_RX 16384          /* per-socket receive ring: what poll() reports on */
 /* opt_reuseaddr/opt_nodelay/opt_keepalive (M1554): setsockopt/getsockopt
  * storage. This stack has no Nagle-style write batching to disable (every
  * net_tcp_sock_send call reaches tcp_write immediately) and the client-only
@@ -632,7 +740,77 @@ int net_raw_recv(void *buf, int max, int timeout_ms) {
  * compatibility: ported code that calls setsockopt(SO_REUSEADDR/TCP_NODELAY)
  * before use, as a huge amount of real networking code unconditionally
  * does, no longer has to fail or be special-cased out. */
-static struct { int used, refs; tcp_conn c; int opt_reuseaddr, opt_nodelay, opt_keepalive, opt_rcvtimeo; } g_tcpsock[TCPSOCK_N];
+/* rx[] is the piece that makes an AF_INET socket POLLABLE (M1967).
+ *
+ * tcp_read pulls frames straight off the NIC, so before this there was no way
+ * to answer "is this socket readable?" without CONSUMING the answer -- and an
+ * event loop asks exactly that, about every socket it owns, before it reads
+ * any of them. poll() therefore had to report POLLNVAL for socket fds, which
+ * is why libuv could not drive them at all.
+ *
+ * Now a non-blocking pump drains the NIC into this ring (parking other
+ * connections' frames as it goes, M1908), readiness is "is the ring
+ * non-empty", and a read drains the ring. The TCP logic itself is unchanged --
+ * this is a buffer in front of it, not a second implementation. */
+static struct {
+    int used, refs; tcp_conn c;
+    int opt_reuseaddr, opt_nodelay, opt_keepalive, opt_rcvtimeo;
+    uint8_t  rx[TCPSOCK_RX];
+    int      rxhead, rxtail;      /* empty when head == tail */
+    int      nonblock;            /* SOCK_NONBLOCK / O_NONBLOCK */
+    int      eof;                 /* peer closed and the ring is the last of it */
+} g_tcpsock[TCPSOCK_N];
+
+static int rxcount(int i) { return g_tcpsock[i].rxhead - g_tcpsock[i].rxtail; }
+static int rxspace(int i) { return TCPSOCK_RX - rxcount(i); }
+static void rxcompact(int i) {                     /* reclaim the drained prefix */
+    int n = rxcount(i);
+    for (int k = 0; k < n; k++) g_tcpsock[i].rx[k] = g_tcpsock[i].rx[g_tcpsock[i].rxtail + k];
+    g_tcpsock[i].rxtail = 0; g_tcpsock[i].rxhead = n;
+}
+
+/* Drain everything the NIC has for this socket into its ring. Never blocks.
+ * Returns the number of bytes added. */
+static int tcpsock_pump(int idx) {
+    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return 0;
+    if (!g_tcpsock[idx].c.up) return 0;
+    if (g_tcpsock[idx].rxtail > 0 && rxspace(idx) < 1600) rxcompact(idx);
+    int added = 0;
+    for (;;) {
+        int space = rxspace(idx);
+        if (space <= 0) break;                      /* ring full: leave it on the wire */
+        long n = tcp_read(&g_tcpsock[idx].c, g_tcpsock[idx].rx + g_tcpsock[idx].rxhead, space, 0);
+        if (n <= 0) {
+            /* tcp_read returns -1 when the connection closed (FIN/RST). That is
+             * EOF, not an error, and it must be remembered: the ring may still
+             * hold bytes the caller has not read, and reporting the close
+             * before they are drained loses them. */
+            if (n < 0) g_tcpsock[idx].eof = 1;
+            break;
+        }
+        g_tcpsock[idx].rxhead += (int)n;
+        added += (int)n;
+    }
+    return added;
+}
+
+/* poll/epoll: would a read return without blocking? Buffered bytes, or EOF. */
+int net_tcp_sock_readable(int idx) {
+    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return 0;
+    if (rxcount(idx) > 0) return 1;
+    tcpsock_pump(idx);
+    return rxcount(idx) > 0 || g_tcpsock[idx].eof || !g_tcpsock[idx].c.up;
+}
+/* A connected socket is always writable here: tcp_write sends immediately. */
+int net_tcp_sock_writable(int idx) {
+    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return 0;
+    return g_tcpsock[idx].c.up ? 1 : 0;
+}
+int net_tcp_sock_set_nonblock(int idx, int on) {
+    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return -1;
+    g_tcpsock[idx].nonblock = on ? 1 : 0;
+    return 0;
+}
 
 int net_tcp_sock_open(void) {
     for (int i = 0; i < TCPSOCK_N; i++) if (!g_tcpsock[i].used) {
@@ -651,6 +829,9 @@ int net_tcp_sock_open(void) {
         g_tcpsock[i].c.errno_hint = 0;   /* same staleness concern, now that SO_ERROR (M1564) makes it visible too */
         g_tcpsock[i].opt_reuseaddr = g_tcpsock[i].opt_nodelay = g_tcpsock[i].opt_keepalive = 0;
         g_tcpsock[i].opt_rcvtimeo = 3000;   /* ms; matches net_tcp_sock_recv's own prior hardcoded ~3s (M1583) */
+        g_tcpsock[i].rxhead = g_tcpsock[i].rxtail = 0;   /* never inherit a previous connection's bytes (M1967) */
+        g_tcpsock[i].nonblock = 0;
+        g_tcpsock[i].eof = 0;
         return i;
     }
     return -1;
@@ -713,6 +894,19 @@ long net_tcp_sock_recv(int idx, void *buf, int max) {
      * 0 -> block (near-)indefinitely, matching real SO_RCVTIMEO's own meaning;
      * tcp_read has no true infinite mode, so approximate it with a deadline far
      * enough out that no realistic caller will ever actually reach it. */
+    /* Serve the ring first -- the pump may already have pulled these bytes off
+     * the wire on a previous poll, and going back to tcp_read for them would
+     * wait for data that has already arrived. (M1967) */
+    if (rxcount(idx) == 0) tcpsock_pump(idx);
+    if (rxcount(idx) > 0) {
+        int n = rxcount(idx); if (n > max) n = max;
+        for (int k = 0; k < n; k++) ((uint8_t *)buf)[k] = g_tcpsock[idx].rx[g_tcpsock[idx].rxtail + k];
+        g_tcpsock[idx].rxtail += n;
+        if (g_tcpsock[idx].rxtail == g_tcpsock[idx].rxhead) g_tcpsock[idx].rxtail = g_tcpsock[idx].rxhead = 0;
+        return n;
+    }
+    if (g_tcpsock[idx].eof || !g_tcpsock[idx].c.up) return 0;     /* EOF, only once drained */
+    if (g_tcpsock[idx].nonblock) return NET_SOCK_EAGAIN;
     uint64_t ms = (uint64_t)g_tcpsock[idx].opt_rcvtimeo;
     uint64_t ticks = ms ? (ms + 9) / 10 : ((uint64_t)-1 >> 1);
     return tcp_read(&g_tcpsock[idx].c, (uint8_t *)buf, max, ticks);
@@ -996,8 +1190,19 @@ static int tcp_recv_seg(uint8_t *buf, int max, const uint8_t *dip,
          * about to poll, so honouring them preserves ordering. */
         int len = park_take(buf, max, dip, sport, dport);
         if (len == 0) {
-            if (timer_ticks() >= deadline) return 0;
-            len = nic_receive(buf, max);
+            /* ticks == 0 means "whatever is here RIGHT NOW", not "give up
+             * immediately": it still makes one non-blocking pass at the NIC.
+             * That is what lets poll()/epoll() answer "is this socket
+             * readable?" without waiting -- an event loop asks about every
+             * socket it owns on every turn, so the question has to be cheap
+             * and must not block on any one of them. (M1967) */
+            if (ticks == 0) {
+                len = nic_receive(buf, max);
+                if (len <= 0) return 0;
+            } else {
+                if (timer_ticks() >= deadline) return 0;
+                len = nic_receive(buf, max);
+            }
             if (len < 34) continue;
             if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 6) continue;   /* IPv4/TCP */
             /* Not ours, but a valid TCP frame: PARK it rather than destroy it —
@@ -1815,10 +2020,18 @@ int tcp_read(tcp_conn *c, uint8_t *out, int max, uint64_t ticks) {
         tcp_send_seg(c->gw, c->ip, c->sport, c->dport, c->myseq, c->theirseq, TCP_FIN | TCP_ACK, 0, 0);
         c->up = 0; return total > 0 ? total : -1;
     }
-    while (timer_ticks() < deadline && total < max) {
+    /* ticks == 0 is a NON-BLOCKING drain: take everything already waiting and
+     * return, however little that is (including nothing). Used by poll/epoll
+     * readiness and by a non-blocking read on an event loop's socket. Note the
+     * inner poll below used a HARDCODED 20 ticks regardless of what the caller
+     * asked for, so even a caller wanting an instant answer waited 200 ms per
+     * segment -- which an event loop pays once per socket per turn. (M1967) */
+    int nb = (ticks == 0);
+    while ((nb || timer_ticks() < deadline) && total < max) {
         uint8_t *tcp; int dlen;
         if (o) { tcp_rto_check(c, o); tcp_output(c, o); }   /* keep retransmits + window-blocked sends moving while we poll (M1886) */
-        if (!tcp_recv_seg(buf, sizeof(buf), c->ip, c->sport, c->dport, 20, &tcp, &dlen)) {
+        if (!tcp_recv_seg(buf, sizeof(buf), c->ip, c->sport, c->dport, nb ? 0 : 20, &tcp, &dlen)) {
+            if (nb) break;                               /* nothing more is waiting */
             if (total > 0) break;                        /* return what we have */
             continue;
         }

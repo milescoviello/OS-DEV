@@ -85,7 +85,15 @@ int  net_udp_recv(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t
 int  net_raw_send(const void *frame, int len);              /* send a complete L2 frame; 0/-1 */
 int  net_raw_recv(void *buf, int max, int timeout_ms);      /* next L2 frame; length/-1 */
 /* TCP client sockets (M1268): persistent TCBs behind AF_INET SOCK_STREAM fds. */
+/* A non-blocking recv with nothing buffered. Distinct from 0 (EOF) and from -1
+ * (the socket is broken) -- an event loop reads until it sees exactly this and
+ * treats either of the others as "this connection is finished". (M1967) */
+#define NET_SOCK_EAGAIN (-11)
 int  net_tcp_sock_open(void);                               /* alloc a TCB slot; idx/-1 */
+int  net_tcp_sock_readable(int idx);                        /* poll: would recv return now? (M1967) */
+int  net_tcp_sock_writable(int idx);                        /* poll: is it connected? (M1967) */
+int  net_tcp_sock_set_nonblock(int idx, int on);            /* O_NONBLOCK -> EAGAIN instead of waiting (M1967) */
+int  net_udp_readable(uint16_t sport);                      /* poll: is a datagram queued for this port? (M1967) */
 int  net_tcp_sock_connect(int idx, const uint8_t ip[4], uint16_t port);  /* 0/-1 */
 long net_tcp_sock_send(int idx, const void *buf, int len);  /* bytes/-1 */
 long net_tcp_sock_recv(int idx, void *buf, int max);        /* bytes/0 timeout/-1 closed */

@@ -7,7 +7,7 @@
 # runs ON -- the kernel, the scheduler, the ext2 driver, the memory manager --
 # is OS-DEV's own from-scratch code.
 #
-# Four checks, each strictly harder than the last:
+# Five checks, each strictly harder than the last:
 #   1. node --version        -- the 102 MB image loads, ld.so resolves 21
 #                               libraries, V8 initialises
 #   2. node -e '...'         -- V8 parses, compiles and JITs JavaScript
@@ -17,6 +17,8 @@
 #                               connect, accept, echo, half-close, and a clean
 #                               exit. This is libuv's event loop driving our
 #                               epoll and our AF_UNIX sockets end to end.
+#   5. node -e 'http...'     -- PHASE 6'S GATE: a DNS lookup and an HTTP request
+#                               over AF_INET sockets that libuv polls.
 #
 # NOT part of `make check`: each Node start is minutes under TCG emulation.
 set -e
@@ -43,7 +45,7 @@ timeout -s KILL 1800 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 3G -s
 QPID=$!
 i=0
 while [ $i -lt 3600 ]; do
-    grep -aqE "node net ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "node http ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     sleep 0.5; i=$((i+1))
 done
 
@@ -67,6 +69,11 @@ fi
 # 3. Real file I/O through libuv onto OUR ext2 driver: write, read back, stat,
 #    readdir. The three numbers are independent -- a stub that faked one would
 #    not get the other two right.
+# The SIZE is the load-bearing number. A wrong struct layout still returns 0
+# and still fills the buffer with plausible values -- M1965's statx had every
+# field eight bytes too far, so Node read stx_ino as the size and reported a
+# 26-byte file as 2675 bytes, while the content read back perfectly. Asserting
+# the exact size is what caught it. (M1967)
 if grep -aq "LXNODEFS: 25 26 true" "$SLOG" && grep -aq "\[lxnode\] node fs -> 0" "$SLOG"; then
     echo "  ok: Node's fs module wrote, re-read, stat'd and listed on the from-scratch ext2 driver"
 else
@@ -92,5 +99,18 @@ if grep -aq "\[lxnode\] node net -> 0" "$SLOG"; then
 else
     echo "  FAIL: Node did not exit cleanly after the socket test:"; grep -aE "node net ->|assert|Error" "$SLOG" | head -3; f=1
 fi
+# 5. THE NETWORK (M1967) -- Phase 6's actual gate: "do not claim the phase
+#    until a script that touches the network runs." A DNS lookup and an HTTP
+#    request, from Node, over AF_INET sockets that libuv polls. Both numbers
+#    matter: the status proves the request completed, the byte count proves
+#    the body came back rather than just the headers.
+if grep -aqE "LXNODEHTTP: 200 [0-9]+" "$SLOG"; then
+    echo "  ok: Node resolved a hostname over DNS and fetched it over HTTP ($(grep -ao 'LXNODEHTTP: 200 [0-9]*' "$SLOG" | head -1))"
+elif grep -aq "LXNODEHTTP-ERR" "$SLOG"; then
+    echo "  FAIL: Node's network request failed:"; grep -a "LXNODEHTTP-ERR" "$SLOG" | head -1; f=1
+else
+    echo "  SKIP: no network result (host has no internet?)"
+fi
+
 [ $f -eq 0 ] || { echo "FAIL: Node.js in-guest"; exit 1; }
-echo "PASS: PHASE 6 (partial) -- real Node.js runs JavaScript, file I/O and SOCKETS inside OS-DEV"
+echo "PASS: PHASE 6 -- real Node.js runs JavaScript, file I/O, sockets AND THE NETWORK inside OS-DEV"

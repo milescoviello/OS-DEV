@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1966-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1967-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -652,9 +652,25 @@ Landed so far, all on the from-scratch ext2 driver:
   ≥ 2 MiB, only when a VMA sat right after the gap; V8 allocates many, so Node
   hit it about one run in three.
 
-Still ahead: Node over the **network** (AF_INET sockets still are not pollable —
-that needs a real RX demux in the TCP stack), Claude Code, and
-Firefox on a from-scratch Wayland display path. The honest scale is still months.
+- **M1967** — **PHASE 6 DONE: Node reached the internet from inside OS-DEV.**
+  `node -e "http.get('http://example.com/')"` printed `LXNODEHTTP: 200 559` — a
+  DNS lookup and an HTTP request, from JavaScript, over sockets libuv polls, on
+  a from-scratch kernel, TCP stack and NIC driver. The blocker: `tcp_read` pulls
+  frames straight off the NIC, so nothing could answer "is there data?" without
+  **consuming the answer**, and `poll()` reported `POLLNVAL` for every socket
+  fd. Each socket now has a receive ring filled by a non-blocking pump.
+  `net_udp_recv` had the same shape of bug with a worse consequence — it
+  **dropped TCP segments belonging to live connections**, so a resolver running
+  beside a fetch silently ate that fetch's data. Then: glibc's resolver sends
+  both queries in one `sendmmsg` (`ENOSYS` → every hostname `EAI_AGAIN`);
+  `/etc/resolv.conf` is now written at boot from the **DHCP lease**;
+  `libnss_dns.so.2` is `dlopen`'d so `ldd` cannot see it and it was never
+  staged; and `getsockname` hardcoded `AF_UNIX`, which aborted glibc outright
+  once AF_INET existed. Plus a bug of mine from M1965: the `statx` handler had
+  every field **eight bytes too far**, so Node read `stx_ino` as the file size.
+
+Still ahead: Claude Code, and Firefox on a from-scratch Wayland display path.
+The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

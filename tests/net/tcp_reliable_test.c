@@ -122,6 +122,12 @@ const char *nic_name(void) { return "reliable-test"; }
 static const uint8_t g_mac[6] = { 2, 0, 0, 0, 0, 1 };
 const uint8_t *nic_mac(void) { return g_mac; }
 void kprintf(const char *fmt, ...) { (void)fmt; }
+/* net_udp_recv's blocking path yields between NIC polls rather than spinning a
+ * core (M1967). timer_ticks already advances on every call, so the deadline
+ * loop terminates without this doing anything -- it only has to exist. Every
+ * kernel seam net.c touches is stubbed here for the same reason; a new call
+ * into task.c/kheap.c/etc. breaks this link until it is. */
+void task_sleep_ms(uint64_t ms) { (void)ms; }
 int tls_get(const char *h, const char *p, uint8_t *o, int m, uint32_t s) { (void)h;(void)p;(void)o;(void)m;(void)s; return -1; }
 int tls_cert_status(void) { return -2; }
 int tls_chain_anchored(void) { return 0; }

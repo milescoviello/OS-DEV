@@ -105,6 +105,7 @@ int    app_unix_connect(int fd, const char *path);/* AF_UNIX: connect to a liste
 int    app_unix_shutdown(int fd, int how); /* AF_UNIX: half-close (SHUT_WR -> peer EOF) (M1965) */
 int    app_unix_socketpair(int *out);             /* AF_UNIX: two connected fds; 0/-1 */             /* AF_INET SOCK_DGRAM socket fd; fd/-1 (M1267) */
 int    app_sock_bind(int fd, int port);              /* bind a datagram socket to a local port; 0/-1 (M1267) */
+int    app_sock_localaddr(int fd, unsigned char ip[4], unsigned short *port);  /* getsockname for an AF_INET fd (M1967) */
 long   app_sendto(int fd, const unsigned char ip[4], int port, const void *buf, int len);  /* bytes/-1 (M1267) */
 long   app_recvfrom(int fd, void *buf, int max, unsigned char srcip[4], unsigned short *srcport);  /* bytes/-1 (M1267) */
 int    app_connect(int fd, const unsigned char ip[4], int port);  /* connect a TCP socket fd; 0/-1 (M1268) */
