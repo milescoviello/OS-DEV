@@ -738,6 +738,23 @@ void task_wake(task_t *t) {
         t->ready_since = timer_ms();   /* re-entered the run queue (M1148) */
         t->wake_pending = 0;           /* being woken NOW: nothing left to remember */
         sched_place_wake(t);           /* clamp vruntime up to the floor: no head-start, no starvation (M1171) */
+    } else if (t && t->state == TASK_BLOCKED) {
+        /* BLOCKED, but still finishing its own switch (M1995). We must not make
+         * it READY here -- that is the two-cores-one-stack bug -- but nobody
+         * else is going to come back for it either, and remembering the wake is
+         * not enough: wake_pending is consumed by the NEXT call to task_block,
+         * and a task already blocked will not make one. It simply slept
+         * forever, which is what the run-time dump showed:
+         *
+         *     thread 27 state=2 wchan=... wake_pending=1
+         *
+         * Hand it to the timer instead. The sleeper scan runs every tick and
+         * already skips tasks that are still on a core, so it will pick this up
+         * the moment the switch completes -- one tick late and correct, rather
+         * than immediate and unsafe. */
+        t->wake_pending = 1;
+        t->wake_at = timer_ms();
+        if (!t->wake_at) t->wake_at = 1;       /* 0 means "not a timed sleep" */
     } else if (t) {
         /* It is not blocked YET. Every blocking caller in this kernel is
          * "check the condition, release the lock, then block", and a waker on

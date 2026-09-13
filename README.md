@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1994-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1995-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1067,6 +1067,38 @@ Landed so far, all on the from-scratch ext2 driver:
   reused, so a stale translation names an address nothing will ever reference
   again. The comment now says that, because the next person to read it will
   otherwise "fix" it the same way I did.
+
+- **M1995** — **`claude --help` went from 1-in-3 to 4-in-4**, and the reason is a
+  bug that had nothing to do with Claude Code.
+
+  **Two cores could fault on the same page and both map it.** Interrupts off
+  stops preemption on *this* core and nothing else, so two threads of one
+  process can be inside the fault handler for the same address at once: both see
+  it absent, both allocate, both fill, and the second `vmm_map` **replaces the
+  first** — discarding everything the first thread's faulting instruction went
+  on to write. In a garbage-collected runtime that is objects turning into small
+  integers, which is exactly how it presented: near-NULL dereferences at a
+  *different* address every run, deep inside JavaScriptCore. The page is now
+  published under the same short lock the check is made under; the loser frees
+  its frame and re-executes.
+
+  **And a lost wakeup, visible in the run-time dump.** M1994 correctly stopped
+  `task_wake` from making a still-switching task runnable — but remembering the
+  wake is not enough, because `wake_pending` is consumed by the *next*
+  `task_block`, and a task that is already blocked will never make one. It slept
+  forever:
+
+  ```
+  [runsync]   thread 27 state=2 wchan=... wake_pending=1
+  ```
+
+  A deferred wake is handed to the timer now: the sleeper scan already skips
+  tasks still on a core, so it takes it up the moment the switch completes —
+  one tick late and correct, rather than immediate and unsafe.
+
+  `-p` now runs for the full fifteen-minute budget doing real work (two million
+  disk reads) instead of erroring out, and `lxstress` is 7/8 with file-backed
+  mappings across eight threads.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

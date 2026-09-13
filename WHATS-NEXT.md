@@ -1,5 +1,52 @@
 # What's next
 
+> **(M1995) `claude --help` WENT FROM 1-IN-3 TO 4-IN-4** -- and the bug had
+> nothing to do with Claude Code.
+>
+> **Two cores could fault on the same page and both map it.** The demand path
+> allocates a frame, zeroes it, fills it, and maps it -- with interrupts off,
+> which stops preemption on THIS core and nothing else. Two threads of one
+> process, on two cores, can be inside the handler for the SAME address at once:
+> both see it absent, both allocate, both fill, and the second `vmm_map`
+> REPLACES the first, discarding everything the first thread's faulting
+> instruction went on to write.
+>
+> For a garbage-collected runtime that is objects turning into small integers,
+> and it presented exactly that way -- near-NULL dereferences at a DIFFERENT
+> address every run, deep inside JavaScriptCore:
+>
+> ```
+> rip=0x03ca516b (CR2=0x0000000000000008)
+> rip=0x03ca4068 (CR2=0x0000000000000e70)
+> ```
+>
+> The page is published under the same short lock the presence check is made
+> under -- a PTE read and a page-table walk, no I/O, nothing that can block --
+> and the loser frees its frame and lets the instruction re-execute.
+>
+> **And a LOST WAKEUP, which the run-time dump named outright.** M1994 correctly
+> stopped `task_wake` from making a still-switching task runnable. But
+> remembering the wake is not enough: `wake_pending` is consumed by the NEXT
+> call to `task_block`, and a task that is ALREADY BLOCKED will never make one.
+> It simply slept forever:
+>
+> ```
+> [runsync]   thread 27 state=2 wchan=... wake_pending=1
+> ```
+>
+> A deferred wake is handed to the timer instead. The sleeper scan runs every
+> tick and already skips tasks still on a core, so it takes this up the moment
+> the switch completes -- one tick late and correct, rather than immediate and
+> unsafe. That is the whole trade, and it is the right way round.
+>
+> Also: `app_vma_carve`'s head and tail trims rewrite `start` and `len`, which
+> describe ONE region and must change together. A concurrent gap search reading
+> the new start with the old length sees a region that never existed.
+>
+> **Where Claude Code is: `--help` is 4/4, and `-p` now runs for the full
+> fifteen-minute budget doing real work** -- two million disk reads -- instead of
+> erroring out after a few seconds.
+
 > **(M1994) `lxstress` IS 8/8 ON THE FULL FILE-BACKED, THREADED SUITE.**
 >
 > Two more real bugs, and one instructive non-bug.

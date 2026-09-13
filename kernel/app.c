@@ -2870,13 +2870,22 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
             continue;
         }
         if (cs == s0) {                             /* head trimmed */
+            /* start and len describe ONE region and must change together
+             * (M1995). A concurrent gap search reading the new start with the
+             * old len -- or the reverse -- sees a region that never existed,
+             * and either hands out an address that is still in use or refuses
+             * one that is free. Same lock the allocator uses; no I/O inside. */
+            uint64_t hfl = vma_alloc_lock(a);
             a->vma[i].start = ce;
             a->vma[i].len   = e0 - ce;
+            vma_alloc_unlock(a, hfl);
             /* The file offset tracks the VMA's new start, or every later
              * demand-fault in this region reads the wrong part of the file. */
             if (a->vma[i].file_backed) a->vma[i].foff += ce - s0;
         } else if (ce == e0) {                      /* tail trimmed */
+            uint64_t tfl2 = vma_alloc_lock(a);
             a->vma[i].len = cs - s0;
+            vma_alloc_unlock(a, tfl2);
         } else {                                    /* hole punched: split in two */
             uint64_t cfl = vma_alloc_lock(a);
             int ns = vma_pick_slot(a);
@@ -3936,7 +3945,35 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
              * its whole range in eagerly and then fixed the PTEs. Correct, but
              * it means an mmap was never actually lazy; a 42 MB executable
              * would be read in full before its first instruction. (M1956) */
-            vmm_map(page, frame, vma_pte_flags(v.prot));
+            /* PUBLISH THE PAGE ONLY IF NOBODY ELSE ALREADY DID (M1995).
+             *
+             * Interrupts are off, which stops preemption on THIS core and
+             * nothing else. Two threads of one process, on two cores, can be
+             * inside this handler for the SAME address at once: both see it
+             * absent, both allocate, both fill, and the second vmm_map replaces
+             * the first -- discarding everything the first thread's faulting
+             * instruction went on to write. For a garbage-collected runtime
+             * that is objects turning into small integers, which is exactly how
+             * it presented: near-NULL dereferences at a different address every
+             * run, deep inside JavaScriptCore.
+             *
+             * The re-check has to be under the same lock the mapping is taken
+             * under, or it is just a narrower window. This one is safe to hold:
+             * it covers a PTE check and a page-table walk -- no I/O, no user
+             * memory, nothing that can block. The loser frees its frame and
+             * returns 1 so the instruction simply re-executes against the
+             * winner's page. */
+            {
+                uint64_t mfl = vma_alloc_lock(a);
+                uint64_t now_pte = vmm_pte_raw(page);
+                if (now_pte & PTE_PRESENT) {
+                    vma_alloc_unlock(a, mfl);
+                    pmm_free_frame(frame);      /* someone else won the race */
+                    return 1;
+                }
+                vmm_map(page, frame, vma_pte_flags(v.prot));
+                vma_alloc_unlock(a, mfl);
+            }
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
             return 1;
         }
