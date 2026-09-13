@@ -20,7 +20,9 @@ int         app_spawn_linux_from_file(const char *path);
 void        app_write_to(app_t *dest, const char *buf, unsigned len);  /* write into a specific app's window grid (M1988) */
 void        app_set_out_to(int pid, app_t *dest);                      /* route a Linux child's stdout to dest's window (M1988) */
 void        app_futex_forget(void *t);                                 /* drop any futex waiter slot owned by task t (M1990) */
-int         app_last_spawn_pid(void);                                  /* pid of the last successful spawn (M1988) */
+int         app_last_spawn_pid(void);
+int         app_state_of(int pid);
+void        app_dump_threads(int pid);                                /* where every thread of a pid is parked (M1996) */                                     /* task state of a live pid, -1 if gone (M1996) */                                  /* pid of the last successful spawn (M1988) */
 app_t      *app_out_to(void);                                          /* the current app's stdout target, or NULL (M1988) */
 int         app_spawn_linux_from_file_arg(const char *path, const char *arg);  /* + a one-shot arg that becomes argv[1] (M1948) */
 int         app_spawn_linux_from_file_argv(const char *path, const char *const *args, int n);  /* + a FULL argv: args[] become argv[1..n] (M1955) */

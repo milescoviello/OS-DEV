@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1995-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1996-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1099,6 +1099,30 @@ Landed so far, all on the from-scratch ext2 driver:
   `-p` now runs for the full fifteen-minute budget doing real work (two million
   disk reads) instead of erroring out, and `lxstress` is 7/8 with file-backed
   mappings across eight threads.
+
+- **M1996** — **Firefox binds every global we advertise.** It reaches our
+  compositor and takes `wl_compositor`, `wl_subcompositor`,
+  `wl_data_device_manager`, `wl_shm`, `wl_output` and `wl_seat` — the whole set
+  — then goes on to scan fonts and open its profile. Getting there needed
+  `inotify_add_watch`/`inotify_rm_watch`: M1986 added `inotify_init1` and not
+  these, which is the worst half to implement. A program gets a working inotify
+  fd, cannot put a single watch on it, and — because a file watcher has nothing
+  else to do — **retries forever**. Firefox sat in a three-syscall loop burning
+  a core with its window never opening. The native watch mechanism has existed
+  since M1266; only the ABI spelling was missing.
+
+  Plus `/etc/hosts`, `/etc/host.conf` and the profile directories it writes
+  before it will open a window.
+
+  **The diagnostic that made this findable is the lasting part.** "Blocked, zero
+  syscalls" is ambiguous between *working silently*, *stuck*, and *dead* — and
+  with several threads the syscall ring cannot disambiguate either, because a
+  thread blocked *inside* a call makes no new entries. There is now a heartbeat
+  that prints the process state, the global syscall delta, and **where every
+  thread is parked** by symbolising its wait channel. That turned "Firefox is
+  silent" into: main and two workers in `app_futex`, one in `pipe_read`, and one
+  `READY` and spinning — which is a lost wakeup or a deadlock, and is the next
+  thing.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

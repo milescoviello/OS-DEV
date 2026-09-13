@@ -286,7 +286,9 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_epoll_ctl_   233
 #define LXS_epoll_wait_  232
 #define LXS_sched_yield_  24   /* Claude Code calls it in a tight loop; ENOSYS turned that into a busy-wait (M1992) */
-#define LXS_epoll_pwait2_ 441  /* epoll_pwait with a timespec instead of a millisecond count (M1992) */
+#define LXS_epoll_pwait2_ 441
+#define LXS_inotify_add_watch_ 254   /* Firefox retries this forever on ENOSYS (M1996) */
+#define LXS_inotify_rm_watch_  255  /* epoll_pwait with a timespec instead of a millisecond count (M1992) */
 #define LXS_epoll_pwait_ 281
 #define LXS_eventfd2_    290
 #define LXS_poll_          7
@@ -1766,6 +1768,23 @@ void linux_syscall_dispatch(struct registers *r) {
          * and every caller has a write-based fallback; ENOSYS is the one answer
          * that is read as "this kernel is broken". */
         r->rax = (uint64_t)-(long)LX_EOPNOTSUPP;
+        break;
+    case LXS_inotify_add_watch_: {          /* (fd, path, mask) -> a watch descriptor */
+        /* inotify_init1 landed in M1986 and these did not, which is the worst
+         * half to implement: a program gets a working inotify fd, cannot put a
+         * single watch on it, and -- because a file watcher has nothing else to
+         * do -- retries forever. Firefox sat in a three-syscall loop
+         * (add_watch, add_watch, ppoll) burning a core with its window never
+         * opening, and the ring is what showed it. The native watch mechanism
+         * has existed since M1266; only the ABI spelling was missing. */
+        if (!r->rsi || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate((const char *)r->rsi, xp, sizeof xp);
+        int wd = app_inotify_add((int)a1, path, (unsigned)r->rdx);
+        r->rax = (wd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)wd;
+        break;
+    }
+    case LXS_inotify_rm_watch_:             /* (fd, wd) */
+        r->rax = (app_inotify_rm((int)a1, (int)r->rsi) == 0) ? 0 : (uint64_t)-(long)LX_EINVAL;
         break;
     case LXS_inotify_init1_:
         /* inotify EXISTS here (M1266) -- only the flags-taking entry point was

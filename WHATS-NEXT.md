@@ -1,5 +1,49 @@
 # What's next
 
+> **(M1996) FIREFOX BINDS EVERY GLOBAL WE ADVERTISE.**
+>
+> ```
+> [wl] client connected (ep 3)
+> [wl] bind wl_compositor -> id 4
+> [wl] bind wl_subcompositor -> id 5
+> [wl] bind wl_data_device_manager -> id 6
+> [wl] bind wl_shm -> id 7
+> [wl] bind wl_output -> id 8
+> [wl] bind wl_seat -> id 3
+> ```
+>
+> That is Firefox, inside OS-DEV, talking to a compositor written for this
+> project -- and then going on to scan fonts, open `/etc/hosts`, and take its
+> profile lock.
+>
+> **What was in the way: `inotify_add_watch`.** M1986 added `inotify_init1` and
+> not this, which is the worst half to implement. A program gets a working
+> inotify fd, cannot put a single watch on it, and -- because a file watcher has
+> nothing else to do -- retries forever. Firefox sat in a three-syscall loop
+> (`add_watch`, `add_watch`, `ppoll`) burning a core with its window never
+> opening. The native watch mechanism has existed since M1266; only the ABI
+> spelling was missing.
+>
+> **THE DIAGNOSTIC IS THE LASTING PART.** "state=2, zero syscalls" is ambiguous
+> between working silently, stuck, and dead -- and with several threads the
+> global syscall ring cannot tell you either, because a thread blocked INSIDE a
+> call makes no new entries. So there is now a heartbeat that prints the process
+> state, the syscall delta, and WHERE EVERY THREAD IS PARKED, by symbolising the
+> wait channel each one blocked on:
+>
+> ```
+> [app] pid 102 main state=2 wchan=app_futex
+> [app]   thread 18 state=2 wchan=pipe_read
+> [app]   thread 19 state=2 wchan=app_futex
+> [app]   thread 20 state=0 wchan=linux_syscall_dispatch   <- READY, spinning
+> [app]   thread 21 state=2 wchan=app_futex
+> ```
+>
+> That turns "Firefox is silent" into a specific claim: three threads waiting on
+> futexes, one on a pipe, and one runnable and spinning in user code for
+> something the others owe it. A lost wakeup or a real deadlock -- and the next
+> thing.
+
 > **(M1995) `claude --help` WENT FROM 1-IN-3 TO 4-IN-4** -- and the bug had
 > nothing to do with Claude Code.
 >

@@ -761,6 +761,23 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         /* Claude Code's own state tree. It creates these itself, one level at
          * a time -- but only if their parent exists, and a failed mkdir here is
          * fatal to it rather than cosmetic. (M1992) */
+        /* /etc/hosts and /etc/host.conf. glibc's resolver reads both before it
+         * will look anything up, and Firefox asks for them by name. A
+         * loopback entry is the truthful minimum. (M1996) */
+        { const char *h = "127.0.0.1\tlocalhost\n::1\tlocalhost\n";
+          unsigned long hl = 0; while (h[hl]) hl++;
+          vfs_write("/disk2/etc/hosts", h, hl); }
+        { const char *h = "multi on\n";
+          unsigned long hl = 0; while (h[hl]) hl++;
+          vfs_write("/disk2/etc/host.conf", h, hl); }
+        /* Firefox writes a profile and a lock under these before it opens a
+         * window; a mkdir whose parent is missing fails, and it treats that as
+         * fatal rather than cosmetic. */
+        vfs_mkdir("/disk2/tmp/firefox");
+        vfs_mkdir("/disk2/root/.mozilla");
+        vfs_mkdir("/disk2/root/.mozilla/firefox");
+        vfs_mkdir("/disk2/root/.cache/mozilla");
+        vfs_mkdir("/disk2/root/.cache/mozilla/firefox");
         vfs_mkdir("/disk2/root/.claude");
         vfs_mkdir("/disk2/root/.claude/telemetry");
         vfs_mkdir("/disk2/root/.claude/plugins");
@@ -974,7 +991,37 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                                    "--window-size", "800,600", "about:blank" };
                     kprintf("[ff] spawning FIREFOX against our compositor...\n");
                     int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_fw, 5);
-                    kprintf("[ff] firefox pid %d\n", spid);
+                    kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
+                    /* A HEARTBEAT, because silence is ambiguous (M1996).
+                     * Firefox spends minutes relocating an 83-library closure
+                     * with no syscalls at all, which is indistinguishable from
+                     * having died -- no output, no fault, no window. The global
+                     * syscall counter separates the two: if it is advancing the
+                     * process is working, and if it is flat it is stuck or
+                     * gone. Printed before handing over to the desktop, so it
+                     * is not competing with the window manager for the log. */
+                    {
+                        int fpid = app_last_spawn_pid();
+                        unsigned long prev = lx_syscalls_made();
+                        for (int t = 0; t < 24; t++) {
+                            task_sleep_ms(15000);
+                            unsigned long now = lx_syscalls_made();
+                            int st = app_state_of(fpid);
+                            kprintf("[ff] t=%ds pid %d state=%d syscalls +%lu\n",
+                                    (t + 1) * 15, fpid, st, now - prev);
+                            prev = now;
+                            if (st < 0) { kprintf("[ff] the process is GONE\n"); break; }
+                            /* Blocked and quiet is the interesting case: the
+                             * ring says WHAT it last asked for, which is the
+                             * only way to tell "waiting for the compositor"
+                             * from "waiting for a file that will never
+                             * appear". */
+                            if (t == 7 || t == 15 || t == 23) {
+                                lx_trace_dump_last("the Firefox heartbeat", 24);
+                                app_dump_threads(fpid);
+                            }
+                        }
+                    }
                 }
                 if (g_fftest) {
                     /* FIREFOX, against our own compositor. It is far heavier
@@ -1047,7 +1094,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * worked, and anything earlier names which one did not. */
             static const char *av_cp[] = { "-p", "say hi" };
             kprintf("[lxclaude] running CLAUDE CODE -p (config + DNS + TLS + HTTP)...\n");
-            int crc3 = app_run_linux_sync("/disk2/usr/bin/claude", av_cp, 2, 900000);
+            int crc3 = app_run_linux_sync("/disk2/usr/bin/claude", av_cp, 2, 300000);
             kprintf("[lxclaude] claude -p -> %d\n", crc3);
         }
         if (g_lxinet_test) {

@@ -1966,6 +1966,41 @@ void app_set_out_to(int pid, app_t *dest) {
  * routing its stdout back to the window that launched it. (M1988) */
 int app_last_spawn_pid(void) { return g_last_spawn_pid; }
 
+/* Is this pid still alive, and in what task state? -1 if the slot is gone or
+ * the process has exited. Used by the Firefox heartbeat, where silence and
+ * death look identical from the log. (M1996) */
+/* Where is every thread of this process parked? (M1996)
+ *
+ * "state=2, zero syscalls" says a process is blocked and says nothing about
+ * where -- and with several threads the global syscall ring cannot tell you
+ * either, because a thread blocked INSIDE a call makes no new entries. The
+ * wchan is the return address of whoever called task_block, so it names the
+ * kernel function each thread is waiting in. */
+void app_dump_threads(int pid) {
+    for (int i = 0; i < MAX_APPS; i++) {
+        if (!apps[i].used || apps[i].pid != pid) continue;
+        kprintf("[app] pid %d main state=%d wchan=%lx\n", pid,
+                apps[i].task ? (int)apps[i].task->state : -1,
+                apps[i].task ? (unsigned long)apps[i].task->wchan : 0UL);
+        for (int k = 0; k < APP_MAXTHREAD; k++)
+            if (apps[i].thr[k])
+                kprintf("[app]   thread %d state=%d wchan=%lx wake_pending=%d\n",
+                        apps[i].thr[k]->id, (int)apps[i].thr[k]->state,
+                        (unsigned long)apps[i].thr[k]->wchan,
+                        apps[i].thr[k]->wake_pending);
+        return;
+    }
+}
+
+int app_state_of(int pid) {
+    for (int i = 0; i < MAX_APPS; i++)
+        if (apps[i].used && apps[i].pid == pid) {
+            if (apps[i].exited) return -1;
+            return apps[i].task ? (int)apps[i].task->state : -2;
+        }
+    return -1;
+}
+
 app_t *app_out_to(void) {
     struct app *a = cur();
     return a ? (app_t *)a->out_to : 0;
@@ -7577,6 +7612,12 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
         }
         irq_restore(f);
         app_futex_dump();
+        /* WHAT WAS IT DOING? The thread states say where each one is parked;
+         * the syscall ring says what the process was actually doing, which is
+         * the difference between "blocked on a futex" and "polling a socket
+         * that will never answer". A timeout without this is a dead end.
+         * (M1996) */
+        lx_trace_dump_last("the sync run timing out", 32);
     }
     return -2;
 }
