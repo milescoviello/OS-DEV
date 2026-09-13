@@ -2586,17 +2586,27 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
+    /* SAME ATOMIC RESERVE AS app_mmap (M1993). Finding a gap and recording the
+     * mapping were two separate acts here too -- and this is the path a dynamic
+     * runtime uses for every shared object it loads, from several threads at
+     * once. Two of them picked the same gap, recorded into different slots, and
+     * the first munmap took the other's memory. A browser reaches three hundred
+     * mappings before it draws anything; that is how often the window is open. */
+    int vs3;
     if (!addr) {
-        addr = vma_find_gap(a, len, 0);
-        if (!addr) return 0;
-    } else if (app_vma_carve(a, addr, len) != 0) {
-        return 0;                                          /* MAP_FIXED: replace what is there */
+        vs3 = vma_reserve(a, len, 0, &addr);
+        if (vs3 < 0) return 0;
+        if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) {
+            a->vma[vs3].start = 0; a->vma[vs3].len = 0; return 0;
+        }
+    } else {
+        if (app_vma_carve(a, addr, len) != 0) return 0;     /* MAP_FIXED: replace what is there */
+        if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
+        if (vma_full(a)) return 0;               /* re-check: the carve may have split */
+        VMA_NEW(a, vs3);
+        a->vma[vs3].start = addr;
+        a->vma[vs3].len   = len;
     }
-    if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-    if (vma_full(a)) return 0;                   /* re-check: the carve may have split */
-    int vs3; VMA_NEW(a, vs3);
-    a->vma[vs3].start = addr;
-    a->vma[vs3].len   = len;
     a->vma[vs3].sealed = 0;
     a->vma[vs3].uffd  = 0;
     a->vma[vs3].file_backed = 1;
@@ -2612,7 +2622,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[vs3].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
+    if (a->vma[vs3].fidx < 0) { a->vma[vs3].start = 0; a->vma[vs3].len = 0; return 0; }   /* release the slot */
     
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -3894,7 +3904,11 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * page of a shared object is short by construction and the
                      * remainder is legitimately zero. Only NO progress at all
                      * means the page is a hole nobody will notice. */
-                    if (got <= 0)
+                    /* Past end-of-file is not a hole: a mapping may legally
+                     * extend beyond the file and those pages ARE zero. Only
+                     * complain when the VMA itself says these bytes should
+                     * have been there (fvalid is the file-backed length). */
+                    if (got <= 0 && v.fvalid && voff < v.fvalid)
                         kprintf("[fault] EMPTY READ filling %lx from %s+%lx: wanted %lu, got %ld -- the page is a HOLE\n",
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got);
                 }

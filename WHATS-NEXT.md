@@ -1,5 +1,46 @@
 # What's next
 
+> **(M1993) A TLB-SHOOTDOWN DEADLOCK, FOUND BY RIP-SAMPLING.**
+>
+> `lxstress` was 8/8 and Claude Code still died, so I made the reproducer look
+> more like what actually kills it: **file-backed** mappings of real libraries at
+> page offsets, dozens held live at once, `close()`d immediately and kept mapped
+> the way every toolkit does, unmapped out of order, across eight threads. The
+> anonymous churn it did before was what an allocator does; this is what a
+> dynamic runtime does, and the two use different code.
+>
+> It hung the guest **4/4**.
+>
+> Sampling all four cores through the QEMU monitor showed the same two
+> instruction addresses in every sample -- the signature of a spin loop, and the
+> technique that cracked M1911:
+>
+> ```
+> RIP=ffffffff801a5772   <- xchg on the shootdown lock
+> RIP=ffffffff801a57a2   <- waiting for g_tlb_pending to drain
+> ```
+>
+> One core held the shootdown lock and waited for the others to ack; the others
+> spun FOR that lock with interrupts off, so they never took the IPI and never
+> acked. Every shootdown ran to its 200000-spin timeout, and with four cores
+> unmapping constantly the guest stopped making progress. It never announced
+> itself as a deadlock because the timeout always "recovered".
+>
+> **The design flaw: the pending COUNT is global**, so a core spinning for the
+> lock cannot answer "do I still owe a flush?". It is a per-core obligation now,
+> and a spinner discharges its own while it waits -- the only arrangement that
+> composes.
+>
+> **Also: `app_mmap_file_at` got the atomic reserve `app_mmap` got in M1989.**
+> Finding a gap and recording the mapping were two separate acts there too, and
+> that is the path a runtime takes for every shared object it loads, from
+> several threads at once. A browser reaches three hundred mappings before it
+> draws anything, which is how often that window is open.
+>
+> With both, the file-backed phase completes and the suite runs 3/6 rather than
+> 0/4. The remaining failures are kernel panics with `rip = 0` -- a corrupted
+> return address, no trace -- which is the next hunt.
+
 > **(M1992) EVERY SYSCALL CLAUDE CODE MAKES IS NOW IMPLEMENTED.**
 >
 > Driving it past `--version` turned into exactly the mechanical loop the plan

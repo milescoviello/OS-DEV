@@ -507,11 +507,35 @@ static volatile unsigned long g_tlb_shootdowns;   /* how many we have actually p
 
 unsigned long vmm_tlb_shootdown_count(void) { return g_tlb_shootdowns; }
 
-void vmm_tlb_shootdown_ack(void) {
+/* WHO STILL OWES A FLUSH, per core (M1993).
+ *
+ * The pending COUNT alone cannot answer "do I owe one?", and that is what
+ * deadlocked this. A core spinning to take the shootdown lock below has
+ * interrupts off, so it never takes the IPI and never acks -- while the core
+ * that holds the lock waits for exactly that ack. With four cores all
+ * unmapping memory (which is what a threaded program does constantly) every
+ * shootdown ran to its 200000-spin timeout, and the guest stopped making
+ * progress: all four cores sampled at the same two instructions, one on the
+ * xchg and the rest on the wait.
+ *
+ * A per-core flag lets a spinner discharge its own obligation by hand while it
+ * waits, which is the standard answer and the only one that composes. */
+static volatile unsigned char g_tlb_owed[32];
+
+static inline int tlb_me(void) { return (int)(smp_current_cpu() & 31); }
+
+/* Flush and clear this core's obligation, if it has one. Safe to call from
+ * anywhere: it is a no-op when nothing is owed. */
+static void tlb_discharge(void) {
+    int me = tlb_me();
+    if (!g_tlb_owed[me]) return;
+    g_tlb_owed[me] = 0;
     uint64_t c = read_cr3();
     __asm__ volatile("mov %0, %%cr3" : : "r"(c) : "memory");   /* full local flush */
     __atomic_sub_fetch(&g_tlb_pending, 1, __ATOMIC_RELEASE);
 }
+
+void vmm_tlb_shootdown_ack(void) { tlb_discharge(); }
 
 void vmm_tlb_shootdown(void) {
     if (smp_cpu_count <= 1) return;             /* uniprocessor: invlpg was enough */
@@ -519,7 +543,19 @@ void vmm_tlb_shootdown(void) {
     /* One shootdown at a time: the pending counter is global. A second caller
      * simply waits its turn, which is fine -- these are rare. */
     static volatile int lock;
-    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    /* Discharge our own obligation WHILE waiting for the lock, or the holder
+     * can never finish and we can never start. This is the deadlock. */
+    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE)) {
+        tlb_discharge();
+        __asm__ volatile("pause");
+    }
+    tlb_discharge();                            /* and once more before we own it */
+    for (int c = 0; c < 32; c++) g_tlb_owed[c] = 0;
+    {   /* Mark every OTHER present core as owing a flush. */
+        int me = tlb_me(), n = smp_cpu_count;
+        if (n > 32) n = 32;
+        for (int c = 0; c < n; c++) if (c != me) g_tlb_owed[c] = 1;
+    }
     __atomic_store_n(&g_tlb_pending, others, __ATOMIC_RELEASE);
     __atomic_add_fetch(&g_tlb_shootdowns, 1, __ATOMIC_RELAXED);
     smp_send_tlb_shootdown_ipi();
@@ -536,6 +572,7 @@ void vmm_tlb_shootdown(void) {
         kprintf("[vmm] TLB shootdown timed out waiting for %d core(s) -- they will flush on next entry\n",
                 __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE));
     }
+    for (int c = 0; c < 32; c++) g_tlb_owed[c] = 0;   /* give up cleanly: owe nothing */
     __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
 }

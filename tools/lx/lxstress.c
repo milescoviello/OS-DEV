@@ -34,10 +34,11 @@
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 
-#define NTHREAD   6
+#define NTHREAD   8
 #define ROUNDS    120
 
 static volatile int futex_word;
@@ -85,9 +86,51 @@ static void churn(int seed) {
     }
 }
 
+/* FILE-BACKED mappings, held MANY AT A TIME (M1993).
+ *
+ * The anonymous churn above is what a program's allocator does. What a dynamic
+ * runtime does is different and exercises different code: it maps real files at
+ * page offsets, keeps hundreds of those mappings alive at once, reads through
+ * them, and unmaps them out of order. That is the shape Claude Code and Firefox
+ * die in and the shape `churn` never produced -- every mapping it made was
+ * anonymous, and it never held more than one.
+ *
+ * The files are whatever the image happens to carry; missing ones are skipped,
+ * so this degrades to a no-op rather than a false failure. */
+#define NLIVE 48
+static void filemaps(int seed) {
+    static const char *files[] = {
+        "/usr/lib64/libc.so.6", "/usr/lib64/libm.so.6", "/usr/lib64/libz.so.1",
+        "/lib64/ld-linux-x86-64.so.2", "/hellofree", "/lxbox", 0
+    };
+    void  *live[NLIVE] = {0};
+    size_t lens[NLIVE] = {0};
+    for (int i = 0; i < 40; i++) {
+        int k = (i + seed) % NLIVE;
+        if (live[k]) { munmap(live[k], lens[k]); live[k] = 0; }
+        const char *fn = files[(i + seed) % 6];
+        if (!fn) continue;
+        int fd = open(fn, O_RDONLY);
+        if (fd < 0) continue;
+        size_t len = (size_t)(1 + ((i + seed) % 12)) * 4096;
+        off_t off = (off_t)((i % 4) * 4096);
+        unsigned char *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, off);
+        close(fd);                       /* the documented pattern: close, keep the mapping */
+        if (m == MAP_FAILED) continue;
+        volatile unsigned char sink = 0;
+        for (size_t o = 0; o < len; o += 4096) sink ^= m[o];
+        (void)sink;
+        /* Make part of it writable, the way a loader does for its relocations. */
+        if ((i & 3) == 0) mprotect(m, 4096, PROT_READ | PROT_WRITE);
+        live[k] = m; lens[k] = len;
+    }
+    for (int k = 0; k < NLIVE; k++) if (live[k]) munmap(live[k], lens[k]);
+}
+
 static void *worker(void *arg) {
     int id = (int)(long)arg;
     churn(id);
+    filemaps(id);
     /* Futex ping-pong with whoever else is here. The wait is TIMED on purpose:
      * an untimed wait on a word nobody advances is a deadlock in the TEST, and
      * a test that hangs teaches nothing about the kernel. Every iteration also
@@ -114,6 +157,8 @@ int main(void) {
      * breaks, threads are not the ingredient. */
     churn(0);
     printf("LXSTRESS: phase1 mmap churn done\n"); fflush(stdout);
+    filemaps(0);
+    printf("LXSTRESS: phase1b file-backed mmap done\n"); fflush(stdout);
 
     /* Phase 2: the same work from several threads at once, with threads
      * created and joined repeatedly so task slots and kernel stacks recycle
@@ -134,7 +179,7 @@ int main(void) {
     stop = 1;
     fwake(&futex_word, NTHREAD * 4);
 
-    printf("LXSTRESS-RESULT: survived %d rounds x %d threads x 2 generations, %lu signal(s)\n",
+    printf("LXSTRESS-RESULT: survived %d rounds x %d threads x 2 generations (+ file-backed maps), %lu signal(s)\n",
            ROUNDS, NTHREAD, sig_count);
     fflush(stdout);
     return 0;

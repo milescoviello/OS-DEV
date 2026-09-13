@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1992-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1993-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1023,6 +1023,26 @@ Landed so far, all on the from-scratch ext2 driver:
   `~/.claude/sessions/`** — then fails, intermittently, in one of two ways. It
   makes **zero unimplemented syscalls**, so what remains is not a missing
   feature.
+
+- **M1993** — **a TLB-shootdown deadlock, found by RIP-sampling.** Extending
+  `lxstress` toward what a dynamic runtime actually does — **file-backed**
+  mappings, hundreds held live at once, closed-then-kept as every toolkit does
+  — hung the guest 4/4. Sampling the cores through the QEMU monitor showed all
+  four pinned at the same two instructions across every sample, which is the
+  signature of a spin loop: one core held the shootdown lock waiting for acks
+  while the other three spun *for that lock* with interrupts off, so they never
+  took the IPI and never acked. Every shootdown then ran to its 200 000-spin
+  timeout and the machine stopped making progress.
+
+  The design flaw was that the pending **count** is global, so a core spinning
+  for the lock cannot tell whether it still owes a flush. It is a per-core
+  obligation now, and a spinner discharges its own while it waits — which is
+  the only arrangement that composes.
+
+  And `app_mmap_file_at` got the same atomic reserve `app_mmap` did in M1989:
+  finding a gap and recording the mapping were two acts there too, and that is
+  the path a runtime uses for **every shared object it loads, from several
+  threads at once**.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

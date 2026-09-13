@@ -568,7 +568,7 @@ static void lx_trace_on_error(const char *b, unsigned long n) {
             if (!nd[j]) {
                 g_err_traced = 1;
                 kprintf("[linuxabi] the program is reporting an error; the last 20 syscalls were:\n");
-                lx_trace_dump_last("that error", 20);
+                lx_trace_dump_last("that error", 0);   /* the WHOLE ring: the failing call is further back than 20 */
                 return;
             }
         }
@@ -619,6 +619,12 @@ void linux_syscall_dispatch(struct registers *r) {
 
     switch (r->rax) {
     case LXS_write: {                       /* (fd, buf, count) */
+        /* BEFORE the fd branching: the message a program prints when it gives
+         * up does not necessarily go to fd 1 or 2. Claude Code writes its
+         * startup error to fd SEVEN -- a dup -- which took the fd-table path
+         * and never reached the console hook this used to live in. (M1992) */
+        if (a3 > 0 && a3 < 4096 && vmm_user_ok(r->rsi, (uint64_t)a3))
+            lx_trace_on_error((const char *)r->rsi, (unsigned long)a3);
         /* fd 1/2 are the console ONLY while untouched. After dup2() onto a
          * pipe they are real fd-table entries and must go there -- routing
          * them to the console regardless is why the first pipeline attempt
@@ -654,7 +660,6 @@ void linux_syscall_dispatch(struct registers *r) {
              * Printing the history at that exact moment is the difference
              * between "it printed an error" and knowing which call returned
              * the answer it could not live with. Once per boot. (M1992) */
-            lx_trace_on_error(p2, (unsigned long)a3);
             /* Launched from a shell? Then its window is where the output
              * belongs -- see app_write_to. Otherwise the console, as before. */
             app_t *dst = app_out_to();
@@ -702,7 +707,6 @@ void linux_syscall_dispatch(struct registers *r) {
                 /* Same reason the routing lives here: buffered output goes out
                  * through writev, so a hook on write() alone never sees the
                  * error message a program prints before giving up. (M1992) */
-                lx_trace_on_error(b, n);
                 /* glibc's buffered stdio flushes through writev, not write, so
                  * the shell-window routing has to be here too -- fixing only
                  * write() would leave every printf-heavy program invisible. */
