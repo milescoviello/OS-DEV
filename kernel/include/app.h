@@ -99,6 +99,7 @@ int    app_unix_send_fd(int sockfd, int fd);  /* SCM_RIGHTS keyed on the SOCKET 
 int    app_unix_recv_fd(int sockfd);          /* SCM_RIGHTS receive keyed on the socket fd; new fd/-1 (M1977) */
 int    app_scm_send(int ep, int fd);   /* SCM_RIGHTS: queue fd to pass over an AF_UNIX endpoint; 0/-1 (M1265) */
 int    app_scm_recv(int ep);           /* SCM_RIGHTS: install a passed fd from the peer; new fd/-1 (M1265) */
+int    app_scm_take_memfd(int ep, void **base, unsigned long *size);  /* take a passed memfd as an object, for the in-kernel compositor (M1979) */
 int    app_eventfd_create(unsigned int initval, int flags);  /* pollable u64-counter fd (M1242) */
 int    app_inotify_init(void);                       /* a pollable filesystem-watch fd (M1266) */
 int    app_inotify_add(int fd, const char *path, unsigned int mask);  /* register a watch; wd/-1 (M1266) */

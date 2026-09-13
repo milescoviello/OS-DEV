@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1978-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1979-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -736,8 +736,18 @@ Landed so far, all on the from-scratch ext2 driver:
   delivered. A raw client that used `read()` instead never hit it, which is what
   made the bytes look innocent.
 
-Still ahead: surfaces and shared-memory buffers, then a window, then Firefox.
-The honest scale is still months.
+- **M1979** — **the compositor reads a client's pixels.**
+  `[wl] commit: 64x32 stride 256 format 0 -> first pixel 0xff3366cc`. The client
+  writes into a memfd, passes the **descriptor** over the protocol socket with
+  SCM_RIGHTS, and commits a surface; the compositor maps that same memory and
+  reads the exact value back. Nothing is copied — the pool *is* the client's
+  memory. `wl_compositor.create_surface`, `wl_shm.create_pool`,
+  `wl_shm_pool.create_buffer`, `wl_surface.attach/damage/commit`, `wl_buffer.release`,
+  and the `wl_shm.format` advertisement a client needs before it will build a
+  buffer at all.
+
+Still ahead: putting that surface in an OS-DEV window, `xdg_shell`, input, then
+Firefox. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

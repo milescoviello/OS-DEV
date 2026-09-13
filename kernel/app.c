@@ -4665,6 +4665,29 @@ uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
     }
     return base;
 }
+
+/* Take a passed memfd as an OBJECT rather than as a descriptor (M1979).
+ *
+ * app_scm_recv installs the fd into the receiving PROCESS's table. The Wayland
+ * compositor is the kernel: it has no fd table, and what it actually wants is
+ * the client's pixels. This hands back the memfd's mapping and size directly.
+ *
+ * The pointer is the memfd's own page-aligned buffer, so the compositor reads
+ * exactly the memory the client wrote -- the same object, not a copy. Returns
+ * 0 on success. */
+int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
+    int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return -1;
+    if (!g_scm[ci].valid) return -1;                 /* nothing pending */
+    if (g_scm[ci].fe.type != 3) return -1;           /* not a memfd: not ours to interpret */
+    int idx = g_scm[ci].fe.obj;
+    if (idx < 0 || idx >= NMEMFD || !memfds[idx].used || !memfds[idx].buf) return -1;
+    if (base) *base = memfds[idx].buf;
+    if (size) *size = memfds[idx].size ? memfds[idx].size : memfds[idx].cap;
+    memfds[idx].refs++;                              /* the compositor holds it now */
+    g_scm[ci].valid = 0;
+    return 0;
+}
+
 /* fd 0/1/2 are reserved for stdin/stdout/stderr (M1191): unused-in-table means
  * the window/keyboard, and dup2 can redirect them to a pipe. So pipe()/fifo_open
  * hand out fds from 3 up, like Unix, leaving 0/1/2 for stdio. */

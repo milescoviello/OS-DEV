@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * lxwl.c -- a REAL Wayland client, against OS-DEV's compositor (M1978).
  *
@@ -21,9 +22,13 @@
 #include <stdlib.h>
 #include <wayland-client.h>
 #include <poll.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static int n_globals;
 static struct wl_compositor *comp;
+static struct wl_shm *shm;
 
 static void on_global(void *data, struct wl_registry *reg, uint32_t name,
                       const char *iface, uint32_t version) {
@@ -33,6 +38,8 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
     fflush(stdout);
     if (!strcmp(iface, "wl_compositor"))
         comp = wl_registry_bind(reg, name, &wl_compositor_interface, version < 4 ? version : 4);
+    else if (!strcmp(iface, "wl_shm"))
+        shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
 }
 static void on_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
     (void)data; (void)reg; (void)name;
@@ -79,6 +86,41 @@ int main(void) {
     }
 
     printf("LXWL: connected, %d globals, wl_compositor bound, 2 roundtrips OK\n", n_globals);
+    fflush(stdout);
+
+    /* --- and now actual PIXELS ------------------------------------------- *
+     * A surface, a shared-memory pool backed by a memfd, a buffer inside it,
+     * and a commit. The pool's descriptor goes to the compositor over the same
+     * socket as the protocol (SCM_RIGHTS), so the pixels themselves are never
+     * copied -- the compositor reads the very bytes written below. */
+    if (!shm) { printf("LXWL: wl_shm was not advertised\n"); fflush(stdout); return 7; }
+
+    const int W = 64, H = 32, STRIDE = W * 4;
+    const int SZ = STRIDE * H;
+    int fd = memfd_create("lxwl-pool", 0);
+    if (fd < 0 || ftruncate(fd, SZ) != 0) { printf("LXWL: memfd setup failed\n"); fflush(stdout); return 8; }
+    uint32_t *px = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) { printf("LXWL: pool mmap failed\n"); fflush(stdout); return 9; }
+    /* A colour the compositor cannot produce by accident. */
+    for (int i = 0; i < W * H; i++) px[i] = 0xFF3366CC;
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, SZ);
+    if (!pool) { printf("LXWL: create_pool failed\n"); fflush(stdout); return 10; }
+    struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0, W, H, STRIDE, WL_SHM_FORMAT_ARGB8888);
+    if (!buf) { printf("LXWL: create_buffer failed\n"); fflush(stdout); return 11; }
+    struct wl_surface *surf = wl_compositor_create_surface(comp);
+    if (!surf) { printf("LXWL: create_surface failed\n"); fflush(stdout); return 12; }
+
+    wl_surface_attach(surf, buf, 0, 0);
+    wl_surface_damage(surf, 0, 0, W, H);
+    wl_surface_commit(surf);
+    if (wl_display_roundtrip(dpy) < 0) {
+        printf("LXWL: commit roundtrip failed (err %d)\n", wl_display_get_error(dpy));
+        fflush(stdout); return 13;
+    }
+
+    printf("LXWL-SURFACE: committed %dx%d ARGB8888, %d KiB pool, pixel 0x%08X\n",
+           W, H, SZ / 1024, px[0]);
     fflush(stdout);
     wl_display_disconnect(dpy);
     return 0;

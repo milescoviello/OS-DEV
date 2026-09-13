@@ -1,5 +1,6 @@
 #!/bin/sh
-# PHASE 8: a real Wayland client talks to OS-DEV's own compositor (M1978).
+# PHASE 8: a real Wayland client talks to OS-DEV's own compositor, and hands
+# it pixels through shared memory (M1978-M1979).
 #
 # The client is built against libwayland-client -- the same library Firefox and
 # GTK use -- and deliberately NOT hand-rolled. A hand-rolled client would only
@@ -41,7 +42,7 @@ timeout -s KILL 400 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -sm
 QPID=$!
 i=0
 while [ $i -lt 760 ]; do
-    grep -aqE "LXWL: |LXWL: connected|wl\] summary|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "LXWL-SURFACE|wl\] summary|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
@@ -73,6 +74,28 @@ if grep -aq "LXWL: connected, 4 globals, wl_compositor bound, 2 roundtrips OK" "
     echo "  ok: A REAL libwayland CLIENT COMPLETED THE HANDSHAKE (bind + 2 roundtrips)"
 else
     echo "  FAIL: the client did not complete:"; grep -aE "LXWL|roundtrip" "$SLOG" | tail -4; f=1
+fi
+# PIXELS. The client wrote 0xFF3366CC into a memfd, passed the DESCRIPTOR over
+# the protocol socket, and committed a surface. The compositor reading that
+# exact value back proves the whole zero-copy path: SCM_RIGHTS carried the
+# descriptor, the pool is the client's own memory rather than a copy, and the
+# buffer geometry was parsed correctly. A wrong stride or offset would give a
+# different pixel; a copy would still give the right one, which is why the
+# SIZE is checked too.
+if grep -aq "first pixel 0xff3366cc" "$SLOG"; then
+    echo "  ok: the compositor READ THE CLIENT'S PIXELS ($(grep -ao 'commit: [0-9]*x[0-9]* stride [0-9]*' "$SLOG" | head -1))"
+else
+    echo "  FAIL: the committed pixels did not arrive:"; grep -aE "\[wl\] (commit|shm pool)" "$SLOG" | head -3; f=1
+fi
+if grep -aq "shm pool .*: 8192 bytes of the client's own memory" "$SLOG"; then
+    echo "  ok: the shm pool is the client's own memory, taken from a passed memfd"
+else
+    echo "  FAIL: the shm pool was not established:"; grep -a "shm pool" "$SLOG" | head -2; f=1
+fi
+if grep -aq "LXWL-SURFACE: committed 64x32 ARGB8888" "$SLOG"; then
+    echo "  ok: and the client completed its commit roundtrip"
+else
+    echo "  FAIL: the client did not finish its commit:"; grep -a "LXWL-SURFACE" "$SLOG" | head -2; f=1
 fi
 
 [ $f -eq 0 ] || { echo "FAIL: Wayland compositor"; exit 1; }

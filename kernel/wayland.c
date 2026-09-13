@@ -35,6 +35,7 @@
 #include "console.h"
 #include "string.h"
 #include "task.h"
+#include "app.h"    /* app_scm_take_memfd: the client's pixels (M1979) */
 
 /* The path clients connect to. It carries the compat root because a Linux
  * program's socket path goes through the ABI layer's translation, and both
@@ -59,6 +60,26 @@
 #define WL_REGISTRY_EV_GLOBAL    0
 /* wl_callback events */
 #define WL_CALLBACK_EV_DONE      0
+/* wl_compositor requests */
+#define WL_COMPOSITOR_CREATE_SURFACE 0
+/* wl_shm requests/events */
+#define WL_SHM_CREATE_POOL       0
+#define WL_SHM_EV_FORMAT         0
+/* wl_shm_pool requests */
+#define WL_SHM_POOL_CREATE_BUFFER 0
+/* wl_surface requests */
+#define WL_SURFACE_DESTROY       0
+#define WL_SURFACE_ATTACH        1
+#define WL_SURFACE_DAMAGE        2
+#define WL_SURFACE_FRAME         3
+#define WL_SURFACE_COMMIT        6
+/* wl_buffer events */
+#define WL_BUFFER_EV_RELEASE     0
+
+/* Pixel formats, by the protocol's numbering. These two are the ones every
+ * client can produce and the only ones worth claiming until we composite. */
+#define WL_SHM_FORMAT_ARGB8888   0
+#define WL_SHM_FORMAT_XRGB8888   1
 
 struct wl_global { const char *iface; uint32_t version; };
 /* Advertised in this order; `name` is the index + 1. Version numbers are the
@@ -72,18 +93,56 @@ static const struct wl_global g_globals[] = {
 };
 #define WL_NGLOBAL (int)(sizeof(g_globals) / sizeof(g_globals[0]))
 
+/* Object kinds, so a request can be routed by what its target IS rather than
+ * by guessing from the opcode -- opcode 0 means something different on every
+ * interface. */
+enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
+               WLK_SURFACE, WLK_SHM_POOL, WLK_BUFFER };
+
+#define WL_MAXOBJ 64
+struct wl_object {
+    uint32_t id;
+    int      kind;
+    /* wl_shm_pool: the client's shared memory, taken from the passed memfd.
+     * wl_buffer: geometry into its pool. wl_surface: the attached buffer. */
+    uint8_t *base; unsigned long size;
+    uint32_t off, width, height, stride, format;
+    uint32_t attached;             /* wl_surface: the wl_buffer id last attached */
+};
+
 struct wl_client {
     int      used;
     int      ep;                   /* AF_UNIX endpoint (unixsock.c) */
     uint8_t  in[WL_INBUF];
     int      inlen;                /* bytes accumulated but not yet consumed */
     uint32_t registry;             /* the client's wl_registry object id, 0 = none yet */
-    uint32_t bound[16]; int nbound;
+    struct wl_object obj[WL_MAXOBJ]; int nobj;
 };
 static struct wl_client g_cl[WL_MAXCLIENT];
 static int g_listener = -1;
 int g_wl_verbose;                 /* -append wlverbose: log every message both ways */
-static unsigned g_nconn, g_nmsg, g_nglobal;
+static unsigned g_nconn, g_nmsg, g_nglobal, g_ncommit;
+static uint32_t g_last_pixel;     /* the top-left pixel of the last committed surface */
+static uint32_t g_last_w, g_last_h;
+
+unsigned wl_commits(void)      { return g_ncommit; }
+uint32_t wl_last_pixel(void)   { return g_last_pixel; }
+uint32_t wl_last_width(void)   { return g_last_w; }
+uint32_t wl_last_height(void)  { return g_last_h; }
+
+static struct wl_object *obj_find(struct wl_client *c, uint32_t id) {
+    for (int i = 0; i < c->nobj; i++) if (c->obj[i].id == id) return &c->obj[i];
+    return 0;
+}
+static struct wl_object *obj_add(struct wl_client *c, uint32_t id, int kind) {
+    if (c->nobj >= WL_MAXOBJ) { kprintf("[wl] object table full\n"); return 0; }
+    struct wl_object *o = &c->obj[c->nobj++];
+    o->id = id; o->kind = kind;
+    o->base = 0; o->size = 0;
+    o->off = o->width = o->height = o->stride = o->format = 0;
+    o->attached = 0;
+    return o;
+}
 
 unsigned wl_clients_connected(void) { return g_nconn; }
 unsigned wl_messages_handled(void)  { return g_nmsg; }
@@ -166,15 +225,100 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         return;
     }
     if (c->registry && obj == c->registry && opcode == WL_REGISTRY_BIND && alen >= 4) {
-        /* bind(name, interface:string, version, new_id). Record the id so the
-         * next milestone can route requests to it; nothing to answer here --
-         * bind produces no event. */
-        int p = 4;                                   /* skip name */
-        if (p + 4 <= alen) {
-            uint32_t slen = rd32(args + p); p += 4;
-            p += (int)((slen + 3) & ~3u);            /* interface string, padded */
-            p += 4;                                  /* version */
-            if (p + 4 <= alen && c->nbound < 16) c->bound[c->nbound++] = rd32(args + p);
+        /* bind(name, interface:string, version, new_id). The NAME tells us
+         * which global, so the new object gets the right kind -- opcode 0 means
+         * a different request on every interface, and routing by kind is the
+         * only way to tell them apart. */
+        uint32_t name = rd32(args + 0);
+        int p = 4;
+        if (p + 4 > alen) return;
+        uint32_t slen = rd32(args + p); p += 4;
+        p += (int)((slen + 3) & ~3u);
+        p += 4;                                      /* version */
+        if (p + 4 > alen) return;
+        uint32_t nid = rd32(args + p);
+        int kind = WLK_NONE;
+        if (name >= 1 && name <= (uint32_t)WL_NGLOBAL) {
+            const char *i2 = g_globals[name - 1].iface;
+            if      (i2[3] == 'c') kind = WLK_COMPOSITOR;   /* wl_compositor */
+            else if (i2[3] == 's' && i2[4] == 'h') kind = WLK_SHM;
+            else if (i2[3] == 's' && i2[4] == 'e') kind = WLK_SEAT;
+            else kind = WLK_XDG_WM_BASE;
+        }
+        obj_add(c, nid, kind);
+        /* wl_shm MUST advertise its formats on bind. A client asks wl_shm what
+         * it supports and will not create a buffer for a format it was never
+         * offered, so a silent bind looks to it like a compositor that cannot
+         * display anything. */
+        if (kind == WLK_SHM) {
+            uint8_t b[4];
+            wr32(b, WL_SHM_FORMAT_ARGB8888); wl_send(c, nid, WL_SHM_EV_FORMAT, b, 4);
+            wr32(b, WL_SHM_FORMAT_XRGB8888); wl_send(c, nid, WL_SHM_EV_FORMAT, b, 4);
+        }
+        return;
+    }
+
+    struct wl_object *o = obj_find(c, obj);
+    if (!o) return;                                  /* an object we do not model: ignore, never fatal */
+
+    if (o->kind == WLK_COMPOSITOR && opcode == WL_COMPOSITOR_CREATE_SURFACE && alen >= 4) {
+        obj_add(c, rd32(args), WLK_SURFACE);
+        return;
+    }
+    if (o->kind == WLK_SHM && opcode == WL_SHM_CREATE_POOL && alen >= 8) {
+        /* create_pool(new_id, fd, size). The fd is NOT in the argument list --
+         * it travels out of band as an SCM_RIGHTS control message, and the
+         * `fd` slot in the wire format is a placeholder. Take the memfd the
+         * client passed and remember where its pixels live. */
+        uint32_t nid = rd32(args + 0);
+        uint32_t size = rd32(args + 4);
+        struct wl_object *po = obj_add(c, nid, WLK_SHM_POOL);
+        if (!po) return;
+        void *base = 0; unsigned long msz = 0;
+        if (app_scm_take_memfd(c->ep, &base, &msz) == 0) {
+            po->base = (uint8_t *)base;
+            po->size = msz < size ? msz : size;
+            kprintf("[wl] shm pool %u: %lu bytes of the client's own memory\n", nid, po->size);
+        } else {
+            kprintf("[wl] shm pool %u: NO descriptor arrived (SCM_RIGHTS missing)\n", nid);
+        }
+        return;
+    }
+    if (o->kind == WLK_SHM_POOL && opcode == WL_SHM_POOL_CREATE_BUFFER && alen >= 24) {
+        /* create_buffer(new_id, offset, width, height, stride, format) */
+        struct wl_object *bo = obj_add(c, rd32(args + 0), WLK_BUFFER);
+        if (!bo) return;
+        bo->base   = o->base; bo->size = o->size;
+        bo->off    = rd32(args + 4);
+        bo->width  = rd32(args + 8);
+        bo->height = rd32(args + 12);
+        bo->stride = rd32(args + 16);
+        bo->format = rd32(args + 20);
+        return;
+    }
+    if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_ATTACH && alen >= 4) {
+        o->attached = rd32(args + 0);                /* the wl_buffer id */
+        return;
+    }
+    if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_COMMIT) {
+        /* THE POINT OF ALL OF IT: the client's pixels are now ours to read,
+         * in the memory it wrote them to. Nothing was copied to get here. */
+        struct wl_object *b = o->attached ? obj_find(c, o->attached) : 0;
+        if (b && b->base && b->height && b->stride) {
+            unsigned long need = (unsigned long)b->off + (unsigned long)b->stride * b->height;
+            if (need <= b->size) {
+                g_last_pixel = rd32(b->base + b->off);
+                g_last_w = b->width; g_last_h = b->height;
+                g_ncommit++;
+                kprintf("[wl] commit: %ux%u stride %u format %u -> first pixel 0x%08x\n",
+                        b->width, b->height, b->stride, b->format, g_last_pixel);
+            } else {
+                kprintf("[wl] commit: buffer claims %lu bytes but the pool holds %lu -- refusing\n",
+                        need, b->size);
+            }
+            /* Tell the client it may reuse the buffer. Without this a client
+             * that double-buffers waits forever for its first frame back. */
+            wl_send(c, b->id, WL_BUFFER_EV_RELEASE, 0, 0);
         }
         return;
     }
@@ -209,7 +353,7 @@ int wl_compositor_poll(void) {
         for (int i = 0; i < WL_MAXCLIENT; i++) if (!g_cl[i].used) { slot = i; break; }
         if (slot < 0) { unix_close(ep); kprintf("[wl] client table full\n"); break; }
         struct wl_client *c = &g_cl[slot];
-        c->used = 1; c->ep = ep; c->inlen = 0; c->registry = 0; c->nbound = 0;
+        c->used = 1; c->ep = ep; c->inlen = 0; c->registry = 0; c->nobj = 0;
         g_nconn++;
         kprintf("[wl] client connected (ep %d)\n", ep);
         worked++;
