@@ -67,7 +67,20 @@
 #define CLIP_MAX 2048        /* system clipboard + per-app paste buffer size */
 
 #define USTACK_BASE  0x50000000ull
-#define USTACK_PAGES 129             /* 128 usable pages (512 KiB — DOOM's BSP renderer recurses deeply) + 1 unmapped guard page at USTACK_BASE: a user-stack overflow faults cleanly instead of silently corrupting the heap below it (M1499) */
+/* 512 KiB was sized for our own apps (DOOM's BSP renderer recurses deeply).
+ * It is nowhere near what a Linux program expects: Linux's default is 8 MiB,
+ * and a big runtime asks for more -- Claude Code's PT_GNU_STACK requests
+ * 12.2 MiB, and JavaScriptCore checks its stack bounds at startup and refuses
+ * to run in less.
+ *
+ * EAGER_PAGES are mapped up front because the kernel writes the initial SysV
+ * frame (argv/envp/auxv) there before the process runs; the rest is a
+ * demand-zero VMA, so a program that never recurses deeply pays nothing for
+ * the headroom. Page 0 at USTACK_BASE stays outside the VMA and unmapped, so
+ * an overflow still faults cleanly instead of corrupting the heap below
+ * (M1499). (M1975) */
+#define USTACK_PAGES 4097            /* 16 MiB usable + 1 guard page */
+#define USTACK_EAGER 64              /* top pages mapped at spawn: the initial frame lives here */
 
 /* Userspace heap: grows up from 1 GiB + 64 MiB (clear of any app image, which
  * loads at 1 GiB and is at most a couple of MiB) toward the stack at 0x50000000.
@@ -588,6 +601,7 @@ uint64_t    app_heap_bytes(app_t *a) { return (a && a->heap_end) ? a->heap_end -
  * RLIM_INFINITY. A program that is told its descriptor limit is unlimited will
  * cheerfully ask for fd 1023 -- and get EBADF from a 512-entry table. (M1972) */
 int         app_nfd_max(void)  { return APP_NFD; }
+uint64_t    app_stack_bytes(void) { return (uint64_t)(USTACK_PAGES - 1) * PAGE_SIZE; }   /* usable user stack, for RLIMIT_STACK (M1975) */
 int         app_proc_max(void) { return MAX_APPS; }
 int         app_vma_count(app_t *a) { return a ? a->nvma : 0; }
 /* Read one VMA's extent and protection, for diagnostics that need to ask
@@ -621,20 +635,68 @@ static int maps_str(char *b, int p, int max, const char *s) {
     while (*s && p < max - 1) b[p++] = *s++;
     return p;
 }
+/* Linux's /proc/<pid>/maps format, exactly (M1975):
+ *
+ *   start-end perms offset dev inode    pathname
+ *   55a1b2c00000-55a1b2c21000 r--p 00000000 08:02 1234    /usr/bin/foo
+ *
+ * The format is not cosmetic and the STACK line is not optional. glibc's
+ * pthread_getattr_np finds the main thread's stack by reading this file and
+ * looking for the entry whose range CONTAINS __libc_stack_end, parsing each
+ * line with "%lx-%lx %4s". Ours printed the stack as a single bare address
+ * with no "-end" at all:
+ *
+ *   0000000050000000  rw-  [stack]
+ *
+ * so no line ever matched, pthread_getattr_np failed, and anything that asks
+ * the system how much stack it has got an error instead of an answer. A
+ * JavaScript engine asks that before it will run a line of code. */
+static const char *vma_path(struct app *a, int i);   /* defined with the VMA table below */
+static int maps_hexraw(char *b, int p, int max, uint64_t v) {   /* no 0x prefix: Linux has none */
+    char t[16]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) { t[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; }
+    while (n > 0 && p < max - 1) b[p++] = t[--n];
+    return p;
+}
+static int maps_line(char *b, int p, int max, uint64_t start, uint64_t end,
+                     int prot, const char *path) {
+    p = maps_hexraw(b, p, max, start);
+    p = maps_str(b, p, max, "-");
+    p = maps_hexraw(b, p, max, end);
+    p = maps_str(b, p, max, " ");
+    char perms[5];
+    perms[0] = (prot & VMA_PROT_READ)  ? 'r' : '-';
+    perms[1] = (prot & VMA_PROT_WRITE) ? 'w' : '-';
+    perms[2] = (prot & VMA_PROT_EXEC)  ? 'x' : '-';
+    perms[3] = 'p';                     /* everything here is MAP_PRIVATE */
+    perms[4] = 0;
+    p = maps_str(b, p, max, perms);
+    p = maps_str(b, p, max, " 00000000 00:00 0 ");
+    if (path && path[0]) { p = maps_str(b, p, max, "                 "); p = maps_str(b, p, max, path); }
+    p = maps_str(b, p, max, "\n");
+    return p;
+}
+
 int app_format_maps(app_t *a, char *b, int max) {
     if (!a || max <= 0) return 0;
     int p = 0;
-    if (a->heap_end > UHEAP_BASE) {     /* the program break heap */
-        p = maps_hex(b, p, max, UHEAP_BASE); p = maps_str(b, p, max, "-");
-        p = maps_hex(b, p, max, a->heap_end); p = maps_str(b, p, max, " rw-  [heap]\n");
+    uint64_t stk_lo = USTACK_BASE + PAGE_SIZE;                               /* page 0 is the guard */
+    uint64_t stk_hi = USTACK_BASE + (uint64_t)USTACK_PAGES * PAGE_SIZE;
+    if (a->heap_end > UHEAP_BASE)       /* the program break heap */
+        p = maps_line(b, p, max, UHEAP_BASE, a->heap_end,
+                      VMA_PROT_READ | VMA_PROT_WRITE, "[heap]");
+    for (int i = 0; i < a->nvma; i++) {
+        /* The lazily-faulted part of the stack is a VMA too; it is reported as
+         * part of the single [stack] range below, not twice. */
+        if (a->vma[i].start >= stk_lo && a->vma[i].start < stk_hi) continue;
+        int prot = a->vma[i].prot ? a->vma[i].prot : (VMA_PROT_READ | VMA_PROT_WRITE);
+        p = maps_line(b, p, max, a->vma[i].start, a->vma[i].start + a->vma[i].len,
+                      prot, a->vma[i].huge ? "[mmap-huge]" : vma_path((struct app *)a, i));
     }
-    for (int i = 0; i < a->nvma; i++) {  /* demand-paged mmap regions */
-        p = maps_hex(b, p, max, a->vma[i].start); p = maps_str(b, p, max, "-");
-        p = maps_hex(b, p, max, a->vma[i].start + a->vma[i].len);
-        p = maps_str(b, p, max, a->vma[i].huge ? " rw-  [mmap-huge]\n" : " rw-  [mmap]\n");
-    }
-    p = maps_hex(b, p, max, USTACK_BASE);   /* the user stack region */
-    p = maps_str(b, p, max, "  rw-  [stack]\n");
+    /* ONE contiguous stack entry covering everything a program may use, so the
+     * line containing __libc_stack_end exists and is findable. */
+    p = maps_line(b, p, max, stk_lo, stk_hi, VMA_PROT_READ | VMA_PROT_WRITE, "[stack]");
     if (p < max) b[p] = 0;
     return p;
 }
@@ -4366,7 +4428,9 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         a->nvma++;
     }
 
-    for (int i = 1; i < USTACK_PAGES; i++) {   /* i=0 (USTACK_BASE) left unmapped: a guard page below the user stack (M1499) */
+    /* Only the TOP pages eagerly (the initial frame is written into them);
+     * the rest is demand-zero through a VMA. (M1975) */
+    for (int i = USTACK_PAGES - USTACK_EAGER; i < USTACK_PAGES; i++) {
         uint64_t frame = pmm_alloc_frame();  /* stack: non-executable (W^X) */
         if (!frame) goto fail_in_space;      /* OOM: reclaim the partial space below */
         if (vmm_map(USTACK_BASE + (uint64_t)i * PAGE_SIZE, frame,
@@ -4374,6 +4438,15 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
             pmm_free_frame(frame);
             goto fail_in_space;
         }
+    }
+    if (a->nvma < APP_MAXVMA) {              /* the lazily-faulted remainder */
+        VMA_NEW(a);
+        a->vma[a->nvma].start = USTACK_BASE + PAGE_SIZE;   /* page 0 stays the guard */
+        a->vma[a->nvma].len   = (uint64_t)(USTACK_PAGES - 1 - USTACK_EAGER) * PAGE_SIZE;
+        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
+        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
+        a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        a->nvma++;
     }
     a->ustack = USTACK_BASE + USTACK_PAGES * PAGE_SIZE;
     uint64_t prog_entry = a->entry;          /* auxv AT_ENTRY: the EXECUTABLE's entry, even when the interpreter runs first (M1954) */
@@ -6029,12 +6102,23 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
         interp_base = ELF_INTERP_BASE;
         entry = ie;
     }
-    for (int i = 1; i < USTACK_PAGES; i++) {   /* i=0 = unmapped guard page below the user stack (M1499) */
+    /* Same split as the spawn path: eager at the top for the initial frame,
+     * demand-zero below it, guard page at USTACK_BASE. (M1975) */
+    for (int i = USTACK_PAGES - USTACK_EAGER; i < USTACK_PAGES; i++) {
         uint64_t frame = pmm_alloc_frame();
         if (!frame) goto fail;
         if (vmm_map(USTACK_BASE + (uint64_t)i * PAGE_SIZE, frame, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) {
             pmm_free_frame(frame); goto fail;
         }
+    }
+    if (a->nvma < APP_MAXVMA) {
+        VMA_NEW(a);
+        a->vma[a->nvma].start = USTACK_BASE + PAGE_SIZE;
+        a->vma[a->nvma].len   = (uint64_t)(USTACK_PAGES - 1 - USTACK_EAGER) * PAGE_SIZE;
+        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
+        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
+        a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        a->nvma++;
     }
 
     /* committed: we are now the new program. Free the OLD space (non-active now). */

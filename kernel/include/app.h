@@ -42,6 +42,7 @@ int         app_format_smaps(app_t *a, char *b, int max);          /* /proc/<pid
 int         app_format_pagemap(app_t *a, char *b, int max);        /* /proc/<pid>/pagemap: per-page residency + PFN (M1167) */
 uint64_t    app_heap_bytes(app_t *a);   /* heap size in bytes */
 int         app_nfd_max(void);          /* per-process descriptor ceiling, for RLIMIT_NOFILE (M1972) */
+uint64_t    app_stack_bytes(void);      /* usable user-stack bytes, for RLIMIT_STACK (M1975) */
 int         app_proc_max(void);         /* process ceiling, for RLIMIT_NPROC (M1972) */
 int         app_vma_count(app_t *a);    /* number of mmap regions */
 int         app_vma_info(app_t *a, int i, uint64_t *start, uint64_t *len, int *prot);  /* one VMA's extent+prot; 0/-1 (M1970) */

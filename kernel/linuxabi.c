@@ -1468,6 +1468,11 @@ void linux_syscall_dispatch(struct registers *r) {
             switch ((int)r->rsi) {
                 case 7: cur = mx = (uint64_t)app_nfd_max();  break;   /* RLIMIT_NOFILE */
                 case 6: cur = mx = (uint64_t)app_proc_max(); break;   /* RLIMIT_NPROC  */
+                /* RLIMIT_STACK: glibc reports the main thread's stack size from
+                 * this, and a runtime that checks its own stack bounds before
+                 * recursing believes it. Claiming RLIM_INFINITY made glibc use
+                 * its 8 MiB default while we actually supplied 512 KiB. (M1975) */
+                case 3: cur = mx = (uint64_t)app_stack_bytes(); break;   /* RLIMIT_STACK */
                 default: break;                                       /* the rest really are unbounded here */
             }
             old[0] = cur; old[1] = mx;

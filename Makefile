@@ -127,7 +127,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -1466,6 +1466,12 @@ gfxtest: $(KERNEL) $(DISK)
 # which is too coupled to fuzz in isolation. SKIPs if QEMU/socat/python3 absent.
 browsertest: $(KERNEL) $(DISK)
 	@tests/run-browser-tests.sh
+
+# PHASE 7: Claude Code in-guest. A 214 MB non-PIE ET_EXEC built with Bun, so
+# the engine is JavaScriptCore. NOT in `make check`: every start is minutes
+# under TCG. SKIPs cleanly when it was never staged.
+claudetest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-claude-test.sh
 
 # AF_INET sockets through the Linux ABI (M1967): a DNS lookup over UDP and an
 # HTTP request over TCP, both driven by poll(). The same path Node uses, run as

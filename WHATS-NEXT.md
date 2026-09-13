@@ -1,5 +1,58 @@
 # What's next
 
+> **(M1975) PHASE 7: CLAUDE CODE RUNS INSIDE OS-DEV.**
+>
+> ```
+> [lxclaude] running CLAUDE CODE (214 MB non-PIE ET_EXEC at 0x200000)...
+> 2.1.270 (Claude Code)
+> [lxclaude] claude --version -> 0
+> ```
+>
+> That string is produced by its own JavaScript, so it can only appear if the
+> image loaded at its link-time address, `ld.so` resolved it, the engine
+> initialised and ran code. **It is a non-PIE `ET_EXEC`** — linked at fixed
+> addresses `0x200000`–`0xD78F000`, impossible to relocate — which is why this
+> needed the kernel moved to the higher half (M1968) and the shared identity map
+> dropped from every address space (M1969–M1970) before it could load at all.
+>
+> **And it is built with Bun, so the engine is JavaScriptCore, not V8.** That
+> was worth discovering: every assumption I had been reasoning from was about
+> V8. The give-away was in the section table — `.bun`, `.bun_builtins`,
+> `__DATA,__wtf_config`, `__DATA,__jsc_opcodes`.
+>
+> **The last blocker was `/proc/self/maps`.** Ours printed the stack as a bare
+> address with no range:
+>
+> ```
+> 0000000050000000  rw-  [stack]
+> ```
+>
+> Linux's format is `start-end perms offset dev inode pathname`, and glibc's
+> `pthread_getattr_np` finds the main thread's stack by parsing each line with
+> `"%lx-%lx %4s"` and looking for the one whose range **contains**
+> `__libc_stack_end`. No line could ever match, so the call returned an error —
+> and JavaScriptCore asks the system for its stack bounds before it will run a
+> line of JavaScript, then aborts *without printing anything* when the answer is
+> an error. The whole file is written in Linux's real format now, with one
+> contiguous `[stack]` entry covering everything a program may use.
+>
+> Two supporting fixes in the same area: the user stack went **512 KiB → 16 MiB**
+> (eager at the top for the initial SysV frame, demand-zero below it, guard page
+> intact) because Claude Code's `PT_GNU_STACK` asks for 12.2 MiB and Linux's
+> default is 8; and `RLIMIT_STACK` reports what we actually give rather than
+> `RLIM_INFINITY`, because a runtime that checks its own stack bounds believes
+> that number.
+>
+> **What it took to find**, since almost none of it was visible from the
+> symptom: the image aborted having written **not one byte**. The syscall ring
+> (M1970-M1972) with return values is what made it tractable — it proved, in
+> order, that no syscall was unimplemented, that none failed in a way Linux
+> would not, that the 214 MB image read byte-correct 192 MB in, that 288 MB
+> churned through the engine's GC fine, and that the abort was identical under
+> `-cpu Haswell` and `-cpu max`. Each of those killed a hypothesis and left the
+> `/proc` format as the only place still lying.
+
+
 > **(M1968-M1969) PHASE 7 BEGINS: Node speaks HTTPS, and the kernel moved to the
 > higher half to make room for Claude Code.**
 >

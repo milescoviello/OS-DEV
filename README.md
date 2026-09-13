@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1974-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1975-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -699,9 +699,21 @@ Landed so far, all on the from-scratch ext2 driver:
   address *span* as RAM — 5120 MiB on a 4 GiB machine, a number `sysinfo`
   passed straight to every Linux program.
 
-Still ahead: Claude Code itself (it loads and runs now, but aborts during its
-own startup), and Firefox on a from-scratch Wayland display path. The honest
-scale is still months.
+- **M1975** — **PHASE 7: CLAUDE CODE RUNS INSIDE OS-DEV.** `2.1.270 (Claude
+  Code)`, exit 0 — a 214 MB **non-PIE `ET_EXEC`** image, loaded at its
+  link-time address in the first gigabyte, printing a string produced by its
+  own JavaScript. It is built with **Bun**, so the engine inside it is
+  **JavaScriptCore**, not V8. The last blocker was our `/proc/self/maps`: the
+  stack line printed a bare address with **no `start-end` range**, so glibc's
+  `pthread_getattr_np` could never find the entry containing
+  `__libc_stack_end` — and JSC asks the system for its stack bounds before it
+  will run a line of code, then aborts *silently* when the answer is an error.
+  Also: the user stack went 512 KiB → **16 MiB** demand-paged (Claude Code's
+  `PT_GNU_STACK` asks for 12.2 MiB; Linux's default is 8), and `RLIMIT_STACK`
+  now reports what we actually give instead of "unlimited".
+
+Still ahead: Firefox on a from-scratch Wayland display path. The honest scale
+is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the
