@@ -2349,6 +2349,46 @@ static const char *vma_path(struct app *a, int vi) {
  * layout is preserved while still being able to use everything below it.
  * O(nvma) per probe with nvma <= APP_MAXVMA, which is nothing next to the
  * page faults the mapping will take. */
+static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align);
+
+/* FIND A GAP AND CLAIM IT IN ONE STEP (M1988).
+ *
+ * Searching for a free range and recording the mapping used to be two separate
+ * unsynchronised acts, and every caller did them in that order. Two threads
+ * calling mmap at once both searched, both found the SAME gap, and both went on
+ * to record a mapping there -- in different slots, so nothing looked wrong in
+ * the table and the overlap audit stayed clean. Then one of them munmap'd and
+ * took the other's memory with it. The victim faulted on an address it had been
+ * given and had already written to.
+ *
+ * Serialising slot allocation alone was not enough; the SEARCH has to be inside
+ * the same critical section as the claim. It is safe to put it there: the
+ * search touches only the kernel's own table, does no I/O and reads no user
+ * memory, so nothing inside can block or fault.
+ *
+ * Returns the claimed slot, with start/len already set, and writes the address
+ * to *out. -1 if there is no gap or no slot. The caller fills in the rest of
+ * the entry; `len` is already non-zero, so no other allocator can take it. */
+static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *out) {
+    uint64_t f = vma_alloc_lock(a);
+    uint64_t addr = vma_find_gap(a, len, align);
+    int slot = -1;
+    if (addr) {
+        slot = vma_pick_slot(a);
+        if (slot >= 0) {
+            for (unsigned b = 0; b < sizeof a->vma[0]; b++) ((char *)&a->vma[slot])[b] = 0;
+            a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
+            a->vma[slot].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+            a->vma[slot].start = addr;
+            a->vma[slot].len   = len;          /* claimed and published together */
+            if (slot >= a->nvma) a->nvma = slot + 1;
+        }
+    }
+    vma_alloc_unlock(a, f);
+    if (slot >= 0 && out) *out = addr;
+    return slot;
+}
+
 static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align) {
     if (!len) return 0;
     for (int pass = 0; pass < 2; pass++) {
@@ -2466,17 +2506,11 @@ static uint64_t app_mmap_nl(uint64_t len) {
      *
      * vma_find_gap has always taken an `align` argument -- it was simply never
      * passed one. */
-    uint64_t addr = vma_find_gap(a, len, len >= HUGE_SIZE ? HUGE_SIZE : 0);
-    if (!addr) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    int vs1; VMA_NEW(a, vs1);
-    a->vma[vs1].start = addr;
-    a->vma[vs1].len   = len;
-    a->vma[vs1].sealed = 0;
-    a->vma[vs1].uffd  = 0;
-    a->vma[vs1].file_backed = 0;
+    uint64_t addr = 0;
+    int vs1 = vma_reserve(a, len, len >= HUGE_SIZE ? HUGE_SIZE : 0, &addr);
+    if (vs1 < 0) return 0;
+    if (addr + len > MMAP_TOP || addr + len < addr) { a->vma[vs1].start = 0; a->vma[vs1].len = 0; return 0; }
     a->vma[vs1].locked = a->mlock_future;       /* MCL_FUTURE: born locked if mlockall(MCL_FUTURE) is in effect (M1283) */
-    a->vma[vs1].huge = 0;
     
     a->mmap_next = addr + len + PAGE_SIZE;          /* leave an unmapped guard gap */
     vma_audit(a, "mmap");
@@ -2682,8 +2716,14 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
         uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
         if (addr <= s0 || addr >= e0) continue;
         if (vma_full(a)) return -1;
+        /* Claim under the ALLOCATOR's lock (M1988). A split and a concurrent
+         * mmap both called vma_pick_slot unsynchronised, got the same free
+         * index, and each wrote its entry there -- one of the two mappings
+         * simply ceased to exist, with the table looking perfectly consistent
+         * afterwards. */
+        uint64_t sfl = vma_alloc_lock(a);
         int ss = vma_pick_slot(a);
-        if (ss < 0) return -1;                       /* no slot: the caller must not split */
+        if (ss < 0) { vma_alloc_unlock(a, sfl); return -1; }   /* no slot: the caller must not split */
         a->vma[ss] = a->vma[i];       /* a COPY on purpose: no VMA_NEW here */
         a->vma[ss].start = addr;
         a->vma[ss].len   = e0 - addr;
@@ -2697,6 +2737,7 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
             if (a->vma[i].fvalid && a->vma[ss].fvalid == 0) a->vma[ss].fvalid = 1;  /* 0 means "no limit"; keep "nothing valid" expressible */
         }
         if (ss >= a->nvma) a->nvma = ss + 1;   /* publish the tail: this path does not go through VMA_NEW (M1988) */
+        vma_alloc_unlock(a, sfl);
         a->vma[i].len = addr - s0;
         return 0;
     }
@@ -2793,11 +2834,14 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
              * this slot is what let a concurrent scan miss a live mapping; a
              * zeroed entry matches no range test, so a racing scan sees either
              * the mapping or nothing -- never a different one. */
-            a->vma[i].start = 0; a->vma[i].len = 0;
+            uint64_t tfl = vma_alloc_lock(a);
+            a->vma[i].start = 0;
             a->vma[i].fidx = -1; a->vma[i].mfd = -1;
             a->vma[i].file_backed = 0; a->vma[i].shared = 0;
             a->vma[i].huge = 0; a->vma[i].sealed = 0; a->vma[i].uffd = 0;
             a->vma[i].locked = 0; a->vma[i].prot = 0;
+            a->vma[i].len = 0;                  /* LAST: len == 0 is what frees the slot */
+            vma_alloc_unlock(a, tfl);
             i++;
             continue;
         }
@@ -2810,14 +2854,16 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
         } else if (ce == e0) {                      /* tail trimmed */
             a->vma[i].len = cs - s0;
         } else {                                    /* hole punched: split in two */
+            uint64_t cfl = vma_alloc_lock(a);
             int ns = vma_pick_slot(a);
-            if (ns < 0) return -1;              /* pre-flight counted the slots; belt and braces */
+            if (ns < 0) { vma_alloc_unlock(a, cfl); return -1; }   /* pre-flight counted the slots; belt and braces */
             a->vma[ns] = a->vma[i];             /* a COPY on purpose: no VMA_NEW here */
             if (a->vma[i].mfd >= 0) memfd_ref(a->vma[i].mfd);   /* now TWO mappings hold it (M1985) */
             a->vma[ns].start = ce;
             a->vma[ns].len   = e0 - ce;
             if (a->vma[ns].file_backed) a->vma[ns].foff += ce - s0;
             if (ns >= a->nvma) a->nvma = ns + 1;
+            vma_alloc_unlock(a, cfl);
             a->vma[i].len = cs - s0;
         }
         i++;
@@ -6738,7 +6784,16 @@ long app_join(int tid) {
     if (slot < 0) return -1;
     task_t *t = a->thr[slot];
     __asm__ volatile("sti");                        /* the poll sleeps on the timer */
-    while (t->state != TASK_DEAD) task_sleep_ms(5); /* wait for the thread to exit (it switches off-CPU first) */
+    /* DEAD is not enough, and app_reap has known that since M1961: a task sets
+     * TASK_DEAD and only THEN performs its final context_switch, so between the
+     * two it is still executing on its own stack. Freeing it there hands the
+     * kstack back while it is in use, and -- because glibc unmaps a joined
+     * thread's stack the instant join returns -- the thread faults on memory
+     * that no longer belongs to anyone. It shows up as a fault with the
+     * process down to a single VMA, from a tid that should not exist any more.
+     * Wait for off_cpu as well, exactly as the reaper does. (M1988) */
+    while (t->state != TASK_DEAD || !__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE))
+        task_sleep_ms(5);
     a->thr[slot] = 0;                               /* drop our reference before freeing */
     task_free(t);                                   /* DEAD + unlinked + off-CPU -> safe to reap */
     return 0;

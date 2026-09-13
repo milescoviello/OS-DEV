@@ -1,5 +1,59 @@
 # What's next
 
+> **(M1989) THE VMA TABLE IS THREAD-SAFE NOW — `lxstress` 0/4 -> 5/6.**
+>
+> Three distinct races, each found by making the previous fix expose the next.
+> None of them could be seen in the table afterwards, which is why they lasted:
+>
+> **1. Removal MOVED entries.** `app_vma_carve` filled the hole it made with the
+> last entry. Every thread shares the table, so a concurrent `munmap` relocated
+> an unrelated mapping to an index a scan had already walked past, and the scan
+> concluded the address was unmapped. Entries are **tombstoned** now (start and
+> len zeroed, inert to every range test) and never move; `VMA_NEW` reuses a
+> tombstone before extending the table, so the slot count does not grow.
+>
+> **2. Two threads could reserve the SAME address.** Finding a free gap and
+> recording the mapping were separate unsynchronised acts, and every caller did
+> them in that order. Both threads searched, both found the same gap, both
+> recorded a mapping there -- in DIFFERENT slots, so the table stayed perfectly
+> consistent and the overlap audit stayed clean. Then one of them `munmap`'d and
+> took the other's memory with it. `vma_reserve` does the search and the claim
+> under one lock.
+>
+> **3. Splits claimed slots outside that lock.** `app_vma_split_at` and the
+> hole-punch path in `app_vma_carve` both called `vma_pick_slot` unsynchronised,
+> so a split and an `mmap` could take the same index and one mapping simply
+> ceased to exist.
+>
+> The lock works where M1987's attempt hung the machine, and the difference is
+> the whole lesson: it covers **only table work** -- no I/O, no user memory --
+> so nothing inside it can block or fault. A lock around the whole operation
+> could not say that, because `app_msync` writes to disk from inside
+> `app_vma_carve`.
+>
+> **Also fixed: `app_join` freed a thread's task as soon as it was `TASK_DEAD`.**
+> A task sets that flag and only THEN performs its final context switch, so
+> between the two it is still executing on its own stack -- `app_reap` has known
+> this since M1961 and waits for `off_cpu`; `app_join` did not. glibc unmaps a
+> joined thread's stack the instant `join` returns, so the thread faulted on
+> memory that belonged to nobody. It showed up as a fault from a tid that should
+> not exist, with the process down to a single VMA.
+>
+> **STILL OPEN, now precisely named.** One run in six panics with the kernel
+> jumping to `0x10`:
+>
+> ```
+> call trace:
+>   [0] 0x0000000000000010
+>   [1] task_block_timeout+0xa3
+>   [2] app_futex+0x1ba
+>   [3] linux_syscall_dispatch
+> ```
+>
+> `switch_to_next()` restored a context whose saved rip is garbage -- a freed
+> task being scheduled -- on the **timed** futex path, which only started being
+> exercised when `lxstress` switched to a timed wait. That is the next one.
+
 > **(M1988) `linux <path>` — YOU CAN NOW RUN A LINUX BINARY BY TYPING IT.**
 >
 > ```

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1988-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1989-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -938,6 +938,36 @@ Landed so far, all on the from-scratch ext2 driver:
   third, overlapping, with Files clipped by the shell while 60% of the desktop
   sat empty. Placement is derived from the actual framebuffer now, and app
   windows cascade in the space the boot column leaves instead of on top of it.
+
+- **M1989** — **the VMA table is thread-safe now.** `lxstress` went from **0/4
+  to 5/6** clean runs. Three distinct races, each found by making the previous
+  fix expose the next:
+
+  1. **Removal MOVED entries.** `app_vma_carve` filled the hole it made with the
+     last entry, so a concurrent `munmap` relocated a live mapping to an index a
+     scan had already walked past. Entries are **tombstoned** now and never
+     move; a racing scan sees the mapping or nothing, never a *different* one.
+  2. **Two threads could reserve the same address.** Searching for a free gap
+     and recording the mapping were separate unsynchronised acts, so both
+     threads found the same gap and both recorded a mapping there — in
+     *different slots*, so the table looked perfectly consistent and the overlap
+     audit stayed clean. Then one `munmap`'d and took the other's memory.
+     `vma_reserve` now does both under one lock.
+  3. **Splits claimed slots outside that lock**, so a split and an `mmap` could
+     take the same index and one mapping ceased to exist.
+
+  The lock is safe where the M1987 attempt was not: it covers only table work —
+  no I/O, no user memory — so nothing inside it can block or fault.
+
+  Also: `app_join` freed a thread's task as soon as it was `TASK_DEAD`, but a
+  task sets that flag and only *then* performs its final context switch. glibc
+  unmaps a joined thread's stack the moment `join` returns, so the thread
+  faulted on memory that no longer belonged to anyone. It waits for `off_cpu`
+  now, exactly as the reaper has since M1961.
+
+  **Still open, and now precisely named:** one run in six panics with the kernel
+  jumping to `0x10` from `linux_syscall_entry → app_futex → task_block_timeout`
+  — a freed task being scheduled, on the *timed* futex path.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 
