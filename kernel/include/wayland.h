@@ -33,3 +33,12 @@ uint32_t wl_last_height(void);
  * exists; the pixels are the client's own memory, not a copy. (M1980) */
 const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride);
 const char     *wl_surface_title(void);   /* xdg_toplevel.set_title, for the titlebar (M1981) */
+
+/* Input, forwarded from the window manager to the focused client (M1983).
+ * Coordinates are SURFACE-relative; keycodes are raw evdev, not characters. */
+void     wl_post_pointer_leave(void);
+void     wl_post_motion(int x, int y);
+void     wl_post_button(int x, int y, unsigned button, int pressed);
+void     wl_post_key(unsigned keycode, int pressed);
+unsigned wl_keys_sent(void);
+unsigned wl_pointer_sent(void);

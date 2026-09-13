@@ -1,6 +1,7 @@
 #!/bin/sh
-# PHASE 8: a real Wayland client talks to OS-DEV's own compositor, and hands
-# it pixels through shared memory (M1978-M1979).
+# PHASE 8: a real Wayland client talks to OS-DEV's own compositor, hands it
+# pixels through shared memory, gets a real window, and TAKES INPUT
+# (M1978-M1983).
 #
 # The client is built against libwayland-client -- the same library Firefox and
 # GTK use -- and deliberately NOT hand-rolled. A hand-rolled client would only
@@ -31,18 +32,20 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: wayland test ($QEMU not foun
 TMP=$(mktemp -d /tmp/osdev_wl.XXXXXX)
 SLOG=$TMP/serial.log
 SOCK=$TMP/mon.sock
+QSOCK=$TMP/qmp.sock
 PPM=$TMP/screen.ppm
 QPID=""
 cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and running a real libwayland client against our compositor..."
-timeout -s KILL 400 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
+timeout -s KILL 900 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
     -append "wltest wlraw nonetdemo" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \
     -display none -serial file:"$SLOG" \
-    -monitor unix:"$SOCK",server,nowait >/dev/null 2>&1 &
+    -monitor unix:"$SOCK",server,nowait -qmp unix:"$QSOCK",server,nowait \
+    -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 >/dev/null 2>&1 &
 QPID=$!
 i=0
 while [ $i -lt 760 ]; do
@@ -137,6 +140,16 @@ else
     echo "  SKIP: on-screen check (socat not available)"
 fi
 
+# INPUT (M1983). Pixels prove a client can draw; this proves it can be USED.
+# Real QEMU input events -- an absolute pointer and a keystroke -- are driven at
+# the VM and have to come back out of libwayland inside the guest as
+# wl_pointer/wl_keyboard events with the right surface-relative coordinates.
+if [ "$f" -eq 0 ]; then
+    python3 tests/wl/drive_input.py "$QSOCK" "$SLOG" "$TMP/in.ppm" || f=1
+else
+    echo "  SKIP: input check (an earlier check already failed)"
+fi
+
 kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 [ $f -eq 0 ] || { echo "FAIL: Wayland compositor"; exit 1; }
-echo "PASS: PHASE 8 -- a real libwayland client's surface is DRAWN IN AN OS-DEV WINDOW"
+echo "PASS: PHASE 8 -- a real libwayland client's surface is DRAWN IN AN OS-DEV WINDOW, and it takes INPUT"

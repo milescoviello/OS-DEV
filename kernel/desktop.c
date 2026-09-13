@@ -1677,6 +1677,27 @@ static void make_app_window(app_t *a) {
  * the desktop's window array from its own task would be a data race on
  * `windows[]` for no benefit. One window, opened on the first commit, sized to
  * the surface -- the multi-surface case arrives with xdg_shell. */
+/* Our cooked keyboard layer hands out CHARACTERS; Wayland carries evdev
+ * KEYCODES. This is the minimal honest mapping for the letters and the few
+ * keys a demo actually presses -- a full layout belongs with a real xkb
+ * keymap, which is the next piece of this. (M1983) */
+static unsigned desktop_key_to_evdev(int ch) {
+    static const unsigned row1[] = { 16,17,18,19,20,21,22,23,24,25 };   /* q..p */
+    static const unsigned row2[] = { 30,31,32,33,34,35,36,37,38 };      /* a..l */
+    static const unsigned row3[] = { 44,45,46,47,48,49,50 };            /* z..m */
+    static const char *r1 = "qwertyuiop", *r2 = "asdfghjkl", *r3 = "zxcvbnm";
+    int c2 = (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch;
+    for (int i = 0; r1[i]; i++) if (r1[i] == c2) return row1[i];
+    for (int i = 0; r2[i]; i++) if (r2[i] == c2) return row2[i];
+    for (int i = 0; r3[i]; i++) if (r3[i] == c2) return row3[i];
+    if (c2 >= '1' && c2 <= '9') return (unsigned)(2 + (c2 - '1'));
+    if (c2 == '0')  return 11;
+    if (c2 == ' ')  return 57;
+    if (c2 == '\n') return 28;                    /* Enter */
+    if (c2 == 27)   return 1;                     /* Escape */
+    return 0;
+}
+
 static int wl_window_open;
 static void wl_window_poll(void) {
     uint32_t sw2 = 0, sh2 = 0, st = 0;
@@ -2239,6 +2260,16 @@ void desktop_run(void) {
                 else if (top->kind == KIND_APP && top->app) { app_sel_clear((app_t *)top->app); app_key((app_t *)top->app, (char)k); dirty = 1; }
                 else if (top->kind == KIND_BROWSER && top->app) { browser_key((browser_t *)top->app, k); dirty = 1; }
                 else if (top->kind == KIND_FILES) { files_key(top, k); dirty = 1; }
+                else if (top->kind == KIND_WAYLAND) {
+                    /* Forward to the Wayland client, as a KEY PRESS AND
+                     * RELEASE. The desktop's cooked layer gives us a character,
+                     * not a make/break pair, and a client that only ever sees
+                     * presses treats every key as held down forever. The value
+                     * is an evdev keycode, which is what the protocol carries
+                     * -- not the character. (M1983) */
+                    wl_post_key(desktop_key_to_evdev(k), 1);
+                    wl_post_key(desktop_key_to_evdev(k), 0);
+                }
             }
         }
 
@@ -2259,6 +2290,29 @@ void desktop_run(void) {
                 if (rx < 0 || ry < 0 || rx >= gw || ry >= gh) { rx = -1; ry = -1; }
                 app_set_mouse((app_t *)fw->app, rx, ry, btn);
                 app_add_mouse_rel((app_t *)fw->app, rdx, rdy);
+            }
+            /* A focused Wayland window gets the pointer, in SURFACE-relative
+             * coordinates -- the client knows nothing about where its window
+             * sits on our desktop, and sending screen coordinates would put
+             * every click in the wrong place. Motion is only forwarded when it
+             * CHANGES: a Wayland client redraws on motion, and re-sending the
+             * same position every frame would keep it busy forever. (M1983) */
+            if (!fw->minimized && fw->kind == KIND_WAYLAND) {
+                int sw3 = fw->w - 14, sh3 = fw->h - TITLEBAR_H - 14;
+                int rx = mx - (fw->x + 6), ry = my - (fw->y + TITLEBAR_H + 6);
+                /* HIT-TEST against the surface, not just the window: pointer
+                 * focus in Wayland follows the cursor, so a client outside
+                 * whose bounds the cursor sits must get a leave() and no
+                 * motion. Forwarding out-of-bounds coordinates is worse than
+                 * useless -- the client happily acts on a click it should
+                 * never have seen. */
+                if (rx >= 0 && ry >= 0 && rx < sw3 && ry < sh3) {
+                    if (mx != prev_x || my != prev_y) wl_post_motion(rx, ry);
+                    if ((btn & 1) != (prev_btn & 1)) wl_post_button(rx, ry, 0x110, btn & 1);   /* BTN_LEFT */
+                    if ((btn & 2) != (prev_btn & 2)) wl_post_button(rx, ry, 0x111, (btn & 2) ? 1 : 0);  /* BTN_RIGHT */
+                } else if (mx != prev_x || my != prev_y) {
+                    wl_post_pointer_leave();
+                }
             }
         }
 

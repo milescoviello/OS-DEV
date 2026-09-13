@@ -34,6 +34,7 @@
 #include "unixsock.h"
 #include "console.h"
 #include "string.h"
+#include "timer.h"
 #include "task.h"
 #include "app.h"    /* app_scm_take_memfd: the client's pixels (M1979) */
 
@@ -84,6 +85,25 @@
 #define XDG_SURFACE_EV_CONFIGURE    0
 #define XDG_TOPLEVEL_SET_TITLE      2
 #define XDG_TOPLEVEL_EV_CONFIGURE   0
+/* wl_seat / wl_pointer / wl_keyboard -- input, back out to the client. */
+#define WL_SEAT_GET_POINTER      0
+#define WL_SEAT_GET_KEYBOARD     1
+#define WL_SEAT_EV_CAPABILITIES  0
+#define WL_SEAT_EV_NAME          1
+#define WL_SEAT_CAP_POINTER      1
+#define WL_SEAT_CAP_KEYBOARD     2
+#define WL_POINTER_EV_ENTER      0
+#define WL_POINTER_EV_LEAVE      1
+#define WL_POINTER_EV_MOTION     2
+#define WL_POINTER_EV_BUTTON     3
+#define WL_POINTER_EV_FRAME      5
+#define WL_KEYBOARD_EV_KEYMAP    0
+#define WL_KEYBOARD_EV_ENTER     1
+#define WL_KEYBOARD_EV_LEAVE     2
+#define WL_KEYBOARD_EV_KEY       3
+#define WL_KEYBOARD_EV_MODIFIERS 4
+#define WL_KEYBOARD_EV_REPEAT    5
+#define WL_KEYBOARD_KEYMAP_NONE  0    /* "no keymap": the client uses raw evdev codes */
 
 /* Pixel formats, by the protocol's numbering. These two are the ones every
  * client can produce and the only ones worth claiming until we composite. */
@@ -107,7 +127,7 @@ static const struct wl_global g_globals[] = {
  * interface. */
 enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
                WLK_SURFACE, WLK_SHM_POOL, WLK_BUFFER,
-               WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL };
+               WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL, WLK_POINTER, WLK_KEYBOARD };
 
 #define WL_MAXOBJ 64
 struct wl_object {
@@ -128,6 +148,12 @@ struct wl_client {
     int      inlen;                /* bytes accumulated but not yet consumed */
     uint32_t registry;             /* the client's wl_registry object id, 0 = none yet */
     uint32_t serial;               /* configure serials, monotonic per client */
+    uint32_t pointer, keyboard;    /* the client's wl_pointer / wl_keyboard, 0 = not asked for */
+    uint32_t surface;              /* the surface input is delivered to */
+    int      ptr_in, kbd_in;       /* enter() already sent. Pointer focus follows the CURSOR and
+                                    * keyboard focus follows the WINDOW -- they are separate in
+                                    * Wayland, and a client ignores input for a surface it has
+                                    * not been told it has. */
     char     title[64];            /* xdg_toplevel.set_title, for the window's titlebar */
     struct wl_object obj[WL_MAXOBJ]; int nobj;
 };
@@ -281,6 +307,17 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
          * it supports and will not create a buffer for a format it was never
          * offered, so a silent bind looks to it like a compositor that cannot
          * display anything. */
+        if (kind == WLK_SEAT) {
+            /* A client asks the seat what it HAS before asking for a pointer
+             * or a keyboard. A seat that never says makes a client assume it
+             * has neither and never request either -- silently, with no
+             * error. */
+            uint8_t cb2[4];
+            wr32(cb2, WL_SEAT_CAP_POINTER | WL_SEAT_CAP_KEYBOARD);
+            wl_send(c, nid, WL_SEAT_EV_CAPABILITIES, cb2, 4);
+            uint8_t nb[64]; int np = put_string(nb, 0, "osdev-seat0");
+            wl_send(c, nid, WL_SEAT_EV_NAME, nb, np);
+        }
         if (kind == WLK_SHM) {
             uint8_t b[4];
             wr32(b, WL_SHM_FORMAT_ARGB8888); wl_send(c, nid, WL_SHM_EV_FORMAT, b, 4);
@@ -293,7 +330,9 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     if (!o) return;                                  /* an object we do not model: ignore, never fatal */
 
     if (o->kind == WLK_COMPOSITOR && opcode == WL_COMPOSITOR_CREATE_SURFACE && alen >= 4) {
-        obj_add(c, rd32(args), WLK_SURFACE);
+        uint32_t sid = rd32(args);
+        obj_add(c, sid, WLK_SURFACE);
+        if (!c->surface) c->surface = sid;      /* input goes to the first surface */
         return;
     }
     if (o->kind == WLK_SHM && opcode == WL_SHM_CREATE_POOL && alen >= 8) {
@@ -325,6 +364,31 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         bo->height = rd32(args + 12);
         bo->stride = rd32(args + 16);
         bo->format = rd32(args + 20);
+        return;
+    }
+    if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_POINTER && alen >= 4) {
+        c->pointer = rd32(args); obj_add(c, c->pointer, WLK_POINTER);
+        return;
+    }
+    if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_KEYBOARD && alen >= 4) {
+        c->keyboard = rd32(args); obj_add(c, c->keyboard, WLK_KEYBOARD);
+        /* NO KEYMAP EVENT YET, deliberately.
+         *
+         * wl_keyboard.keymap is (format, fd, size) and the `fd` is an
+         * OUT-OF-BAND argument: it occupies no space in the message body and
+         * travels as an SCM_RIGHTS control message. Sending a placeholder word
+         * for it produces a message libwayland parses as malformed, and it
+         * kills the connection -- which presents as a client that asked for a
+         * keyboard and then received nothing at all, including events that had
+         * nothing to do with the keyboard.
+         *
+         * Passing a real descriptor from the kernel means an xkb keymap in a
+         * kernel-created memfd, which is the next piece of this. Until then a
+         * client gets a pointer, repeat_info, and key events whose evdev codes
+         * it can use directly if it wants them. */
+        uint8_t ri[8];
+        wr32(ri + 0, 25); wr32(ri + 4, 400); /* repeat: 25/s after 400 ms */
+        wl_send(c, c->keyboard, WL_KEYBOARD_EV_REPEAT, ri, 8);
         return;
     }
     if (o->kind == WLK_XDG_WM_BASE && opcode == XDG_WM_BASE_GET_XDG_SURFACE && alen >= 8) {
@@ -411,6 +475,125 @@ void wl_server_task(void) {
     }
 }
 
+/* --- input, from the window manager out to the client (M1983) ------------- *
+ *
+ * The desktop owns the keyboard and the mouse; a Wayland client only ever sees
+ * what the compositor forwards, and only while it has focus. That is the whole
+ * security model of the protocol, and it falls out naturally here because the
+ * events arrive from kernel/desktop.c's own input path.
+ *
+ * enter() must come first. A client ignores motion, buttons and keys for a
+ * surface it has not been told it has -- so a compositor that forwards input
+ * without entering first sends events that are correctly parsed and silently
+ * dropped, which looks exactly like input not working. */
+static unsigned g_keys_sent, g_ptr_sent;
+unsigned wl_keys_sent(void)    { return g_keys_sent; }
+unsigned wl_pointer_sent(void) { return g_ptr_sent; }
+
+static uint32_t wl_now_ms(void) { return (uint32_t)timer_ms(); }
+
+/* wl_fixed_t: signed 24.8 fixed point. Surface coordinates use it, and passing
+ * a plain integer puts the pointer at 1/256th of where it should be. */
+static uint32_t wl_fixed(int v) { return (uint32_t)(v * 256); }
+
+static void wl_ptr_enter(struct wl_client *c, int x, int y) {
+    if (c->ptr_in || !c->surface || !c->pointer) return;
+    uint8_t b[16]; int p = 0;
+    wr32(b + p, ++c->serial); p += 4;
+    wr32(b + p, c->surface);  p += 4;
+    wr32(b + p, wl_fixed(x)); p += 4;
+    wr32(b + p, wl_fixed(y)); p += 4;
+    wl_send(c, c->pointer, WL_POINTER_EV_ENTER, b, p);
+    wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+    c->ptr_in = 1;
+}
+
+static void wl_kbd_enter(struct wl_client *c) {
+    if (c->kbd_in || !c->surface || !c->keyboard) return;
+    uint8_t b[16]; int p = 0;
+    wr32(b + p, ++c->serial); p += 4;
+    wr32(b + p, c->surface);  p += 4;
+    wr32(b + p, 0);           p += 4;          /* keys: an empty array (none held) */
+    wl_send(c, c->keyboard, WL_KEYBOARD_EV_ENTER, b, p);
+    /* modifiers must follow enter: a client that never gets one keeps whatever
+     * modifier state it had from a previous focus. All clear, group 0.
+     *
+     * FIVE words -- serial, depressed, latched, locked, GROUP. Sending four
+     * is not a missing field, it is a malformed message: libwayland measures
+     * the body against the signature, fails the whole connection with EINVAL,
+     * and the client stops receiving everything, not just modifiers. */
+    uint8_t m[20]; p = 0;
+    wr32(m + p, ++c->serial); p += 4;
+    wr32(m + p, 0); p += 4;                    /* mods_depressed */
+    wr32(m + p, 0); p += 4;                    /* mods_latched */
+    wr32(m + p, 0); p += 4;                    /* mods_locked */
+    wr32(m + p, 0); p += 4;                    /* group */
+    wl_send(c, c->keyboard, WL_KEYBOARD_EV_MODIFIERS, m, p);
+    c->kbd_in = 1;
+}
+
+/* The cursor left the surface. Without this a client believes the pointer is
+ * still inside it forever -- it keeps a hover highlight up, and it never sees
+ * the enter() that should follow the cursor coming back. */
+void wl_post_pointer_leave(void) {
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used || !c->pointer || !c->ptr_in) continue;
+        uint8_t b[8]; int p = 0;
+        wr32(b + p, ++c->serial); p += 4;
+        wr32(b + p, c->surface);  p += 4;
+        wl_send(c, c->pointer, WL_POINTER_EV_LEAVE, b, p);
+        wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        c->ptr_in = 0;
+    }
+}
+
+void wl_post_motion(int x, int y) {
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used || !c->pointer) continue;
+        wl_ptr_enter(c, x, y);
+        uint8_t b[12]; int p = 0;
+        wr32(b + p, wl_now_ms()); p += 4;
+        wr32(b + p, wl_fixed(x)); p += 4;
+        wr32(b + p, wl_fixed(y)); p += 4;
+        wl_send(c, c->pointer, WL_POINTER_EV_MOTION, b, p);
+        wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        g_ptr_sent++;
+    }
+}
+
+void wl_post_button(int x, int y, unsigned button, int pressed) {
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used || !c->pointer) continue;
+        wl_ptr_enter(c, x, y);
+        uint8_t b[16]; int p = 0;
+        wr32(b + p, ++c->serial);  p += 4;
+        wr32(b + p, wl_now_ms());  p += 4;
+        wr32(b + p, button);       p += 4;     /* evdev: BTN_LEFT is 0x110 */
+        wr32(b + p, pressed ? 1u : 0u); p += 4;
+        wl_send(c, c->pointer, WL_POINTER_EV_BUTTON, b, p);
+        wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        g_ptr_sent++;
+    }
+}
+
+void wl_post_key(unsigned keycode, int pressed) {
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used || !c->keyboard) continue;
+        wl_kbd_enter(c);
+        uint8_t b[16]; int p = 0;
+        wr32(b + p, ++c->serial); p += 4;
+        wr32(b + p, wl_now_ms()); p += 4;
+        wr32(b + p, keycode);     p += 4;      /* evdev keycode, NOT a character */
+        wr32(b + p, pressed ? 1u : 0u); p += 4;
+        wl_send(c, c->keyboard, WL_KEYBOARD_EV_KEY, b, p);
+        g_keys_sent++;
+    }
+}
+
 int wl_compositor_poll(void) {
     if (g_listener < 0) return 0;
     int worked = 0;
@@ -424,6 +607,8 @@ int wl_compositor_poll(void) {
         struct wl_client *c = &g_cl[slot];
         c->used = 1; c->ep = ep; c->inlen = 0; c->registry = 0; c->nobj = 0;
         c->serial = 0; c->title[0] = 0;
+        c->pointer = c->keyboard = c->surface = 0;
+        c->ptr_in = c->kbd_in = 0;
         g_nconn++;
         kprintf("[wl] client connected (ep %d)\n", ep);
         worked++;

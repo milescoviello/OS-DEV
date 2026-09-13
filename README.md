@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1982-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1983-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -773,8 +773,30 @@ Landed so far, all on the from-scratch ext2 driver:
   load-bearing first step and not the finish line: rendering a page into a
   window is the goal.
 
-Still ahead: input (`wl_seat` back out to the client), and Firefox actually
-painting. The honest scale is still months.
+- **M1983** — **`wl_seat`: a Wayland window takes real input.** The desktop
+  already owned the keyboard and the mouse; it now forwards them to the focused
+  client as `wl_pointer` and `wl_keyboard` events, in **surface-relative**
+  coordinates it computes from the window's own position. The test is driven by
+  real QEMU input: it *screendumps to find where the surface landed*, aims the
+  pointer at a known offset inside it, and asserts the client reports that same
+  offset back — so the whole chain of arithmetic (screen → window → surface) is
+  checked, not merely that an event arrived. Pointer focus follows the cursor
+  (`enter` → `leave` → a second `enter`), keyboard focus follows the window, and
+  a press of `a` arrives as **evdev keycode 30** — a keycode, not a character.
+
+  Two failures worth recording, both of the same shape: **a well-formed-looking
+  message that is the wrong length kills the connection, not the feature.**
+  `wl_keyboard.keymap` carries its `fd` out-of-band in an `SCM_RIGHTS` control
+  message, so the descriptor occupies *no space in the body* — writing a
+  placeholder word for it made libwayland reject the message and drop the
+  client, which presents as a keyboard that receives nothing at all.
+  `wl_keyboard.modifiers` is **five** words (serial, depressed, latched, locked,
+  **group**); sending four is not a missing field, it is a malformed message,
+  and libwayland failed the whole connection with `EINVAL`. In both cases the
+  visible symptom was "input does not work", several layers away from the cause.
+
+Still ahead: a real xkb keymap in a kernel-created memfd (GTK needs one for text
+input), and Firefox actually painting. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

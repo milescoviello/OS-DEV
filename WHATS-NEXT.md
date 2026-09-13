@@ -1,5 +1,46 @@
 # What's next
 
+> **(M1983) PHASE 8: A WAYLAND WINDOW IN OS-DEV NOW TAKES REAL INPUT.**
+>
+> ```
+>   ok: located the client's surface on screen at (286,222) -- aiming input at it
+>   ok: the pointer arrived at SURFACE-relative (19,11) for an aim of (20,12)
+>   ok: wl_pointer.enter preceded the motion
+>   ok: moving off the surface sent wl_pointer.leave
+>   ok: moving back on sent a second wl_pointer.enter -- focus tracks the cursor
+>   ok: a real mouse click arrived as wl_pointer.button BTN_LEFT (0x110)
+>   ok: pressing 'a' arrived as wl_keyboard.key evdev keycode 30
+> ```
+>
+> A window a client can draw into but cannot be typed into is not a usable
+> window, so this is the other half of the display path. `kernel/desktop.c`
+> already owned the keyboard and the mouse; it now forwards them to the focused
+> Wayland client, converting screen coordinates into **surface-relative** ones
+> from the window's own geometry, and converting our cooked character stream
+> into the **evdev keycodes** the protocol actually carries.
+>
+> **The test does not know where the window is, and that is the point.** It
+> screendumps, finds the client's surface by its colour, aims the pointer at a
+> known offset inside it, and asserts the client reports *that same offset* back
+> — so the whole chain of arithmetic is checked rather than "an event arrived".
+> Pointer focus follows the cursor and keyboard focus follows the window, which
+> is why the sequence is enter → leave → a **second** enter: a leave that cannot
+> be undone is a bug that only shows up on the way back in.
+>
+> **Two failures, both the same shape: a message of the wrong length kills the
+> connection, not the feature.** `wl_keyboard.keymap` carries its `fd`
+> out-of-band in an `SCM_RIGHTS` control message, so the descriptor occupies *no
+> space in the body*; writing a placeholder word for it made libwayland reject
+> the message and drop the client, presenting as a keyboard that received
+> nothing at all — including events with nothing to do with the keyboard.
+> `wl_keyboard.modifiers` is **five** words (serial, depressed, latched, locked,
+> **group**) and I sent four, which failed the connection with `EINVAL`. Both
+> times the symptom was "input does not work", several layers from the cause.
+>
+> Still ahead here: a real xkb keymap in a **kernel-created memfd** passed over
+> SCM_RIGHTS — GTK will not do text input without one — and then Firefox
+> actually painting.
+
 > **(M1975) PHASE 7: CLAUDE CODE RUNS INSIDE OS-DEV.**
 >
 > ```
