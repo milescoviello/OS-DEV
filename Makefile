@@ -127,7 +127,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -204,6 +204,16 @@ $(LXROOT)/lxmmap: tools/lx/lxmmap.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (MAP_FIXED mmap)"
 
+$(LXROOT)/lxwlraw: tools/lx/lxwlraw.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (the Wayland handshake by hand, with a hexdump)"
+
+$(LXROOT)/lxwl: tools/lx/lxwl.c
+	@mkdir -p $(LXROOT)
+	$(CC) -O2 -o $@ $< -lwayland-client
+	@echo "  HOSTCC  $@ (a REAL libwayland client -- the same library Firefox uses)"
+
 $(LXROOT)/lxscm: tools/lx/lxscm.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -254,7 +264,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
@@ -307,7 +317,10 @@ $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 	@cp -f $< $@
 	@echo "  STAGE   $@ (the Makefile GNU make runs INSIDE OS-DEV)"
 
-$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
+# Depends on lxwl as well: the libwayland-client closure is staged FROM that
+# binary, so it has to exist first. Without the dependency the staging step ran
+# before the client was built and silently skipped it. (M1978)
+$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl
 	@mkdir -p $(LXROOT)
 	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@tools/stage-linux-tool.sh $(LXROOT) make "$$(command -v gmake || command -v make)"
@@ -337,6 +350,12 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh
 	@# ICU, nghttp2, simdjson) -- staged whole and unmodified, exactly like the
 	@# toolchain. We do not port Node; we run it.
 	@tools/stage-linux-tool.sh $(LXROOT) node
+	@# PHASE 8: libwayland-client and its closure, so a real Wayland client can
+	@# run in-guest. Staged from the lxwl binary we just built against it.
+	@# ABSPATH, not a relative one: the staging script only accepts an absolute
+	@# binary path (a relative one looks like a bare command name and it goes
+	@# looking in /usr/bin, then skips). (M1978)
+	@if [ -f $(LXROOT)/lxwl ]; then tools/stage-linux-tool.sh $(LXROOT) lxwl $(abspath $(LXROOT)/lxwl); fi
 	@for t in echo cat ls; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@# PHASE 7: Claude Code. A single 214 MB dynamically-linked ELF (a Node
@@ -1472,6 +1491,11 @@ gfxtest: $(KERNEL) $(DISK)
 browsertest: $(KERNEL) $(DISK)
 	@tests/run-browser-tests.sh
 
+# PHASE 8: OS-DEV's own Wayland compositor, exercised by a REAL libwayland
+# client (the same library Firefox uses). In `make check`: one 2 GiB boot.
+waylandtest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-wayland-tests.sh
+
 # PHASE 7: Claude Code in-guest. A 214 MB non-PIE ET_EXEC built with Bun, so
 # the engine is JavaScriptCore. NOT in `make check`: every start is minutes
 # under TCG. SKIPs cleanly when it was never staged.
@@ -1523,7 +1547,7 @@ check:
 	@$(MAKE) --no-print-directory $(CHECK_SERIAL)
 	@echo "ALL TESTS PASSED (parallel pool + $(CHECK_SERIAL) serially)"
 
-check-all: lxinettest jstest imgtest x509test tlsfuzztest nettest tcpreliabletest fstest ext2test xattrtest iso9660test kattest bignumfuzztest barrettfuzztest stringtest svgtest deflatetest pngenctest ziptest tartest heaptest journaltest wavtest acpiamltest webptest elftest httptest kheaptest jsonfuzztest regexfuzztest jssrcfuzztest htmlentfuzztest htmlattrtest urltest colortest csstest csseltest readertest shgreptest shsedtest shmathtest shsplittest shbracetest shexpandtest shquotetest shtesttest lsfmttest shsorttest shtxttest wsframetest wsclienttest usbbottest layouttest sha1test calctest sheettest plottest jsoncoretest difftest mdtest editortest arctest hashtest normpathtest completetest boottest kstacktest ustacktest wxtest smeptest smpthreadtest smpschedtest journalguesttest fatjournaltest netcontest gdbstubtest rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest ehcitest xhcitest hdatest ipctest linuxabitest
+check-all: waylandtest lxinettest jstest imgtest x509test tlsfuzztest nettest tcpreliabletest fstest ext2test xattrtest iso9660test kattest bignumfuzztest barrettfuzztest stringtest svgtest deflatetest pngenctest ziptest tartest heaptest journaltest wavtest acpiamltest webptest elftest httptest kheaptest jsonfuzztest regexfuzztest jssrcfuzztest htmlentfuzztest htmlattrtest urltest colortest csstest csseltest readertest shgreptest shsedtest shmathtest shsplittest shbracetest shexpandtest shquotetest shtesttest lsfmttest shsorttest shtxttest wsframetest wsclienttest usbbottest layouttest sha1test calctest sheettest plottest jsoncoretest difftest mdtest editortest arctest hashtest normpathtest completetest boottest kstacktest ustacktest wxtest smeptest smpthreadtest smpschedtest journalguesttest fatjournaltest netcontest gdbstubtest rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest ehcitest xhcitest hdatest ipctest linuxabitest
 	@echo "ALL TESTS PASSED (jstest + imgtest + x509test + tlsfuzztest + nettest + tcpreliabletest + fstest + ext2test + xattrtest + iso9660test + kattest + bignumfuzztest + barrettfuzztest + stringtest + svgtest + deflatetest + pngenctest + ziptest + tartest + heaptest + journaltest + wavtest + acpiamltest + webptest + elftest + httptest + kheaptest + jsonfuzztest + regexfuzztest + jssrcfuzztest + htmlentfuzztest + htmlattrtest + urltest + colortest + csstest + csseltest + readertest + shgreptest + shsedtest + shmathtest + shsplittest + shbracetest + shexpandtest + shquotetest + shtesttest + lsfmttest + shsorttest + shtxttest + wsframetest + wsclienttest + usbbottest + layouttest + sha1test + calctest + sheettest + plottest + jsoncoretest + difftest + mdtest + editortest + arctest + hashtest + normpathtest + completetest + boottest + kstacktest + ustacktest + wxtest + smeptest + smpthreadtest + smpschedtest + journalguesttest + fatjournaltest + netcontest + gdbstubtest + rtl8139test + virtionettest + virtioblktest + virtiorngtest + virtioconsoletest + nvmetest + floppytest + parttest + blockdevtest + raidtest + ahcitest + atapitest + atalba48test + idedmatest + virtiogputest + svgatest + usbstoragetest + usbkbdtest + ehcitest + xhcitest + hdatest + httpdtest + gfxtest + browsertest + layoutrendertest + ipctest + linuxabitest)"
 
 clean:

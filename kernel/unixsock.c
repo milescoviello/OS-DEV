@@ -22,6 +22,7 @@
  * double-claimed slot. Same idiom as pmm.c/swap.c/tls.c/pty.c/mbox.c. */
 #include "unixsock.h"
 #include "task.h"
+#include "console.h"   /* kprintf for the close/EOF trace (M1978) */
 
 static volatile int usock_lock;
 static inline uint64_t usock_irq_save(void) {
@@ -190,16 +191,31 @@ long unix_recv(int ep, void *buf, unsigned long max) {
     struct uring *rx = s ? &c->a2b : &c->b2a;                    /* B reads a2b, A reads b2a */
     int self_closed = s ? c->b_closed : c->a_closed;
     if (self_closed) { usock_irq_restore(fl); return -1; }       /* we closed our own end */
-    if (rcount(rx) == 0) {
+    /* WAIT IN A LOOP, and never report EOF for an empty ring (M1978).
+     *
+     * This used to block once and, if the ring was still empty on waking,
+     * return 0 -- which to every caller means END OF FILE. A spurious wake is
+     * not EOF, and spurious wakes are routine here: task_wake on a task that
+     * has not blocked yet sets `wake_pending`, so a burst of sends while the
+     * reader is running leaves a wake banked that fires the instant it finally
+     * blocks. A Wayland client hit this exactly: it read 94 bytes of our
+     * registry events, came back for the rest, and got 0 -- libwayland reads
+     * that as the compositor hanging up, and wl_display_roundtrip never
+     * returns. EOF is a property of the PEER, not of the ring being empty. */
+    while (rcount(rx) == 0) {
         int peer_closed = (s ? c->a_closed : c->b_closed) || (s ? c->a_wr_closed : c->b_wr_closed);
-        if (peer_closed) { usock_irq_restore(fl); return 0; }    /* EOF: peer closed (or shut down writing) and ring drained */
+        if (peer_closed) {
+            if (g_unix_verbose)
+                kprintf("[usock] recv(ep %d side %d) EOF: a_closed=%d b_closed=%d a_wr=%d b_wr=%d\n",
+                        ep, s, c->a_closed, c->b_closed, c->a_wr_closed, c->b_wr_closed);
+            usock_irq_restore(fl); return 0;                     /* EOF: peer closed (or shut down writing) and ring drained */
+        }
         task_t **mw = s ? &c->b_waiter : &c->a_waiter;
         *mw = task_self();
         usock_irq_restore(fl);
         task_block();                                            /* woken by the peer's send/close (or a kill) */
         fl = usock_irq_save();
         *mw = 0;
-        if (rcount(rx) == 0) { usock_irq_restore(fl); return 0; }   /* still empty -> EOF / spurious, don't re-block */
     }
     int got = rget(rx, (unsigned char *)buf, (int)max);
     usock_irq_restore(fl);
@@ -220,9 +236,11 @@ int unix_shutdown(int ep, int how) {
     return 0;
 }
 
+int g_unix_verbose;     /* -append unixverbose: trace closes and EOF decisions */
 int unix_close(int ep) {
     uint64_t fl = usock_irq_save();
     int s; struct uconn *c = ep_conn(ep, &s); if (!c) { usock_irq_restore(fl); return -1; }
+    if (g_unix_verbose) kprintf("[usock] close(ep %d side %d)\n", ep, s);
     if (s) c->b_closed = 1; else c->a_closed = 1;
     task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer so its recv returns EOF */
     if (*pw) { task_wake(*pw); *pw = 0; }

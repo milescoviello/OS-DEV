@@ -35,6 +35,7 @@
 #include "smp.h"
 #include "task.h"
 #include "lxerrno.h"
+#include "wayland.h"   /* g_wl_verbose (M1978) */
 #include "vmm.h"
 #include "app.h"
 #include "rtc.h"
@@ -1099,6 +1100,7 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_recvmsg_:
     case LXS_recvmmsg_: {                   /* (fd, msg[vec], vlen, flags[, timeout]) */
         int is_mm = (r->rax == LXS_recvmmsg_);
+        long rflags = is_mm ? (long)r->r10 : (long)r->rdx;   /* recvmsg(fd,msg,flags); recvmmsg(fd,vec,vlen,flags,ts) */
         unsigned long vlen = is_mm ? (unsigned long)r->rdx : 1;
         if (vlen > 64) vlen = 64;
         unsigned long stride = is_mm ? 64 : 56;
@@ -1115,10 +1117,31 @@ void linux_syscall_dispatch(struct registers *r) {
             /* Receive into a staging buffer and SCATTER: a datagram arrives
              * whole and then fills the iovecs in order. */
             static uint8_t sbuf[2048];
+            /* NEVER read more than the caller can take. Reading into a staging
+             * buffer and scattering means anything past the end of the iovecs
+             * is DROPPED -- and for a stream socket those bytes are gone from
+             * the ring, so the caller is silently short. A Wayland client read
+             * 94 bytes of a 148-byte burst of registry events and waited
+             * forever for the other 54, which had been thrown away here.
+             * (M1978) */
+            unsigned long want = 0;
+            for (uint64_t i = 0; i < iovlen; i++) want += v[i].iov_len;
+            if (want > sizeof sbuf) want = sizeof sbuf;
+            if (!want) break;
             uint8_t sip[4] = {0,0,0,0}; uint16_t sp = 0;
             long gn;
-            if (app_fd_type((int)a1) == 9) gn = app_recvfrom((int)a1, sbuf, (int)sizeof sbuf, sip, &sp);
-            else                            gn = app_fd_read((int)a1, sbuf, sizeof sbuf);
+            /* MSG_DONTWAIT (0x40) makes THIS CALL non-blocking regardless of
+             * the descriptor's own O_NONBLOCK. Ignoring it is not a shortcut,
+             * it is a hang: libwayland reads with MSG_DONTWAIT on a BLOCKING
+             * socket and loops until it gets EAGAIN, so a read that waits
+             * instead never comes back -- wl_display_read_events stopped dead
+             * there with every byte already delivered. (M1978) */
+            int nb_save = app_fd_nonblock((int)a1);
+            if (rflags & 0x40) app_fd_set_nonblock((int)a1, 1);
+            if (app_fd_type((int)a1) == 9) gn = app_recvfrom((int)a1, sbuf, (int)want, sip, &sp);
+            else                            gn = app_fd_read((int)a1, sbuf, want);
+            if (rflags & 0x40) app_fd_set_nonblock((int)a1, nb_save);
+            if (g_wl_verbose) kprintf("[sock] recvmsg(fd %ld) want=%lu -> %ld\n", a1, want, gn);
             if (gn == APP_FD_EAGAIN) { if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; goto msgdone; } break; }
             if (gn < 0) break;
             unsigned long off = 0;

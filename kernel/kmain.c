@@ -8,6 +8,8 @@
 #include "console.h"
 #include "vga.h"
 #include "gdt.h"
+#include "unixsock.h"   /* g_unix_verbose (M1978) */
+#include "wayland.h"    /* Wayland display server (M1978) */
 #include "linuxabi.h"
 #include "interrupts.h"
 #include "timer.h"
@@ -245,6 +247,9 @@ static volatile int g_lxfull_test;            /* -append lxfulltest: the whole L
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
+static volatile int g_wlraw;                  /* -append wlraw: also run the raw handshake client (M1978) */
+
+static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
@@ -493,6 +498,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
+        if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
+        if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
+        if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
@@ -847,6 +855,46 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * this proves the MECHANISM fires on a genuinely multi-threaded
              * process, which is the part that can be asserted reliably. */
             kprintf("[lxabi] TLB shootdowns performed: %lu\n", vmm_tlb_shootdown_count());
+        }
+        if (g_wltest) {
+            /* PHASE 8 (M1978): bring the display up, then run a REAL
+             * libwayland client against it -- the same library Firefox uses,
+             * so a pass means the wire format is right by the standard rather
+             * than by agreement with our own idea of it.
+             *
+             * The compositor is polled from HERE rather than a background
+             * task: the client is run synchronously, so the two have to take
+             * turns, and app_run_linux_sync returns only when the client has
+             * exited. A background task is the next step, once the compositor
+             * owns a window. */
+            vfs_mkdir("/disk2/run");
+            if (wl_compositor_init() == 0) {
+                /* The compositor runs as its OWN TASK. Driving it from here in
+                 * lockstep with one synchronous client was a scaffold, and a
+                 * misleading one: when the loop's budget ran out the display
+                 * simply stopped answering, which looks exactly like a client
+                 * that has hung. A display server has to keep serving whatever
+                 * its clients are doing. */
+                task_create(wl_server_task, 0, 0);
+                /* The raw client first: it proves whether the BYTES arrive
+                 * intact, independently of libwayland's opinion of them. */
+                if (g_wlraw) {
+                    kprintf("[wl] raw handshake client...\n");
+                    app_run_linux_sync("/disk2/lxwlraw", 0, 0, 60000);
+                }
+                kprintf("[wl] spawning a real libwayland client...\n");
+                app_spawn_linux_from_file("/disk2/lxwl");
+                for (int t = 0; t < 6000; t++) {
+                    task_sleep_ms(10);
+                    if (wl_messages_handled() >= 4 && t > 100) break;
+                }
+                /* If the client stalled, the ring says what it was doing --
+                 * a compositor that sent everything correctly and a client
+                 * that never reads look identical from this side. */
+                if (wl_messages_handled() < 4) lx_trace_dump("a stalled Wayland client");
+                kprintf("[wl] summary: %u client(s), %u message(s), %u global(s) sent\n",
+                        wl_clients_connected(), wl_messages_handled(), wl_globals_sent());
+            }
         }
         if (g_lxclaude_test) {
             /* Claude Code on its own boot. It is a 214 MB non-PIE ET_EXEC

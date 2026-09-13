@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1977-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1978-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -723,8 +723,21 @@ Landed so far, all on the from-scratch ext2 driver:
   can actually be aliased into a process, and is frozen once mapped (growing
   would leave every existing mapping pointing at freed memory).
 
-Still ahead: the compositor itself, then Firefox. The honest scale is still
-months.
+- **M1978** — **a real Wayland client talks to OS-DEV's own compositor.**
+  `LXWL: connected, 4 globals, wl_compositor bound, 2 roundtrips OK` — from a
+  client built against **libwayland-client, the same library Firefox and GTK
+  use**, staged unmodified. Not a ported X server: the protocol is a Unix socket
+  plus shared memory, both of which we now have, and a Wayland compositor *is* a
+  window manager, so this stays additive to `kernel/desktop.c` rather than
+  putting a foreign server in charge of windows. The blocker was ours and
+  invisible from outside the process: libwayland reads with **`MSG_DONTWAIT`**
+  on a *blocking* socket and loops until it gets `EAGAIN`, and we ignored the
+  flag — so `wl_display_read_events` stopped dead with every byte already
+  delivered. A raw client that used `read()` instead never hit it, which is what
+  made the bytes look innocent.
+
+Still ahead: surfaces and shared-memory buffers, then a window, then Firefox.
+The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

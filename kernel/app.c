@@ -4462,7 +4462,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * all. gcc creates its intermediate .s exactly that way. (M1960) */
         vfs_cwd_set_for(a, "/disk2");
         { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
-        static const char *argv0[2 + LX_PEND_ARGS], *envp0[6];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[8];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
          * re-execs itself by argv[0] (lxbox does) would otherwise ask for
@@ -4485,7 +4485,15 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * directories explicitly is the portable substitute, and it
          * propagates to everything a program execs. (M1964) */
         envp0[3] = "LD_LIBRARY_PATH=/usr/lib64:/lib64:/usr/lib/gcc/x86_64-pc-linux-gnu/15:/usr/lib64/binutils/x86_64-pc-linux-gnu/2.46.0";
-        envp0[4] = 0;
+        /* Wayland finds its display socket through the environment and
+         * nothing else: libwayland's wl_display_connect(NULL) reads
+         * XDG_RUNTIME_DIR and WAYLAND_DISPLAY, and simply fails if the first
+         * is unset -- which is what a real client did here before this line.
+         * The socket lives at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY, so these two
+         * have to name what kernel/wayland.c actually bound. (M1978) */
+        envp0[4] = "XDG_RUNTIME_DIR=/run";
+        envp0[5] = "WAYLAND_DISPLAY=wayland-0";
+        envp0[6] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to
          * map its shared libraries first and only then jump to the entry. */

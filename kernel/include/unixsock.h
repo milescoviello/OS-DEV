@@ -12,6 +12,7 @@
  * (task_block) until data arrives or the peer closes (EOF).
  */
 
+extern int g_unix_verbose;   /* trace closes + EOF decisions (M1978) */
 int  unix_listen(const char *path);                            /* -> listener id, or -1 */
 int  unix_connect(const char *path);                           /* -> endpoint id (client side A), or -1 */
 int  unix_accept(int lid);                                     /* -> endpoint id (server side B); blocks; -1 bad lid */
