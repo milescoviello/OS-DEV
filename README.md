@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1983-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1984-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -795,8 +795,27 @@ Landed so far, all on the from-scratch ext2 driver:
   and libwayland failed the whole connection with `EINVAL`. In both cases the
   visible symptom was "input does not work", several layers away from the cause.
 
-Still ahead: a real xkb keymap in a kernel-created memfd (GTK needs one for text
-input), and Firefox actually painting. The honest scale is still months.
+- **M1984** — **our own XKB keymap, handed to a client over `SCM_RIGHTS`.**
+  Wayland does not carry key labels; it carries a **file descriptor** to a
+  keymap the client compiles with libxkbcommon, and a client that never gets one
+  turns no keycode into a character — GTK, and therefore Firefox, does no text
+  input without it. `kernel/include/xkbmap.h` is a hand-written US layout,
+  deliberately **self-contained** (no `include "complete"`) so it compiles with
+  `XKB_CONTEXT_NO_DEFAULT_INCLUDES` and needs no `/usr/share/X11/xkb` tree in the
+  guest. The kernel builds a memfd from it and queues it for the client's next
+  `recvmsg` — the **first descriptor this system passes in that direction**, the
+  kernel giving a process a file rather than taking one. End to end in-guest:
+  `[wl] sent xkb keymap (7138 bytes) as a memfd` →
+  `LXWL-XKB: compiled the compositor's keymap` →
+  `LXWL-XKB-KEY: evdev 30 -> keysym a, text "a"`.
+
+  It also fixed a real bug it would otherwise have hit: the `SCM_RIGHTS` mailbox
+  was **one slot per connection, shared by both directions**, so a process could
+  receive back the descriptor it had just sent, and only one could ever be in
+  flight. It is now a per-direction FIFO — order matters, because libwayland
+  matches descriptors to messages by the order it pops them.
+
+Still ahead: Firefox actually painting. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

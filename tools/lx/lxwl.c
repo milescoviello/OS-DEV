@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <xkbcommon/xkbcommon.h>
 
 static int n_globals;
 static struct wl_compositor *comp;
@@ -36,13 +37,36 @@ static struct wl_keyboard *kbd;
 static struct wl_pointer *ptr;
 static int configured;
 static int n_keys, n_motion, n_buttons;
+/* libxkbcommon: the SAME library GTK uses to turn a keycode into text. */
+static struct xkb_context *xkb_ctx;
+static struct xkb_keymap  *xkb_km;
+static struct xkb_state   *xkb_st;
 
 /* The listeners below take every event in the interface because libwayland
  * calls through a table -- a NULL entry for an event the compositor sends is a
  * crash, not a no-op. */
 static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, uint32_t sz) {
-    (void)d;(void)k;(void)fd;(void)sz;
-    printf("LXWL-INPUT: keymap format %u\n", f); fflush(stdout);
+    (void)d;(void)k;
+    printf("LXWL-INPUT: keymap format %u, fd %d, %u bytes\n", f, fd, sz); fflush(stdout);
+    /* This is exactly what GTK does with the event: map the descriptor the
+     * compositor passed, hand the text to libxkbcommon, and keep the compiled
+     * keymap for the rest of the connection. If any of it fails there is no
+     * text input -- only raw keycodes, which no toolkit will use. */
+    char *map = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        printf("LXWL-XKB: mmap of the keymap fd FAILED\n"); fflush(stdout); close(fd); return;
+    }
+    /* NO_DEFAULT_INCLUDES: the keymap must be self-contained, because the guest
+     * has no /usr/share/X11/xkb tree for an `include` to resolve against. */
+    xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_DEFAULT_INCLUDES);
+    if (xkb_ctx)
+        xkb_km = xkb_keymap_new_from_string(xkb_ctx, map, XKB_KEYMAP_FORMAT_TEXT_V1, 0);
+    munmap(map, sz); close(fd);
+    if (!xkb_km) { printf("LXWL-XKB: the keymap did NOT compile\n"); fflush(stdout); return; }
+    xkb_st = xkb_state_new(xkb_km);
+    printf("LXWL-XKB: compiled the compositor's keymap (%u bytes, %u keycodes)\n",
+           sz, (unsigned)(xkb_keymap_max_keycode(xkb_km) - xkb_keymap_min_keycode(xkb_km) + 1));
+    fflush(stdout);
 }
 static void kb_enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *su, struct wl_array *keys) {
     (void)d;(void)k;(void)s;(void)su;(void)keys;
@@ -51,10 +75,25 @@ static void kb_enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surfa
 static void kb_leave(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *su) { (void)d;(void)k;(void)s;(void)su; }
 static void kb_key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t key, uint32_t st) {
     (void)d;(void)k;(void)s;(void)t;
-    if (st) { n_keys++; printf("LXWL-KEY: evdev keycode %u pressed\n", key); fflush(stdout); }
+    if (st) {
+        n_keys++;
+        printf("LXWL-KEY: evdev keycode %u pressed\n", key); fflush(stdout);
+        if (xkb_st) {
+            /* XKB keycodes are evdev + 8. Getting that offset wrong yields a
+             * plausible WRONG character for every key rather than an error. */
+            char txt[32] = {0}, nm[64] = {0};
+            xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_st, key + 8);
+            xkb_keysym_get_name(sym, nm, sizeof nm);
+            xkb_state_key_get_utf8(xkb_st, key + 8, txt, sizeof txt);
+            printf("LXWL-XKB-KEY: evdev %u -> keysym %s, text \"%s\"\n", key, nm, txt);
+            fflush(stdout);
+        }
+    }
 }
 static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s, uint32_t dep, uint32_t lat, uint32_t lock, uint32_t grp) {
-    (void)d;(void)k;(void)s;(void)dep;(void)lat;(void)lock;(void)grp;
+    (void)d;(void)k;(void)s;
+    /* Feed the compositor's modifier state into xkb, or Shift+a stays 'a'. */
+    if (xkb_st) xkb_state_update_mask(xkb_st, dep, lat, lock, 0, 0, grp);
 }
 static void kb_repeat(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay) { (void)d;(void)k;(void)rate;(void)delay; }
 static const struct wl_keyboard_listener kbd_listener = {

@@ -1,5 +1,41 @@
 # What's next
 
+> **(M1984) OUR OWN XKB KEYMAP, HANDED TO A CLIENT OVER SCM_RIGHTS.**
+>
+> ```
+> [wl] sent xkb keymap (7138 bytes) as a memfd
+> LXWL-XKB: compiled the compositor's keymap (7138 bytes, 127 keycodes)
+> LXWL-XKB-KEY: evdev 30 -> keysym a, text "a"
+> ```
+>
+> Wayland carries no key labels. It carries a **descriptor** to a keymap the
+> client compiles with libxkbcommon, and a client that never receives one turns
+> no keycode into a character at all — GTK, and therefore Firefox, will take no
+> text input without it. `kernel/include/xkbmap.h` is a hand-written US layout
+> that is deliberately **self-contained**: no `include "complete"`, so it
+> compiles under `XKB_CONTEXT_NO_DEFAULT_INCLUDES` and needs none of the
+> `/usr/share/X11/xkb` data files in the guest. `tests/run-xkb-tests.sh`
+> compiles that exact string with the real libxkbcommon on the host — 22 checks
+> in under a second — because a bad keymap presents only as "typing does
+> nothing", minutes into a TCG boot and several layers from the cause.
+>
+> **This is the first descriptor the system passes in that direction**: the
+> kernel *giving* a process a file rather than taking one. `app_scm_give_kernel_memfd`
+> builds a memfd from a kernel buffer and queues it for the client's next
+> `recvmsg`, which installs it as an ordinary fd the client can `mmap`.
+>
+> Doing that exposed a real bug in `SCM_RIGHTS` itself. The mailbox was **one
+> slot per connection, shared by both directions**, which meant a process could
+> **receive back the descriptor it had just sent** — a Wayland client passes its
+> pool memfd and immediately reads the reply — and only one could ever be in
+> flight, so a toolkit passing several silently lost all but the first. It is
+> now a per-connection, per-direction **FIFO**: order matters, because
+> libwayland matches descriptors to messages by the order it pops them.
+>
+> Mutating `scm_in` back to the shared slot fails exactly the right things: the
+> compositor stops receiving the client's pixels, and the client compiles its
+> own pool as a keymap and fails.
+
 > **(M1983) PHASE 8: A WAYLAND WINDOW IN OS-DEV NOW TAKES REAL INPUT.**
 >
 > ```

@@ -107,6 +107,24 @@ if grep -aq 'toplevel title: "OS-DEV Wayland demo"' "$SLOG"; then
 else
     echo "  FAIL: set_title did not arrive:"; grep -a "toplevel title" "$SLOG" | head -2; f=1
 fi
+# THE KEYMAP (M1984). Wayland does not carry key labels -- it carries a
+# descriptor to a keymap the client compiles with libxkbcommon, and a client
+# that never gets one turns no keycode into a character. This is the kernel
+# handing a client a file it created, over SCM_RIGHTS, in the other direction
+# from the pixels above.
+ksz=$(grep -ao "\[wl\] sent xkb keymap ([0-9]* bytes)" "$SLOG" | head -1 | tr -dc 0-9)
+csz=$(grep -ao "LXWL-INPUT: keymap format 1, fd [0-9]*, [0-9]* bytes" "$SLOG" | head -1 | awk '{print $(NF-1)}')
+if [ -n "$ksz" ] && [ "$ksz" = "$csz" ]; then
+    echo "  ok: the compositor handed over its own XKB keymap as a kernel-created memfd ($ksz bytes, and the client sees the same size)"
+else
+    echo "  FAIL: the keymap was not delivered intact (compositor sent '$ksz', client saw '$csz'):"
+    grep -a "keymap" "$SLOG" | head -3; f=1
+fi
+if grep -aq "LXWL-XKB: compiled the compositor's keymap" "$SLOG"; then
+    echo "  ok: the client mmap'd that descriptor and libxkbcommon COMPILED it ($(grep -ao "compiled the compositor's keymap ([^)]*)" "$SLOG" | head -1))"
+else
+    echo "  FAIL: libxkbcommon did not compile the keymap:"; grep -a "LXWL-XKB\|LXWL-INPUT: keymap" "$SLOG" | head -3; f=1
+fi
 if grep -aq "LXWL-XDG: toplevel configured and acknowledged" "$SLOG"; then
     echo "  ok: the xdg_surface.configure / ack_configure handshake completed"
 else

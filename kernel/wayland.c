@@ -37,6 +37,7 @@
 #include "timer.h"
 #include "task.h"
 #include "app.h"    /* app_scm_take_memfd: the client's pixels (M1979) */
+#include "xkbmap.h" /* our own XKB keymap, handed over as a memfd (M1984) */
 
 /* The path clients connect to. It carries the compat root because a Linux
  * program's socket path goes through the ABI layer's translation, and both
@@ -372,20 +373,33 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     }
     if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_KEYBOARD && alen >= 4) {
         c->keyboard = rd32(args); obj_add(c, c->keyboard, WLK_KEYBOARD);
-        /* NO KEYMAP EVENT YET, deliberately.
+        /* THE KEYMAP (M1984). wl_keyboard.keymap is (format, fd, size), and a
+         * client that never receives one cannot turn a keycode into a
+         * character at all -- GTK, and therefore Firefox, does no text input
+         * without it.
          *
-         * wl_keyboard.keymap is (format, fd, size) and the `fd` is an
-         * OUT-OF-BAND argument: it occupies no space in the message body and
-         * travels as an SCM_RIGHTS control message. Sending a placeholder word
-         * for it produces a message libwayland parses as malformed, and it
-         * kills the connection -- which presents as a client that asked for a
-         * keyboard and then received nothing at all, including events that had
-         * nothing to do with the keyboard.
+         * `fd` is an OUT-OF-BAND argument: it occupies NO SPACE IN THE MESSAGE
+         * BODY and travels as an SCM_RIGHTS control message. The body is two
+         * words, format and size. Writing a placeholder word for the fd -- as
+         * this did at first -- produces a message libwayland parses as
+         * malformed and answers by killing the connection, which presents as a
+         * client that asked for a keyboard and then received nothing at all,
+         * including events with nothing to do with the keyboard.
          *
-         * Passing a real descriptor from the kernel means an xkb keymap in a
-         * kernel-created memfd, which is the next piece of this. Until then a
-         * client gets a pointer, repeat_info, and key events whose evdev codes
-         * it can use directly if it wants them. */
+         * The order matters too: the descriptor must be queued BEFORE the
+         * bytes are written, because libwayland pops the next descriptor when
+         * it demarshals an argument declared as one. */
+        unsigned long klen = 0; while (osdev_xkb_keymap[klen]) klen++;
+        klen++;                                     /* the protocol's size INCLUDES the NUL */
+        if (app_scm_give_kernel_memfd(c->ep, "osdev-keymap", osdev_xkb_keymap, klen) == 0) {
+            uint8_t kb[8];
+            wr32(kb + 0, 1);                        /* XKB_V1 */
+            wr32(kb + 4, (uint32_t)klen);           /* ...and NO word for the fd */
+            wl_send(c, c->keyboard, WL_KEYBOARD_EV_KEYMAP, kb, 8);
+            kprintf("[wl] sent xkb keymap (%u bytes) as a memfd\n", (unsigned)klen);
+        } else {
+            kprintf("[wl] could not hand over the keymap\n");
+        }
         uint8_t ri[8];
         wr32(ri + 0, 25); wr32(ri + 4, 400); /* repeat: 25/s after 400 ms */
         wl_send(c, c->keyboard, WL_KEYBOARD_EV_REPEAT, ri, 8);

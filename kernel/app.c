@@ -836,28 +836,56 @@ static struct app *cur(void) { return (struct app *)task_self()->proc; }
  * endpoint is delivered to the other. */
 extern int unix_ep_conn(int ep);   /* kernel/unixsock.c */
 #define SCM_SLOTS 16
-static struct { int valid; struct fdent fe; } g_scm[SCM_SLOTS];
+#define SCM_QDEPTH 4
+/* DIRECTIONAL, and a queue (M1984).
+ *
+ * This was a single slot per connection, shared by both sides. Two bugs came
+ * with that, and neither is theoretical now that a real protocol runs over it:
+ *
+ *  - A process could RECEIVE BACK THE FD IT JUST SENT. A Wayland client passes
+ *    its pool memfd and then immediately reads the compositor's reply; with one
+ *    shared slot, that read hands it its own descriptor.
+ *  - Only one descriptor could be in flight. GTK passes several (a keymap, a
+ *    pool, dma-bufs), and the second `sendmsg` silently failed.
+ *
+ * Indexed [connection][sender's side]: a sender pushes onto its own side's
+ * queue and a receiver pops the PEER's. FIFO, because the protocol matches
+ * descriptors to messages by ORDER -- libwayland pops the next fd when it
+ * demarshals an argument declared as one, so a reordered queue attaches the
+ * wrong file to the wrong message. */
+struct scmq { struct fdent fe[SCM_QDEPTH]; int head, tail; };
+static struct scmq g_scm[SCM_SLOTS][2];
+static int scmq_empty(struct scmq *q) { return q->head == q->tail; }
+static int scmq_full(struct scmq *q)  { return (q->tail + 1) % SCM_QDEPTH == q->head; }
+static struct scmq *scm_out(int ep) {                 /* where THIS endpoint sends */
+    int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return 0;
+    return &g_scm[ci][ep & 1];
+}
+static struct scmq *scm_in(int ep) {                  /* where THIS endpoint receives from */
+    int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return 0;
+    return &g_scm[ci][(ep & 1) ^ 1];
+}
 
 int app_scm_send(int ep, int fd) {
     struct app *a = cur(); if (!a) return -1;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
-    int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return -1;
-    if (g_scm[ci].valid) return -1;            /* one in-flight fd per connection */
-    g_scm[ci].fe = a->fd[fd];                  /* snapshot the descriptor (shares the underlying object) */
-    g_scm[ci].fe.cloexec = 0;                  /* a freshly-received fd is not close-on-exec */
-    g_scm[ci].valid = 1;
+    struct scmq *q = scm_out(ep); if (!q) return -1;
+    if (scmq_full(q)) return -1;               /* the peer has not drained its queue */
+    q->fe[q->tail] = a->fd[fd];                /* snapshot the descriptor (shares the underlying object) */
+    q->fe[q->tail].cloexec = 0;                /* a freshly-received fd is not close-on-exec */
+    q->tail = (q->tail + 1) % SCM_QDEPTH;
     return 0;
 }
 
 int app_scm_recv(int ep) {
     struct app *a = cur(); if (!a) return -1;
-    int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return -1;
-    if (!g_scm[ci].valid) return -1;           /* nothing pending */
+    struct scmq *q = scm_in(ep); if (!q) return -1;
+    if (scmq_empty(q)) return -1;              /* nothing pending */
     int fd = -1;
     for (int i = 3 /*APP_FD_FIRST: 0-2 are stdio*/; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }
     if (fd < 0) return -1;                     /* receiver's fd table is full */
-    a->fd[fd] = g_scm[ci].fe;                  /* install the passed descriptor */
-    g_scm[ci].valid = 0;
+    a->fd[fd] = q->fe[q->head];                /* install the passed descriptor */
+    q->head = (q->head + 1) % SCM_QDEPTH;
     return fd;
 }
 
@@ -4676,15 +4704,42 @@ uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
  * exactly the memory the client wrote -- the same object, not a copy. Returns
  * 0 on success. */
 int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
-    int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return -1;
-    if (!g_scm[ci].valid) return -1;                 /* nothing pending */
-    if (g_scm[ci].fe.type != 3) return -1;           /* not a memfd: not ours to interpret */
-    int idx = g_scm[ci].fe.obj;
+    struct scmq *q = scm_in(ep); if (!q) return -1;
+    if (scmq_empty(q)) return -1;                    /* nothing pending */
+    if (q->fe[q->head].type != 3) return -1;         /* not a memfd: not ours to interpret */
+    int idx = q->fe[q->head].obj;
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used || !memfds[idx].buf) return -1;
     if (base) *base = memfds[idx].buf;
     if (size) *size = memfds[idx].size ? memfds[idx].size : memfds[idx].cap;
     memfds[idx].refs++;                              /* the compositor holds it now */
-    g_scm[ci].valid = 0;
+    q->head = (q->head + 1) % SCM_QDEPTH;
+    return 0;
+}
+
+/* The OTHER direction: the KERNEL hands a client a descriptor (M1984).
+ *
+ * app_scm_send passes a descriptor out of a process's fd table. The compositor
+ * is the kernel and has no fd table, but Wayland's `wl_keyboard.keymap` obliges
+ * it to hand the client a readable file. So: build a memfd from a kernel
+ * buffer, own it outright, and queue it for the peer's next recvmsg -- which
+ * installs it in the CLIENT's table as an ordinary descriptor it can mmap.
+ *
+ * The content is copied, deliberately. A keymap is a few kilobytes read once;
+ * aliasing a kernel .rodata string into a user mapping to save that copy would
+ * hand a process a page of kernel image. */
+int app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsigned long len) {
+    struct scmq *q = scm_out(ep); if (!q) return -1;
+    if (scmq_full(q)) return -1;
+    int idx = memfd_alloc(name); if (idx < 0) return -1;
+    struct memfd *m = &memfds[idx];
+    if (memfd_grow(m, len) != 0) { memfd_unref(idx); return -1; }
+    for (unsigned long i = 0; i < len; i++) m->buf[i] = ((const char *)data)[i];
+    m->size = len;
+    struct fdent fe;
+    for (unsigned long i = 0; i < sizeof fe; i++) ((char *)&fe)[i] = 0;
+    fe.used = 1; fe.type = 3 /* memfd */; fe.obj = idx; fe.off = 0;
+    q->fe[q->tail] = fe;
+    q->tail = (q->tail + 1) % SCM_QDEPTH;
     return 0;
 }
 

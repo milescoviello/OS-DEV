@@ -148,6 +148,18 @@ def main():
     else:
         print("  FAIL: the keystroke never reached the client"); fail = 1
 
+    # The whole point of the keymap: the client turns the keycode into TEXT,
+    # with the same library GTK uses. A compositor that sends keycodes and no
+    # keymap gets a client that can be typed at and understands nothing.
+    m = wait_for(log, r'LXWL-XKB-KEY: evdev 30 -> keysym (\S+), text "([^"]*)"', 30)
+    if m and m.group(1) == "a" and m.group(2) == "a":
+        print("  ok: libxkbcommon turned that keycode into keysym 'a' and the text \"a\" -- real text input")
+    elif m:
+        print("  FAIL: evdev 30 became keysym %s / text %r, expected 'a' and \"a\""
+              % (m.group(1), m.group(2))); fail = 1
+    else:
+        print("  FAIL: the client never translated the keycode through the keymap"); fail = 1
+
     m = wait_for(log, r"LXWL-INPUT-RESULT: (\d+) key event\(s\), (\d+) motion, (\d+) button", 30)
     if m:
         print("  ok: the client's own tally: %s key, %s motion, %s button" % m.groups())
