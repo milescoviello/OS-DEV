@@ -459,11 +459,26 @@ static int lx_path_arg(uint32_t nr) {
  * -fno-omit-frame-pointer is not something we can impose on a foreign binary,
  * so this is best-effort: it stops at the first RBP that is not a plausible,
  * increasing user address rather than chasing garbage. */
+/* Read user memory WITHOUT materialising it (M1991).
+ *
+ * vmm_user_ok resolves a lazily-mappable page as a side effect -- which is the
+ * right thing for a syscall argument and exactly wrong on the fault path: the
+ * backtrace walks a user stack that may be half-mapped, so checking it with
+ * vmm_user_ok re-enters app_fault_handle from inside app_fault_handle. Four
+ * levels deep the recursion guard refuses and the process dies of the
+ * diagnostic rather than of its own bug. vmm_translate answers the same
+ * question and changes nothing. */
+static int lx_user_mapped(uint64_t p, uint64_t n) {
+    for (uint64_t a = p & ~(uint64_t)0xFFF; a < p + n; a += 0x1000)
+        if (!vmm_translate(a)) return 0;
+    return 1;
+}
+
 void lx_user_backtrace(struct registers *r) {
     kprintf("[linuxabi] user backtrace: rip=%lx rsp=%lx rbp=%lx\n", r->rip, r->rsp, r->rbp);
     uint64_t rbp = r->rbp, prev = 0;
     for (int f = 0; f < 16; f++) {
-        if (rbp <= prev || (rbp & 7) || !vmm_user_ok(rbp, 16)) break;
+        if (rbp <= prev || (rbp & 7) || !lx_user_mapped(rbp, 16)) break;
         uint64_t ret = ((const uint64_t *)rbp)[1];
         if (!ret) break;
         kprintf("    [%d] %lx\n", f, ret);
@@ -479,7 +494,7 @@ void lx_user_backtrace(struct registers *r) {
     struct app *a = app_current();
     int shown = 0;
     for (uint64_t sp = r->rsp; sp < r->rsp + 1024 && shown < 24; sp += 8) {
-        if (!vmm_user_ok(sp, 8)) break;
+        if (!lx_user_mapped(sp, 8)) break;
         uint64_t w = *(const uint64_t *)sp;
         if (w < 0x1000) continue;
         int exec = 0;

@@ -1,5 +1,43 @@
 # What's next
 
+> **(M1991) TWO CORES COULD RUN THE SAME TASK'S STACK.**
+>
+> `switch_to_next` carries a CRITICAL note in its own source: never make a
+> still-executing task pickable, because that "is exactly what let two cores end
+> up running the same task's stack". **The timer's sleeper scan was doing
+> precisely that.**
+>
+> A task blocking WITH A DEADLINE sets `TASK_BLOCKED`, releases the run-queue
+> lock, and only then calls `switch_to_next` -- so for a window it is BLOCKED
+> and still running on its own stack. `task_wake_sleepers` saw `wake_at <= now`,
+> marked it `READY`, and another core picked it up and resumed a context from a
+> stack that was still in use. It presented as a panic with `rip` at a tiny
+> constant (`0x10`, `0x82`) under `task_block_timeout`, which reads as memory
+> corruption and is not.
+>
+> `core_prev` did not cover it, and the reason is a nice trap: it is
+> DELIBERATELY zeroed when the outgoing task blocked rather than being preempted
+> -- `finish_switch` has nothing to complete for a blocked task -- so exactly the
+> case that needed tracking was the case that had none. `core_leaving` now
+> tracks the outgoing task whatever its state, cleared by whoever runs next on
+> that core, which is proof the stack has been left.
+>
+> **Eight stress runs, zero kernel panics**, where this used to halt the machine.
+> The untimed `task_block()` was never exposed because it sets `wake_at = 0`
+> precisely so the timer scan ignores it; only the timed path could be hit, and
+> only once `lxstress` started using timed futex waits.
+>
+> Also fixed: **the fault-path diagnostics were re-entering the fault handler.**
+> `vmm_user_ok` MATERIALISES a lazily-mappable page -- the right thing for a
+> syscall argument, and exactly wrong when walking a half-mapped user stack from
+> inside `app_fault_handle`. Four levels down the recursion guard refused and
+> the process died of the diagnostic rather than of its own bug. They use
+> `vmm_translate` now, which answers the same question and changes nothing.
+>
+> **Still open:** 2 runs in 8 hit the recursion guard, and the chain it prints
+> now names the shape -- one address re-faulting three times, i.e. a resolution
+> that returns "retry" without having mapped anything. That is the next one.
+
 > **(M1990) A FUTEX WAITER COULD RESURRECT A DEAD THREAD — `lxstress` 7/8.**
 >
 > A waiter records `task_self()` in the futex table, and `FUTEX_WAKE` later calls

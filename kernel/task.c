@@ -262,12 +262,22 @@ static task_t *core_prev[MAX_SCHED_CPUS];
  * context_switch. Cleared -- and the task marked off_cpu -- by whoever runs
  * next on the same core, which is proof it has left its stack. (M1961) */
 static task_t *core_dying[MAX_SCHED_CPUS];
+/* The task this core is switching AWAY from, whatever its state. core_prev is
+ * deliberately 0 when the outgoing task blocked rather than being preempted --
+ * finish_switch has nothing to complete for it -- which left a BLOCKING task
+ * tracked by nothing between `cur[c]` being reassigned and context_switch
+ * actually leaving its stack. That is the window in which the timer's sleeper
+ * scan could make a timed waiter READY while it was still running, and another
+ * core could then pick it. Cleared by whoever runs next on this core, which is
+ * proof the stack has been left. (M1991) */
+static task_t *core_leaving[MAX_SCHED_CPUS];
 void task_finish_switch(void) {
     int c = mycore();
     /* BEFORE the early return below: we are running on this core, so anything
      * that exited here has finished its final context_switch. */
     task_t *d = core_dying[c];
     if (d) { core_dying[c] = 0; __atomic_store_n(&d->off_cpu, 1, __ATOMIC_RELEASE); }
+    core_leaving[c] = 0;                 /* it has left its stack (M1991) */
     task_t *p = core_prev[c];
     if (!p) return;
     core_prev[c] = 0;
@@ -585,6 +595,7 @@ static void switch_to_next(void) {
     int prev_was_running = (prev->state == TASK_RUNNING);
     if (!prev_was_running) prev->nvcsw++;   /* blocked/exited itself (its own caller already set state) => voluntary (M1150) */
     core_prev[mycore()] = prev_was_running ? prev : 0;   /* what finish_switch() must complete, if anything */
+    core_leaving[mycore()] = prev;       /* still on its stack until the next task clears this (M1991) */
 
     next->state = TASK_RUNNING;
     if (next->ready_since) {                      /* leaving the run queue: charge the time it waited (M1148) */
@@ -737,13 +748,30 @@ void task_sleep_ms(uint64_t ms) {
 /* Called from the timer IRQ (interrupts already off): wake every task whose
  * timed-sleep deadline has passed. The ring is tiny, so a full scan per tick is
  * cheap; only BLOCKED tasks with a non-zero wake_at are sleepers. */
+/* Is this task executing on SOME core right now? (M1991)
+ *
+ * `state` cannot answer that: a task blocking with a deadline sets TASK_BLOCKED
+ * and only THEN releases the run-queue lock and calls switch_to_next, so for a
+ * window it is BLOCKED and still running on its own stack. switch_to_next's own
+ * CRITICAL note says what happens if something makes such a task pickable --
+ * "exactly what let two cores end up running the same task's stack". The timer's
+ * sleeper scan was doing precisely that to timed futex waiters, and the result
+ * was a context restored from a stack two cores had been using: a panic with
+ * rip = 0x10 under task_block_timeout. */
+static int task_on_a_cpu(task_t *t) {
+    for (int c = 0; c < MAX_SCHED_CPUS; c++)
+        if (cur[c] == t || core_leaving[c] == t || core_prev[c] == t || core_dying[c] == t) return 1;
+    return 0;
+}
+
 void task_wake_sleepers(void) {
     if (!current) return;
     rq_lock_take();
     uint64_t now = timer_ms();
     task_t *t = current;
     do {
-        if (t->state == TASK_BLOCKED && t->wake_at && t->wake_at <= now) {
+        /* Leave it for the next tick rather than racing its own switch. */
+        if (t->state == TASK_BLOCKED && t->wake_at && t->wake_at <= now && !task_on_a_cpu(t)) {
             t->wake_at = 0;
             t->state = TASK_READY;
             t->ready_since = now;       /* re-entered the run queue (M1148) */

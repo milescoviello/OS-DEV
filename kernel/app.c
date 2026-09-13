@@ -3676,17 +3676,26 @@ static uint64_t vma_pte_flags(uint8_t prot) {
  * fault and SAY SO: killing one process with a named reason beats taking the
  * machine down with an unnamed one. */
 static volatile int g_fault_depth[16];
+static volatile uint64_t g_fault_chain[16][6];
 static int app_fault_handle_inner(uint64_t cr2, uint64_t err);
 int app_fault_handle(uint64_t cr2, uint64_t err) {
     int cpu = (int)(smp_current_cpu() & 15);
-    if (g_fault_depth[cpu] >= 4) {
-        kprintf("[fault] RECURSION: depth %d resolving %lx (err %lx) -- refusing rather than overrunning the kernel stack\n",
-                g_fault_depth[cpu], cr2, err);
+    int d = g_fault_depth[cpu];
+    if (d >= 4) {
+        /* Print the WHOLE CHAIN, not just the top. "Depth 4 resolving X" says a
+         * recursion happened; the addresses that got us there say WHICH access
+         * inside the fault path is itself faulting, which is the only thing
+         * that leads to a fix. */
+        kprintf("[fault] RECURSION: refusing at depth %d -- the chain was:\n", d);
+        for (int q = 0; q < d && q < 6; q++)
+            kprintf("    [%d] %lx\n", q, (unsigned long)g_fault_chain[cpu][q]);
+        kprintf("    [%d] %lx (err %lx) <- refused\n", d, cr2, err);
         return 0;
     }
-    g_fault_depth[cpu]++;
+    if (d < 6) g_fault_chain[cpu][d] = cr2;
+    g_fault_depth[cpu] = d + 1;
     int r = app_fault_handle_inner(cr2, err);
-    g_fault_depth[cpu]--;
+    g_fault_depth[cpu] = d;
     return r;
 }
 

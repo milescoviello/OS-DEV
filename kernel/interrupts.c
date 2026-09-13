@@ -283,7 +283,11 @@ void isr_dispatch(struct registers *r) {
              * there is no way to tell that apart from a genuine fault without
              * looking at the opcode. Sixteen bytes is enough to disassemble by
              * hand. (M1985) */
-            if (vmm_user_ok(r->rip, 16)) {
+            /* vmm_translate, not vmm_user_ok: the latter MATERIALISES a
+             * lazily-mappable page, which on the fault path re-enters the
+             * fault handler. (M1991) */
+            if (vmm_translate(r->rip & ~(uint64_t)0xFFF) &&
+                vmm_translate((r->rip + 15) & ~(uint64_t)0xFFF)) {
                 /* ONE kprintf, not sixteen. Every call takes the console lock,
                  * and on a busy machine sixteen of them are interleaved
                  * character-by-character with whatever another core is

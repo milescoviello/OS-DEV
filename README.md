@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1990-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1991-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -977,6 +977,26 @@ Landed so far, all on the from-scratch ext2 driver:
   fire the stale entry without ever having touched that futex. Every path a task
   can end on — thread exit, process exit, join, the reaper — now drops its
   slots, and the wake loop refuses to queue a `TASK_DEAD` task.
+
+- **M1991** — **two cores could run the same task's stack.** The scheduler's own
+  `switch_to_next` carries a CRITICAL note: never make a still-executing task
+  pickable, because that "is exactly what let two cores end up running the same
+  task's stack". The timer's sleeper scan was doing precisely that. A task
+  blocking *with a deadline* sets `TASK_BLOCKED`, releases the run-queue lock,
+  and only then calls `switch_to_next` — so for a window it is BLOCKED and still
+  running on its own stack, and `task_wake_sleepers` would see `wake_at <= now`
+  and mark it `READY` for another core to pick. `core_prev` did not cover it:
+  that is deliberately zeroed when the outgoing task *blocked* rather than being
+  preempted, because `finish_switch` has nothing to complete for it. A new
+  `core_leaving` tracks the outgoing task whatever its state, cleared by whoever
+  runs next on that core — which is proof the stack has been left. **Eight
+  stress runs, zero kernel panics**, where this used to halt the machine.
+
+  Also: the fault-path diagnostics were re-entering the fault handler.
+  `vmm_user_ok` *materialises* a lazily-mappable page — right for a syscall
+  argument, exactly wrong when walking a half-mapped user stack from inside
+  `app_fault_handle`. They use `vmm_translate` now, which answers the same
+  question and changes nothing.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 
