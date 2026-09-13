@@ -125,6 +125,19 @@ static unsigned g_nconn, g_nmsg, g_nglobal, g_ncommit;
 static uint32_t g_last_pixel;     /* the top-left pixel of the last committed surface */
 static uint32_t g_last_w, g_last_h;
 
+/* The most recently committed surface, for the desktop to draw. Returns NULL
+ * until a client has actually committed one. The pointer is into the CLIENT'S
+ * shared memory, so what the desktop blits is what the client wrote -- there is
+ * no intermediate copy anywhere in the path. (M1980) */
+static uint8_t *g_last_base; static uint32_t g_last_stride;
+const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride) {
+    if (!g_last_base || !g_last_w || !g_last_h) return 0;
+    if (w) *w = g_last_w;
+    if (h) *h = g_last_h;
+    if (stride) *stride = g_last_stride;
+    return (const uint32_t *)g_last_base;
+}
+
 unsigned wl_commits(void)      { return g_ncommit; }
 uint32_t wl_last_pixel(void)   { return g_last_pixel; }
 uint32_t wl_last_width(void)   { return g_last_w; }
@@ -309,6 +322,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             if (need <= b->size) {
                 g_last_pixel = rd32(b->base + b->off);
                 g_last_w = b->width; g_last_h = b->height;
+                g_last_base = b->base + b->off; g_last_stride = b->stride;
                 g_ncommit++;
                 kprintf("[wl] commit: %ux%u stride %u format %u -> first pixel 0x%08x\n",
                         b->width, b->height, b->stride, b->format, g_last_pixel);

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1979-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1980-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -746,8 +746,17 @@ Landed so far, all on the from-scratch ext2 driver:
   and the `wl_shm.format` advertisement a client needs before it will build a
   buffer at all.
 
-Still ahead: putting that surface in an OS-DEV window, `xdg_shell`, input, then
-Firefox. The honest scale is still months.
+- **M1980** — **a Wayland client's surface is drawn in an OS-DEV window.** The
+  desktop gained a window kind that blits the committed surface straight from
+  the client's shared memory to the framebuffer — one copy in the entire path,
+  and it is the one that puts pixels on screen. Asserted by **screenshot**: the
+  client paints `0x3366CC`, a colour the theme never uses, and the check
+  requires **exactly** its 64×32 pixels in one contiguous block — a scaled,
+  clipped, torn or wrongly-strided blit all produce blue pixels and all produce
+  the wrong shape.
+
+Still ahead: `xdg_shell` (real windows a client can title and resize), input,
+then Firefox. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

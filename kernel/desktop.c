@@ -13,6 +13,7 @@
  * are delivered to it when it's focused.
  */
 #include "desktop.h"
+#include "wayland.h"   /* draw a committed Wayland surface (M1980) */
 #include "fb.h"
 #include "speaker.h"
 #include "font.h"
@@ -41,7 +42,9 @@
 #define GRIP        16
 
 enum { KIND_PLAIN, KIND_WELCOME, KIND_FILES, KIND_APP, KIND_CLOCK, KIND_ABOUT,
-       KIND_BROWSER, KIND_SYSMON, KIND_POWEROFF, KIND_REBOOT };  /* power actions: not windows, they call ACPI */
+       KIND_BROWSER, KIND_SYSMON, KIND_POWEROFF, KIND_REBOOT,
+       KIND_WAYLAND };  /* a Wayland client's surface, drawn from its own shared memory (M1980) */
+                        /* power actions above are not windows: they call ACPI */
 
 /* ---- cyberpunk theme palette ----
  * Named so the ~180 call sites that used to carry independent 0xRRGGBB
@@ -673,6 +676,24 @@ static void draw_content(const window_t *w, int focused) {
         } else if (w->app) {                                  /* text terminal: size the live grid to the window, then render (M1473) */
             app_set_grid((app_t *)w->app, (w->w - 14) / font_width, (w->h - TITLEBAR_H - 14) / font_height);
             app_render((app_t *)w->app, bx - 2, by - 2, focused);
+        }
+        break;
+    }
+    case KIND_WAYLAND: {
+        /* A Wayland client's surface. The pixels are the CLIENT'S memory,
+         * mapped into the compositor by wl_shm -- this blit is the only copy
+         * in the whole path, and it goes straight to the framebuffer. */
+        uint32_t sw2 = 0, sh2 = 0, st = 0;
+        const uint32_t *px = wl_surface_pixels(&sw2, &sh2, &st);
+        if (px && sw2 && sh2) {
+            int maxw = w->w - 8, maxh = w->h - TITLEBAR_H - 8;
+            for (uint32_t yy = 0; yy < sh2 && (int)yy < maxh; yy++) {
+                const uint32_t *row = (const uint32_t *)((const uint8_t *)px + (unsigned long)yy * st);
+                for (uint32_t xx = 0; xx < sw2 && (int)xx < maxw; xx++)
+                    fb_pixel(bx - 2 + (int)xx, by - 2 + (int)yy, row[xx] & 0x00FFFFFF);
+            }
+        } else {
+            fb_text(bx + 4, by + 4, "waiting for a client to commit a surface...", THEME_TEXT_DIM, 1);
         }
         break;
     }
@@ -1649,6 +1670,26 @@ static void make_app_window(app_t *a) {
         THEME_PANEL, app_title(a), KIND_APP, a, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };  /* maximized,sx,sy,sw,sh,fsel,fconfirm, editing,editbuf,editlen, minimized */
 }
 
+/* Open a window for a Wayland client's surface (M1980).
+ *
+ * The desktop polls for this rather than the compositor calling in: a Wayland
+ * compositor IS the window manager, and having the display server reach into
+ * the desktop's window array from its own task would be a data race on
+ * `windows[]` for no benefit. One window, opened on the first commit, sized to
+ * the surface -- the multi-surface case arrives with xdg_shell. */
+static int wl_window_open;
+static void wl_window_poll(void) {
+    uint32_t sw2 = 0, sh2 = 0, st = 0;
+    if (wl_window_open || win_count >= MAX_WINDOWS) return;
+    if (!wl_surface_pixels(&sw2, &sh2, &st)) return;
+    spawn_n++;
+    int x = 150 + (spawn_n % 6) * 26, y = 60 + (spawn_n % 6) * 26;
+    windows[win_count++] = (window_t){ x, y, (int)sw2 + 14, (int)sh2 + TITLEBAR_H + 14,
+                                       THEME_PANEL, "Wayland client", KIND_WAYLAND, 0,
+                                       0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
+    wl_window_open = 1;
+}
+
 /* Open a browser window at `url` (NULL -> its default). */
 static void spawn_browser(const char *url) {
     if (win_count >= MAX_WINDOWS) return;
@@ -1905,6 +1946,7 @@ void desktop_run(void) {
          * cap check stays as a belt-and-braces guard). */
         app_t *na;
         while (win_count < MAX_WINDOWS && (na = app_take_pending())) { make_app_window(na); dirty = 1; }
+        { int before = win_count; wl_window_poll(); if (win_count != before) dirty = 1; }
 
         /* open browser windows requested by the shell (`browse <url>`) */
         char burl[160];

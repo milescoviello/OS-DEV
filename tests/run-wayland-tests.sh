@@ -28,9 +28,12 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: wayland test ($QEMU not foun
 [ -f "$EXT2" ] || { echo "SKIP: wayland test (no $EXT2)"; exit 0; }
 [ -f build/lxroot/lxwl ] || { echo "SKIP: wayland test (libwayland not staged)"; exit 0; }
 
-SLOG=$(mktemp /tmp/osdev_wl.XXXXXX.log)
+TMP=$(mktemp -d /tmp/osdev_wl.XXXXXX)
+SLOG=$TMP/serial.log
+SOCK=$TMP/mon.sock
+PPM=$TMP/screen.ppm
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and running a real libwayland client against our compositor..."
@@ -38,16 +41,16 @@ timeout -s KILL 400 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -sm
     -append "wltest wlraw nonetdemo" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \
-    -display none -serial file:"$SLOG" >/dev/null 2>&1 &
+    -display none -serial file:"$SLOG" \
+    -monitor unix:"$SOCK",server,nowait >/dev/null 2>&1 &
 QPID=$!
 i=0
 while [ $i -lt 760 ]; do
-    grep -aqE "LXWL-SURFACE|wl\] summary|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "LXWL-SURFACE|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
 sleep 0.5
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 f=0
 if grep -aq "KERNEL PANIC" "$SLOG"; then
@@ -98,5 +101,28 @@ else
     echo "  FAIL: the client did not finish its commit:"; grep -a "LXWL-SURFACE" "$SLOG" | head -2; f=1
 fi
 
+# ...and finally: is it ON SCREEN? The compositor reading the right pixels and
+# the window manager DRAWING them are different claims. Wait for the desktop,
+# then screendump and look for the client's colour.
+if command -v socat >/dev/null 2>&1 && [ "$f" -eq 0 ]; then
+    i=0
+    while [ $i -lt 200 ]; do
+        grep -aq "launching the desktop environment" "$SLOG" 2>/dev/null && break
+        sleep 0.5; i=$((i+1))
+    done
+    sleep 6                      # let the desktop paint its first frames
+    shot=1
+    j=0
+    while [ $j -lt 6 ]; do
+        printf 'screendump %s\n' "$PPM" | socat - UNIX-CONNECT:"$SOCK" >/dev/null 2>&1 || true
+        if [ -s "$PPM" ] && python3 tests/wl/shot_check.py "$PPM"; then shot=0; break; fi
+        sleep 3; j=$((j+1))
+    done
+    [ "$shot" -eq 0 ] || { echo "  FAIL: the surface never appeared on screen"; f=1; }
+else
+    echo "  SKIP: on-screen check (socat not available)"
+fi
+
+kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 [ $f -eq 0 ] || { echo "FAIL: Wayland compositor"; exit 1; }
-echo "PASS: PHASE 8 -- a real libwayland client completed the handshake against OS-DEV's own compositor"
+echo "PASS: PHASE 8 -- a real libwayland client's surface is DRAWN IN AN OS-DEV WINDOW"

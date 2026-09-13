@@ -884,10 +884,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 }
                 kprintf("[wl] spawning a real libwayland client...\n");
                 app_spawn_linux_from_file("/disk2/lxwl");
+                /* Wait for a surface, then FALL THROUGH to the desktop: the
+                 * window manager is what draws it, so the display has to come
+                 * up for there to be anything to look at. */
                 for (int t = 0; t < 6000; t++) {
                     task_sleep_ms(10);
-                    if (wl_messages_handled() >= 4 && t > 100) break;
+                    if (wl_commits() > 0 && t > 60) break;
                 }
+                kprintf("[wl] surface ready: %ux%u -- handing over to the desktop\n",
+                        wl_last_width(), wl_last_height());
                 /* If the client stalled, the ring says what it was doing --
                  * a compositor that sent everything correctly and a client
                  * that never reads look identical from this side. */
