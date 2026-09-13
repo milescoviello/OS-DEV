@@ -75,6 +75,15 @@
 #define WL_SURFACE_COMMIT        6
 /* wl_buffer events */
 #define WL_BUFFER_EV_RELEASE     0
+/* xdg_wm_base / xdg_surface / xdg_toplevel -- the shell protocol GTK and
+ * Firefox use to get a real, titled, sized window. */
+#define XDG_WM_BASE_GET_XDG_SURFACE 2
+#define XDG_WM_BASE_PONG            3
+#define XDG_SURFACE_GET_TOPLEVEL    1
+#define XDG_SURFACE_ACK_CONFIGURE   4
+#define XDG_SURFACE_EV_CONFIGURE    0
+#define XDG_TOPLEVEL_SET_TITLE      2
+#define XDG_TOPLEVEL_EV_CONFIGURE   0
 
 /* Pixel formats, by the protocol's numbering. These two are the ones every
  * client can produce and the only ones worth claiming until we composite. */
@@ -97,7 +106,8 @@ static const struct wl_global g_globals[] = {
  * by guessing from the opcode -- opcode 0 means something different on every
  * interface. */
 enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
-               WLK_SURFACE, WLK_SHM_POOL, WLK_BUFFER };
+               WLK_SURFACE, WLK_SHM_POOL, WLK_BUFFER,
+               WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL };
 
 #define WL_MAXOBJ 64
 struct wl_object {
@@ -108,6 +118,7 @@ struct wl_object {
     uint8_t *base; unsigned long size;
     uint32_t off, width, height, stride, format;
     uint32_t attached;             /* wl_surface: the wl_buffer id last attached */
+    uint32_t link;                 /* xdg_surface -> its wl_surface; xdg_toplevel -> its xdg_surface */
 };
 
 struct wl_client {
@@ -116,6 +127,8 @@ struct wl_client {
     uint8_t  in[WL_INBUF];
     int      inlen;                /* bytes accumulated but not yet consumed */
     uint32_t registry;             /* the client's wl_registry object id, 0 = none yet */
+    uint32_t serial;               /* configure serials, monotonic per client */
+    char     title[64];            /* xdg_toplevel.set_title, for the window's titlebar */
     struct wl_object obj[WL_MAXOBJ]; int nobj;
 };
 static struct wl_client g_cl[WL_MAXCLIENT];
@@ -137,6 +150,11 @@ const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride) {
     if (stride) *stride = g_last_stride;
     return (const uint32_t *)g_last_base;
 }
+
+/* The last committed surface's window title, or "" if the client never set
+ * one (a client that uses wl_surface without xdg_shell has no title to give). */
+static const char *g_last_title = "";
+const char *wl_surface_title(void) { return g_last_title; }
 
 unsigned wl_commits(void)      { return g_ncommit; }
 uint32_t wl_last_pixel(void)   { return g_last_pixel; }
@@ -309,6 +327,42 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         bo->format = rd32(args + 20);
         return;
     }
+    if (o->kind == WLK_XDG_WM_BASE && opcode == XDG_WM_BASE_GET_XDG_SURFACE && alen >= 8) {
+        struct wl_object *xs = obj_add(c, rd32(args + 0), WLK_XDG_SURFACE);
+        if (xs) xs->link = rd32(args + 4);              /* the wl_surface it wraps */
+        return;
+    }
+    if (o->kind == WLK_XDG_SURFACE && opcode == XDG_SURFACE_GET_TOPLEVEL && alen >= 4) {
+        uint32_t tid = rd32(args + 0);
+        struct wl_object *tl = obj_add(c, tid, WLK_XDG_TOPLEVEL);
+        if (tl) tl->link = o->id;
+        /* A toplevel is not mapped until the client has acknowledged a
+         * configure, so the compositor has to send one UNPROMPTED -- a client
+         * that never gets configure never attaches a buffer, and waits
+         * forever having done nothing wrong. 0x0 means "you choose your own
+         * size", which is what a client wants for its first frame. */
+        uint8_t b[16]; int p = 0;
+        wr32(b + p, 0); p += 4;                          /* width  */
+        wr32(b + p, 0); p += 4;                          /* height */
+        wr32(b + p, 0); p += 4;                          /* states: an empty array */
+        wl_send(c, tid, XDG_TOPLEVEL_EV_CONFIGURE, b, p);
+        uint8_t sb[4]; wr32(sb, ++c->serial);
+        wl_send(c, o->id, XDG_SURFACE_EV_CONFIGURE, sb, 4);
+        return;
+    }
+    if (o->kind == WLK_XDG_TOPLEVEL && opcode == XDG_TOPLEVEL_SET_TITLE && alen >= 4) {
+        uint32_t slen = rd32(args + 0);
+        if (slen > 0 && 4 + slen <= (uint32_t)alen) {
+            unsigned n = slen - 1;                        /* the length counts the NUL */
+            if (n > sizeof c->title - 1) n = sizeof c->title - 1;
+            for (unsigned i = 0; i < n; i++) c->title[i] = (char)args[4 + i];
+            c->title[n] = 0;
+            kprintf("[wl] toplevel title: \"%s\"\n", c->title);
+        }
+        return;
+    }
+    if (o->kind == WLK_XDG_SURFACE && opcode == XDG_SURFACE_ACK_CONFIGURE) return;  /* nothing to do yet */
+
     if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_ATTACH && alen >= 4) {
         o->attached = rd32(args + 0);                /* the wl_buffer id */
         return;
@@ -323,6 +377,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                 g_last_pixel = rd32(b->base + b->off);
                 g_last_w = b->width; g_last_h = b->height;
                 g_last_base = b->base + b->off; g_last_stride = b->stride;
+                g_last_title = c->title[0] ? c->title : "Wayland client";
                 g_ncommit++;
                 kprintf("[wl] commit: %ux%u stride %u format %u -> first pixel 0x%08x\n",
                         b->width, b->height, b->stride, b->format, g_last_pixel);
@@ -368,6 +423,7 @@ int wl_compositor_poll(void) {
         if (slot < 0) { unix_close(ep); kprintf("[wl] client table full\n"); break; }
         struct wl_client *c = &g_cl[slot];
         c->used = 1; c->ep = ep; c->inlen = 0; c->registry = 0; c->nobj = 0;
+        c->serial = 0; c->title[0] = 0;
         g_nconn++;
         kprintf("[wl] client connected (ep %d)\n", ep);
         worked++;

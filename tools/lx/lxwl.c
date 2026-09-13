@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <wayland-client.h>
+#include "xdg-shell-client-protocol.h"
 #include <poll.h>
 #include <stdint.h>
 #include <sys/mman.h>
@@ -29,6 +30,15 @@
 static int n_globals;
 static struct wl_compositor *comp;
 static struct wl_shm *shm;
+static struct xdg_wm_base *wm_base;
+static int configured;
+
+static void xs_configure(void *d, struct xdg_surface *xs, uint32_t serial) {
+    (void)d;
+    xdg_surface_ack_configure(xs, serial);   /* required: the surface is not mapped until this */
+    configured = 1;
+}
+static const struct xdg_surface_listener xs_listener = { xs_configure };
 
 static void on_global(void *data, struct wl_registry *reg, uint32_t name,
                       const char *iface, uint32_t version) {
@@ -40,6 +50,8 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
         comp = wl_registry_bind(reg, name, &wl_compositor_interface, version < 4 ? version : 4);
     else if (!strcmp(iface, "wl_shm"))
         shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    else if (!strcmp(iface, "xdg_wm_base"))
+        wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 3 ? version : 3);
 }
 static void on_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
     (void)data; (void)reg; (void)name;
@@ -110,6 +122,22 @@ int main(void) {
     if (!buf) { printf("LXWL: create_buffer failed\n"); fflush(stdout); return 11; }
     struct wl_surface *surf = wl_compositor_create_surface(comp);
     if (!surf) { printf("LXWL: create_surface failed\n"); fflush(stdout); return 12; }
+
+    /* xdg_shell: the protocol that turns a bare surface into a real WINDOW --
+     * one the client can title, and that the compositor can size. GTK and
+     * Firefox do exactly this, and a compositor that does not answer the
+     * initial configure leaves them waiting forever having done nothing wrong.
+     * The ordering below is the protocol's, not a preference: commit with NO
+     * buffer first, wait for configure, acknowledge it, and only then attach. */
+    if (!wm_base) { printf("LXWL: xdg_wm_base was not advertised\n"); fflush(stdout); return 14; }
+    struct xdg_surface *xs = xdg_wm_base_get_xdg_surface(wm_base, surf);
+    struct xdg_toplevel *tl = xdg_surface_get_toplevel(xs);
+    xdg_surface_add_listener(xs, &xs_listener, NULL);
+    xdg_toplevel_set_title(tl, "OS-DEV Wayland demo");
+    wl_surface_commit(surf);                       /* the initial, buffer-less commit */
+    if (wl_display_roundtrip(dpy) < 0) { printf("LXWL: configure roundtrip failed\n"); fflush(stdout); return 15; }
+    if (!configured) { printf("LXWL: never received xdg_surface.configure\n"); fflush(stdout); return 16; }
+    printf("LXWL-XDG: toplevel configured and acknowledged\n"); fflush(stdout);
 
     wl_surface_attach(surf, buf, 0, 0);
     wl_surface_damage(surf, 0, 0, W, H);

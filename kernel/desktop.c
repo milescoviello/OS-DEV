@@ -1684,8 +1684,11 @@ static void wl_window_poll(void) {
     if (!wl_surface_pixels(&sw2, &sh2, &st)) return;
     spawn_n++;
     int x = 150 + (spawn_n % 6) * 26, y = 60 + (spawn_n % 6) * 26;
+    /* The title comes from xdg_toplevel.set_title, which is how a Wayland
+     * client names its own window -- the same call Firefox uses to put a page
+     * title in the titlebar. */
     windows[win_count++] = (window_t){ x, y, (int)sw2 + 14, (int)sh2 + TITLEBAR_H + 14,
-                                       THEME_PANEL, "Wayland client", KIND_WAYLAND, 0,
+                                       THEME_PANEL, wl_surface_title(), KIND_WAYLAND, 0,
                                        0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
     wl_window_open = 1;
 }

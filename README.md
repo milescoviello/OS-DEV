@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1980-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1981-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -755,8 +755,16 @@ Landed so far, all on the from-scratch ext2 driver:
   clipped, torn or wrongly-strided blit all produce blue pixels and all produce
   the wrong shape.
 
-Still ahead: `xdg_shell` (real windows a client can title and resize), input,
-then Firefox. The honest scale is still months.
+- **M1981** — **`xdg_shell`: a Wayland client owns a real window.**
+  `[wl] toplevel title: "OS-DEV Wayland demo"` — the client names its own
+  window and the compositor's titlebar shows it. This is the protocol GTK and
+  Firefox actually use, and the part that is easy to get silently wrong: a
+  compositor must send the **initial `configure` unprompted**, because a
+  toplevel is not mapped until the client acknowledges one — a client that
+  never receives it waits forever having done nothing wrong.
+
+Still ahead: input (`wl_seat` back out to the client), multiple surfaces, then
+Firefox. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the

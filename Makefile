@@ -209,10 +209,19 @@ $(LXROOT)/lxwlraw: tools/lx/lxwlraw.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (the Wayland handshake by hand, with a hexdump)"
 
-$(LXROOT)/lxwl: tools/lx/lxwl.c
+# xdg-shell is a PROTOCOL EXTENSION, not part of libwayland: its marshalling
+# code is generated from the XML by wayland-scanner and compiled in. Generated
+# into tools/lx/gen/ at build time so the checked-in tree carries the XML's
+# meaning rather than a stale copy of its output. (M1981)
+tools/lx/gen/xdg-shell-client-protocol.h tools/lx/gen/xdg-shell-protocol.c:
+	@mkdir -p tools/lx/gen
+	@if command -v wayland-scanner >/dev/null 2>&1 && [ -f $(XDG_SHELL_XML) ]; then 	    wayland-scanner client-header $(XDG_SHELL_XML) tools/lx/gen/xdg-shell-client-protocol.h && 	    wayland-scanner private-code  $(XDG_SHELL_XML) tools/lx/gen/xdg-shell-protocol.c && 	    echo "  SCANNER tools/lx/gen/xdg-shell-*  (from $(XDG_SHELL_XML))"; 	 else echo "  SKIP    xdg-shell bindings (wayland-scanner or the XML is missing)"; fi
+
+XDG_SHELL_XML ?= /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+
+$(LXROOT)/lxwl: tools/lx/lxwl.c tools/lx/gen/xdg-shell-client-protocol.h tools/lx/gen/xdg-shell-protocol.c
 	@mkdir -p $(LXROOT)
-	$(CC) -O2 -o $@ $< -lwayland-client
-	@echo "  HOSTCC  $@ (a REAL libwayland client -- the same library Firefox uses)"
+	@if [ -f tools/lx/gen/xdg-shell-protocol.c ]; then 	    $(CC) -O2 -Itools/lx/gen -o $@ $< tools/lx/gen/xdg-shell-protocol.c -lwayland-client && 	    echo "  HOSTCC  $@ (a REAL libwayland client + xdg-shell -- the same path Firefox uses)"; 	 else echo "  SKIP    $@ (no xdg-shell bindings)"; fi
 
 $(LXROOT)/lxscm: tools/lx/lxscm.c
 	@mkdir -p $(LXROOT)

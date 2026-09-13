@@ -46,7 +46,7 @@ timeout -s KILL 400 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -sm
 QPID=$!
 i=0
 while [ $i -lt 760 ]; do
-    grep -aqE "LXWL-SURFACE|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "LXWL-SURFACE|LXWL: |KERNEL PANIC" "$SLOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
@@ -94,6 +94,20 @@ if grep -aq "shm pool .*: 8192 bytes of the client's own memory" "$SLOG"; then
     echo "  ok: the shm pool is the client's own memory, taken from a passed memfd"
 else
     echo "  FAIL: the shm pool was not established:"; grep -a "shm pool" "$SLOG" | head -2; f=1
+fi
+# xdg_shell: the protocol that turns a bare surface into a real WINDOW -- one
+# the client titles and the compositor sizes. It is what GTK and Firefox use,
+# and a compositor that does not send the INITIAL configure unprompted leaves
+# them waiting forever having done nothing wrong.
+if grep -aq 'toplevel title: "OS-DEV Wayland demo"' "$SLOG"; then
+    echo "  ok: the client named its own window through xdg_toplevel.set_title"
+else
+    echo "  FAIL: set_title did not arrive:"; grep -a "toplevel title" "$SLOG" | head -2; f=1
+fi
+if grep -aq "LXWL-XDG: toplevel configured and acknowledged" "$SLOG"; then
+    echo "  ok: the xdg_surface.configure / ack_configure handshake completed"
+else
+    echo "  FAIL: the client never got a configure:"; grep -a "LXWL-XDG" "$SLOG" | head -2; f=1
 fi
 if grep -aq "LXWL-SURFACE: committed 64x32 ARGB8888" "$SLOG"; then
     echo "  ok: and the client completed its commit roundtrip"

@@ -32,3 +32,4 @@ uint32_t wl_last_height(void);
 /* The last committed surface, for the window manager to draw. NULL until one
  * exists; the pixels are the client's own memory, not a copy. (M1980) */
 const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride);
+const char     *wl_surface_title(void);   /* xdg_toplevel.set_title, for the titlebar (M1981) */
