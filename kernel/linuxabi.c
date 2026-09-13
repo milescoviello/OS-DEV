@@ -402,6 +402,17 @@ struct lx_iovec { void *iov_base; unsigned long iov_len; };
 /* Counters so the boot self-test can prove the path was actually taken rather
  * than inferring it from a value that could have come from anywhere. */
 volatile unsigned long lx_syscall_count, lx_unknown_count;
+static int64_t g_lx_boot_unix;   /* wall-clock second the machine booted; see clock_gettime (M1972) */
+
+/* The wall clock, anchored to uptime so it cannot run backwards. Every
+ * time-returning syscall uses this: reporting a different answer from time(),
+ * gettimeofday() and clock_gettime() is its own bug, and a caller that mixes
+ * them gets a negative interval. */
+static int64_t lx_realtime_sec(void) {
+    uint64_t ms = timer_ms();
+    if (!g_lx_boot_unix) g_lx_boot_unix = (int64_t)rtc_unix() - (int64_t)(ms / 1000);
+    return g_lx_boot_unix + (int64_t)(ms / 1000);
+}
 
 /* The last LXRING_N Linux syscalls, for post-mortem on a process that dies
  * without saying anything. (M1970) */
@@ -1446,7 +1457,20 @@ void linux_syscall_dispatch(struct registers *r) {
         if (r->r10) {
             uint64_t *old = (uint64_t *)r->r10;
             if (!vmm_user_ok(r->r10, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-            old[0] = old[1] = ~0ull;         /* RLIM_INFINITY, both cur and max */
+            /* Tell the TRUTH for the limits we actually enforce. Reporting
+             * RLIM_INFINITY for everything is fine for RLIMIT_STACK (glibc
+             * just picks a default) and actively harmful for RLIMIT_NOFILE:
+             * a program told its descriptor limit is unlimited asks for
+             * fd 1023 -- Linux's conventional top -- and gets EBADF from a
+             * 512-entry table. Claude Code does exactly that with
+             * fcntl(0, F_DUPFD_CLOEXEC, 1023). (M1972) */
+            uint64_t cur = ~0ull, mx = ~0ull;
+            switch ((int)r->rsi) {
+                case 7: cur = mx = (uint64_t)app_nfd_max();  break;   /* RLIMIT_NOFILE */
+                case 6: cur = mx = (uint64_t)app_proc_max(); break;   /* RLIMIT_NPROC  */
+                default: break;                                       /* the rest really are unbounded here */
+            }
+            old[0] = cur; old[1] = mx;
         }
         r->rax = 0;
         break;
@@ -1467,7 +1491,19 @@ void linux_syscall_dispatch(struct registers *r) {
         /* CLOCK_REALTIME(0) wants wall time; everything else (MONOTONIC and
          * the CPU-time clocks) is satisfied from uptime, which is what our
          * millisecond timer actually measures. */
-        if (a1 == 0) { ts[0] = (int64_t)rtc_unix(); ts[1] = (int64_t)((ms % 1000) * 1000000); }
+        /* CLOCK_REALTIME has to be COHERENT with itself (M1972).
+         *
+         * It used to take seconds from the RTC and nanoseconds from uptime --
+         * two clocks that are not related. The RTC ticks over at some arbitrary
+         * point inside the uptime second, so consecutive reads could go
+         * BACKWARDS by up to a second, and code that measures a duration by
+         * subtracting two of them gets a negative interval. Anchor the wall
+         * clock to uptime once, then derive it: still the right absolute time,
+         * and monotonic like the real thing. */
+        if (a1 == 0) {
+            ts[0] = lx_realtime_sec();
+            ts[1] = (int64_t)((ms % 1000) * 1000000);
+        }
         else         { ts[0] = (int64_t)(ms / 1000); ts[1] = (int64_t)((ms % 1000) * 1000000); }
         r->rax = 0;
         break;
@@ -1835,7 +1871,7 @@ void linux_syscall_dispatch(struct registers *r) {
             if (!vmm_user_ok(r->rdi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             int64_t *tv = (int64_t *)r->rdi;
             uint64_t ms = timer_ms();
-            tv[0] = (int64_t)rtc_unix();
+            tv[0] = lx_realtime_sec();
             tv[1] = (int64_t)((ms % 1000) * 1000);   /* microseconds */
         }
         r->rax = 0;                          /* the timezone arg is obsolete; Linux ignores it too */
@@ -2020,9 +2056,9 @@ void linux_syscall_dispatch(struct registers *r) {
          * either. `as` stamps the object file's timestamp from this. */
         if (r->rdi) {
             if (!vmm_user_ok(r->rdi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-            *(int64_t *)r->rdi = (int64_t)rtc_unix();
+            *(int64_t *)r->rdi = lx_realtime_sec();
         }
-        r->rax = (uint64_t)rtc_unix();
+        r->rax = (uint64_t)lx_realtime_sec();
         break;
     case LXS_getppid_:
         r->rax = (uint64_t)app_sys_getppid();

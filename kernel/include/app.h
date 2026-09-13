@@ -41,6 +41,8 @@ void        app_faults(app_t *a, uint64_t *minflt, uint64_t *majflt);  /* any ap
 int         app_format_smaps(app_t *a, char *b, int max);          /* /proc/<pid>/smaps: per-region Rss/Pss/Dirty/Swap (M1151) */
 int         app_format_pagemap(app_t *a, char *b, int max);        /* /proc/<pid>/pagemap: per-page residency + PFN (M1167) */
 uint64_t    app_heap_bytes(app_t *a);   /* heap size in bytes */
+int         app_nfd_max(void);          /* per-process descriptor ceiling, for RLIMIT_NOFILE (M1972) */
+int         app_proc_max(void);         /* process ceiling, for RLIMIT_NPROC (M1972) */
 int         app_vma_count(app_t *a);    /* number of mmap regions */
 int         app_vma_info(app_t *a, int i, uint64_t *start, uint64_t *len, int *prot);  /* one VMA's extent+prot; 0/-1 (M1970) */
 int         app_ppid(app_t *a);         /* parent pid, for /proc/<pid>/stat (M1231) */

@@ -258,7 +258,12 @@ struct app {
  * kernel is 146 of them, so a 128-fd ceiling meant ld simply never saw the
  * tail of its own command line. It reported "undefined reference to kmalloc"
  * about a file that defines it perfectly well. */
-#define APP_NFD 512
+/* 1024, which is Linux's conventional RLIMIT_NOFILE and therefore the number
+ * real programs assume. They do not all read the limit before using it: Claude
+ * Code asks for fcntl(0, F_DUPFD_CLOEXEC, 1023) outright -- "put this at the
+ * top of the descriptor space" -- and a 512-entry table can only answer EBADF.
+ * At ~288 bytes per entry and MAX_APPS 32 this costs about 9 MB of BSS. (M1972) */
+#define APP_NFD 1024
     /* type: 0=free, 1=pipe (obj=pipe index, write_end), 2=file (path+off, M1193). */
     /* path 64 -> 256 (M1936): 63 usable bytes could not even hold a moderately
      * nested source path, and the truncation was silent.
@@ -579,6 +584,11 @@ const char *app_arg(app_t *a) { return a ? a->launch_arg : ""; }          /* /pr
 void       *app_task(app_t *a) { return a ? (void *)a->task : 0; }        /* the task_t*, for /proc/<pid>/ctl stop/cont */
 uint64_t    app_cr3(app_t *a) { return a ? a->cr3 : 0; }                  /* the app's address space, for /proc/<pid>/wss */
 uint64_t    app_heap_bytes(app_t *a) { return (a && a->heap_end) ? a->heap_end - UHEAP_BASE : 0; }
+/* The real ceilings, so the ABI layer can report them instead of claiming
+ * RLIM_INFINITY. A program that is told its descriptor limit is unlimited will
+ * cheerfully ask for fd 1023 -- and get EBADF from a 512-entry table. (M1972) */
+int         app_nfd_max(void)  { return APP_NFD; }
+int         app_proc_max(void) { return MAX_APPS; }
 int         app_vma_count(app_t *a) { return a ? a->nvma : 0; }
 /* Read one VMA's extent and protection, for diagnostics that need to ask
  * "is this address executable in this process?" -- a stack scan looking for
@@ -4637,6 +4647,12 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 8) {   /* inotify: drain queued events (M1266) */
         return inotify_read(a->fd[fd].obj, buf, max);
     }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M1972) */
+        /* EOF, not an error: a Linux binary here has no interactive input
+         * source wired up, and a program that reads its stdin should see a
+         * closed one rather than a failure it has to interpret. */
+        (void)max; return 0;
+    }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 9) {   /* connected UDP socket: recv (M1967) */
         if (!a->fd[fd].peer_port) return -1;                                  /* ENOTCONN */
         return app_recvfrom(fd, buf, (int)max, 0, 0);
@@ -4741,6 +4757,10 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
             }
         irq_restore(f);
         return 8;
+    }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M1972) */
+        console_write_n((const char *)buf, len);
+        return (long)len;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 9) {   /* connected UDP socket: send (M1967) */
         if (!a->fd[fd].peer_port) return -1;                                  /* ENOTCONN: no default peer */
@@ -5283,7 +5303,27 @@ long app_recvfrom(int fd, void *buf, int max, uint8_t srcip[4], uint16_t *srcpor
  * copies the whole fdent so it survives a fork, as POSIX requires). */
 long app_fcntl(int fd, int cmd, long arg) {
     struct app *a = cur();
-    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    if (!a || fd < 0 || fd >= APP_NFD) return -1;
+    /* fds 0/1/2 are the CONSOLE while untouched, and have no fd-table entry --
+     * so every fcntl on them failed with EBADF, where Linux answers happily.
+     * `fcntl(0, F_DUPFD_CLOEXEC, 1023)` is a real thing real programs do at
+     * startup. Give them the answers a tty would, and materialise a genuine
+     * descriptor (type 14) when one is actually asked for. (M1972) */
+    if (!a->fd[fd].used) {
+        if (fd > 2) return -1;                       /* genuinely not open */
+        if (cmd == F_GETFD) return 0;                /* no FD_CLOEXEC on stdio */
+        if (cmd == F_SETFD) return 0;
+        if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+            int lo = (int)arg; if (lo < APP_FD_FIRST) lo = APP_FD_FIRST;
+            if (lo >= APP_NFD) return -1;
+            int nf = -1; for (int i = lo; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
+            if (nf < 0) return -1;
+            a->fd[nf] = (struct fdent){ 1, 14, 1, fd, {0}, 0, 0 };   /* obj = which stdio fd it aliases */
+            a->fd[nf].cloexec = (cmd == F_DUPFD_CLOEXEC) ? 1 : 0;
+            return nf;
+        }
+        return -1;
+    }
     if (cmd == F_GETFD) return a->fd[fd].cloexec ? FD_CLOEXEC : 0;
     if (cmd == F_SETFD) { a->fd[fd].cloexec = (arg & FD_CLOEXEC) ? 1 : 0; return 0; }
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
@@ -5501,6 +5541,9 @@ int app_fd_ready(app_t *ap, int fd, int events) {
         /* POLLIN on a listening socket means "accept() would not block", which
          * is exactly what a server's event loop waits for. */
         if ((events & POLLIN) && unix_pending(a->fd[fd].obj)) re |= POLLIN;
+    } else if (a->fd[fd].type == 14) {                     /* console alias: always writable, reads give EOF (M1972) */
+        if (events & POLLIN)  re |= POLLIN;                /* an EOF read is "ready", not blocked */
+        if (events & POLLOUT) re |= POLLOUT;
     } else if (a->fd[fd].type == 9) {                      /* AF_INET datagram socket (M1967) */
         /* An unbound socket has no port to receive on, so it is never readable;
          * it is always writable (sendto binds one on first use). */
