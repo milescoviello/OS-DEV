@@ -1,5 +1,39 @@
 # What's next
 
+> **(M1997) THE FUTEX LAYER IS NOT THE PROBLEM, AND NOW THERE IS EVIDENCE.**
+>
+> Firefox stalls with three threads parked in `app_futex`, so the obvious theory
+> was a lost wakeup -- and there was a good mechanism for one. The waiter key is
+> the futex word's PHYSICAL address, which is stable only while the page is:
+> Firefox forks content processes, a copy-on-write between the wait and the wake
+> renames the futex, and both sides then wait forever with nothing wrong at the
+> futex layer to look at. Linux keys private futexes on `(mm, uaddr)` for
+> exactly this reason.
+>
+> **I implemented it and it broke `lxstress` outright** -- 3/3 to 0/3. The
+> kernel's own `clear_child_tid` wake, which is the kernel half of a blocking
+> `pthread_join`, goes through the native entry point; changing how the ABI
+> names a futex made the two spellings disagree, and every join hung. Reverted.
+>
+> **The A/B that "cleared" the change first was invalid**, and that is the part
+> worth keeping: the edit meant to disable the new keying used a string replace
+> with no assertion, matched nothing, and produced two identical binaries. Both
+> "failed", which looked like exculpatory evidence and was not. *Assert that a
+> patch applied before trusting the experiment it feeds.*
+>
+> So the question got answered by measurement instead. `-append futextrace` logs
+> every wait and wake with its address and result. Under Firefox:
+>
+> - 237 wakes, 235 of which woke nobody -- all for addresses no thread was
+>   parked on, which is exactly what uncontended `pthread_mutex_unlock` does
+> - **no wake was ever issued for the address the blocked thread is waiting on**
+>
+> Nothing is being lost. Those threads are waiting for work that never arrives,
+> which moves the question up a layer to what the runnable thread is doing --
+> and that is the next thing.
+>
+> Also fixed: `/etc/hosts` was written before `/disk2/etc` was created.
+
 > **(M1996) FIREFOX BINDS EVERY GLOBAL WE ADVERTISE.**
 >
 > ```

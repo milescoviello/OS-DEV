@@ -3599,6 +3599,8 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
 /* 32 -> 256 (M1959): one GLOBAL table shared by every process, and a real
  * threaded program parks most of its threads on a futex at once. 32 was a
  * hard ceiling on how many threads could block anywhere in the system. */
+int g_futex_trace;              /* -append futextrace (M1997) */
+static int g_futex_traced;
 #define FUTEX_NWAIT 256
 static struct { uint64_t key; void *task; int used; } g_futex[FUTEX_NWAIT];
 
@@ -3678,6 +3680,10 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         for (int i = 0; i < FUTEX_NWAIT; i++) if (!g_futex[i].used) { slot = i; break; }
         if (slot < 0) { irq_restore(f); return -1; }        /* too many waiters */
         g_futex[slot].key = key; g_futex[slot].task = task_self(); g_futex[slot].used = 1;
+        if (g_futex_trace && g_futex_traced < 240) {
+            g_futex_traced++;
+            kprintf("[futex] WAIT tid %d uaddr %lx key %lx\n", task_current_id(), uaddr, key);
+        }
         irq_restore(f);                 /* release BEFORE blocking (M1612) -- see app_wake_lock's own comment */
         if (timeout_ms >= 0) {          /* bounded wait (M1578): matches epoll_wait/poll's own -1=forever, else ms convention */
             task_block_timeout(timer_ms() + (uint64_t)timeout_ms);   /* woken by a WAKE, the deadline, a kill, or a signal */
@@ -3702,6 +3708,16 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
                 if (wt && task_state_of(wt) != TASK_DEAD) { task_wake(wt); woke++; }
             }
         irq_restore(f);
+        /* A WAKE THAT WOKE NOBODY is the interesting one: either there is
+         * genuinely no waiter (normal, and common), or there is one whose key
+         * does not match ours -- which is a lost wakeup and a hang. Printing
+         * the address lets the two be told apart against the WAIT lines.
+         * (M1997) */
+        if (g_futex_trace && g_futex_traced < 240) {
+            g_futex_traced++;
+            kprintf("[futex] WAKE tid %d uaddr %lx key %lx -> %d\n",
+                    task_current_id(), uaddr, key, woke);
+        }
         return woke;
     }
     return -1;

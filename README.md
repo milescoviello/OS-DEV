@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1996-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1997-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1123,6 +1123,29 @@ Landed so far, all on the from-scratch ext2 driver:
   silent" into: main and two workers in `app_futex`, one in `pipe_read`, and one
   `READY` and spinning — which is a lost wakeup or a deadlock, and is the next
   thing.
+
+- **M1997** — **the futex layer is not the problem, and now there is evidence.**
+  Firefox stalls with three threads in `app_futex`, so the obvious theory was a
+  lost wakeup: the waiter key is a *physical* address, and Firefox forks, so a
+  copy-on-write between the wait and the wake would rename the futex and lose it
+  forever. I rewrote the key as `(process, virtual address)` the way Linux does
+  for private futexes — and it **broke `lxstress` outright**, because the
+  kernel's own `clear_child_tid` wake goes through the native entry point and
+  the two spellings stopped matching. Reverted.
+
+  The A/B that "cleared" the change first was also invalid: the edit that was
+  supposed to disable it silently matched nothing, so both builds were the same
+  binary. **Assert that a patch applied before trusting the experiment.**
+
+  So the question got answered with measurement instead. `-append futextrace`
+  logs every wait and wake with its address, and under Firefox: 237 wakes, 235
+  of which woke nobody — all for addresses no thread was parked on, which is
+  what uncontended `pthread_mutex_unlock` looks like — and **no wake was ever
+  issued for the address the blocked thread is waiting on**. Nothing is lost.
+  Those threads are waiting for work that never arrives, which moves the
+  question up a layer.
+
+  Also fixed: `/etc/hosts` was written before `/disk2/etc` existed.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

@@ -500,6 +500,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
         if (cmdline_has(cl, "vmaaudit"))   { extern int g_vma_audit; g_vma_audit = 1; }   /* check the no-overlap invariant on every mmap/munmap (M1988) */
         if (cmdline_has(cl, "lxstress"))   { g_lxabi_test = 1; g_lxstress = 1; }   /* mmap/thread/futex churn, on its own boot (M1987) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
@@ -761,6 +762,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         /* Claude Code's own state tree. It creates these itself, one level at
          * a time -- but only if their parent exists, and a failed mkdir here is
          * fatal to it rather than cosmetic. (M1992) */
+        vfs_mkdir("/disk2/etc");            /* BEFORE anything writes into it (M1997) */
         /* /etc/hosts and /etc/host.conf. glibc's resolver reads both before it
          * will look anything up, and Firefox asks for them by name. A
          * loopback entry is the truthful minimum. (M1996) */
