@@ -42,7 +42,7 @@ timeout -s KILL 1800 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 4G -s
 QPID=$!
 i=0
 while [ $i -lt 3600 ]; do
-    grep -aqE "claude --version ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "claude --help ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
@@ -71,6 +71,13 @@ if grep -aq "claude --version -> 0" "$SLOG"; then
     echo "  ok: and exited 0"
 else
     echo "  FAIL: it did not exit cleanly:"; grep -a "claude --version ->" "$SLOG" | head -1; f=1
+fi
+# --help runs the whole argument parser and help renderer -- a real amount of
+# the bundled JavaScript, rather than printing one constant.
+if grep -aq "Usage: claude \[options\] \[command\] \[prompt\]" "$SLOG" && grep -aq "claude --help -> 0" "$SLOG"; then
+    echo "  ok: and --help rendered the full CLI (argument parser + help text), exit 0"
+else
+    echo "  FAIL: --help did not render:"; grep -aE "Usage: claude|claude --help ->" "$SLOG" | head -2; f=1
 fi
 
 [ $f -eq 0 ] || { echo "FAIL: Claude Code in-guest"; exit 1; }

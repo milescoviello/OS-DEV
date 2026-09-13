@@ -95,6 +95,8 @@ long   app_getcwd(char *buf, unsigned long max);  /* copy the cwd string out; le
 const char *app_cwd_str(app_t *a);     /* the cwd path string of any app, for /proc/<pid>/cwd (M1249) */
 const char *app_exe_str(app_t *a);     /* the spawn/exec path of any app, for /proc/<pid>/exe (M1250) */
 int    app_pipe2(int *out, int flags); /* pipe() + atomic O_CLOEXEC (M1239) */
+int    app_unix_send_fd(int sockfd, int fd);  /* SCM_RIGHTS keyed on the SOCKET fd (M1977) */
+int    app_unix_recv_fd(int sockfd);          /* SCM_RIGHTS receive keyed on the socket fd; new fd/-1 (M1977) */
 int    app_scm_send(int ep, int fd);   /* SCM_RIGHTS: queue fd to pass over an AF_UNIX endpoint; 0/-1 (M1265) */
 int    app_scm_recv(int ep);           /* SCM_RIGHTS: install a passed fd from the peer; new fd/-1 (M1265) */
 int    app_eventfd_create(unsigned int initval, int flags);  /* pollable u64-counter fd (M1242) */
@@ -216,6 +218,7 @@ long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe f
 int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
 int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
 int  app_fd_type(int fd);                                      /* fd-table type, or -1 if not open (M1965) */
+int  app_fd_set_cloexec(int fd, int on);                       /* FD_CLOEXEC, for MFD_CLOEXEC/SOCK_CLOEXEC (M1977) */
 long app_pread(int fd, void *buf, unsigned long max, long off);        /* read a FILE fd without moving its cursor; bytes/0 EOF/-1 (M1572) */
 long app_pwrite(int fd, const void *buf, unsigned long len, long off); /* write a FILE fd without moving its cursor; bytes/-1 (M1572) */
 int  app_fd_close(int fd);             /* close an fd; 0/-1 (M1187) */
@@ -227,6 +230,7 @@ long app_tee(int in_fd, int out_fd, unsigned long len);    /* copy bytes pipe->p
 int  app_memfd_create(const char *name, int flags);        /* anonymous sealable in-RAM file fd (>=3); -1 (M1212) */
 long app_memfd_seal(int fd, unsigned add);                 /* add F_SEAL_* (one-way); new seal set/-1 (M1212) */
 long app_ftruncate(int fd, long len);                      /* resize a memfd (seal-checked); 0/-1 (M1212) */
+uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off);  /* MAP_SHARED a memfd: the wl_shm primitive; VA/0 (M1977) */
 long app_fsync(int fd);                                     /* fsync/fdatasync: 0 for a real file fd (write-through already durable), -1 otherwise (M1566) */
 long app_sync_file_range(int fd, uint64_t offset, uint64_t nbytes, unsigned flags);  /* same as app_fsync; range/flags unused (M1566) */
 void app_sync(void);                                        /* whole-system flush, no fd, never fails (M1588) */

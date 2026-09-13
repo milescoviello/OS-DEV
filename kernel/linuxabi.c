@@ -256,6 +256,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_recvmsg_      47
 #define LXS_recvmmsg_    299
 #define LXS_sendmmsg_    307
+#define LXS_memfd_create_ 319
+#define LXS_ftruncate_    77
 #define LXS_clock_nanosleep_ 230
 #define LXS_statx_       332
 #define LXS_sched_getaffinity_ 204
@@ -993,6 +995,29 @@ void linux_syscall_dispatch(struct registers *r) {
      *                    void *control; u64 controllen; int flags; }   56 bytes
      *   struct mmsghdr { struct msghdr hdr; u32 len; }                 64 bytes
      */
+    case LXS_ftruncate_: {                  /* (fd, length) */
+        /* A memfd is created EMPTY; it has to be sized before it can be
+         * mapped, so wl_shm's very first move is memfd_create + ftruncate.
+         * app_ftruncate has existed since M1212 with no Linux number. (M1977) */
+        long tr = app_ftruncate((int)a1, (long)r->rsi);
+        if (g_lx_systrace) kprintf("[sock] ftruncate(fd %ld, %ld) -> %ld\n", a1, (long)r->rsi, tr);
+        r->rax = (uint64_t)(tr == 0 ? 0 : -(long)LX_EINVAL);
+        break;
+    }
+    case LXS_memfd_create_: {               /* (name, flags) -> an anonymous in-RAM file */
+        /* The foundation of wl_shm: a client puts its pixels in a memfd, passes
+         * the descriptor to the compositor over the socket, and both mmap it.
+         * app_memfd_create has existed since M1212; it simply had no Linux
+         * number. (M1977) */
+        const char *nm = (const char *)r->rdi;
+        if (nm && !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int mf = app_memfd_create(nm ? nm : "memfd", 0);
+        if (mf < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        if (r->rsi & 1) app_fd_set_cloexec(mf, 1);      /* MFD_CLOEXEC */
+        if (g_lx_systrace) kprintf("[sock] memfd_create(%s) -> %d\n", nm ? nm : "?", mf);
+        r->rax = (uint64_t)mf;
+        break;
+    }
     case LXS_sendmsg_:
     case LXS_sendmmsg_: {                   /* (fd, msg[vec], vlen, flags) */
         int is_mm = (r->rax == LXS_sendmmsg_);
@@ -1026,6 +1051,33 @@ void linux_syscall_dispatch(struct registers *r) {
                 if (tot >= sizeof gbuf) break;
             }
             if (bad) break;
+            /* SCM_RIGHTS: hand any descriptors in msg_control to the peer
+             * BEFORE the bytes, so they are already queued when it reads.
+             *
+             *   struct cmsghdr { u64 cmsg_len; int cmsg_level; int cmsg_type; }
+             *   then the payload -- for SCM_RIGHTS, an array of ints.
+             *
+             * This is how a Wayland client gives the compositor its pixels: it
+             * puts them in a memfd and passes the descriptor down the same
+             * socket as the protocol messages. (M1977) */
+            uint64_t ctl = *(const uint64_t *)(h + 32);
+            uint64_t ctllen = *(const uint64_t *)(h + 40);
+            if (ctl && ctllen >= 16 && vmm_user_ok(ctl, ctllen)) {
+                const uint8_t *cm = (const uint8_t *)ctl;
+                uint64_t clen = *(const uint64_t *)(cm + 0);
+                int level = *(const int *)(cm + 8), ctype = *(const int *)(cm + 12);
+                if (level == 1 /*SOL_SOCKET*/ && ctype == 1 /*SCM_RIGHTS*/ &&
+                    clen >= 16 && clen <= ctllen) {
+                    int nfd = (int)((clen - 16) / sizeof(int));
+                    const int *fds = (const int *)(cm + 16);
+                    for (int q = 0; q < nfd; q++) {
+                        if (app_unix_send_fd((int)a1, fds[q]) != 0)
+                            kprintf("[sock] SCM_RIGHTS: could not pass fd %d\n", fds[q]);
+                        else if (g_lx_systrace)
+                            kprintf("[sock] SCM_RIGHTS: passed fd %d\n", fds[q]);
+                    }
+                }
+            }
             long sn;
             if (nameptr && namelen >= 8 && vmm_user_ok(nameptr, 8)) {
                 const uint8_t *sa = (const uint8_t *)nameptr;
@@ -1085,6 +1137,33 @@ void linux_syscall_dispatch(struct registers *r) {
                 o[2] = (uint8_t)(sp >> 8); o[3] = (uint8_t)(sp & 0xFF);
                 for (int i = 0; i < 4; i++) o[4 + i] = sip[i];
                 *(uint32_t *)(h + 8) = 16;                /* msg_namelen */
+            }
+            /* SCM_RIGHTS the other way: install any descriptors the peer passed
+             * and describe them in msg_control. A receiver that asked for no
+             * control space gets none, which is what Linux does. (M1977) */
+            {
+                uint64_t ctl = *(const uint64_t *)(h + 32);
+                uint64_t ctllen = *(const uint64_t *)(h + 40);
+                uint64_t wrote = 0;
+                if (ctl && ctllen >= 16 + sizeof(int) && vmm_user_ok(ctl, ctllen)) {
+                    int cap = (int)((ctllen - 16) / sizeof(int));
+                    uint8_t *cm = (uint8_t *)ctl;
+                    int *outfds = (int *)(cm + 16);
+                    int nfd = 0;
+                    while (nfd < cap) {
+                        int nf2 = app_unix_recv_fd((int)a1);
+                        if (nf2 < 0) break;
+                        outfds[nfd++] = nf2;
+                        if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: received fd %d\n", nf2);
+                    }
+                    if (nfd > 0) {
+                        wrote = 16 + (uint64_t)nfd * sizeof(int);
+                        *(uint64_t *)(cm + 0) = wrote;
+                        *(int *)(cm + 8)  = 1;            /* SOL_SOCKET */
+                        *(int *)(cm + 12) = 1;            /* SCM_RIGHTS  */
+                    }
+                }
+                *(uint64_t *)(h + 40) = wrote;            /* msg_controllen: what we actually filled */
             }
             *(uint32_t *)(h + 48) = 0;                    /* msg_flags: nothing truncated */
             if (first < 0) first = (long)off;
@@ -1379,6 +1458,18 @@ void linux_syscall_dispatch(struct registers *r) {
         int fd = (int)r->r8;
         if (len <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (!(flags & LX_MAP_ANONYMOUS)) {
+            /* A memfd has no PATH, so the file-backed route below cannot serve
+             * it -- and mapping one is the entire point of memfd. Both
+             * processes that map the same object get the same physical pages,
+             * which is what makes wl_shm a zero-copy pixel handoff. (M1977) */
+            if (fd >= 0 && app_fd_type(fd) == 3) {
+                uint64_t mb = app_mmap_memfd(fd, (uint64_t)len, (uint64_t)r->r9);
+                if (g_lx_systrace)
+                    kprintf("[lxmmap] memfd fd=%d len=%lx off=%lx -> %lx\n",
+                            fd, (unsigned long)len, (unsigned long)r->r9, (unsigned long)mb);
+                if (!mb) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+                r->rax = mb; break;
+            }
             /* File-backed: resolve the fd to its path and map at the given
              * offset. This is the shape a dynamic linker uses for every
              * PT_LOAD of a shared object. (M1953) */

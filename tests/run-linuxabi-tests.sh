@@ -178,6 +178,7 @@ LXBOX: pipeline wc=4 writer=0
 LXMMAP: MAP_FIXED honoured
 LXFMAP: file-backed mmap at offset 8192 read the right page
 LXVMAGAP: a 2MiB mmap next to an unaligned gap
+LXSCM: memfd + SCM_RIGHTS + MAP_SHARED
 LXNOPIE: ET_EXEC ran below 1 GiB
 LXNOPIEDYN: ET_EXEC + PT_INTERP ran
 LXDYN: a dynamically-linked binary ran
@@ -297,6 +298,16 @@ LXTHREAD: 4 threads
     # at a fixed low address could not be loaded at all. Two shapes, because
     # they fail differently: static (no interpreter) and dynamic (ld.so has to
     # be told where program headers are that are NOT at base + e_phoff).
+    # M1977: the wl_shm foundation, and therefore the foundation of any Wayland
+    # client including Firefox -- a client puts pixels in a memfd, passes the
+    # DESCRIPTOR over the socket, and both sides map it. The assertion is on
+    # SHARING (a write through one mapping seen through the other), not just on
+    # the transfer: a private copy would pass everything else.
+    if grep -aq "LXSCM: memfd + SCM_RIGHTS + MAP_SHARED" "$SLOG3"; then
+        echo "  ok: fd passing + shared memory ($(grep -ao 'fd [0-9]* passed as [0-9]*, [0-9]* KiB shared both ways' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: memfd/SCM_RIGHTS/MAP_SHARED:"; grep -a "LXSCM" "$SLOG3" | head -2; f3=1
+    fi
     if grep -aq "LXNOPIE: ET_EXEC ran below 1 GiB" "$SLOG3"; then
         echo "  ok: a non-PIE ET_EXEC binary ran at its link-time address below 1 GiB ($(grep -ao 'main=[0-9a-f]*' "$SLOG3" | head -1))"
     else

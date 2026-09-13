@@ -4573,12 +4573,25 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
  * (WRITE/SHRINK/GROW/SEAL). Refcounted across fork/dup2 exactly like a pipe. */
 #define NMEMFD 16
 #define MEMFD_MAX (16ul * 1024 * 1024)   /* 16 MiB per object (kheap-bounded) */
-static struct memfd { int used, refs; unsigned seals; unsigned long size, cap; char *buf; char name[32]; } memfds[NMEMFD];
+/* `raw` is the allocation; `buf` is the PAGE-ALIGNED view inside it, and the
+ * capacity is a whole number of pages. Both are needed to mmap a memfd
+ * (M1977): mapping it into a process means aliasing its pages, which requires
+ * the region to start on a page boundary AND to own every page it spans --
+ * otherwise the last page could be shared with an unrelated kernel allocation
+ * and get handed to userspace along with it.
+ *
+ * `mapped` freezes the size once a process has mapped it. Growing would
+ * kmalloc a new buffer and copy, leaving every existing mapping pointing at
+ * freed memory. wl_shm sizes a pool once and then maps it, so refusing is
+ * both correct and sufficient. */
+static struct memfd { int used, refs; unsigned seals; unsigned long size, cap;
+                      char *buf, *raw; int mapped; char name[32]; } memfds[NMEMFD];
 
 static int memfd_alloc(const char *name) {
     for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used) {
         struct memfd *m = &memfds[i];
-        m->used = 1; m->refs = 1; m->seals = 0; m->size = 0; m->cap = 0; m->buf = 0;
+        m->used = 1; m->refs = 1; m->seals = 0; m->size = 0; m->cap = 0;
+        m->buf = 0; m->raw = 0; m->mapped = 0;
         int j = 0; if (name) while (name[j] && j < (int)sizeof m->name - 1) { m->name[j] = name[j]; j++; }
         m->name[j] = 0;
         return i;
@@ -4589,21 +4602,60 @@ static void memfd_ref(int idx) { if (idx >= 0 && idx < NMEMFD && memfds[idx].use
 static void memfd_unref(int idx) {
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used) return;
     if (--memfds[idx].refs > 0) return;
-    if (memfds[idx].buf) kfree(memfds[idx].buf);
-    memfds[idx].used = 0; memfds[idx].buf = 0; memfds[idx].size = memfds[idx].cap = 0;
+    if (memfds[idx].raw) kfree(memfds[idx].raw);
+    memfds[idx].used = 0; memfds[idx].buf = 0; memfds[idx].raw = 0;
+    memfds[idx].mapped = 0; memfds[idx].size = memfds[idx].cap = 0;
 }
 /* Ensure cap >= need (doubling), preserving the first `size` bytes. 0/-1. */
 static int memfd_grow(struct memfd *m, unsigned long need) {
     if (need <= m->cap) return 0;
     if (need > MEMFD_MAX) return -1;
-    unsigned long nc = m->cap ? m->cap * 2 : 64;
+    if (m->mapped) return -1;            /* a live mapping would be left dangling */
+    unsigned long nc = m->cap ? m->cap * 2 : PAGE_SIZE;
     while (nc < need) nc *= 2;
     if (nc > MEMFD_MAX) nc = MEMFD_MAX;
-    char *nb = kmalloc(nc); if (!nb) return -1;
+    nc = (nc + PAGE_SIZE - 1) & ~(unsigned long)(PAGE_SIZE - 1);   /* whole pages: see the struct comment */
+    char *nr = kmalloc(nc + PAGE_SIZE); if (!nr) return -1;
+    char *nb = (char *)(((uintptr_t)nr + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
     for (unsigned long i = 0; i < m->size; i++) nb[i] = m->buf[i];
-    if (m->buf) kfree(m->buf);
-    m->buf = nb; m->cap = nc;
+    for (unsigned long i = m->size; i < nc; i++) nb[i] = 0;        /* never hand stale kernel bytes to a mapping */
+    if (m->raw) kfree(m->raw);
+    m->raw = nr; m->buf = nb; m->cap = nc;
     return 0;
+}
+
+/* mmap(MAP_SHARED) of a memfd (M1977): alias its pages into the caller.
+ *
+ * This is how wl_shm works -- a client and the compositor both map the same
+ * object and neither copies a pixel. The frames come from the memfd's own
+ * page-aligned buffer, so both mappings resolve to the same physical memory
+ * and a write through one is immediately visible through the other. */
+uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
+    struct app *a = cur(); if (!a || !len) return 0;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3) return 0;
+    struct memfd *m = &memfds[a->fd[fd].obj];
+    if (!m->used || !m->buf) return 0;
+    len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (off & (PAGE_SIZE - 1)) return 0;                  /* must start on a page */
+    if (off + len > m->cap) return 0;                     /* beyond the object */
+    uint64_t base = vma_find_gap(a, len, 0);
+    if (!base) return 0;
+    for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
+        uint64_t phys = vmm_translate((uint64_t)(uintptr_t)(m->buf + off + i));
+        if (!phys) return 0;                              /* unbacked: refuse rather than map a hole */
+        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) return 0;
+    }
+    m->mapped = 1;
+    if (a->nvma < APP_MAXVMA) {          /* recorded so munmap/poll/maps see it */
+        VMA_NEW(a);
+        a->vma[a->nvma].start = base; a->vma[a->nvma].len = len;
+        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
+        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
+        a->vma[a->nvma].shared = 1;
+        a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        a->nvma++;
+    }
+    return base;
 }
 /* fd 0/1/2 are reserved for stdin/stdout/stderr (M1191): unused-in-table means
  * the window/keyboard, and dup2 can redirect them to a pipe. So pipe()/fifo_open
@@ -4888,6 +4940,11 @@ int app_fd_nonblock(int fd) {
 int app_fd_set_nonblock(int fd, int on) {
     struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
     a->fd[fd].nonblock = on ? 1 : 0;
+    return 0;
+}
+int app_fd_set_cloexec(int fd, int on) {
+    struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    a->fd[fd].cloexec = on ? 1 : 0;
     return 0;
 }
 int app_fd_type(int fd) {
@@ -5255,6 +5312,25 @@ int app_unix_connect(int fd, const char *path) {
     a->fd[fd].obj = ep;
     return 0;
 }
+/* SCM_RIGHTS over a SOCKET FD (M1977).
+ *
+ * app_scm_send/app_scm_recv have existed since M1265 but take an ENDPOINT id,
+ * the pre-fd-table handle. Everything that speaks Wayland passes descriptors
+ * this way -- a client hands the compositor a memfd holding its pixels -- so
+ * the ABI layer needs a version keyed on the socket fd it actually has. */
+int app_unix_send_fd(int sockfd, int fd) {
+    struct app *a = cur(); if (!a) return -1;
+    if (sockfd < 0 || sockfd >= APP_NFD || !a->fd[sockfd].used || a->fd[sockfd].type != 12) return -1;
+    if (a->fd[sockfd].obj < 0) return -1;
+    return app_scm_send(a->fd[sockfd].obj, fd);
+}
+int app_unix_recv_fd(int sockfd) {
+    struct app *a = cur(); if (!a) return -1;
+    if (sockfd < 0 || sockfd >= APP_NFD || !a->fd[sockfd].used || a->fd[sockfd].type != 12) return -1;
+    if (a->fd[sockfd].obj < 0) return -1;
+    return app_scm_recv(a->fd[sockfd].obj);
+}
+
 /* shutdown(2) on an AF_UNIX fd (M1965): end this side's write direction so the
  * peer reads EOF. */
 int app_unix_shutdown(int fd, int how) {

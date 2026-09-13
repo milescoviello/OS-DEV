@@ -813,6 +813,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] LXNOPIE exit -> %d\n", nprc);
             /* Claude Code's exact shape: ET_EXEC *and* dynamically linked, so
              * ld.so has to find program headers that are not at base+e_phoff. */
+            /* The wl_shm foundation: a descriptor passed over a socket, and
+             * memory shared through it. Everything Wayland does with pixels
+             * rests on this. (M1977) */
+            kprintf("[lxabi] launching the memfd + SCM_RIGHTS test...\n");
+            int scmrc = app_run_linux_sync("/disk2/lxscm", 0, 0, 120000);
+            kprintf("[lxabi] LXSCM exit -> %d\n", scmrc);
             kprintf("[lxabi] launching a NON-PIE DYNAMIC binary...\n");
             int ndrc = app_run_linux_sync("/disk2/lxnopiedyn", 0, 0, 120000);
             kprintf("[lxabi] LXNOPIEDYN exit -> %d\n", ndrc);

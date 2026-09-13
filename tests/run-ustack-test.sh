@@ -24,13 +24,18 @@ fi
 
 echo "booting with -append ustackover (deliberate ring-3 user-stack overflow)..."
 # The app is killed mid-boot; the KERNEL must boot on, so poll for the desktop.
-timeout -s KILL 30 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+# 30s was sized for a 512 KiB user stack. M1975 made it 16 MiB (Linux gives 8,
+# and Claude Code's PT_GNU_STACK asks for 12.2), so RECURSING TO THE GUARD PAGE
+# now takes ~32x as long -- and under `make check`'s parallel pool the old
+# budget expired before the fault, which reads as "the guard page stopped
+# working" when nothing of the sort happened.
+timeout -s KILL 180 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
     -append ustackover \
     -display none -serial file:"$LOG" >/dev/null 2>&1 &
 QPID=$!
 i=0
-while [ $i -lt 60 ]; do
+while [ $i -lt 360 ]; do
     grep -q "launching the desktop" "$LOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))

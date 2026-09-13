@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1976-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1977-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -712,8 +712,19 @@ Landed so far, all on the from-scratch ext2 driver:
   `PT_GNU_STACK` asks for 12.2 MiB; Linux's default is 8), and `RLIMIT_STACK`
   now reports what we actually give instead of "unlimited".
 
-Still ahead: Firefox on a from-scratch Wayland display path. The honest scale
-is still months.
+- **M1977** — **PHASE 8 BEGINS: the `wl_shm` foundation.** `LXSCM: memfd +
+  SCM_RIGHTS + MAP_SHARED — fd 5 passed as 6, 64 KiB shared both ways`. A
+  Wayland client hands the compositor its pixels by putting them in a memfd and
+  passing the **descriptor** over the socket they already share — no pixel is
+  ever copied. Both halves existed natively (`app_memfd_create` M1212,
+  `app_scm_send/recv` M1265) and neither had a Linux syscall number, so:
+  `memfd_create`, `ftruncate`, and SCM_RIGHTS control messages through
+  `sendmsg`/`recvmsg`. memfd storage became page-aligned and page-granular so it
+  can actually be aliased into a process, and is frozen once mapped (growing
+  would leave every existing mapping pointing at freed memory).
+
+Still ahead: the compositor itself, then Firefox. The honest scale is still
+months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the
