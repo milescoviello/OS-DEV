@@ -1,0 +1,89 @@
+#define _GNU_SOURCE
+/*
+ * lxmemfd.c -- who OWNS the pages behind a memfd mapping? (M1985)
+ *
+ * A memfd's buffer lives in the KERNEL HEAP, and mmap()ing it aliases those
+ * pages into the process. That makes two ordinary, documented things dangerous
+ * if the kernel gets ownership wrong, and this binary does both:
+ *
+ *   1. mmap(), then munmap(). Unmapping walks the region and frees every page
+ *      it finds. If those pages are not reference-counted, the first munmap
+ *      hands live kernel-heap memory back to the physical allocator -- and the
+ *      next allocation anywhere in the kernel gets memory the heap is still
+ *      using. The symptom is never here: it is a corrupted buffer somewhere
+ *      else entirely. So after unmapping we ALLOCATE AND DIRTY several
+ *      megabytes to make the kernel hand those frames out again, then check
+ *      the memfd's contents are still what we wrote.
+ *
+ *   2. mmap(), then close() while still mapped. That is the DOCUMENTED way to
+ *      use a memfd -- every toolkit does it -- and if the mapping does not
+ *      hold a reference to the object, the last close frees the buffer under a
+ *      live mapping.
+ *
+ * A pass means the pattern survives both. A failure prints what it found.
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+#define SZ  (64 * 1024)
+#define PAT 0xA5
+#define CHURN (4 * 1024 * 1024)
+
+static int fails;
+static void ok(int cond, const char *what) {
+    printf("LXMEMFD-%s: %s\n", cond ? "OK" : "FAIL", what);
+    fflush(stdout);
+    if (!cond) fails++;
+}
+
+static int done(void) {
+    printf("LXMEMFD-RESULT: %d failure(s)\n", fails);
+    fflush(stdout);
+    return fails ? 1 : 0;
+}
+
+static int count_pattern(const unsigned char *p, int n) {
+    int bad = 0;
+    for (int i = 0; i < n; i++) if (p[i] != PAT) bad++;
+    return bad;
+}
+
+int main(void) {
+    int fd = (int)syscall(SYS_memfd_create, "ownership", 0);
+    if (fd < 0) { ok(0, "memfd_create"); return done(); }
+    if (ftruncate(fd, SZ) != 0) { ok(0, "ftruncate"); return done(); }
+
+    unsigned char *p = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { ok(0, "first mmap"); return done(); }
+    memset(p, PAT, SZ);
+    ok(count_pattern(p, SZ) == 0, "wrote a pattern through a MAP_SHARED memfd mapping");
+
+    /* (1) unmap, then make the kernel reuse whatever it just reclaimed. */
+    munmap(p, SZ);
+    unsigned char *churn = mmap(NULL, CHURN, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (churn == MAP_FAILED) { ok(0, "churn mmap"); return done(); }
+    memset(churn, 0x5A, CHURN);            /* every page touched: they are really ours now */
+
+    unsigned char *q = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (q == MAP_FAILED) { ok(0, "re-mmap after munmap"); return done(); }
+    int bad = count_pattern(q, SZ);
+    if (bad) printf("LXMEMFD: %d of %d bytes were overwritten after munmap + 4 MiB of churn\n", bad, SZ);
+    ok(bad == 0, "the memfd's contents SURVIVED munmap + 4 MiB of other allocations");
+
+    /* (2) close while still mapped -- the documented pattern. */
+    close(fd);
+    memset(churn, 0x3C, CHURN);            /* churn again, now that the fd is gone */
+    int bad2 = count_pattern(q, SZ);
+    if (bad2) printf("LXMEMFD: %d of %d bytes changed after close() with the mapping live\n", bad2, SZ);
+    ok(bad2 == 0, "the mapping OUTLIVED the last close() of the memfd");
+
+    munmap(churn, CHURN);
+    munmap(q, SZ);
+    return done();
+}

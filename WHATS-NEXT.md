@@ -1,5 +1,54 @@
 # What's next
 
+> **(M1985) WHO OWNS THE PAGES BEHIND A `memfd` MAPPING.**
+>
+> ```
+> [fault] Page Fault err=0x7 in a ring-3 task at rip=0xb00023a0 (CR2=0x40009f77)
+> [fault] bytes at rip: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+> ```
+>
+> Those two lines are the whole story, and the second one is new. `firefox
+> --version` had worked since M1982 and stopped working in M1984 — and the
+> reported fault made no sense: a **write** fault at the first instruction of
+> `_dl_catch_exception`, whose first instruction is `endbr64` and writes
+> nothing. Printing the bytes at `rip` settled it in one line: the instruction
+> was not ld.so's code, because **ld.so's code was not there**. `00 00` is
+> `add %al,(%rax)`, and `rax` held exactly the address the fault reported.
+>
+> **The cause.** A memfd's buffer is kernel heap. `mmap`ing one aliases those
+> pages into the process — and `munmap`, address-space teardown and `close()`
+> all treated them as pages the process owned. The first `munmap` handed live
+> kernel memory back to the physical allocator; the next `pmm_alloc_frame`
+> anywhere in the kernel got memory the heap was still using. In this case the
+> frame handed out was inside the buffer `ld.so` had just been read into, the
+> ELF loader zeroed it before copying, and the image came up with a 4 KiB hole
+> of zeros in its text. **Nothing failed anywhere near where the damage was
+> done** — which is the whole difficulty of this bug class.
+>
+> M1984 only triggered it: the keymap made a client `mmap` a memfd and then
+> `munmap` it, which nothing had done before.
+>
+> **The fix** is that a mapping BORROWS: it reference-counts the frames (so
+> unmapping decrements rather than frees) and holds a reference to the OBJECT
+> (so `mmap()`-then-`close()`, the documented way to use a memfd and what every
+> toolkit does, no longer frees the buffer under a live mapping). Fork,
+> munmap-splits and process exit all carry the reference correctly. The two
+> `pmm_addref` calls in `app_ringbuf`/`app_shm_open` that the plan has listed
+> as open since Phase 6 are now guarded by `pmm_refcountable` as well — above
+> the ceiling `pmm_addref` silently does nothing, so those mappings did not
+> hold the reference they claimed to.
+>
+> `tools/lx/lxmemfd.c` tests the thing that actually matters and is hard to
+> observe: it writes a pattern, unmaps, then **allocates and dirties 4 MiB to
+> make the kernel hand the reclaimed frames back out**, and checks the pattern
+> survived. Then it closes the fd with the mapping still live and checks again.
+> Reverting either half of the fix fails it.
+>
+> **And the process failure is worth recording too:** `fftest` is not part of
+> `make check` (a 268 MB image is minutes per start under TCG), so M1984 shipped
+> green with Firefox broken. The regression was found by trying to go forward,
+> not by the suite.
+
 > **(M1984) OUR OWN XKB KEYMAP, HANDED TO A CLIENT OVER SCM_RIGHTS.**
 >
 > ```

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1984-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1985-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -814,6 +814,29 @@ Landed so far, all on the from-scratch ext2 driver:
   receive back the descriptor it had just sent, and only one could ever be in
   flight. It is now a per-direction FIFO — order matters, because libwayland
   matches descriptors to messages by the order it pops them.
+
+- **M1985** — **who owns the pages behind a `memfd` mapping.** A memfd's buffer
+  is **kernel heap**, so mapping it aliases the heap into a process — and
+  `munmap`, process exit and `close()` all treated those pages as the process's
+  own. The first `munmap` handed live kernel memory back to the physical
+  allocator; the next allocation anywhere in the kernel got memory the heap was
+  still using. It surfaced as something else entirely: `ld.so` was read into a
+  buffer whose frames had been re-handed out, so **one page of its text came up
+  zero-filled**, and Firefox died on `add %al,(%rax)` at the first instruction
+  of whatever function happened to live there. A mapping now reference-counts
+  both the frames and the object, so `mmap()`-then-`close()` — the documented
+  way to use a memfd, and what every toolkit does — is finally safe. The two
+  `pmm_addref` calls in `app_ringbuf`/`app_shm_open` that were unguarded by
+  `pmm_refcountable` are guarded too: above the refcount ceiling `pmm_addref`
+  silently does nothing, so those mappings did not hold the reference they
+  claimed to.
+
+  **The diagnostic that cracked it is the lasting part.** A ring-3 fault now
+  prints the **bytes at `rip`**, the last 16 Linux syscalls with their return
+  values, and a user backtrace. `bytes at rip: 00 00 00 ...` said in one line
+  what two hours of reasoning about relocation had not: the instruction was not
+  ld.so's code, because ld.so's code was not there. (`00 00` is
+  `add %al,(%rax)` — which is exactly the write the fault reported.)
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

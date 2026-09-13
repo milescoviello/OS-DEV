@@ -17,6 +17,7 @@
 #include "console.h"
 #include "syscall.h"
 #include "app.h"
+#include "linuxabi.h"
 #include "task.h"
 #include "timer.h"      /* timer_tick_ms — per-core CPU-time accounting (M1548) */
 #include "vmm.h"        /* kstack_is_guard — flag a kernel-stack-overflow #PF (M1495) */
@@ -269,6 +270,40 @@ void isr_dispatch(struct registers *r) {
              * address, the one line could not distinguish "computed garbage"
              * from "a kernel pointer was copied into the program". */
             dump_registers(r);
+            /* A LINUX-ABI process faulting is the case where a register dump
+             * says least: the code is someone else's, unsymbolised, and the
+             * useful history is the SYSCALLS it made on the way here. Dump the
+             * ring and walk the user stack -- the abort() path has done this
+             * since M1970, and a fault is the same question. Skipped entirely
+             * when nothing has used the Linux ABI, so native faults read
+             * exactly as before. (M1985) */
+            /* THE BYTES AT RIP. A fault reported at a function's first
+             * instruction, or an access whose direction does not match any
+             * instruction there, means the frame is being read wrong -- and
+             * there is no way to tell that apart from a genuine fault without
+             * looking at the opcode. Sixteen bytes is enough to disassemble by
+             * hand. (M1985) */
+            if (vmm_user_ok(r->rip, 16)) {
+                /* ONE kprintf, not sixteen. Every call takes the console lock,
+                 * and on a busy machine sixteen of them are interleaved
+                 * character-by-character with whatever another core is
+                 * printing -- which is both unreadable and slow enough to blow
+                 * a test's boot budget. Format first, print once. */
+                static const char hx[] = "0123456789abcdef";
+                const uint8_t *ip = (const uint8_t *)r->rip;
+                char line[16 * 3 + 1];
+                for (int bi = 0; bi < 16; bi++) {
+                    line[bi * 3 + 0] = ' ';
+                    line[bi * 3 + 1] = hx[ip[bi] >> 4];
+                    line[bi * 3 + 2] = hx[ip[bi] & 15];
+                }
+                line[16 * 3] = 0;
+                kprintf("[fault] bytes at rip:%s\n", line);
+            }
+            /* The last few syscalls, not the last 256: on a fault the tail is
+             * what matters, and the full ring is hundreds of console-locked
+             * lines. abort() still dumps the whole thing. */
+            if (lx_syscalls_made()) { lx_trace_dump_last("a ring-3 fault", 16); lx_user_backtrace(r); }
             app_fault_current(r);  /* dump a core, mark the app exited + task_exit(); does not return */
         }
 

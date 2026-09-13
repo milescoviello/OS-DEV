@@ -35,3 +35,6 @@ uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
 extern int g_lx_mmap_trace;    /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
 extern int g_lx_systrace;      /* -append lxsystrace: log EVERY Linux syscall */
 void lx_trace_dump(const char *why);
+void lx_trace_dump_last(const char *why, unsigned long want);  /* ...or just the last `want` (M1985) */
+void lx_user_backtrace(struct registers *r);   /* walk the user stack for return addresses (M1970) */
+unsigned long lx_syscalls_made(void);          /* 0 = nothing has used the Linux ABI this boot */

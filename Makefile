@@ -225,6 +225,11 @@ $(LXROOT)/lxwl: tools/lx/lxwl.c tools/lx/gen/xdg-shell-client-protocol.h tools/l
 	@mkdir -p $(LXROOT)
 	@if [ -f tools/lx/gen/xdg-shell-protocol.c ]; then 	    $(CC) -O2 -Itools/lx/gen -o $@ $< tools/lx/gen/xdg-shell-protocol.c -lwayland-client -lxkbcommon && 	    echo "  HOSTCC  $@ (a REAL libwayland client + xdg-shell -- the same path Firefox uses)"; 	 else echo "  SKIP    $@ (no xdg-shell bindings)"; fi
 
+$(LXROOT)/lxmemfd: tools/lx/lxmemfd.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (who owns the pages behind a memfd mapping)"
+
 $(LXROOT)/lxscm: tools/lx/lxscm.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -275,7 +280,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

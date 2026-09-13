@@ -452,7 +452,7 @@ static int lx_path_arg(uint32_t nr) {
  * -fno-omit-frame-pointer is not something we can impose on a foreign binary,
  * so this is best-effort: it stops at the first RBP that is not a plausible,
  * increasing user address rather than chasing garbage. */
-static void lx_user_backtrace(struct registers *r) {
+void lx_user_backtrace(struct registers *r) {
     kprintf("[linuxabi] user backtrace: rip=%lx rsp=%lx rbp=%lx\n", r->rip, r->rsp, r->rbp);
     uint64_t rbp = r->rbp, prev = 0;
     for (int f = 0; f < 16; f++) {
@@ -485,8 +485,11 @@ static void lx_user_backtrace(struct registers *r) {
     }
 }
 
-void lx_trace_dump(const char *why) {
+unsigned long lx_syscalls_made(void) { return lx_syscall_count; }
+
+void lx_trace_dump_last(const char *why, unsigned long want) {
     unsigned long n = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
+    if (want && n > want) n = want;
     kprintf("[linuxabi] last %lu syscalls before %s (oldest first):\n", n, why);
     for (unsigned long k = 0; k < n; k++) {
         struct lxring_ent *e = &g_lxring[(g_lxring_i - n + k) & (LXRING_N - 1)];
@@ -497,6 +500,8 @@ void lx_trace_dump(const char *why) {
         else            kprintf("    %3u(%lx, %lx, %lx) = %lx\n", e->nr, e->a1, e->a2, e->a3, e->ret);
     }
 }
+
+void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }   /* 0 = the whole ring */
 
 /*
  * The Linux dispatcher. Mirrors syscall_dispatch's shape (it mutates the same

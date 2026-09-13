@@ -138,13 +138,13 @@ struct app {
  * read-only reservation it replaced, and ld.so faulted zeroing the BSS tail.
  * Resetting the whole slot makes every field opt-in. (M1956) */
 #define VMA_NEW(a) do { for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(a)->nvma])[_b] = 0; \
-                        (a)->vma[(a)->nvma].fidx = -1; } while (0)   /* 0 is a VALID path index, so zeroing is not "no path" (M1962) */
+                        (a)->vma[(a)->nvma].fidx = -1; (a)->vma[(a)->nvma].mfd = -1; } while (0)   /* 0 is a VALID path/memfd index, so zeroing is not "none" (M1962/M1985) */
 
 /* Linux PROT_* bits, as recorded on a VMA and honoured by app_fault_handle (M1956) */
 #define VMA_PROT_READ  0x1
 #define VMA_PROT_WRITE 0x2
 #define VMA_PROT_EXEC  0x4
-    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; short fidx; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fidx indexes the global path table (M1962: an inline 256-byte path made the struct so big the TABLE was the limit, not the address space); prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
+    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fidx indexes the global path table (M1962: an inline 256-byte path made the struct so big the TABLE was the limit, not the address space); prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
     int      nvma;
     uint64_t mmap_next;                  /* bump allocator for mmap addresses */
     int      mlock_future;               /* mlockall(MCL_FUTURE): new mmaps are born locked (M1283) */
@@ -827,6 +827,12 @@ int app_format_pagemap(app_t *a, char *b, int max) {
 }
 
 static struct app *cur(void) { return (struct app *)task_self()->proc; }
+
+/* memfd reference counting, forward-declared: the fd table, munmap, fork and
+ * process teardown all hold references to a memfd object, and they live far
+ * above its definition. (M1985) */
+static void memfd_ref(int idx);
+static void memfd_unref(int idx);
 
 /* SCM_RIGHTS — fd passing over AF_UNIX (M1265). A per-connection mailbox holds
  * one in-flight descriptor (a snapshot of the sender's fdent); the peer's
@@ -1588,6 +1594,13 @@ int app_reap(app_t *a) {
             __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3_reap) : "memory");
             __asm__ volatile("push %0; popfq" : : "r"(flags2) : "memory", "cc");
         }
+        /* Release this process's memfd mappings BEFORE the address space goes
+         * away. The teardown below decrements each frame's reference (they are
+         * kernel-heap pages the process only borrowed), but nothing there
+         * knows about the OBJECT -- and a memfd whose last fd was closed while
+         * still mapped is kept alive precisely by this reference. (M1985) */
+        for (int vi = 0; vi < a->nvma; vi++)
+            if (a->vma[vi].mfd >= 0) { memfd_unref(a->vma[vi].mfd); a->vma[vi].mfd = -1; }
         vmm_destroy_address_space(a->cr3);   /* free page tables + user frames */
         a->cr3 = 0;
         if (a->gfx) { kfree(a->gfx); a->gfx = 0; }   /* graphics canvas (kernel heap) */
@@ -2546,6 +2559,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
         }
 
         if (cs == s0 && ce == e0) {                 /* whole VMA goes */
+            if (a->vma[i].mfd >= 0) memfd_unref(a->vma[i].mfd);   /* the mapping's reference (M1985) */
             a->vma[i] = a->vma[a->nvma - 1];
             a->nvma--;
             continue;                               /* re-test the swapped-in entry at this index */
@@ -2560,6 +2574,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
             a->vma[i].len = cs - s0;
         } else {                                    /* hole punched: split in two */
             a->vma[a->nvma] = a->vma[i];        /* a COPY on purpose (slot reserved by the pre-flight count): no VMA_NEW here */
+            if (a->vma[i].mfd >= 0) memfd_ref(a->vma[i].mfd);   /* now TWO mappings hold it (M1985) */
             a->vma[a->nvma].start = ce;
             a->vma[a->nvma].len   = e0 - ce;
             if (a->vma[a->nvma].file_backed) a->vma[a->nvma].foff += ce - s0;
@@ -3059,6 +3074,18 @@ uint64_t app_ringbuf(uint64_t len) {
         }
         uint8_t *z = (uint8_t *)hhdm(frame);
         for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0;
+        /* The ring's DOUBLE mapping needs a real second reference; above
+         * PMM_MAXREFS pmm_addref is a no-op, so unmapping the mirror would
+         * free the frame the primary still uses. (M1985) */
+        if (!pmm_refcountable(frame)) {
+            pmm_free_frame(frame);
+            for (uint64_t u = 0; u < mapped; u += PAGE_SIZE) {
+                uint64_t ph = vmm_translate(base + u);
+                vmm_unmap(base + len + u); vmm_unmap(base + u);
+                if (ph) pmm_free_frame(ph);
+            }
+            return 0;
+        }
         vmm_map(base + off, frame, PTE_WRITABLE | PTE_USER | PTE_NX);          /* primary */
         pmm_addref(frame);
         vmm_map(base + len + off, frame, PTE_WRITABLE | PTE_USER | PTE_NX);    /* mirror */
@@ -3094,6 +3121,11 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
     uint64_t base = vma_find_gap(a, total, 0);
     if (!base) return 0;
     if (base + total > MMAP_TOP || base + total < base) return 0;
+    /* Above PMM_MAXREFS pmm_addref SILENTLY DOES NOTHING, so the mapping below
+     * would not hold the reference it claims to and the first unmap would free
+     * a frame the SHM object still owns. Refuse instead: an honest failure to
+     * share beats a mapping that outlives its own memory. (M1985) */
+    for (int p = 0; p < np; p++) if (!pmm_refcountable(frames[p])) return 0;
     for (int p = 0; p < np; p++) {
         vmm_map(base + (uint64_t)p * PAGE_SIZE, frames[p], PTE_WRITABLE | PTE_USER | PTE_NX);
         pmm_addref(frames[p]);                       /* this mapping holds a ref on the shared frame */
@@ -4490,7 +4522,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * all. gcc creates its intermediate .s exactly that way. (M1960) */
         vfs_cwd_set_for(a, "/disk2");
         { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
-        static const char *argv0[2 + LX_PEND_ARGS], *envp0[8];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[24];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
          * re-execs itself by argv[0] (lxbox does) would otherwise ask for
@@ -4521,7 +4553,34 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * have to name what kernel/wayland.c actually bound. (M1978) */
         envp0[4] = "XDG_RUNTIME_DIR=/run";
         envp0[5] = "WAYLAND_DISPLAY=wayland-0";
+        /* GTK picks a backend by probing, and it probes X11 FIRST. Naming the
+         * backend is what stops Firefox from failing on a DISPLAY we will
+         * never have -- there is no X server here and there is not going to be
+         * one; the display path is our own compositor. (M1985) */
         envp0[6] = 0;
+        if (0) {
+        envp0[6]  = "GDK_BACKEND=wayland";
+        envp0[7]  = "MOZ_ENABLE_WAYLAND=1";
+        /* Firefox's sandbox is built on Linux namespaces and seccomp-bpf
+         * filters applied to its own children. We have neither, and a sandbox
+         * that cannot be installed is a hard startup failure rather than a
+         * degraded mode. Turning it off is honest: this is a compat layer, not
+         * a security boundary, and saying so is better than a silent stub that
+         * claims a sandbox exists. */
+        envp0[8]  = "MOZ_DISABLE_CONTENT_SANDBOX=1";
+        envp0[9]  = "MOZ_DISABLE_GMP_SANDBOX=1";
+        envp0[10] = "MOZ_DISABLE_RDD_SANDBOX=1";
+        envp0[11] = "MOZ_DISABLE_SOCKET_PROCESS=1";
+        /* A GTK app writes: a profile, a font cache, a dconf directory. All of
+         * them land under these, and an unset XDG_*_HOME falls back to
+         * $HOME/.config, which has to exist and be writable. */
+        envp0[12] = "XDG_CONFIG_HOME=/root/.config";
+        envp0[13] = "XDG_CACHE_HOME=/root/.cache";
+        envp0[14] = "XDG_DATA_HOME=/root/.local/share";
+        envp0[15] = "FONTCONFIG_PATH=/etc/fonts";
+        envp0[16] = "LANG=C.UTF-8";
+        envp0[17] = 0;
+        }
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to
          * map its shared libraries first and only then jump to the entry. */
@@ -4531,6 +4590,28 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
             if (!ie) goto fail_in_space;
             interp_base = ELF_INTERP_BASE;
             a->entry = ie;                   /* the INTERPRETER runs first */
+            /* VERIFY THE LOADER'S OWN WORK (M1985). A loader that silently
+             * places a DIFFERENT image than the file is the worst failure
+             * shape here: the program starts, runs real code for a while, and
+             * dies somewhere unrelated -- a zero page inside ld.so's text
+             * presents as a fault at the first instruction of whichever
+             * function happened to live there. Sampling is enough to catch it,
+             * costs microseconds, and names the problem where it happened
+             * instead of 30 syscalls later. */
+            {
+                const uint8_t *src = (const uint8_t *)g_pend_interp;
+                int bad = 0;
+                for (unsigned long off = 0x1000; off + 16 < g_pend_interp_sz && off < 0x30000; off += 0x1000) {
+                    const uint8_t *dst = (const uint8_t *)(ELF_INTERP_BASE + off);
+                    if (!vmm_translate((uint64_t)dst)) continue;       /* not part of a mapped segment */
+                    for (int q = 0; q < 16; q++) if (dst[q] != src[off + q]) { bad = 1; break; }
+                    if (bad) {
+                        kprintf("[linuxabi] INTERPRETER MISLOADED at +%lx: mapped %02x %02x %02x %02x, file %02x %02x %02x %02x\n",
+                                off, dst[0], dst[1], dst[2], dst[3], src[off], src[off+1], src[off+2], src[off+3]);
+                        break;
+                    }
+                }
+            }
         }
         uint64_t rsp = lx_spawn_stack_dyn(elf, elf_image_bias(elf), prog_entry, interp_base,
                                           a->ustack, USTACK_BASE + PAGE_SIZE, argv0, envp0);
@@ -4676,21 +4757,48 @@ uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
     if (off + len > m->cap) return 0;                     /* beyond the object */
     uint64_t base = vma_find_gap(a, len, 0);
     if (!base) return 0;
+    if (a->nvma >= APP_MAXVMA) return 0;   /* no slot to record it: see the ownership note below */
+    /* OWNERSHIP (M1985). These frames belong to the KERNEL HEAP -- they are the
+     * memfd's kmalloc'd buffer, aliased into the process, not pages this
+     * process allocated. Two things follow, and neither was true before:
+     *
+     *  - The frames must be REFCOUNTED. munmap and address-space teardown both
+     *    call pmm_free_frame on every present user page; without a reference
+     *    the first one hands a live kernel-heap page back to the PMM, and the
+     *    next pmm_alloc_frame gets memory the heap is still using. That is
+     *    exactly what happened: a page of ld.so's text was loaded through a
+     *    buffer whose frame had been re-handed out, so the image came up with
+     *    a hole of zeros and the program died at the first instruction of
+     *    whatever function lived there.
+     *  - The MAPPING must hold a reference to the object. Every toolkit does
+     *    mmap() and then close() immediately -- that is the documented way to
+     *    use a memfd -- and the last close used to kfree the buffer out from
+     *    under a live mapping.
+     *
+     * Above PMM_MAXREFS a frame cannot be refcounted at all, so the honest
+     * answer there is to refuse the mapping rather than make one that will be
+     * freed from under the heap. */
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
         uint64_t phys = vmm_translate((uint64_t)(uintptr_t)(m->buf + off + i));
-        if (!phys) return 0;                              /* unbacked: refuse rather than map a hole */
-        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) return 0;
+        if (!phys || !pmm_refcountable(phys)) goto unwind;   /* unbacked or unshareable: map no hole */
+        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) goto unwind;
+        pmm_addref(phys);
+        continue;
+      unwind:
+        for (uint64_t u = 0; u < i; u += PAGE_SIZE) {
+            uint64_t up = vmm_translate(base + u);
+            if (up) { vmm_unmap(base + u); pmm_free_frame(up); }
+        }
+        return 0;
     }
     m->mapped = 1;
-    if (a->nvma < APP_MAXVMA) {          /* recorded so munmap/poll/maps see it */
-        VMA_NEW(a);
-        a->vma[a->nvma].start = base; a->vma[a->nvma].len = len;
-        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
-        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
-        a->vma[a->nvma].shared = 1;
-        a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
-        a->nvma++;
-    }
+    memfd_ref(a->fd[fd].obj);            /* the MAPPING keeps the object alive, not the fd */
+    VMA_NEW(a);                          /* recorded so munmap/poll/maps see it */
+    a->vma[a->nvma].start = base; a->vma[a->nvma].len = len;
+    a->vma[a->nvma].shared = 1;
+    a->vma[a->nvma].mfd = (short)a->fd[fd].obj;
+    a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+    a->nvma++;
     return base;
 }
 
@@ -6000,6 +6108,10 @@ long app_fork_at(struct registers *r, uint64_t child_rsp) {
     a->entry = p->entry; a->ustack = p->ustack; a->heap_end = p->heap_end;
     a->mmap_next = p->mmap_next; a->nvma = p->nvma; a->aslr_mmap_base = p->aslr_mmap_base;   /* inherit the ASLR layout across fork (M1287) */
     for (int i = 0; i < APP_MAXVMA; i++) a->vma[i] = p->vma[i];
+    /* A memfd mapping is inherited by the child, so the CHILD holds a
+     * reference too -- otherwise the parent's exit frees a buffer the child is
+     * still reading. (M1985) */
+    for (int i = 0; i < a->nvma; i++) if (a->vma[i].mfd >= 0) memfd_ref(a->vma[i].mfd);
     /* The path table the VMAs index into is GLOBAL, so a forked child inherits
      * it for free -- and cannot be handed indices into an empty one. (M1962) */
     for (int i = 0; i < APP_NSIG; i++) a->sig_handler[i] = p->sig_handler[i];

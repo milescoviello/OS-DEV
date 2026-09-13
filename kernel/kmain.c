@@ -250,6 +250,7 @@ static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET soc
 static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
 static volatile int g_wlraw;                  /* -append wlraw: also run the raw handshake client (M1978) */
 
+static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
@@ -501,6 +502,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
+        if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
@@ -829,6 +831,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] launching the memfd + SCM_RIGHTS test...\n");
             int scmrc = app_run_linux_sync("/disk2/lxscm", 0, 0, 120000);
             kprintf("[lxabi] LXSCM exit -> %d\n", scmrc);
+            /* ...and WHO OWNS those shared pages. A memfd's buffer is kernel
+             * heap; mapping it aliases the heap into a process, so unmapping
+             * or closing it wrong hands live kernel memory back to the
+             * allocator. That corrupts something else entirely, which is why
+             * it needs a test that looks for the corruption on purpose.
+             * (M1985) */
+            kprintf("[lxabi] launching the memfd OWNERSHIP test...\n");
+            int mfrc = app_run_linux_sync("/disk2/lxmemfd", 0, 0, 120000);
+            kprintf("[lxabi] LXMEMFD exit -> %d\n", mfrc);
             kprintf("[lxabi] launching a NON-PIE DYNAMIC binary...\n");
             int ndrc = app_run_linux_sync("/disk2/lxnopiedyn", 0, 0, 120000);
             kprintf("[lxabi] LXNOPIEDYN exit -> %d\n", ndrc);
@@ -870,6 +881,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * exited. A background task is the next step, once the compositor
              * owns a window. */
             vfs_mkdir("/disk2/run");
+            /* A GTK program writes before it draws: a profile, a font cache, a
+             * dconf directory. HOME and the XDG_*_HOME paths have to EXIST --
+             * glib treats an unwritable config dir as fatal, not as a reason
+             * to skip caching. (M1985) */
+            vfs_mkdir("/disk2/root");
+            vfs_mkdir("/disk2/root/.config");
+            vfs_mkdir("/disk2/root/.cache");
+            vfs_mkdir("/disk2/root/.local");
+            vfs_mkdir("/disk2/root/.local/share");
+            vfs_mkdir("/disk2/tmp");
             if (wl_compositor_init() == 0) {
                 /* The compositor runs as its OWN TASK. Driving it from here in
                  * lockstep with one synchronous client was a scaffold, and a
@@ -892,6 +913,19 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 for (int t = 0; t < 6000; t++) {
                     task_sleep_ms(10);
                     if (wl_commits() > 0 && t > 60) break;
+                }
+                if (g_ffwl) {
+                    /* FIREFOX ON OUR OWN DISPLAY (M1985). Spawned
+                     * ASYNCHRONOUSLY and then left alone: the desktop below is
+                     * what draws a surface, so blocking here would mean
+                     * nothing could ever appear. Firefox takes minutes to
+                     * reach a first paint under TCG; the compositor task and
+                     * the window manager both keep running while it does. */
+                    static const char *av_fw[] = { "--no-remote", "--new-instance",
+                                                   "--window-size", "800,600", "about:blank" };
+                    kprintf("[ff] spawning FIREFOX against our compositor...\n");
+                    int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_fw, 5);
+                    kprintf("[ff] firefox pid %d\n", spid);
                 }
                 if (g_fftest) {
                     /* FIREFOX, against our own compositor. It is far heavier

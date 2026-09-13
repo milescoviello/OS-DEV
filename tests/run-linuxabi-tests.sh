@@ -89,7 +89,13 @@ cleanup2() { [ -n "$QPID2" ] && { kill -9 "$QPID2" 2>/dev/null || true; wait "$Q
 trap 'rc=$?; cleanup2; exit $rc' EXIT
 
 echo "booting with a deliberately-faulting Linux binary (console-lock deadlock regression)..."
-timeout -s KILL 120 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+# 300s, not 120s: the QEMU kill has to outlast the WAIT LOOP below (280s), or
+# the VM is killed while the loop is still watching for a marker that can no
+# longer arrive -- which reports a wedge that did not happen. M1985 made each
+# ring-3 fault print its instruction bytes, the last syscalls and a user
+# backtrace; standalone that boot still finishes in ~2s, but under the parallel
+# pool the console is contended and the old kill landed first.
+timeout -s KILL 300 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
     -append "lxfaulttest" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \
@@ -179,6 +185,7 @@ LXMMAP: MAP_FIXED honoured
 LXFMAP: file-backed mmap at offset 8192 read the right page
 LXVMAGAP: a 2MiB mmap next to an unaligned gap
 LXSCM: memfd + SCM_RIGHTS + MAP_SHARED
+LXMEMFD-RESULT:
 LXNOPIE: ET_EXEC ran below 1 GiB
 LXNOPIEDYN: ET_EXEC + PT_INTERP ran
 LXDYN: a dynamically-linked binary ran
@@ -307,6 +314,28 @@ LXTHREAD: 4 threads
         echo "  ok: fd passing + shared memory ($(grep -ao 'fd [0-9]* passed as [0-9]*, [0-9]* KiB shared both ways' "$SLOG3" | head -1))"
     else
         echo "  FAIL: memfd/SCM_RIGHTS/MAP_SHARED:"; grep -a "LXSCM" "$SLOG3" | head -2; f3=1
+    fi
+    # M1985: and who OWNS those shared pages. A memfd's buffer is kernel heap,
+    # so mapping it aliases the heap into a process. munmap and process exit
+    # both free every page they find, and close() while still mapped is the
+    # DOCUMENTED way to use a memfd -- so all three have to know the process is
+    # only borrowing. When they did not, the damage landed somewhere else
+    # entirely: a page of ld.so's text came up zero-filled and Firefox died at
+    # the first instruction of whatever function lived there.
+    if grep -aq "LXMEMFD-OK: the memfd's contents SURVIVED munmap" "$SLOG3"; then
+        echo "  ok: a memfd's pages survive munmap + 4 MiB of churn -- the process only BORROWS the kernel's heap"
+    else
+        echo "  FAIL: munmap of a memfd mapping freed kernel-heap pages:"; grep -a "LXMEMFD" "$SLOG3" | head -3; f3=1
+    fi
+    if grep -aq "LXMEMFD-OK: the mapping OUTLIVED the last close" "$SLOG3"; then
+        echo "  ok: ...and a mapping outlives the last close() of the memfd, which is how every toolkit uses one"
+    else
+        echo "  FAIL: closing a mapped memfd freed its buffer:"; grep -a "LXMEMFD" "$SLOG3" | head -3; f3=1
+    fi
+    if grep -aq "LXMEMFD-RESULT: 0 failure" "$SLOG3"; then
+        echo "  ok: the memfd ownership test reported no failures"
+    else
+        echo "  FAIL: the memfd ownership test failed:"; grep -a "LXMEMFD" "$SLOG3" | head -4; f3=1
     fi
     if grep -aq "LXNOPIE: ET_EXEC ran below 1 GiB" "$SLOG3"; then
         echo "  ok: a non-PIE ET_EXEC binary ran at its link-time address below 1 GiB ($(grep -ao 'main=[0-9a-f]*' "$SLOG3" | head -1))"
