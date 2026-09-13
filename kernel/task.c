@@ -700,10 +700,39 @@ void task_block_timeout(uint64_t deadline_ms) {
     irq_restore(f);
 }
 
+/* Is this task executing on SOME core right now? (M1991)
+ *
+ * `state` cannot answer that: a task blocking with a deadline sets TASK_BLOCKED
+ * and only THEN releases the run-queue lock and calls switch_to_next, so for a
+ * window it is BLOCKED and still running on its own stack. switch_to_next's own
+ * CRITICAL note says what happens if something makes such a task pickable --
+ * "exactly what let two cores end up running the same task's stack". The timer's
+ * sleeper scan was doing precisely that to timed futex waiters, and the result
+ * was a context restored from a stack two cores had been using: a panic with
+ * rip = 0x10 under task_block_timeout. */
+static int task_on_a_cpu(task_t *t) {
+    for (int c = 0; c < MAX_SCHED_CPUS; c++)
+        if (cur[c] == t || core_leaving[c] == t || core_prev[c] == t || core_dying[c] == t) return 1;
+    return 0;
+}
+
 void task_wake(task_t *t) {
     uint64_t f = irq_save();
     rq_lock_take();
-    if (t && t->state == TASK_BLOCKED) {
+    /* STILL ON A CPU? Then remember the wake instead of making it pickable
+     * (M1994). A task blocking with a deadline sets TASK_BLOCKED, releases the
+     * run-queue lock, and only THEN calls switch_to_next -- so for a window it
+     * is BLOCKED and still executing on its own stack. Flipping it to READY
+     * there lets another core pick it up and resume a context from a stack that
+     * is still in use; switch_to_next's own CRITICAL note calls that "exactly
+     * what let two cores end up running the same task's stack". M1991 closed
+     * this for the timer's sleeper scan and left the identical hole here, which
+     * is why the same panic survived -- rip at a tiny constant under
+     * task_block_timeout, from app_futex.
+     *
+     * wake_pending is exactly the right answer and already exists for the
+     * neighbouring case: the task consumes it the moment it finishes blocking. */
+    if (t && t->state == TASK_BLOCKED && !task_on_a_cpu(t)) {
         t->wake_at = 0;            /* cancel any pending timed wake */
         t->state = TASK_READY;
         t->ready_since = timer_ms();   /* re-entered the run queue (M1148) */
@@ -748,21 +777,6 @@ void task_sleep_ms(uint64_t ms) {
 /* Called from the timer IRQ (interrupts already off): wake every task whose
  * timed-sleep deadline has passed. The ring is tiny, so a full scan per tick is
  * cheap; only BLOCKED tasks with a non-zero wake_at are sleepers. */
-/* Is this task executing on SOME core right now? (M1991)
- *
- * `state` cannot answer that: a task blocking with a deadline sets TASK_BLOCKED
- * and only THEN releases the run-queue lock and calls switch_to_next, so for a
- * window it is BLOCKED and still running on its own stack. switch_to_next's own
- * CRITICAL note says what happens if something makes such a task pickable --
- * "exactly what let two cores end up running the same task's stack". The timer's
- * sleeper scan was doing precisely that to timed futex waiters, and the result
- * was a context restored from a stack two cores had been using: a panic with
- * rip = 0x10 under task_block_timeout. */
-static int task_on_a_cpu(task_t *t) {
-    for (int c = 0; c < MAX_SCHED_CPUS; c++)
-        if (cur[c] == t || core_leaving[c] == t || core_prev[c] == t || core_dying[c] == t) return 1;
-    return 0;
-}
 
 void task_wake_sleepers(void) {
     if (!current) return;

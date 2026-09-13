@@ -1718,7 +1718,20 @@ int app_reap(app_t *a) {
         flock_release_pid(a->pid);                       /* drop any advisory file locks it held (M1177) */
         pty_release_pid(a->pid);                          /* close any pseudoterminals it owned (M1185) */
         app_fd_release(a);                                /* close its open fds/pipes (M1187) */
-        if (a->task) task_free(a->task);
+        /* THE off_cpu RULE APPLIES TO THE MAIN TASK TOO (M1994). The thread
+         * loop below says "same rule as the main task above" -- describing a
+         * check that was not there. A task sets TASK_DEAD and only then
+         * performs its final context switch, and the reaper runs on some other
+         * core, so the dying task may still be on its own stack. Freeing it
+         * there returns the kernel stack to the allocator while it is in use. */
+        if (a->task) {
+            task_t *mt = a->task;
+            app_futex_forget(mt);
+            if (mt->state == TASK_DEAD && __atomic_load_n(&mt->off_cpu, __ATOMIC_ACQUIRE))
+                task_free(mt);
+            else
+                task_stop(mt);                  /* still finishing: never scheduled again, never freed here */
+        }
         a->task = 0;
         /* Un-joined worker threads (M1139): free the dead ones; STOP any still
          * alive so the scheduler skips them — they must never run once we free

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1993-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1994-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1043,6 +1043,30 @@ Landed so far, all on the from-scratch ext2 driver:
   finding a gap and recording the mapping were two acts there too, and that is
   the path a runtime uses for **every shared object it loads, from several
   threads at once**.
+
+- **M1994** — **`lxstress` is 8/8 on the full file-backed, threaded suite.** Two
+  more real bugs, and one instructive non-bug.
+
+  **`task_wake` had the hole M1991 fixed in the timer's sleeper scan and no
+  other.** A task blocking with a deadline sets `TASK_BLOCKED`, releases the
+  run-queue lock, and only *then* switches — so for a window it is BLOCKED and
+  still on its own stack. `task_wake` flipped it to `READY` there, and another
+  core resumed a context from a stack still in use. `wake_pending` already
+  existed for the neighbouring case and is the right answer.
+
+  **`app_reap` freed the main task with no `off_cpu` check** — while the thread
+  loop directly below it says "same rule as the main task above", describing a
+  check that was not there.
+
+  And the instructive one: `kstack_free`'s comment claimed "only the BSP runs
+  tasks, so no shootdown", which stopped being true at M1531. Adding the
+  shootdown it implied **made things worse** — `smpthreadtest` went from passing
+  to a kernel stack overflow inside the IPI handler, because that path runs from
+  `task_free` with the run-queue lock held. The conclusion was right for the
+  wrong reason: kernel-stack **virtual** addresses are bump-allocated and never
+  reused, so a stale translation names an address nothing will ever reference
+  again. The comment now says that, because the next person to read it will
+  otherwise "fix" it the same way I did.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

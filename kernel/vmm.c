@@ -666,9 +666,31 @@ void kstack_free(void *stackbase, uint64_t size) {
     if (!stackbase) return;
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t base  = (uint64_t)stackbase;
+    /* NO CROSS-CORE SHOOTDOWN, AND THE REASON MATTERS (M1994).
+     *
+     * The comment here used to say "only the BSP runs tasks", which stopped
+     * being true at M1531 when the scheduler went multi-core -- so this looked
+     * exactly like a stale-TLB bug: unmap locally, hand the frames back, and
+     * let another core write through a cached translation into memory that now
+     * belongs to something else.
+     *
+     * It is not one, and the real invariant is worth stating: kernel-stack
+     * VIRTUAL addresses are bump-allocated out of kstack_next and NEVER REUSED
+     * (the allocator returns 0 when the window is exhausted rather than
+     * wrapping). A stale translation for a freed stack therefore names an
+     * address nothing will ever reference again, so it can never be
+     * dereferenced -- the physical frame is recycled, the virtual address is
+     * not.
+     *
+     * Adding the shootdown that the wrong comment implied made things WORSE,
+     * and that is instructive: vmm_tlb_shootdown spins for up to 200000
+     * iterations, and this runs from task_free with the run-queue lock held and
+     * interrupts off. smpthreadtest went from passing to a kernel stack
+     * overflow inside the IPI handler. A lock-free path that only needed its
+     * comment corrected does not want a synchronous broadcast in it. */
     for (uint64_t v = base; v < base + pages * PAGE_SIZE; v += PAGE_SIZE) {
         uint64_t p = vmm_translate(v);
-        vmm_unmap(v);                                                /* invlpg local; only the BSP runs tasks, so no shootdown */
+        vmm_unmap(v);                            /* invlpg, local: see above */
         if (p) pmm_free_frame(p);
     }
 }

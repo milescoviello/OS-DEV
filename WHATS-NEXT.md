@@ -1,5 +1,40 @@
 # What's next
 
+> **(M1994) `lxstress` IS 8/8 ON THE FULL FILE-BACKED, THREADED SUITE.**
+>
+> Two more real bugs, and one instructive non-bug.
+>
+> **`task_wake` had the exact hole M1991 fixed in the timer's sleeper scan.** A
+> task blocking with a deadline sets `TASK_BLOCKED`, releases the run-queue
+> lock, and only THEN calls switch_to_next -- so for a window it is BLOCKED and
+> still executing on its own stack. `task_wake` flipped it to `READY` there and
+> another core resumed a context from a stack that was still in use. That is why
+> the same panic survived M1991: I fixed one of the two callers. `wake_pending`
+> already existed for the neighbouring "wake arrived while still RUNNING" case
+> and is exactly the right answer here.
+>
+> **`app_reap` freed the main task with no `off_cpu` check.** The thread loop
+> immediately below it says "Same off_cpu rule as the main task above" --
+> describing a rule that was never written. A task sets `TASK_DEAD` and only
+> then performs its final context switch; the reaper runs on another core, so
+> the dying task may still be on its stack.
+>
+> **And the non-bug, which cost a suite to learn.** `kstack_free` carried the
+> comment "invlpg local; only the BSP runs tasks, so no shootdown" -- false
+> since M1531 made the scheduler multi-core, and it reads exactly like a
+> stale-TLB bug. Adding the shootdown it implied made things WORSE:
+> `smpthreadtest` went from passing to a kernel stack overflow inside the IPI
+> handler, because `vmm_tlb_shootdown` spins up to 200000 times and this runs
+> from `task_free` with the run-queue lock held and interrupts off.
+>
+> The conclusion was right for the wrong reason. Kernel-stack VIRTUAL addresses
+> are bump-allocated out of `kstack_next` and never reused -- the allocator
+> returns 0 when the window is exhausted rather than wrapping -- so a stale
+> translation for a freed stack names an address nothing will ever reference
+> again. The physical frame is recycled; the virtual address is not. The comment
+> says that now, because the next person to read the old one will "fix" it the
+> same way I did.
+
 > **(M1993) A TLB-SHOOTDOWN DEADLOCK, FOUND BY RIP-SAMPLING.**
 >
 > `lxstress` was 8/8 and Claude Code still died, so I made the reproducer look
