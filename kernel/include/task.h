@@ -109,6 +109,7 @@ uint64_t task_robust(void);                /* the current thread's robust-list p
 void    task_block(void);                  /* block current task until woken */
 void    task_block_timeout(uint64_t deadline_ms);  /* like task_block, but also woken by the timer at deadline_ms (M1578) */
 void    task_wake(task_t *t);              /* mark a blocked task runnable again */
+static inline task_state_t task_state_of(task_t *t) { return t->state; }   /* never wake a DEAD task (M1990) */
 void    task_sleep_ms(uint64_t ms);        /* sleep the current task off-CPU until the timer wakes it */
 void    task_wake_sleepers(void);          /* timer IRQ: wake tasks whose sleep deadline passed */
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1989-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1990-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -965,9 +965,18 @@ Landed so far, all on the from-scratch ext2 driver:
   faulted on memory that no longer belonged to anyone. It waits for `off_cpu`
   now, exactly as the reaper has since M1961.
 
-  **Still open, and now precisely named:** one run in six panics with the kernel
-  jumping to `0x10` from `linux_syscall_entry → app_futex → task_block_timeout`
-  — a freed task being scheduled, on the *timed* futex path.
+- **M1990** — **a futex waiter could resurrect a dead thread.** `lxstress` is
+  now **7/8**. A waiter records `task_self()` in the futex table and
+  `FUTEX_WAKE` later calls `task_wake()` on that stored pointer — and *nothing
+  cleared the slot when the task died*. A thread that exited while parked on a
+  futex left a dangling pointer, and a later wake on the same key put a **freed
+  task on the run queue**; the next schedule restored a context whose saved
+  `rip` was whatever the reused memory happened to hold. The futex key is a
+  **physical** address, which makes it worse rather than better: once the dead
+  thread's pages are recycled, an unrelated process can hash to the same key and
+  fire the stale entry without ever having touched that futex. Every path a task
+  can end on — thread exit, process exit, join, the reaper — now drops its
+  slots, and the wake loop refuses to queue a `TASK_DEAD` task.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

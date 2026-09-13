@@ -1728,6 +1728,7 @@ int app_reap(app_t *a) {
             if (!t) continue;
             /* Same off_cpu rule as the main task above: a DEAD thread may still
              * be finishing its final context_switch. (M1961) */
+            app_futex_forget(t);                 /* and not from the reaper's side either (M1990) */
             if (t->state == TASK_DEAD && __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) task_free(t);
             else task_stop(t);
             a->thr[i] = 0;
@@ -3559,6 +3560,34 @@ static int futex_release(int slot) {
     return still_ours;
 }
 
+/* FORGET EVERY FUTEX SLOT BELONGING TO A TASK (M1990).
+ *
+ * A waiter records `task_self()` in g_futex[] and FUTEX_WAKE later calls
+ * task_wake() on that stored pointer. Nothing cleared the slot when the task
+ * DIED -- so a thread that exited while parked on a futex, or that timed out
+ * and then exited, left a dangling pointer behind. A later wake on the same key
+ * put a FREED TASK on the run queue, and the next schedule restored a context
+ * whose saved rip was whatever the reused memory happened to hold:
+ *
+ *     call trace:
+ *       [0] 0x0000000000000010
+ *       [1] task_block_timeout+0xa3
+ *       [2] app_futex+0x1ba
+ *
+ * The key makes it worse rather than better: it is a PHYSICAL address, so once
+ * the dead thread's pages are recycled another process can hash to the same key
+ * and fire the stale entry without ever having touched that futex.
+ *
+ * Called from every path a task can end on -- thread exit, process exit, and
+ * the reaper -- because any one of them left alone is the whole bug. */
+void app_futex_forget(void *t) {
+    if (!t) return;
+    uint64_t f = irq_save();
+    for (int i = 0; i < FUTEX_NWAIT; i++)
+        if (g_futex[i].used && (void *)g_futex[i].task == t) g_futex[i].used = 0;
+    irq_restore(f);
+}
+
 /* Who is parked on a futex right now, and on what key. Printed when a
  * synchronous run times out -- a threaded hang is a lost wakeup until proven
  * otherwise, and this is the evidence. (M1959) */
@@ -3597,9 +3626,13 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         int woke = 0;
         for (int i = 0; i < FUTEX_NWAIT && woke < val; i++)
             if (g_futex[i].used && g_futex[i].key == key) {
+                task_t *wt = (task_t *)g_futex[i].task;
                 g_futex[i].used = 0;
-                task_wake((task_t *)g_futex[i].task);
-                woke++;
+                /* A DEAD task must never go back on the run queue. The slots
+                 * are cleared on every exit path now, so this should be
+                 * unreachable -- and it is one comparison against scheduling a
+                 * freed context, which halts the machine. */
+                if (wt && task_state_of(wt) != TASK_DEAD) { task_wake(wt); woke++; }
             }
         irq_restore(f);
         return woke;
@@ -4615,7 +4648,12 @@ int  app_sys_getpid(void) { return cur()->pid; }
 int  app_sys_getppid(void) { struct app *a = cur(); return a ? a->parent : 0; }   /* parent pid (M1236) */
 void app_sys_clear(void)  { grid_clear(cur()); }
 void app_setcolor(int idx) { struct app *a = cur(); if (a) a->curcol = (uint8_t)(idx & 15); }
-void app_sys_exit(int code) { struct app *a = cur(); a->exit_code = code; a->exited = 1; task_exit(); }
+void app_sys_exit(int code) {
+    struct app *a = cur();
+    a->exit_code = code; a->exited = 1;
+    app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
+    task_exit();
+}
 /* --- ELF core dump (M1104) -------------------------------------------------
  * When a ring-3 app dies on an unhandled fault, write an ET_CORE ELF to
  * /tmp/core capturing its registers (a PT_NOTE/NT_PRSTATUS) and its writable
@@ -6738,6 +6776,7 @@ int app_is_main_thread(void) {
  * blocking on it forever. The list lives in this thread's (still-mapped) user
  * memory; we bound the count and validate every pointer before touching it. */
 void app_thread_exit(void) {
+    app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
     uint64_t rp = task_robust();
     if (rp && vmm_user_ok(rp, sizeof(robust_t))) {
         robust_t *r = (robust_t *)rp;
@@ -6795,6 +6834,7 @@ long app_join(int tid) {
     while (t->state != TASK_DEAD || !__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE))
         task_sleep_ms(5);
     a->thr[slot] = 0;                               /* drop our reference before freeing */
+    app_futex_forget(t);                            /* no stale waiter may outlive it (M1990) */
     task_free(t);                                   /* DEAD + unlinked + off-CPU -> safe to reap */
     return 0;
 }

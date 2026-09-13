@@ -1,5 +1,35 @@
 # What's next
 
+> **(M1990) A FUTEX WAITER COULD RESURRECT A DEAD THREAD — `lxstress` 7/8.**
+>
+> A waiter records `task_self()` in the futex table, and `FUTEX_WAKE` later calls
+> `task_wake()` on that stored pointer. **Nothing cleared the slot when the task
+> died.** A thread that exited while parked on a futex -- or that timed out and
+> then exited -- left a dangling pointer behind, and a later wake on the same key
+> put a FREED TASK on the run queue. The next schedule restored a context whose
+> saved `rip` was whatever the reused memory happened to hold:
+>
+> ```
+> call trace:
+>   [0] 0x0000000000000010
+>   [1] task_block_timeout+0xa3
+>   [2] app_futex+0x1ba
+> ```
+>
+> The key makes it worse rather than better: it is a **physical** address, so
+> once the dead thread's pages are recycled an unrelated process can hash to the
+> same key and fire the stale entry without ever having touched that futex.
+>
+> Every path a task can end on now drops its slots -- thread exit, process exit,
+> `app_join`, and the reaper -- because any one of them left alone is the whole
+> bug. The wake loop also refuses to queue a `TASK_DEAD` task, which should now
+> be unreachable and costs one comparison against halting the machine.
+>
+> It only became reproducible because `lxstress` moved to a **timed** futex wait
+> (the untimed version deadlocked the test itself). The remaining 1-in-8 has the
+> same trace and is a scheduler-side question: `task_block_timeout` releases the
+> run-queue lock before `switch_to_next()`.
+
 > **(M1989) THE VMA TABLE IS THREAD-SAFE NOW — `lxstress` 0/4 -> 5/6.**
 >
 > Three distinct races, each found by making the previous fix expose the next.
