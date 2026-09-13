@@ -178,6 +178,8 @@ LXBOX: pipeline wc=4 writer=0
 LXMMAP: MAP_FIXED honoured
 LXFMAP: file-backed mmap at offset 8192 read the right page
 LXVMAGAP: a 2MiB mmap next to an unaligned gap
+LXNOPIE: ET_EXEC ran below 1 GiB
+LXNOPIEDYN: ET_EXEC + PT_INTERP ran
 LXDYN: a dynamically-linked binary ran
 guest exited with status 11
 LXTHREAD: 4 threads
@@ -289,6 +291,21 @@ LXTHREAD: 4 threads
         echo "  ok: a big anonymous mmap next to an unaligned gap did not alias its neighbour"
     else
         echo "  FAIL: a big mmap overlapped an existing mapping:"; grep -a "LXVMAGAP" "$SLOG3" | head -2; f3=1
+    fi
+    # M1970: NON-PIE binaries. The low 1 GiB used to be a supervisor-only
+    # identity map shared into every address space, so an ET_EXEC image linked
+    # at a fixed low address could not be loaded at all. Two shapes, because
+    # they fail differently: static (no interpreter) and dynamic (ld.so has to
+    # be told where program headers are that are NOT at base + e_phoff).
+    if grep -aq "LXNOPIE: ET_EXEC ran below 1 GiB" "$SLOG3"; then
+        echo "  ok: a non-PIE ET_EXEC binary ran at its link-time address below 1 GiB ($(grep -ao 'main=[0-9a-f]*' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: the non-PIE binary did not run:"; grep -a "LXNOPIE:" "$SLOG3" | head -2; f3=1
+    fi
+    if grep -aq "LXNOPIEDYN: ET_EXEC + PT_INTERP ran" "$SLOG3"; then
+        echo "  ok: and a non-PIE DYNAMIC one -- ld.so found program headers that are not at base+e_phoff"
+    else
+        echo "  FAIL: the non-PIE dynamic binary did not run:"; grep -a "LXNOPIEDYN" "$SLOG3" | head -2; f3=1
     fi
     if grep -aq "LXDYN: a dynamically-linked binary ran, argc=1 argv0=/lxdyn" "$SLOG3"; then
         echo "  ok: ld-linux-x86-64.so.2 ran, mapped libc.so.6 and started a dynamic binary"

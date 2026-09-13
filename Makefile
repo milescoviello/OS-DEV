@@ -204,6 +204,11 @@ $(LXROOT)/lxmmap: tools/lx/lxmmap.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (MAP_FIXED mmap)"
 
+$(LXROOT)/lxnopiedyn: tools/lx/lxnopiedyn.c
+	@mkdir -p $(LXROOT)
+	$(CC) -no-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (NON-PIE + DYNAMIC: Claude Code's exact ELF shape)"
+
 $(LXROOT)/lxnopie: tools/lx/lxnopie.c
 	@mkdir -p $(LXROOT)
 	$(CC) -no-pie -static -O2 -o $@ $<
@@ -244,7 +249,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

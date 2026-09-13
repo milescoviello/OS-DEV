@@ -406,9 +406,10 @@ volatile unsigned long lx_syscall_count, lx_unknown_count;
 /* The last LXRING_N Linux syscalls, for post-mortem on a process that dies
  * without saying anything. (M1970) */
 #define LXRING_N 64
-struct lxring_ent { uint32_t nr; uint64_t a1, a2, a3; char path[56]; };
+struct lxring_ent { uint32_t nr; uint64_t a1, a2, a3, ret; char path[56]; };
 static struct lxring_ent g_lxring[LXRING_N];
 static unsigned long g_lxring_i;
+static struct lxring_ent *g_lxring_cur;
 
 /* Which argument of a syscall is a pathname, if any: 1 = rdi, 2 = rsi, 0 = none.
  * Captured AT RECORD TIME, not at dump time -- by the time a process aborts,
@@ -447,6 +448,26 @@ static void lx_user_backtrace(struct registers *r) {
         prev = rbp;
         rbp = ((const uint64_t *)rbp)[0];
     }
+    /* The chain above needs frame pointers, and optimised code does not keep
+     * them -- it stops early or follows garbage. Scanning the stack for values
+     * that fall inside a mapped EXECUTABLE region finds the return addresses
+     * regardless, at the cost of some false positives. Both are printed
+     * because they fail in different ways. (M1970) */
+    kprintf("[linuxabi] stack scan (executable-looking words):\n");
+    struct app *a = app_current();
+    int shown = 0;
+    for (uint64_t sp = r->rsp; sp < r->rsp + 1024 && shown < 24; sp += 8) {
+        if (!vmm_user_ok(sp, 8)) break;
+        uint64_t w = *(const uint64_t *)sp;
+        if (w < 0x1000) continue;
+        int exec = 0;
+        for (int i = 0; a && i < app_vma_count(a); i++) {
+            uint64_t st, ln; int prot;
+            if (app_vma_info(a, i, &st, &ln, &prot) != 0) continue;
+            if (w >= st && w < st + ln && (prot & 0x4)) { exec = 1; break; }   /* PROT_EXEC */
+        }
+        if (exec) { kprintf("    +%lu: %lx\n", sp - r->rsp, w); shown++; }
+    }
 }
 
 void lx_trace_dump(const char *why) {
@@ -454,8 +475,11 @@ void lx_trace_dump(const char *why) {
     kprintf("[linuxabi] last %lu syscalls before %s (oldest first):\n", n, why);
     for (unsigned long k = 0; k < n; k++) {
         struct lxring_ent *e = &g_lxring[(g_lxring_i - n + k) & (LXRING_N - 1)];
-        if (e->path[0]) kprintf("    %3u(%lx, %lx, %lx)  \"%s\"\n", e->nr, e->a1, e->a2, e->a3, e->path);
-        else            kprintf("    %3u(%lx, %lx, %lx)\n", e->nr, e->a1, e->a2, e->a3);
+        /* The RETURN VALUE is the point. Arguments alone show what a program
+         * asked for; only the result shows which answer it could not live
+         * with, and a negative return here is a Linux errno. */
+        if (e->path[0]) kprintf("    %3u(%lx, %lx, %lx) = %lx  \"%s\"\n", e->nr, e->a1, e->a2, e->a3, e->ret, e->path);
+        else            kprintf("    %3u(%lx, %lx, %lx) = %lx\n", e->nr, e->a1, e->a2, e->a3, e->ret);
     }
 }
 
@@ -493,6 +517,7 @@ void linux_syscall_dispatch(struct registers *r) {
                 re->path[ci] = 0;
             }
         }
+        g_lxring_cur = re;          /* patched with the result once the dispatch returns */
         g_lxring_i++;
     }
     if (g_lx_systrace && (lx_syscall_count & 0xFFF) == 0)
@@ -1372,7 +1397,19 @@ void linux_syscall_dispatch(struct registers *r) {
          * Linux's silent-replace needs VMA splitting we do not have yet. */
         uint64_t base = (flags & LX_MAP_FIXED) ? app_mmap_fixed(r->rdi, (uint64_t)len)
                                               : app_mmap((uint64_t)len);
-        if (!base) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+        if (g_lx_mmap_trace)
+            kprintf("[lxmmap] anon addr=%lx len=%lx prot=%ld fixed=%d -> %lx\n",
+                    (unsigned long)r->rdi, (unsigned long)len, prot,
+                    (flags & LX_MAP_FIXED) ? 1 : 0, (unsigned long)base);
+        /* A refused anonymous mapping is worth saying out loud even without the
+         * trace flag: an allocator that cannot get memory usually aborts, and
+         * an abort says nothing about why. (M1970) */
+        if (!base) {
+            kprintf("[linuxabi] mmap(anon, addr=%lx, len=%lx, fixed=%d) REFUSED\n",
+                    (unsigned long)r->rdi, (unsigned long)len,
+                    (flags & LX_MAP_FIXED) ? 1 : 0);
+            r->rax = (uint64_t)-(long)LX_ENOMEM; break;
+        }
         /* our regions come back writable+NX; tighten to what was asked for */
         if (prot != (1 | 2)) app_mprotect(base, (uint64_t)len, (int)prot);
         r->rax = base;
@@ -2035,6 +2072,9 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
     }
+    /* Patch the ring entry with what we actually answered. Recorded here rather
+     * than at entry because the whole value of the record is the RESULT. */
+    if (g_lxring_cur) { g_lxring_cur->ret = r->rax; g_lxring_cur = 0; }
 }
 
 /* ---- the System V initial process stack (M1939) --------------------------

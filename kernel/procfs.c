@@ -548,8 +548,22 @@ int procfs_exists(const char *abs, int *chardev) {
     if (startswith(abs, "/proc/")) {
         const char *f = abs + 6;
         for (int i = 0; i < NPROC; i++) if (peq(f, proc_files[i].name)) return 1;
+        /* A per-pid path must be one we can actually SERVE. Claiming every
+         * /proc/<pid>/<anything> made open() succeed and the following read()
+         * fail with EBADF -- a file that exists until you touch it. Claude Code
+         * opened /proc/self/cgroup, got a descriptor, read EBADF and aborted;
+         * the syscall ring's return values are what showed it. (M1970) */
+        static const char *pid_files[] = {
+            "status", "stat", "io", "statm", "wchan", "cwd", "exe", "root",
+            "wss", "oom_score", "oom_score_adj", "strace", "regs", "sstrace",
+            "sigfd", "ctl", "cgroup", "cmdline", "limits", "environ", 0
+        };
         int pid; const char *sub;                 /* /proc/<pid>/... and /proc/self/... */
-        if (proc_pid_path(abs, &pid, &sub)) return 1;
+        if (proc_pid_path(abs, &pid, &sub)) {
+            for (int i = 0; pid_files[i]; i++) if (peq(sub, pid_files[i])) return 1;
+            if (startswith(sub, "mem/")) return 1;
+            return 0;
+        }
         return 0;
     }
     return 0;
@@ -814,6 +828,11 @@ long procfs_read(const char *abs, void *buf, unsigned long max) {
             if (peq(file, "cwd"))     return gen_pid_cwd((char *)buf, (int)max, proc);             /* current directory (M1249) */
             if (peq(file, "exe"))     return gen_pid_exe((char *)buf, (int)max, proc);             /* program image path (M1250) */
             if (peq(file, "root")) { char *bb = (char *)buf; if (max >= 3) { bb[0] = '/'; bb[1] = '\n'; bb[2] = 0; return 2; } return 0; }  /* no per-proc chroot -> "/" (M1249) */
+            /* cgroup v2's one-line format. We have no cgroups, and "0::/" is
+             * how Linux says "the root of the unified hierarchy" -- which is
+             * the truth here. A runtime reads this to discover a container
+             * memory limit; the answer means "not in a container". (M1970) */
+            if (peq(file, "cgroup")) { const char *c = "0::/\n"; int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; } ((char *)buf)[n] = 0; return n; }
             if (peq(file, "wss"))     return gen_pid_wss((char *)buf, (int)max, pid, proc);
             if (peq(file, "oom_score")) return gen_pid_oom((char *)buf, (int)max, proc);            /* OOM victim score (M1277) */
             if (peq(file, "oom_score_adj")) return gen_pid_oom_score_adj((char *)buf, (int)max, proc);  /* OOM tuning bias rw (M1282) */

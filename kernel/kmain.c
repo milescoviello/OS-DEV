@@ -811,6 +811,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] launching a NON-PIE (ET_EXEC) binary...\n");
             int nprc = app_run_linux_sync("/disk2/lxnopie", 0, 0, 120000);
             kprintf("[lxabi] LXNOPIE exit -> %d\n", nprc);
+            /* Claude Code's exact shape: ET_EXEC *and* dynamically linked, so
+             * ld.so has to find program headers that are not at base+e_phoff. */
+            kprintf("[lxabi] launching a NON-PIE DYNAMIC binary...\n");
+            int ndrc = app_run_linux_sync("/disk2/lxnopiedyn", 0, 0, 120000);
+            kprintf("[lxabi] LXNOPIEDYN exit -> %d\n", ndrc);
             /* The Phase 4 gate: a DYNAMICALLY-LINKED binary, which needs
              * PT_INTERP + ld.so + libc.so.6 all working. */
             kprintf("[lxabi] launching a DYNAMICALLY-LINKED binary...\n");

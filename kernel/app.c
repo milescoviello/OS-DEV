@@ -580,6 +580,17 @@ void       *app_task(app_t *a) { return a ? (void *)a->task : 0; }        /* the
 uint64_t    app_cr3(app_t *a) { return a ? a->cr3 : 0; }                  /* the app's address space, for /proc/<pid>/wss */
 uint64_t    app_heap_bytes(app_t *a) { return (a && a->heap_end) ? a->heap_end - UHEAP_BASE : 0; }
 int         app_vma_count(app_t *a) { return a ? a->nvma : 0; }
+/* Read one VMA's extent and protection, for diagnostics that need to ask
+ * "is this address executable in this process?" -- a stack scan looking for
+ * return addresses, for instance. 0 on success. (M1970) */
+int app_vma_info(app_t *ap, int i, uint64_t *start, uint64_t *len, int *prot) {
+    struct app *a = (struct app *)ap;
+    if (!a || i < 0 || i >= a->nvma) return -1;
+    if (start) *start = a->vma[i].start;
+    if (len)   *len   = a->vma[i].len;
+    if (prot)  *prot  = a->vma[i].prot;
+    return 0;
+}
 int         app_ppid(app_t *a)    { return a ? a->parent : 0; }   /* parent pid, for /proc/<pid>/stat (M1231) */
 void        app_io_counts(app_t *a, uint64_t *rc, uint64_t *wc) { if (rc) *rc = a ? a->rchar : 0; if (wc) *wc = a ? a->wchar : 0; }  /* /proc/<pid>/io (M1244) */
 int         app_pgid_of(app_t *a) { return a ? a->pgid : 0; }     /* process-group id (M1231) */

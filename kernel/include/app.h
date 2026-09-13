@@ -42,6 +42,7 @@ int         app_format_smaps(app_t *a, char *b, int max);          /* /proc/<pid
 int         app_format_pagemap(app_t *a, char *b, int max);        /* /proc/<pid>/pagemap: per-page residency + PFN (M1167) */
 uint64_t    app_heap_bytes(app_t *a);   /* heap size in bytes */
 int         app_vma_count(app_t *a);    /* number of mmap regions */
+int         app_vma_info(app_t *a, int i, uint64_t *start, uint64_t *len, int *prot);  /* one VMA's extent+prot; 0/-1 (M1970) */
 int         app_ppid(app_t *a);         /* parent pid, for /proc/<pid>/stat (M1231) */
 void        app_io_account(int is_write, long n);            /* tally fd read/write bytes for /proc/<pid>/io (M1244) */
 void        app_io_counts(app_t *a, uint64_t *rc, uint64_t *wc);  /* read the rchar/wchar tallies (M1244) */
