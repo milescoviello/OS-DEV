@@ -379,6 +379,7 @@ struct mq_attr { long mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs; };
 #define SYS_ws_serve     345   /* (port, lastmsg, lastmax, nframes*) -> accept 1 WS client + echo its frames; frames/-1 (M1849) */
 #define SYS_unix_shutdown 346  /* (ep, how) -> half-close: SHUT_WR gives the peer EOF; 0/-1 (M1965) */
 #define SYS_unix_unlisten 347  /* (lid) -> release a listener's bound name; 0/-1 (M1965) */
+#define SYS_linux_run    348   /* (path, argstr) -> spawn a LINUX binary from the guest's own shell; pid/-1 (M1988) */
 
 /* select(2) (M1584): a from-scratch fd_set, now a BIT ARRAY rather than a
  * single word (M1936). It was one `unsigned long` with FD_SETSIZE 32, which was

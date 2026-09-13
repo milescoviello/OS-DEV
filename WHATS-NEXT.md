@@ -1,5 +1,60 @@
 # What's next
 
+> **(M1988) `linux <path>` — YOU CAN NOW RUN A LINUX BINARY BY TYPING IT.**
+>
+> ```
+> osdev:/$ linux /usr/bin/claude --version
+> linux: started /usr/bin/claude as pid 101
+> osdev:/$ 2.1.270 (Claude Code)
+> ```
+>
+> Until now the compatibility layer could only run what a KERNEL BOOT FLAG told
+> it to. That makes it a demo. A new syscall (`SYS_linux_run`) and a shell
+> command make it a property of the system: anything staged in the image can be
+> started from OS-DEV's own shell, with arguments.
+>
+> **Getting the output into the window was the other half, and it is the part
+> that was actually wrong.** A Linux process writes to fd 1, which went to the
+> kernel console -- and the desktop covers the console. So the first real use of
+> this rendered five hundred lines of `claude --help` somewhere nobody could
+> see, and from the shell it looked like nothing had happened at all. A Linux
+> child launched from a shell now writes into THAT SHELL's window.
+>
+> Two bugs found while proving it, both worth recording:
+>
+> - `app_spawn_linux_from_file_argv` returns **0/-1, not a pid**. Reading it as
+>   one meant the output routing was armed for "pid 0", i.e. never -- and the
+>   symptom was identical to not having written the feature.
+> - A screenshot **cannot** tell a working run from a broken one here. The
+>   program's output is printed onto the line that already holds the next
+>   prompt, so both cases have the same number of text lines and nearly the same
+>   ink. Three successive pixel heuristics failed to discriminate. The kernel
+>   can tell, because the two cases take different code paths, and it now says
+>   which -- one log line that means both "a Linux binary ran from the desktop"
+>   and "its stdout took the window path".
+>
+> **THE DESKTOP GOT A LEGIBILITY PASS**, prompted by looking at it on a real
+> screen instead of through a test's crop:
+>
+> - The wallpaper was drawn at **full theme intensity** -- the same
+>   `THEME_MAGENTA` and `THEME_CYAN` as the titlebars, borders and accents. The
+>   sun and grid were exactly as loud as the windows in front of them, so
+>   nothing on screen read as nearer than anything else. That is a depth-cue
+>   problem, not a taste one: a desktop needs wallpaper, window body, chrome and
+>   the focused window at visibly different intensities or the eye has nothing
+>   to order them by. The background now sits at 20-44%.
+> - The boot layout was three fixed rectangles sized for a much smaller screen.
+>   On 1280x960 all three landed inside the top-left third, overlapping --
+>   Files clipped by the shell, Welcome half-covered -- while 60% of the desktop
+>   sat empty. Placement comes from the actual framebuffer now, Welcome is sized
+>   to its content rather than to a percentage (a percentage clipped its last
+>   line), and app windows cascade in the space the boot column leaves.
+>
+> Also fixed: `tests/run-desktop-tests.sh` ran **two** osdrive sessions back to
+> back, each booting its own VM without `-snapshot`, so the second opened the
+> same `fat.img` while the first was still shutting down and booted nothing. It
+> won that race when run alone and lost it under `make check`.
+
 > **(M1987) NAMING THE CORRUPTION, AND A REPRODUCER THAT TAKES A MINUTE.**
 >
 > M1986 ended with Firefox dying like this:

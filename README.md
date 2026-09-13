@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1987-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1988-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -908,6 +908,36 @@ Landed so far, all on the from-scratch ext2 driver:
   backtrace, and — on an unmapped fault — **the whole VMA table and the thread
   id**. Plus a recursion guard, because a kernel-stack overflow presents as the
   kernel executing its own stack, which looks exactly like random corruption.
+
+- **M1988** — **`linux <path>` — you can now run a Linux binary by typing it.**
+  Until now the compatibility layer could only run what a *kernel boot flag*
+  told it to, which makes it a demo rather than a property of the system. A new
+  syscall and a shell command close that:
+
+  ```
+  osdev:/$ linux /usr/bin/claude --version
+  linux: started /usr/bin/claude as pid 101
+  osdev:/$ 2.1.270 (Claude Code)
+  ```
+
+  That last line is Claude Code's own JavaScript, printed into an OS-DEV shell
+  window, from a command someone typed. Getting it *into the window* was the
+  other half: a Linux process writes to fd 1, which went to the kernel console
+  — and the desktop covers the console, so the first real use of this rendered
+  five hundred lines of `claude --help` somewhere nobody could see and looked,
+  from the shell, like nothing had happened. A Linux child launched from a shell
+  now writes into **that shell's window**.
+
+  **The desktop got a legibility pass, which it badly needed.** The wallpaper
+  was drawn at *full theme intensity* — the same `THEME_MAGENTA` and
+  `THEME_CYAN` the titlebars and accents use — so the sun and grid were exactly
+  as loud as the windows in front of them and nothing read as being nearer than
+  anything else. The identity is unchanged; the background now sits at 20–44% so
+  the foreground can be heard over it. And the boot layout was three fixed
+  rectangles sized for a smaller screen: on 1280×960 they landed in the top-left
+  third, overlapping, with Files clipped by the shell while 60% of the desktop
+  sat empty. Placement is derived from the actual framebuffer now, and app
+  windows cascade in the space the boot column leaves instead of on top of it.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

@@ -88,11 +88,16 @@ static void churn(int seed) {
 static void *worker(void *arg) {
     int id = (int)(long)arg;
     churn(id);
-    /* futex ping-pong with whoever else is here */
+    /* Futex ping-pong with whoever else is here. The wait is TIMED on purpose:
+     * an untimed wait on a word nobody advances is a deadlock in the TEST, and
+     * a test that hangs teaches nothing about the kernel. Every iteration also
+     * advances the word, so a waiter that missed its wake sees a changed value
+     * and returns immediately. */
     for (int i = 0; i < 60 && !stop; i++) {
-        int v = futex_word;
-        fwake(&futex_word, 1);
-        if (v == futex_word) fwait(&futex_word, v);
+        __atomic_fetch_add(&futex_word, 1, __ATOMIC_SEQ_CST);
+        fwake(&futex_word, 2);
+        struct timespec ts = { 0, 20 * 1000 * 1000 };   /* 20 ms */
+        syscall(SYS_futex, (int *)&futex_word, FUTEX_WAIT_PRIVATE, futex_word, &ts, NULL, 0);
     }
     return NULL;
 }

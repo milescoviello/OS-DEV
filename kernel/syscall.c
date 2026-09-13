@@ -760,6 +760,55 @@ void syscall_dispatch(struct registers *r) {
     case SYS_insmod:                       /* () -> load the built-in .ko (relocate+resolve+run); retval/-err (M1261) */
         r->rax = (uint64_t)(int64_t)module_load_builtin();
         break;
+    case SYS_linux_run: {                  /* (path, argstr) -> run a LINUX binary (M1988)
+                                            *
+                                            * Until now the only way to start a Linux binary here was a
+                                            * boot flag in kmain -- which means the compatibility layer
+                                            * could only ever run what the KERNEL decided to run. This is
+                                            * the seam that makes it a property of the system instead: a
+                                            * user types `linux /usr/bin/claude --version` in OS-DEV's own
+                                            * shell and the ABI does the rest.
+                                            *
+                                            * argstr is split on spaces into argv[1..]; quoting belongs to
+                                            * the shell and is not reinvented here. */
+        if (!ustr(r->rdi)) { r->rax = (uint64_t)-1; break; }
+        const char *lp = (const char *)r->rdi;
+        static char abuf[512];
+        static char *av[16];
+        int nav = 0;
+        if (r->rsi && ustr(r->rsi)) {
+            const char *src = (const char *)r->rsi;
+            int k = 0;
+            while (*src && k < (int)sizeof abuf - 1) {
+                while (*src == ' ') src++;
+                if (!*src) break;
+                if (nav >= 16) break;
+                av[nav++] = &abuf[k];
+                while (*src && *src != ' ' && k < (int)sizeof abuf - 1) abuf[k++] = *src++;
+                abuf[k++] = 0;
+            }
+        }
+        /* The path is given in the LINUX process's world (/usr/bin/claude);
+         * the loader wants it in ours, under the ext2 mount. */
+        static char full[VFS_PATH_MAX];
+        int fk = 0;
+        if (lp[0] == '/' && !(lp[1] == 'd' && lp[2] == 'i' && lp[3] == 's' && lp[4] == 'k')) {
+            const char *pre = "/disk2";
+            while (pre[fk]) { full[fk] = pre[fk]; fk++; }
+        }
+        for (int q = 0; lp[q] && fk < VFS_PATH_MAX - 1; q++) full[fk++] = lp[q];
+        full[fk] = 0;
+        {
+            int rc_l = app_spawn_linux_from_file_argv(full, (const char *const *)av, nav);
+            /* Point the child's stdout at the window that asked for it. The
+             * spawn returns 0/-1, not a pid -- reading it as one armed nothing
+             * and the output went to the invisible console exactly as before. */
+            int npid = (rc_l < 0) ? -1 : app_last_spawn_pid();
+            if (npid > 0) app_set_out_to(npid, (app_t *)self);
+            r->rax = (uint64_t)(long)npid;
+        }
+        break;
+    }
     case SYS_insmod_path: {                /* (path) -> load a .ko module from a real file (M1595) */
         if (!ustr(r->rdi)) { r->rax = (uint64_t)-1; break; }
         uint8_t *buf; long n = read_whole_file((const char *)r->rdi, &buf);

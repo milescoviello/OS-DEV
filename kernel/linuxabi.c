@@ -584,7 +584,12 @@ void linux_syscall_dispatch(struct registers *r) {
          * ring 3 make the kernel read arbitrary memory and print it. */
         if (a3 < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (a3 && !vmm_user_ok(r->rsi, (uint64_t)a3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        console_write_n(p2, (unsigned long)a3);   /* lock once: no splicing (M1952) */
+        {   /* Launched from a shell? Then its window is where the output
+             * belongs -- see app_write_to. Otherwise the console, as before. */
+            app_t *dst = app_out_to();
+            if (dst) app_write_to(dst, p2, (unsigned)a3);
+            else console_write_n(p2, (unsigned long)a3);   /* lock once: no splicing (M1952) */
+        }
         r->rax = (uint64_t)a3;
         break;
     }
@@ -623,7 +628,12 @@ void linux_syscall_dispatch(struct registers *r) {
                 total += w;
                 if ((unsigned long)w < n) { r->rax = (uint64_t)total; goto done; }   /* short: stop, don't skip a gap */
             } else {
-                console_write_n(b, n);                /* lock once: no splicing (M1952) */
+                /* glibc's buffered stdio flushes through writev, not write, so
+                 * the shell-window routing has to be here too -- fixing only
+                 * write() would leave every printf-heavy program invisible. */
+                app_t *dst = app_out_to();
+                if (dst) app_write_to(dst, b, (unsigned)n);
+                else console_write_n(b, n);           /* lock once: no splicing (M1952) */
                 total += (long)n;
             }
         }

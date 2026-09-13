@@ -6365,6 +6365,26 @@ static int run_command(char *line, char *cwd) {
             print("uid=0(root) gid=0(root)\n");             /* single-user */
         } else if (streq(line, "clear")) {
             sys_clear();
+        } else if (startswith(line, "linux ")) {
+            /* RUN A LINUX BINARY (M1988). Until this existed, the Linux
+             * compatibility layer could only run what a kernel boot flag told
+             * it to -- which makes it a demo rather than a property of the
+             * system. Now it is something you can type:
+             *     linux /usr/bin/claude --version
+             *     linux /usr/lib64/firefox/firefox --version
+             * Output goes to the serial console and the kernel log, because a
+             * Linux process writes to fd 1 and has no window of its own yet. */
+            const char *p = line + 6; while (*p == ' ') p++;
+            char path[192]; int k = 0;
+            while (*p && *p != ' ' && k < (int)sizeof path - 1) path[k++] = *p++;
+            path[k] = 0;
+            while (*p == ' ') p++;
+            if (!path[0]) { print("usage: linux <path> [args...]\n"); g_status = 2; }
+            else {
+                long pid = sys_linux_run(path, p);
+                if (pid < 0) { print("linux: could not start "); print(path); print("\n"); g_status = 1; }
+                else { print("linux: started "); print(path); print(" as pid "); printl((int)pid); print("\n"); }
+            }
         } else if (streq(line, "reboot")) {
             print("rebooting...\n");
             sys_reboot();

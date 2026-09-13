@@ -1061,6 +1061,21 @@ static void make_wallpaper(uint32_t *buf, int w, int h) {
             buf[(size_t)y * w + x] = (uint32_t)(wp_cl(r) << 16 | wp_cl(g) << 8 | wp_cl(b));
         }
 
+    /* A BACKGROUND MUST NOT COMPETE WITH THE FOREGROUND (M1988).
+     *
+     * Every element below used to be drawn at FULL theme intensity -- the same
+     * THEME_MAGENTA and THEME_CYAN the titlebars, borders and accents use. So
+     * the sun and the grid were exactly as loud as the windows in front of
+     * them, and nothing on screen read as being nearer than anything else.
+     * That is not a taste problem, it is a depth-cue problem: a desktop needs
+     * the wallpaper, the window body, the chrome and the FOCUSED window to sit
+     * at visibly different intensities, or the eye has nothing to order them
+     * by. The identity is unchanged; the volume is turned down to where the
+     * foreground can be heard over it. */
+    #define WP_DIM(c, pct) ((uint32_t)((((((c) >> 16) & 0xFF) * (pct) / 100) << 16) | \
+                                       (((((c) >>  8) & 0xFF) * (pct) / 100) <<  8) | \
+                                        ((((c)        & 0xFF) * (pct) / 100))))
+
     /* sliced neon sun: 3 bright rings (0/2/4) separated by 2 gap rings (1/3,
      * sky/stars show through), clipped to the sky region so it appears to
      * sit on/behind the horizon+grid below it. */
@@ -1072,24 +1087,25 @@ static void make_wallpaper(uint32_t *buf, int w, int h) {
             if (d2 >= sr2) continue;
             int ring = (int)(d2 * 6 / sr2);
             if (ring & 1) continue;                              /* odd ring = gap: leave sky/stars visible */
-            buf[(size_t)y * w + x] = (ring == 0) ? THEME_MAGENTA : (ring == 2) ? THEME_CYAN : THEME_VIOLET;
+            uint32_t rc = (ring == 0) ? THEME_MAGENTA : (ring == 2) ? THEME_CYAN : THEME_VIOLET;
+            buf[(size_t)y * w + x] = WP_DIM(rc, 34);
         }
 
     /* bright horizon line, anchoring the sun above it to the grid below it */
-    wp_line(buf, w, h, 0, horizon, w - 1, horizon, THEME_MAGENTA);
-    if (horizon + 1 < h) wp_line(buf, w, h, 0, horizon + 1, w - 1, horizon + 1, THEME_MAGENTA);
+    wp_line(buf, w, h, 0, horizon, w - 1, horizon, WP_DIM(THEME_MAGENTA, 44));
+    if (horizon + 1 < h) wp_line(buf, w, h, 0, horizon + 1, w - 1, horizon + 1, WP_DIM(THEME_MAGENTA, 28));
 
     /* perspective grid: lines converging to the vanishing point (chromatic
      * alternation for visual richness), then horizontal bands on top so
      * they stay crisp/unbroken at every crossing. */
     for (int i = 0; i <= 20; i++) {
         int bx = (int)((long)i * (w - 1) / 20);
-        wp_line(buf, w, h, bx, h - 1, gx, horizon, (i & 1) ? THEME_VIOLET : THEME_CYAN);
+        wp_line(buf, w, h, bx, h - 1, gx, horizon, WP_DIM((i & 1) ? THEME_VIOLET : THEME_CYAN, 20));
     }
     for (int i = 1; i <= 12; i++) {
         long t = (long)i * 1024 / 12;
         int gy2 = horizon + (int)((long)(h - horizon) * (t * t) / (1024L * 1024L));
-        wp_line(buf, w, h, 0, gy2, w - 1, gy2, lerp(THEME_CYAN, THEME_VIOLET, i, 12));
+        wp_line(buf, w, h, 0, gy2, w - 1, gy2, WP_DIM(lerp(THEME_CYAN, THEME_VIOLET, i, 12), 24));
     }
 
     /* Sparse scanline texture (Phase 4 texture experiment): darken every 3rd
@@ -1664,9 +1680,17 @@ static int ctx_desktop_action(int row) {
 static void make_app_window(app_t *a) {
     if (win_count >= MAX_WINDOWS) return;
     spawn_n++;
-    int x = 150 + (spawn_n % 6) * 26, y = 60 + (spawn_n % 6) * 26;
-    windows[win_count++] = (window_t){ x, y,
-        app_cols()*font_width + 14, app_rows()*font_height + TITLEBAR_H + 14,
+    /* Open to the RIGHT of the boot column and cascade there, instead of at a
+     * fixed 150,60 that lands on top of it. Clamped so a window can never open
+     * with its titlebar off-screen, which is how one becomes unmovable. */
+    int aw = app_cols()*font_width + 14, ah = app_rows()*font_height + TITLEBAR_H + 14;
+    int m = screen_w / 24, left = m + screen_w * 30 / 100 + m / 2;
+    int x = left + (spawn_n % 5) * 22, y = m + (spawn_n % 5) * 22;
+    if (x + aw > screen_w - m / 2) x = screen_w - m / 2 - aw;
+    if (y + ah > screen_h - TASKBAR_H - m / 2) y = screen_h - TASKBAR_H - m / 2 - ah;
+    if (x < m / 2) x = m / 2;
+    if (y < m / 2) y = m / 2;
+    windows[win_count++] = (window_t){ x, y, aw, ah,
         THEME_PANEL, app_title(a), KIND_APP, a, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };  /* maximized,sx,sy,sw,sh,fsel,fconfirm, editing,editbuf,editlen, minimized */
 }
 
@@ -1941,8 +1965,26 @@ void desktop_run(void) {
     load_wallpaper();                    /* WALL.PNG from disk, else the gradient */
     start_y = screen_h - TASKBAR_H + 5;
 
-    windows[win_count++] = (window_t){ 60, 70, 360, 290, THEME_PANEL, "Welcome", KIND_WELCOME, 0, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };  /* dark slate (M1476) */
-    windows[win_count++] = (window_t){ 60, 300, 500, 200, THEME_PANEL, "Files", KIND_FILES, 0, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
+    /* THE BOOT LAYOUT IS PROPORTIONAL NOW (M1988). It used to be three fixed
+     * rectangles sized for a much smaller screen: on 1280x960 they all landed
+     * inside the top-left third, overlapping each other -- Files was clipped by
+     * the shell and Welcome was half-covered -- while 60% of the desktop sat
+     * empty. Placement is derived from the actual framebuffer, in a left
+     * column that does not overlap the shell to its right. */
+    {
+        int m = screen_w / 24;                            /* margin, ~53px at 1280 */
+        int colw = screen_w * 30 / 100;                   /* left column width */
+        int usable = screen_h - TASKBAR_H - m * 2;
+        /* Welcome gets its CONTENT's height, not a percentage of the screen:
+         * it is a fixed-layout panel (win_min_size pins it at 360x290), so a
+         * proportional height clips its last line on some screens and leaves a
+         * gap on others. Files takes whatever is left. */
+        int wel_h = 290 + TITLEBAR_H;
+        if (wel_h > usable / 2) wel_h = usable / 2;
+        windows[win_count++] = (window_t){ m, m, colw, wel_h, THEME_PANEL, "Welcome", KIND_WELCOME, 0, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };  /* dark slate (M1476) */
+        windows[win_count++] = (window_t){ m, m + wel_h + m / 2, colw, usable - wel_h - m / 2,
+                                           THEME_PANEL, "Files", KIND_FILES, 0, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
+    }
     app_spawn_named("shell");           /* a real ring-3 shell (WM gives it a
                                          * window below; spawn more via Apps) */
 

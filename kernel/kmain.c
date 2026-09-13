@@ -499,6 +499,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "vmaaudit"))   { extern int g_vma_audit; g_vma_audit = 1; }   /* check the no-overlap invariant on every mmap/munmap (M1988) */
         if (cmdline_has(cl, "lxstress"))   { g_lxabi_test = 1; g_lxstress = 1; }   /* mmap/thread/futex churn, on its own boot (M1987) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
@@ -1013,6 +1014,18 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxclaude] running CLAUDE CODE --help (the full CLI, not a constant)...\n");
             int crc2 = app_run_linux_sync("/disk2/usr/bin/claude", av_ch, 1, 900000);
             kprintf("[lxclaude] claude --help -> %d\n", crc2);
+            /* AND NOW A REAL REQUEST (M1988). -p is non-interactive print mode:
+             * it loads the config, resolves api.anthropic.com, opens TLS and
+             * asks for a completion. There are DELIBERATELY no credentials in
+             * this image -- staging the developer's own ~/.claude into a guest
+             * disk is not something a test should do -- so the expected answer
+             * is an authentication error. That is still the result worth
+             * having: an auth error means DNS, TCP, TLS and the HTTP client all
+             * worked, and anything earlier names which one did not. */
+            static const char *av_cp[] = { "-p", "say hi" };
+            kprintf("[lxclaude] running CLAUDE CODE -p (config + DNS + TLS + HTTP)...\n");
+            int crc3 = app_run_linux_sync("/disk2/usr/bin/claude", av_cp, 2, 900000);
+            kprintf("[lxclaude] claude -p -> %d\n", crc3);
         }
         if (g_lxinet_test) {
             /* AF_INET through the ABI (M1967): a DNS lookup over UDP and an

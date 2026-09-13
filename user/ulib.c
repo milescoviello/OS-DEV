@@ -360,6 +360,9 @@ int  sys_raw_send(const void *frame, unsigned len) { return (int)do_syscall(SYS_
 long sys_raw_recv(void *buf, unsigned max) { return do_syscall(SYS_raw_recv, (long)buf, (long)max, 0); }
 long sys_insmod(void) { return do_syscall(SYS_insmod, 0, 0, 0); }
 long sys_insmod_path(const char *path) { return do_syscall(SYS_insmod_path, (long)path, 0, 0); }
+/* Run a LINUX binary from OS-DEV's own shell (M1988). `args` is a plain string,
+ * split on spaces by the kernel; returns the new pid, or -1. */
+long sys_linux_run(const char *path, const char *args) { return do_syscall(SYS_linux_run, (long)path, (long)args, 0); }
 int  sys_rmmod(const char *name) { return (int)do_syscall(SYS_rmmod, (long)name, 0, 0); }
 int  sys_sendfd(int ep, int fd) { return (int)do_syscall(SYS_sendfd, ep, fd, 0); }
 int  sys_recvfd(int ep) { return (int)do_syscall(SYS_recvfd, ep, 0, 0); }

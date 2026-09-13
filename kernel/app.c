@@ -138,9 +138,49 @@ struct app {
  * a freshly MAP_FIXED'd read-WRITE data segment inherited prot=1 from the
  * read-only reservation it replaced, and ld.so faulted zeroing the BSS tail.
  * Resetting the whole slot makes every field opt-in. (M1956) */
-#define VMA_NEW(a) do { for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(a)->nvma])[_b] = 0; \
-                        (a)->vma[(a)->nvma].fidx = -1; (a)->vma[(a)->nvma].mfd = -1;              \
-                        (a)->vma[(a)->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE; } while (0)
+/* TOMBSTONES (M1988). Removal used to fill the hole it made by moving the LAST
+ * entry down into it. Every thread of a process shares this table, so that
+ * relocates an unrelated mapping to an index a concurrent scan has already
+ * walked past -- and the scan then reports the address as unmapped, which kills
+ * a process for touching memory it mapped itself and had already written.
+ *
+ * Now an entry NEVER MOVES. Removal leaves a tombstone (start = len = 0, inert
+ * to every range test in this file) and VMA_NEW reuses one before it extends
+ * the table, so the slot count does not grow without bound. A scan racing a
+ * removal can see the entry or see the tombstone; it cannot see a DIFFERENT
+ * mapping wearing the same index, which was the whole bug.
+ *
+ * VMA_NEW writes to a->vma_slot, not to a->vma[a->nvma]: every site that used
+ * the old idiom names the slot instead, and commits with VMA_COMMIT. Sites
+ * check vma_full() beforehand rather than `nvma >= APP_MAXVMA`, because a full
+ * high-water mark with tombstones in it still has room. */
+#define vma_full(a) (vma_pick_slot(a) < 0)
+/* CLAIMING A SLOT IS THE ONE PART THAT MUST BE MUTUALLY EXCLUSIVE (M1988).
+ *
+ * Tombstoning fixed removal; allocation was still racing. Two threads calling
+ * mmap at once both ran vma_pick_slot, both got the same free index, and both
+ * wrote their mapping into it. One mapping simply vanished -- its caller got an
+ * address back and faulted on the first byte, with the table containing no
+ * overlap and nothing wrong with it. (The overlap audit is clean throughout,
+ * which is what pointed here.)
+ *
+ * This critical section is safe to spin on where the earlier whole-operation
+ * lock was not: it touches only the kernel's own table, does no I/O, and
+ * accesses no user memory, so nothing inside it can block or fault. The slot is
+ * CLAIMED by writing a non-zero len before the lock is dropped -- every other
+ * allocator looks for len == 0 -- and the high-water mark is published in the
+ * same section. A half-built entry is inert to range tests because its start is
+ * still 0, and x86's store ordering means a scanner that sees the caller's
+ * final `len` has already seen its `start`. */
+#define VMA_NEW(a, slot) do { uint64_t _vf = vma_alloc_lock(a);                                          \
+                        (slot) = vma_pick_slot(a);                                                 \
+                        if ((slot) < 0) (slot) = 0;                 /* caller checked vma_full */  \
+                        for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(slot)])[_b] = 0; \
+                        (a)->vma[(slot)].fidx = -1; (a)->vma[(slot)].mfd = -1;                     \
+                        (a)->vma[(slot)].prot = VMA_PROT_READ | VMA_PROT_WRITE;                    \
+                        (a)->vma[(slot)].len = 1;                   /* claimed: start is still 0 */ \
+                        if ((slot) >= (a)->nvma) (a)->nvma = (slot) + 1;                           \
+                        vma_alloc_unlock(a, _vf); } while (0)
 /* 0 is a VALID path/memfd index, so zeroing is not "none" (M1962/M1985) -- and
  * ZERO PROT MEANS PROT_NONE, which is not what any of these regions are.
  *
@@ -170,6 +210,8 @@ struct app {
      * one lock covers them; it is nested inside cli, like every other lock in
      * this file. */
     volatile int vma_lk;
+    struct app *out_to;                  /* a Linux child writes its stdout into THIS app's window (M1988) */
+    int      out_announced;              /* the routing has been logged once */
     void    *vma_owner;                  /* the task holding it; re-entry by the SAME task is allowed */
     int      vma_depth;
     uint64_t mmap_next;                  /* bump allocator for mmap addresses */
@@ -327,6 +369,34 @@ struct app {
 };
 
 static struct app apps[MAX_APPS];
+
+/* SELF-AUDIT (-append vmaaudit, M1988). Two VMAs must never describe the same
+ * address: that is the invariant every "no VMA" fault suggests is broken, and
+ * inferring it from fault addresses is guesswork. O(n^2) in the table size, so
+ * it is opt-in -- a browser with a thousand mappings would feel it. */
+int g_vma_audit;
+static void vma_audit(struct app *a, const char *why) {
+    if (!g_vma_audit || !a) return;
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        uint64_t s1 = a->vma[i].start, e1 = s1 + a->vma[i].len;
+        if (e1 <= s1) { kprintf("[vma] AUDIT %s: vma[%d] %lx len %lx is degenerate\n", why, i, s1, a->vma[i].len); continue; }
+        for (int j = i + 1; j < a->nvma; j++) {
+            if (!a->vma[j].len) continue;
+            uint64_t s2 = a->vma[j].start, e2 = s2 + a->vma[j].len;
+            if (s1 < e2 && s2 < e1)
+                kprintf("[vma] AUDIT %s: OVERLAP vma[%d] %lx-%lx and vma[%d] %lx-%lx\n",
+                        why, i, s1, e1, j, s2, e2);
+        }
+    }
+}
+
+/* See the tombstone note on VMA_NEW. (M1988) */
+static inline int vma_pick_slot(struct app *a) {
+    for (int i = 0; i < a->nvma; i++) if (!a->vma[i].len) return i;
+    return a->nvma < APP_MAXVMA ? a->nvma : -1;
+}
+
 static int next_pid = 100;
 static int fg_pgid;             /* the controlling terminal's foreground process group (job control, M1176; 0 = none) */
 int app_oom_kill(void);         /* OOM killer (M1275): defined below, called from the sbrk exhaustion path above it */
@@ -395,6 +465,18 @@ static inline void irq_restore(uint64_t f) {
  * never MOVE -- which is the actual hazard -- and it is its own milestone.
  * These stubs keep the call sites, and the interrupt discipline, in place.
  */
+/* The slot-claim lock. Short, non-blocking, no user memory: see VMA_NEW. */
+static inline uint64_t vma_alloc_lock(struct app *a) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    if (a) while (__atomic_exchange_n(&a->vma_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static inline void vma_alloc_unlock(struct app *a, uint64_t f) {
+    if (a) __atomic_store_n(&a->vma_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+
 static inline uint64_t vma_lock(struct app *a) {
     (void)a;
     uint64_t f;
@@ -1835,6 +1917,46 @@ static void ansi_csi(struct app *a, char final) {
  * (ESC [ ... <letter>), which are parsed for colour/cursor/erase. Output with
  * no ESC byte renders byte-identically to before, so existing apps are
  * unaffected. */
+/* Write into a SPECIFIC app's window grid (M1988).
+ *
+ * A Linux process has no window of its own: its stdout goes to the kernel
+ * console, which the desktop covers -- so `linux /usr/bin/claude --help`
+ * rendered five hundred lines of help into a console nobody could see, and
+ * from the shell it looked like nothing happened at all. A Linux binary
+ * launched from a shell now writes into THAT SHELL's window, which is what
+ * anyone typing the command expects. */
+void app_write_to(app_t *dest, const char *buf, unsigned len) {
+    struct app *a = (struct app *)dest;
+    if (!a || !a->used) return;
+    /* Say it ONCE per destination. The property worth asserting is not "the
+     * program produced output" -- the serial log shows that either way, which
+     * is why the bug survived -- but "the output went to a WINDOW rather than
+     * the console". One line names exactly that, and a screenshot heuristic
+     * that tries to infer it from pixels turns out not to be able to: the
+     * output lands on the line that already holds the next prompt, so a broken
+     * run and a working one have the same number of text lines. */
+    if (!a->out_announced) {
+        a->out_announced = 1;
+        kprintf("[app] a Linux child's stdout is going to the window of pid %d\n", a->pid);
+    }
+    for (unsigned i = 0; i < len; i++) grid_putc(a, buf[i]);
+}
+
+void app_set_out_to(int pid, app_t *dest) {
+    for (int i = 0; i < MAX_APPS; i++)
+        if (apps[i].used && apps[i].pid == pid) { apps[i].out_to = (struct app *)dest; return; }
+}
+/* The pid of the most recent successful spawn. app_spawn_linux_from_file_argv
+ * returns 0/-1 (started or not), not a pid -- which is fine for a kernel caller
+ * that then waits, and wrong for anything that needs to NAME the child, like
+ * routing its stdout back to the window that launched it. (M1988) */
+int app_last_spawn_pid(void) { return g_last_spawn_pid; }
+
+app_t *app_out_to(void) {
+    struct app *a = cur();
+    return a ? (app_t *)a->out_to : 0;
+}
+
 void app_sys_write(const char *buf, unsigned len) {
     struct app *a = cur();
     for (unsigned i = 0; i < len; i++) {
@@ -2286,26 +2408,26 @@ static uint64_t app_mmap_fixed_nl(uint64_t addr, uint64_t len) {
     if (!a || len == 0) return 0;
     if (addr & (PAGE_SIZE - 1)) return 0;                       /* must be page-aligned */
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
     /* MAP_FIXED REPLACES whatever is there -- that is its defining behaviour,
      * not a detail. Refusing on overlap (which is what this did) is what broke
      * ld.so: it reserves a span and then MAP_FIXEDs its segments into it. */
     if (app_vma_carve(a, addr, len) != 0) return 0;
-    if (a->nvma >= APP_MAXVMA) return 0;                        /* re-check: the carve may have split */
-    VMA_NEW(a);
-    a->vma[a->nvma].start = addr;
-    a->vma[a->nvma].len   = len;
-    a->vma[a->nvma].sealed = 0;
-    a->vma[a->nvma].uffd  = 0;
-    a->vma[a->nvma].file_backed = 0;
-    a->vma[a->nvma].locked = a->mlock_future;
-    a->vma[a->nvma].huge = 0;
-    a->vma[a->nvma].shared = 0;          /* slots are recycled by the carve: never inherit */
-    a->vma[a->nvma].foff = 0;
-    a->vma[a->nvma].fidx = -1;
-    a->nvma++;
+    if (vma_full(a)) return 0;                        /* re-check: the carve may have split */
+    int vs0; VMA_NEW(a, vs0);
+    a->vma[vs0].start = addr;
+    a->vma[vs0].len   = len;
+    a->vma[vs0].sealed = 0;
+    a->vma[vs0].uffd  = 0;
+    a->vma[vs0].file_backed = 0;
+    a->vma[vs0].locked = a->mlock_future;
+    a->vma[vs0].huge = 0;
+    a->vma[vs0].shared = 0;          /* slots are recycled by the carve: never inherit */
+    a->vma[vs0].foff = 0;
+    a->vma[vs0].fidx = -1;
+    
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
@@ -2321,11 +2443,11 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
 static uint64_t app_mmap_nl(uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
-    if (a->nvma >= APP_MAXVMA)
+    if (vma_full(a))
         kprintf("[app] '%s': OUT OF VMA SLOTS (%d) -- mmap refused with the window still free\n",
                 a->title ? a->title : "?", APP_MAXVMA);
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     /* Ask for the alignment UP FRONT. This used to find an unaligned gap and
      * then round the result up to 2 MiB afterwards (M1168, so MADV_COLLAPSE
@@ -2347,16 +2469,17 @@ static uint64_t app_mmap_nl(uint64_t len) {
     uint64_t addr = vma_find_gap(a, len, len >= HUGE_SIZE ? HUGE_SIZE : 0);
     if (!addr) return 0;
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    VMA_NEW(a);
-    a->vma[a->nvma].start = addr;
-    a->vma[a->nvma].len   = len;
-    a->vma[a->nvma].sealed = 0;
-    a->vma[a->nvma].uffd  = 0;
-    a->vma[a->nvma].file_backed = 0;
-    a->vma[a->nvma].locked = a->mlock_future;       /* MCL_FUTURE: born locked if mlockall(MCL_FUTURE) is in effect (M1283) */
-    a->vma[a->nvma].huge = 0;
-    a->nvma++;
+    int vs1; VMA_NEW(a, vs1);
+    a->vma[vs1].start = addr;
+    a->vma[vs1].len   = len;
+    a->vma[vs1].sealed = 0;
+    a->vma[vs1].uffd  = 0;
+    a->vma[vs1].file_backed = 0;
+    a->vma[vs1].locked = a->mlock_future;       /* MCL_FUTURE: born locked if mlockall(MCL_FUTURE) is in effect (M1283) */
+    a->vma[vs1].huge = 0;
+    
     a->mmap_next = addr + len + PAGE_SIZE;          /* leave an unmapped guard gap */
+    vma_audit(a, "mmap");
     return addr;
 }
 uint64_t app_mmap(uint64_t len) {
@@ -2376,20 +2499,20 @@ static uint64_t app_mmap_huge_nl(uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
     len = (len + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);          /* whole 2 MiB pages */
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     uint64_t addr = vma_find_gap(a, len, HUGE_SIZE);   /* 2 MiB-aligned base */
     if (!addr) return 0;
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    VMA_NEW(a);
-    a->vma[a->nvma].start = addr;
-    a->vma[a->nvma].len   = len;
-    a->vma[a->nvma].sealed = 0;
-    a->vma[a->nvma].uffd  = 0;
-    a->vma[a->nvma].file_backed = 0;
-    a->vma[a->nvma].locked = 0;
-    a->vma[a->nvma].huge = 1;
-    a->nvma++;
+    int vs2; VMA_NEW(a, vs2);
+    a->vma[vs2].start = addr;
+    a->vma[vs2].len   = len;
+    a->vma[vs2].sealed = 0;
+    a->vma[vs2].uffd  = 0;
+    a->vma[vs2].file_backed = 0;
+    a->vma[vs2].locked = 0;
+    a->vma[vs2].huge = 1;
+    
     a->mmap_next = addr + len + HUGE_SIZE;          /* guard gap, preserving 2 MiB alignment */
     return addr;
 }
@@ -2426,7 +2549,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
     if (!a || len == 0 || !path) return 0;
     if ((addr | off) & (PAGE_SIZE - 1)) return 0;          /* both must be page-aligned */
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     if (!addr) {
         addr = vma_find_gap(a, len, 0);
@@ -2435,18 +2558,18 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
         return 0;                                          /* MAP_FIXED: replace what is there */
     }
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-    if (a->nvma >= APP_MAXVMA) return 0;                   /* re-check: the carve may have split */
-    VMA_NEW(a);
-    a->vma[a->nvma].start = addr;
-    a->vma[a->nvma].len   = len;
-    a->vma[a->nvma].sealed = 0;
-    a->vma[a->nvma].uffd  = 0;
-    a->vma[a->nvma].file_backed = 1;
-    a->vma[a->nvma].locked = 0;
-    a->vma[a->nvma].huge = 0;
-    a->vma[a->nvma].shared = shared ? 1 : 0;
-    a->vma[a->nvma].foff = off;
-    a->vma[a->nvma].fidx = vma_intern_path(path);
+    if (vma_full(a)) return 0;                   /* re-check: the carve may have split */
+    int vs3; VMA_NEW(a, vs3);
+    a->vma[vs3].start = addr;
+    a->vma[vs3].len   = len;
+    a->vma[vs3].sealed = 0;
+    a->vma[vs3].uffd  = 0;
+    a->vma[vs3].file_backed = 1;
+    a->vma[vs3].locked = 0;
+    a->vma[vs3].huge = 0;
+    a->vma[vs3].shared = shared ? 1 : 0;
+    a->vma[vs3].foff = off;
+    a->vma[vs3].fidx = vma_intern_path(path);
     /* REFUSE rather than truncate. This buffer was 64 bytes, and binutils'
      * libbfd lives 98 characters down /usr/lib64/binutils/<triplet>/<ver>/ --
      * so every demand-fault on that mapping read a path that does not exist,
@@ -2454,8 +2577,8 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[a->nvma].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
-    a->nvma++;
+    if (a->vma[vs3].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
+    
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
@@ -2464,22 +2587,22 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     struct app *a = cur();
     if (!a || len == 0 || !path) return 0;
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
     uint64_t addr = vma_find_gap(a, len, 0);
     if (!addr) return 0;
     if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    VMA_NEW(a);
-    a->vma[a->nvma].start = addr;
-    a->vma[a->nvma].len   = len;
-    a->vma[a->nvma].sealed = 0;
-    a->vma[a->nvma].uffd  = 0;
-    a->vma[a->nvma].file_backed = 1;
-    a->vma[a->nvma].locked = 0;
-    a->vma[a->nvma].huge = 0;
-    a->vma[a->nvma].shared = shared ? 1 : 0;
-    a->vma[a->nvma].foff = 0;
-    a->vma[a->nvma].fidx = vma_intern_path(path);
+    int vs4; VMA_NEW(a, vs4);
+    a->vma[vs4].start = addr;
+    a->vma[vs4].len   = len;
+    a->vma[vs4].sealed = 0;
+    a->vma[vs4].uffd  = 0;
+    a->vma[vs4].file_backed = 1;
+    a->vma[vs4].locked = 0;
+    a->vma[vs4].huge = 0;
+    a->vma[vs4].shared = shared ? 1 : 0;
+    a->vma[vs4].foff = 0;
+    a->vma[vs4].fidx = vma_intern_path(path);
     /* REFUSE rather than truncate. This buffer was 64 bytes, and binutils'
      * libbfd lives 98 characters down /usr/lib64/binutils/<triplet>/<ver>/ --
      * so every demand-fault on that mapping read a path that does not exist,
@@ -2487,8 +2610,8 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[a->nvma].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
-    a->nvma++;
+    if (a->vma[vs4].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
+    
     a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
@@ -2558,20 +2681,22 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
     for (int i = 0; i < a->nvma; i++) {
         uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
         if (addr <= s0 || addr >= e0) continue;
-        if (a->nvma >= APP_MAXVMA) return -1;
-        a->vma[a->nvma] = a->vma[i];       /* a COPY on purpose: no VMA_NEW here */
-        a->vma[a->nvma].start = addr;
-        a->vma[a->nvma].len   = e0 - addr;
-        if (a->vma[a->nvma].file_backed) {
-            a->vma[a->nvma].foff += addr - s0;
+        if (vma_full(a)) return -1;
+        int ss = vma_pick_slot(a);
+        if (ss < 0) return -1;                       /* no slot: the caller must not split */
+        a->vma[ss] = a->vma[i];       /* a COPY on purpose: no VMA_NEW here */
+        a->vma[ss].start = addr;
+        a->vma[ss].len   = e0 - addr;
+        if (a->vma[ss].file_backed) {
+            a->vma[ss].foff += addr - s0;
             /* fvalid is measured from the VMA start, so the tail's shrinks by
              * exactly what the head keeps -- and clamps at zero when the split
              * lands past the last file-backed byte. */
             uint64_t used = addr - s0;
-            a->vma[a->nvma].fvalid = (a->vma[i].fvalid > used) ? a->vma[i].fvalid - used : 0;
-            if (a->vma[i].fvalid && a->vma[a->nvma].fvalid == 0) a->vma[a->nvma].fvalid = 1;  /* 0 means "no limit"; keep "nothing valid" expressible */
+            a->vma[ss].fvalid = (a->vma[i].fvalid > used) ? a->vma[i].fvalid - used : 0;
+            if (a->vma[i].fvalid && a->vma[ss].fvalid == 0) a->vma[ss].fvalid = 1;  /* 0 means "no limit"; keep "nothing valid" expressible */
         }
-        a->nvma++;
+        if (ss >= a->nvma) a->nvma = ss + 1;   /* publish the tail: this path does not go through VMA_NEW (M1988) */
         a->vma[i].len = addr - s0;
         return 0;
     }
@@ -2632,7 +2757,13 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
         if (a->vma[i].huge && ((cs | ce) & (HUGE_SIZE - 1))) return -1;
         if (cs > s0 && ce < e0) extra++;                        /* middle: becomes two VMAs */
     }
-    if (a->nvma + extra > APP_MAXVMA) return -1;
+    /* Count FREE slots, not the distance to the high-water mark: tombstones
+     * left by earlier removals are usable. (M1988) */
+    {
+        int free_slots = APP_MAXVMA - a->nvma;
+        for (int i = 0; i < a->nvma; i++) if (!a->vma[i].len) free_slots++;
+        if (extra > free_slots) return -1;
+    }
 
     /* --- mutate --- */
     for (int i = 0; i < a->nvma; ) {
@@ -2658,9 +2789,17 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
 
         if (cs == s0 && ce == e0) {                 /* whole VMA goes */
             if (a->vma[i].mfd >= 0) memfd_unref(a->vma[i].mfd);   /* the mapping's reference (M1985) */
-            a->vma[i] = a->vma[a->nvma - 1];
-            a->nvma--;
-            continue;                               /* re-test the swapped-in entry at this index */
+            /* TOMBSTONE, not a swap-down (M1988). Moving the last entry into
+             * this slot is what let a concurrent scan miss a live mapping; a
+             * zeroed entry matches no range test, so a racing scan sees either
+             * the mapping or nothing -- never a different one. */
+            a->vma[i].start = 0; a->vma[i].len = 0;
+            a->vma[i].fidx = -1; a->vma[i].mfd = -1;
+            a->vma[i].file_backed = 0; a->vma[i].shared = 0;
+            a->vma[i].huge = 0; a->vma[i].sealed = 0; a->vma[i].uffd = 0;
+            a->vma[i].locked = 0; a->vma[i].prot = 0;
+            i++;
+            continue;
         }
         if (cs == s0) {                             /* head trimmed */
             a->vma[i].start = ce;
@@ -2671,16 +2810,23 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
         } else if (ce == e0) {                      /* tail trimmed */
             a->vma[i].len = cs - s0;
         } else {                                    /* hole punched: split in two */
-            a->vma[a->nvma] = a->vma[i];        /* a COPY on purpose (slot reserved by the pre-flight count): no VMA_NEW here */
+            int ns = vma_pick_slot(a);
+            if (ns < 0) return -1;              /* pre-flight counted the slots; belt and braces */
+            a->vma[ns] = a->vma[i];             /* a COPY on purpose: no VMA_NEW here */
             if (a->vma[i].mfd >= 0) memfd_ref(a->vma[i].mfd);   /* now TWO mappings hold it (M1985) */
-            a->vma[a->nvma].start = ce;
-            a->vma[a->nvma].len   = e0 - ce;
-            if (a->vma[a->nvma].file_backed) a->vma[a->nvma].foff += ce - s0;
-            a->nvma++;
+            a->vma[ns].start = ce;
+            a->vma[ns].len   = e0 - ce;
+            if (a->vma[ns].file_backed) a->vma[ns].foff += ce - s0;
+            if (ns >= a->nvma) a->nvma = ns + 1;
             a->vma[i].len = cs - s0;
         }
         i++;
     }
+    /* Reclaim the high-water mark from the END only. Lowering a->nvma past
+     * trailing tombstones shortens a concurrent scan, which can only make it
+     * skip entries that are already empty. */
+    while (a->nvma > 0 && a->vma[a->nvma - 1].len == 0) a->nvma--;
+    vma_audit(a, "carve");
     app_tlb_sync(a);                    /* the pages are gone; no core may keep a translation (M1963) */
     return 0;
 }
@@ -2754,7 +2900,7 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
     if (!(flags & MREMAP_MAYMOVE)) return (uint64_t)-1;   /* blocked, and not allowed to move */
 
     /* MOVE: reserve a fresh region (bump allocator, like app_mmap), copy, free old */
-    if (a->nvma >= APP_MAXVMA) return (uint64_t)-1;
+    if (vma_full(a)) return (uint64_t)-1;
     uint64_t nbase = vma_find_gap(a, new_len, 0);
     if (!nbase) return (uint64_t)-1;
     if (nbase + new_len > MMAP_TOP || nbase + new_len < nbase) return (uint64_t)-1;
@@ -2772,10 +2918,10 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
         for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
         vmm_map(nbase + off, nf, PTE_WRITABLE | PTE_USER | PTE_NX);
     }
-    VMA_NEW(a);
-    a->vma[a->nvma].start = nbase; a->vma[a->nvma].len = new_len;
-    a->vma[a->nvma].sealed = a->vma[a->nvma].uffd = a->vma[a->nvma].file_backed = a->vma[a->nvma].locked = a->vma[a->nvma].huge = 0;
-    a->nvma++;
+    int vs5; VMA_NEW(a, vs5);
+    a->vma[vs5].start = nbase; a->vma[vs5].len = new_len;
+    a->vma[vs5].sealed = a->vma[vs5].uffd = a->vma[vs5].file_backed = a->vma[vs5].locked = a->vma[vs5].huge = 0;
+    
     a->mmap_next = nbase + new_len + PAGE_SIZE;
     app_munmap_nl(old_addr, old_len);                     /* free the old region's frames + VMA (the lock is already held) */
     return nbase;
@@ -3235,7 +3381,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t total = len * 2;
     if (total < len) return 0;                       /* overflow */
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     uint64_t base = vma_find_gap(a, total, 0);
     if (!base) return 0;
     if (base + total > MMAP_TOP || base + total < base) return 0;
@@ -3271,15 +3417,15 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
         __asm__ volatile("invlpg (%0)" : : "r"(base + len + off) : "memory");
         mapped += PAGE_SIZE;
     }
-    VMA_NEW(a);
-    a->vma[a->nvma].start = base;
-    a->vma[a->nvma].len   = total;
-    a->vma[a->nvma].sealed = 0;
-    a->vma[a->nvma].uffd  = 0;
-    a->vma[a->nvma].file_backed = 0;
-    a->vma[a->nvma].locked = 0;
-    a->vma[a->nvma].huge = 0;
-    a->nvma++;
+    int vs6; VMA_NEW(a, vs6);
+    a->vma[vs6].start = base;
+    a->vma[vs6].len   = total;
+    a->vma[vs6].sealed = 0;
+    a->vma[vs6].uffd  = 0;
+    a->vma[vs6].file_backed = 0;
+    a->vma[vs6].locked = 0;
+    a->vma[vs6].huge = 0;
+    
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -3302,7 +3448,7 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
     if (!a) return 0;
     uint64_t *frames; int np;
     if (shm_get(name, size, &frames, &np) < 0) return 0;
-    if (a->nvma >= APP_MAXVMA) return 0;
+    if (vma_full(a)) return 0;
     uint64_t total = (uint64_t)np * PAGE_SIZE;
     uint64_t base = vma_find_gap(a, total, 0);
     if (!base) return 0;
@@ -3317,8 +3463,8 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
         pmm_addref(frames[p]);                       /* this mapping holds a ref on the shared frame */
         __asm__ volatile("invlpg (%0)" : : "r"(base + (uint64_t)p * PAGE_SIZE) : "memory");
     }
-    VMA_NEW(a);
-    a->vma[a->nvma].start = base; a->vma[a->nvma].len = total; a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0; a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0; a->nvma++;
+    int vs7; VMA_NEW(a, vs7);
+    a->vma[vs7].start = base; a->vma[vs7].len = total; a->vma[vs7].sealed = 0; a->vma[vs7].uffd = 0; a->vma[vs7].file_backed = 0; a->vma[vs7].locked = 0; a->vma[vs7].huge = 0; 
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -4625,19 +4771,19 @@ static void app_trampoline(void) {
  * are placed by the image itself. Returns 1/0. (M1956) */
 static int app_vma_add_mapped(struct app *a, const char *path, uint64_t addr, uint64_t len,
                               uint64_t foff, uint64_t fvalid, int prot) {
-    if (!a || !len || a->nvma >= APP_MAXVMA) return 0;
-    VMA_NEW(a);
-    a->vma[a->nvma].start = addr;
-    a->vma[a->nvma].len   = len;
-    a->vma[a->nvma].prot  = (uint8_t)(prot & 0x7);
+    if (!a || !len || vma_full(a)) return 0;
+    int vs8; VMA_NEW(a, vs8);
+    a->vma[vs8].start = addr;
+    a->vma[vs8].len   = len;
+    a->vma[vs8].prot  = (uint8_t)(prot & 0x7);
     if (path) {
-        a->vma[a->nvma].file_backed = 1;
-        a->vma[a->nvma].foff = foff;
-        a->vma[a->nvma].fvalid = fvalid;
-        a->vma[a->nvma].fidx = vma_intern_path(path);
-        if (a->vma[a->nvma].fidx < 0) return 0;   /* no slot, or too long: refuse (M1955) */
+        a->vma[vs8].file_backed = 1;
+        a->vma[vs8].foff = foff;
+        a->vma[vs8].fvalid = fvalid;
+        a->vma[vs8].fidx = vma_intern_path(path);
+        if (a->vma[vs8].fidx < 0) return 0;   /* no slot, or too long: refuse (M1955) */
     }
-    a->nvma++;
+    
     return 1;
 }
 
@@ -4743,12 +4889,12 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
      * code reaches into it, not up front for a page count most runs never
      * fully use. Same effective permissions either way (writable, non-exec —
      * enforced by elf_load only ever deferring !PF_X segments). */
-    for (int li = 0; li < nlazy && a->nvma < APP_MAXVMA; li++) {
-        VMA_NEW(a);
-        a->vma[a->nvma].start = lazy[li].start; a->vma[a->nvma].len = lazy[li].len;
-        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
-        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
-        a->nvma++;
+    for (int li = 0; li < nlazy && !vma_full(a); li++) {
+        int vs9; VMA_NEW(a, vs9);
+        a->vma[vs9].start = lazy[li].start; a->vma[vs9].len = lazy[li].len;
+        a->vma[vs9].sealed = 0; a->vma[vs9].uffd = 0;
+        a->vma[vs9].file_backed = 0; a->vma[vs9].locked = 0; a->vma[vs9].huge = 0;
+        
     }
 
     /* Only the TOP pages eagerly (the initial frame is written into them);
@@ -4762,14 +4908,14 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
             goto fail_in_space;
         }
     }
-    if (a->nvma < APP_MAXVMA) {              /* the lazily-faulted remainder */
-        VMA_NEW(a);
-        a->vma[a->nvma].start = USTACK_BASE + PAGE_SIZE;   /* page 0 stays the guard */
-        a->vma[a->nvma].len   = (uint64_t)(USTACK_PAGES - 1 - USTACK_EAGER) * PAGE_SIZE;
-        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
-        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
-        a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
-        a->nvma++;
+    if (!vma_full(a)) {              /* the lazily-faulted remainder */
+        int vs10; VMA_NEW(a, vs10);
+        a->vma[vs10].start = USTACK_BASE + PAGE_SIZE;   /* page 0 stays the guard */
+        a->vma[vs10].len   = (uint64_t)(USTACK_PAGES - 1 - USTACK_EAGER) * PAGE_SIZE;
+        a->vma[vs10].sealed = 0; a->vma[vs10].uffd = 0;
+        a->vma[vs10].file_backed = 0; a->vma[vs10].locked = 0; a->vma[vs10].huge = 0;
+        a->vma[vs10].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        
     }
     a->ustack = USTACK_BASE + USTACK_PAGES * PAGE_SIZE;
     uint64_t prog_entry = a->entry;          /* auxv AT_ENTRY: the EXECUTABLE's entry, even when the interpreter runs first (M1954) */
@@ -5024,7 +5170,7 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     if (off + len > m->cap) return 0;                     /* beyond the object */
     uint64_t base = vma_find_gap(a, len, 0);
     if (!base) return 0;
-    if (a->nvma >= APP_MAXVMA) return 0;   /* no slot to record it: see the ownership note below */
+    if (vma_full(a)) return 0;   /* no slot to record it: see the ownership note below */
     /* OWNERSHIP (M1985). These frames belong to the KERNEL HEAP -- they are the
      * memfd's kmalloc'd buffer, aliased into the process, not pages this
      * process allocated. Two things follow, and neither was true before:
@@ -5060,12 +5206,12 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     }
     m->mapped = 1;
     memfd_ref(a->fd[fd].obj);            /* the MAPPING keeps the object alive, not the fd */
-    VMA_NEW(a);                          /* recorded so munmap/poll/maps see it */
-    a->vma[a->nvma].start = base; a->vma[a->nvma].len = len;
-    a->vma[a->nvma].shared = 1;
-    a->vma[a->nvma].mfd = (short)a->fd[fd].obj;
-    a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
-    a->nvma++;
+    int vs11; VMA_NEW(a, vs11);                          /* recorded so munmap/poll/maps see it */
+    a->vma[vs11].start = base; a->vma[vs11].len = len;
+    a->vma[vs11].shared = 1;
+    a->vma[vs11].mfd = (short)a->fd[fd].obj;
+    a->vma[vs11].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+    
     return base;
 }
 uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
@@ -6674,14 +6820,14 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
             pmm_free_frame(frame); goto fail;
         }
     }
-    if (a->nvma < APP_MAXVMA) {
-        VMA_NEW(a);
-        a->vma[a->nvma].start = USTACK_BASE + PAGE_SIZE;
-        a->vma[a->nvma].len   = (uint64_t)(USTACK_PAGES - 1 - USTACK_EAGER) * PAGE_SIZE;
-        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
-        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
-        a->vma[a->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE;
-        a->nvma++;
+    if (!vma_full(a)) {
+        int vs12; VMA_NEW(a, vs12);
+        a->vma[vs12].start = USTACK_BASE + PAGE_SIZE;
+        a->vma[vs12].len   = (uint64_t)(USTACK_PAGES - 1 - USTACK_EAGER) * PAGE_SIZE;
+        a->vma[vs12].sealed = 0; a->vma[vs12].uffd = 0;
+        a->vma[vs12].file_backed = 0; a->vma[vs12].locked = 0; a->vma[vs12].huge = 0;
+        a->vma[vs12].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        
     }
 
     /* committed: we are now the new program. Free the OLD space (non-active now). */
@@ -6716,12 +6862,12 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     /* Register the NEW image's deferred whole-BSS range(s) (see app_spawn) —
      * done here, after a->nvma was just reset above, not right after elf_load
      * ran (which is before this reset would wipe them back out). */
-    for (int li = 0; li < nlazy && a->nvma < APP_MAXVMA; li++) {
-        VMA_NEW(a);
-        a->vma[a->nvma].start = lazy[li].start; a->vma[a->nvma].len = lazy[li].len;
-        a->vma[a->nvma].sealed = 0; a->vma[a->nvma].uffd = 0;
-        a->vma[a->nvma].file_backed = 0; a->vma[a->nvma].locked = 0; a->vma[a->nvma].huge = 0;
-        a->nvma++;
+    for (int li = 0; li < nlazy && !vma_full(a); li++) {
+        int vs13; VMA_NEW(a, vs13);
+        a->vma[vs13].start = lazy[li].start; a->vma[vs13].len = lazy[li].len;
+        a->vma[vs13].sealed = 0; a->vma[vs13].uffd = 0;
+        a->vma[vs13].file_backed = 0; a->vma[vs13].locked = 0; a->vma[vs13].huge = 0;
+        
     }
     a->aslr_mmap_base = aslr_mmap_pick(); a->mmap_next = a->aslr_mmap_base;   /* ASLR: a fresh randomized mmap base per exec (M1287) */
     for (int i = 0; i < APP_NSIG; i++) a->sig_handler[i] = 0;

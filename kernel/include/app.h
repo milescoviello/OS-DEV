@@ -17,6 +17,10 @@ int         app_getarg(char *out, int max);      /* read the calling app's launc
 int         app_list_names(char *buf, int max);  /* space-separated prog names; bytes written */
 int         app_spawn_from_file(const char *path);/* load + run an ELF from a FAT32 file */
 int         app_spawn_linux_from_file(const char *path);
+void        app_write_to(app_t *dest, const char *buf, unsigned len);  /* write into a specific app's window grid (M1988) */
+void        app_set_out_to(int pid, app_t *dest);                      /* route a Linux child's stdout to dest's window (M1988) */
+int         app_last_spawn_pid(void);                                  /* pid of the last successful spawn (M1988) */
+app_t      *app_out_to(void);                                          /* the current app's stdout target, or NULL (M1988) */
 int         app_spawn_linux_from_file_arg(const char *path, const char *arg);  /* + a one-shot arg that becomes argv[1] (M1948) */
 int         app_spawn_linux_from_file_argv(const char *path, const char *const *args, int n);  /* + a FULL argv: args[] become argv[1..n] (M1955) */
 int         app_run_linux_sync(const char *path, const char *const *args, int n, int timeout_ms);  /* spawn + BLOCK in kernel context until it exits; exit status, -1 no-start, -2 timeout (M1955) */
