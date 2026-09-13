@@ -874,6 +874,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             int crc1 = app_run_linux_sync("/disk2/usr/bin/claude", av_cv1, 1, 900000);
             g_lx_systrace = 0;
             kprintf("[lxclaude] claude --version -> %d\n", crc1);
+
+            /* --help is a far larger exercise than --version: it runs the whole
+             * argument parser and help renderer, i.e. a real amount of the
+             * bundled JavaScript rather than printing one constant. Needs no
+             * network and no credentials. (M1976) */
+            static const char *av_ch[] = { "--help" };
+            kprintf("[lxclaude] running CLAUDE CODE --help (the full CLI, not a constant)...\n");
+            int crc2 = app_run_linux_sync("/disk2/usr/bin/claude", av_ch, 1, 900000);
+            kprintf("[lxclaude] claude --help -> %d\n", crc2);
         }
         if (g_lxinet_test) {
             /* AF_INET through the ABI (M1967): a DNS lookup over UDP and an

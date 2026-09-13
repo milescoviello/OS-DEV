@@ -16,8 +16,14 @@ AS      := /usr/bin/nasm
 LD      := /usr/bin/ld
 OBJCOPY := /usr/bin/objcopy
 
+# -mcmodel=kernel is NOT optional here (M1975). The kernel is linked into the
+# top 2 GiB (M1968), and the default `small` model assumes every symbol fits in
+# the low 2 GiB -- it emits 32-bit displacements that truncate every kernel
+# address, and the result builds cleanly and then fails to boot. These flags are
+# a hand-copy of the host Makefile's and had already drifted once; if you change
+# them there, change them here.
 CFLAGS  := -std=gnu11 -ffreestanding -nostdlib -fno-stack-protector -fno-pic \
-           -fno-pie -mno-red-zone -mgeneral-regs-only -fwrapv \
+           -fno-pie -mcmodel=kernel -mno-red-zone -mgeneral-regs-only -fwrapv \
            -fno-omit-frame-pointer -Ikernel/include -O2
 ASFLAGS := -f elf64
 LDFLAGS := -n -T linker.ld
