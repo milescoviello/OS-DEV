@@ -405,7 +405,7 @@ volatile unsigned long lx_syscall_count, lx_unknown_count;
 
 /* The last LXRING_N Linux syscalls, for post-mortem on a process that dies
  * without saying anything. (M1970) */
-#define LXRING_N 64
+#define LXRING_N 256
 struct lxring_ent { uint32_t nr; uint64_t a1, a2, a3, ret; char path[56]; };
 static struct lxring_ent g_lxring[LXRING_N];
 static unsigned long g_lxring_i;
@@ -1809,11 +1809,24 @@ void linux_syscall_dispatch(struct registers *r) {
         if (!vmm_user_ok(r->rdi, 112)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         uint8_t *si = (uint8_t *)r->rdi;
         for (int i = 0; i < 112; i++) si[i] = 0;
-        *(int64_t  *)(si + 0)  = (int64_t)(timer_ms() / 1000);      /* uptime  */
-        *(uint64_t *)(si + 24) = pmm_total_bytes();       /* totalram */
-        *(uint64_t *)(si + 32) = pmm_free_bytes();        /* freeram  */
-        *(uint16_t *)(si + 88) = 1;                                  /* procs    */
-        *(uint32_t *)(si + 104) = 1;                                 /* mem_unit */
+        /* FIELD OFFSETS (fixed M1971). These were wrong by one slot and the
+         * call still returned 0 with a buffer full of plausible numbers --
+         * exactly the failure mode of the statx layout (M1967).
+         *
+         *    0 uptime(s64)   8 loads[3](u64)  32 totalram   40 freeram
+         *   48 sharedram    56 bufferram      64 totalswap  72 freeswap
+         *   80 procs(u16)   82 pad(u16)       88 totalhigh  96 freehigh
+         *  104 mem_unit(u32)                                size 112
+         *
+         * totalram had been written into loads[2], freeram into totalram, and
+         * procs into totalhigh -- so a caller read the FREE figure as the
+         * total, saw freeram as 0 and procs as 0. A runtime sizes its heap
+         * from these. */
+        *(int64_t  *)(si + 0)   = (int64_t)(timer_ms() / 1000);   /* uptime   */
+        *(uint64_t *)(si + 32)  = pmm_total_bytes();              /* totalram */
+        *(uint64_t *)(si + 40)  = pmm_free_bytes();               /* freeram  */
+        *(uint16_t *)(si + 80)  = 1;                               /* procs: we have no cheap live count, and 0 is worse than an understatement */
+        *(uint32_t *)(si + 104) = 1;                              /* mem_unit */
         r->rax = 0;
         break;
     }

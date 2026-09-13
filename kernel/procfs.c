@@ -553,10 +553,16 @@ int procfs_exists(const char *abs, int *chardev) {
          * fail with EBADF -- a file that exists until you touch it. Claude Code
          * opened /proc/self/cgroup, got a descriptor, read EBADF and aborted;
          * the syscall ring's return values are what showed it. (M1970) */
+        /* MUST match what procfs_read below actually serves. Claiming a name
+         * it does not serve recreates the exact bug this list exists to fix:
+         * open() succeeds and read() returns EBADF. "environ" was in here and
+         * is not served; "maps" is served and was missing, so it read as
+         * absent. (M1971) */
         static const char *pid_files[] = {
-            "status", "stat", "io", "statm", "wchan", "cwd", "exe", "root",
-            "wss", "oom_score", "oom_score_adj", "strace", "regs", "sstrace",
-            "sigfd", "ctl", "cgroup", "cmdline", "limits", "environ", 0
+            "auxv", "cgroup", "cmdline", "comm", "cwd", "exe", "fd", "io",
+            "limits", "maps", "oom_score", "oom_score_adj", "pagemap", "regs",
+            "root", "sigfd", "smaps", "sstrace", "stat", "statm", "status",
+            "strace", "wchan", "wss", "ctl", 0
         };
         int pid; const char *sub;                 /* /proc/<pid>/... and /proc/self/... */
         if (proc_pid_path(abs, &pid, &sub)) {
@@ -815,6 +821,13 @@ static long gen_pid_sstrace(char *b, int max, void *proc) {
 
 long procfs_read(const char *abs, void *buf, unsigned long max) {
     if (max == 0) return -1;
+    /* NESTED NODES FIRST, and the order is the whole point (M1971). This call
+     * used to sit after the "/proc/" block, which returns -1 for any name it
+     * does not recognise -- so /proc/sys/vm/mmap_min_addr was reported to
+     * EXIST by procfs_exists, opened successfully, and then failed its read
+     * with EBADF. A file that exists until you touch it is worse than one that
+     * is simply absent: the caller has already committed to using it. */
+    { long sn = sysfs_read(abs, (char *)buf, (int)max); if (sn >= 0) return sn; }
     if (startswith(abs, "/proc/")) {
         int pid; const char *file;
         if (proc_pid_path(abs, &pid, &file)) {            /* /proc/<pid>/... */
@@ -869,7 +882,6 @@ long procfs_read(const char *abs, void *buf, unsigned long max) {
             if (peq(f, proc_files[i].name)) return proc_files[i].gen((char *)buf, (int)max);
         return -1;
     }
-    { long sn = sysfs_read(abs, (char *)buf, (int)max); if (sn >= 0) return sn; }   /* nested nodes first (M1970) */
     if (startswith(abs, "/dev/")) {
         const char *f = abs + 5;
         if (peq(f, "null"))   return 0;                         /* EOF */
