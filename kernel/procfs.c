@@ -581,6 +581,17 @@ static int proc_pid_path(const char *abs, int *pid, const char **file) {
     const char *p = abs + 6;
     if (startswith(p, "self/")) {                 /* /proc/self/... -> the calling task */
         *pid = task_current_id(); *file = p + 5;
+        /* /proc/<pid>/task/<tid>/<file> -- the PER-THREAD view. A runtime that
+         * manages its own threads reads this (Firefox reads task/<tid>/stat
+         * while starting up). We have no separate per-thread accounting, so
+         * the thread's file is answered with the process's: the numbers are
+         * the ones we actually have rather than zeros, and the alternative was
+         * ENOENT for a path Linux always provides. (M1982) */
+        if (startswith(*file, "task/")) {
+            const char *q = *file + 5;
+            while (*q && *q != '/') q++;
+            if (*q == '/' && q[1]) *file = q + 1;
+        }
         return **file != 0;
     }
     if (*p < '1' || *p > '9') return 0;          /* a pid starts 1-9; flat files start with a letter */

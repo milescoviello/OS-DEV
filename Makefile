@@ -78,7 +78,9 @@ MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
 # ~/.local/share/claude/versions/, with ~/.local/bin/claude a launcher, so
 # `command -v` finds the launcher rather than the image -- resolve it. (M1968)
 CLAUDE_BIN ?= $(shell readlink -f "$$(command -v claude 2>/dev/null)" 2>/dev/null)
-EXT2SIZE  := 1500M   # 512M -> 1500M (M1964): Node is 102 MB plus 21 shared libraries, on top of the 195 MB toolchain+source tree
+# Firefox's install directory. Staged whole -- see the rule below for why.
+FIREFOX_DIR ?= $(firstword $(wildcard /usr/lib64/firefox /usr/lib/firefox))
+EXT2SIZE  := 2200M   # 512M -> 1500M (M1964): Node is 102 MB plus 21 shared libraries, on top of the 195 MB toolchain+source tree
 ifneq ($(MKE2FS),)
 EXT2IMG   := $(BUILD)/ext2.img
 EXT2FLAGS := -drive file=$(BUILD)/ext2.img,format=raw,if=ide
@@ -127,7 +129,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -375,6 +377,13 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl
 	@# installed -- the build must not depend on the developer's own tooling
 	@# being present.
 	@if [ -n "$(CLAUDE_BIN)" ] && [ -f "$(CLAUDE_BIN)" ]; then 	    tools/stage-linux-tool.sh $(LXROOT) claude "$(CLAUDE_BIN)"; 	 else echo "  SKIP    claude (not installed; set CLAUDE_BIN=/path to stage it)"; fi
+	@# PHASE 8: Firefox. Its own directory goes in WHOLESALE -- libxul.so,
+	@# omni.ja, the .so plugins and the resource tree -- because Firefox
+	@# resolves those relative to its own install path, not through ld.so. The
+	@# shared-library closure comes from libxul rather than the launcher: the
+	@# launcher is a 600 KB stub with six dependencies, and everything real
+	@# (GTK, cairo, pango, fontconfig, dbus) is libxul's. (M1982)
+	@if [ -d "$(FIREFOX_DIR)" ]; then 	    mkdir -p $(LXROOT)$(FIREFOX_DIR) && cp -a "$(FIREFOX_DIR)/." $(LXROOT)$(FIREFOX_DIR)/ && 	    echo "  STAGE   firefox <- $(FIREFOX_DIR) ($$(du -sh $(FIREFOX_DIR) | cut -f1))"; 	    tools/stage-linux-tool.sh $(LXROOT) libxul "$(FIREFOX_DIR)/libxul.so" >/dev/null 2>&1 || true; 	    n=0; for so in $$(ldd "$(FIREFOX_DIR)/libxul.so" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do 	        r=$$(readlink -f "$$so" 2>/dev/null) || continue; [ -f "$$r" ] || continue; 	        mkdir -p $(LXROOT)$$(dirname "$$so") $(LXROOT)/usr/lib64; 	        cp -f "$$r" $(LXROOT)$$so; cp -f "$$r" $(LXROOT)/usr/lib64/$$(basename "$$so") 2>/dev/null || true; 	        n=$$((n+1)); done; 	    echo "  STAGE   libxul closure (+ $$n shared libs)"; 	 else echo "  SKIP    firefox (not installed; set FIREFOX_DIR=)"; fi
 	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
 	@touch $@
 
@@ -1499,6 +1508,11 @@ gfxtest: $(KERNEL) $(DISK)
 # which is too coupled to fuzz in isolation. SKIPs if QEMU/socat/python3 absent.
 browsertest: $(KERNEL) $(DISK)
 	@tests/run-browser-tests.sh
+
+# PHASE 8: Firefox in-guest. A 268 MB install with an 83-library closure. NOT
+# in `make check`: minutes per start under TCG. SKIPs when it was never staged.
+firefoxtest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-firefox-test.sh
 
 # PHASE 8: OS-DEV's own Wayland compositor, exercised by a REAL libwayland
 # client (the same library Firefox uses). In `make check`: one 2 GiB boot.

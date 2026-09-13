@@ -259,6 +259,7 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_sendmmsg_    307
 #define LXS_memfd_create_ 319
 #define LXS_ftruncate_    77
+#define LXS_readahead_   187
 #define LXS_clock_nanosleep_ 230
 #define LXS_statx_       332
 #define LXS_sched_getaffinity_ 204
@@ -996,6 +997,14 @@ void linux_syscall_dispatch(struct registers *r) {
      *                    void *control; u64 controllen; int flags; }   56 bytes
      *   struct mmsghdr { struct msghdr hdr; u32 len; }                 64 bytes
      */
+    case LXS_readahead_:
+        /* (fd, offset, count). A HINT: "I will read this soon." Linux may
+         * start the I/O early or ignore it entirely, and the caller's
+         * correctness never depends on it -- Firefox issues a burst of these
+         * while loading libxul. Returning 0 is the honest answer for a kernel
+         * with no readahead machinery; ENOSYS made it look like a failure. */
+        r->rax = 0;
+        break;
     case LXS_ftruncate_: {                  /* (fd, length) */
         /* A memfd is created EMPTY; it has to be sized before it can be
          * mapped, so wl_shm's very first move is memfd_create + ftruncate.

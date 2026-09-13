@@ -247,6 +247,7 @@ static volatile int g_lxfull_test;            /* -append lxfulltest: the whole L
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
+static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
 static volatile int g_wlraw;                  /* -append wlraw: also run the raw handshake client (M1978) */
 
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
@@ -499,6 +500,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
+        if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
@@ -890,6 +892,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 for (int t = 0; t < 6000; t++) {
                     task_sleep_ms(10);
                     if (wl_commits() > 0 && t > 60) break;
+                }
+                if (g_fftest) {
+                    /* FIREFOX, against our own compositor. It is far heavier
+                     * than anything run here before -- a 268 MB install with
+                     * an 83-library closure -- so this is its own boot, and
+                     * the first run is about finding out what it asks for. */
+                    static const char *av_ff[] = { "--version" };
+                    kprintf("[ff] running FIREFOX --version...\n");
+                    int frc = app_run_linux_sync("/disk2/usr/lib64/firefox/firefox", av_ff, 1, 1200000);
+                    kprintf("[ff] firefox --version -> %d\n", frc);
                 }
                 kprintf("[wl] surface ready: %ux%u -- handing over to the desktop\n",
                         wl_last_width(), wl_last_height());

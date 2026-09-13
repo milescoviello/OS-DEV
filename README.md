@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1981-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1982-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -763,8 +763,18 @@ Landed so far, all on the from-scratch ext2 driver:
   toplevel is not mapped until the client acknowledges one — a client that
   never receives it waits forever having done nothing wrong.
 
-Still ahead: input (`wl_seat` back out to the client), multiple surfaces, then
-Firefox. The honest scale is still months.
+- **M1982** — **Firefox runs inside OS-DEV.** `Mozilla Firefox 153.0.4`, exit 0
+  — a 268 MB install whose `libxul.so` pulls an **83-library closure** (GTK,
+  cairo, pango, fontconfig, dbus), staged unmodified and resolved by the real
+  `ld.so`. It asked for exactly two things we lacked: `readahead(2)` (a hint
+  Linux is free to ignore, so `ENOSYS` made it look like a failure) and
+  `/proc/self/task/<tid>/stat`, the per-thread view. It now runs with **zero
+  ENOSYS and zero missing files**. As with `claude --version`, this is the
+  load-bearing first step and not the finish line: rendering a page into a
+  window is the goal.
+
+Still ahead: input (`wl_seat` back out to the client), and Firefox actually
+painting. The honest scale is still months.
 
 Also still open: a **unified inode/page cache** (the block buffer cache is the
 seed), and extending the crash-consistency journal to the rest of the
