@@ -182,6 +182,7 @@ static-PIE LIBC binary: argc=1 argv0=/hellolibc
 LXIO: wrote+read 200 lines
 LXBOX: pipeline wc=4 writer=0
 LXMMAP: MAP_FIXED honoured
+LXMMAP-PROT:
 LXFMAP: file-backed mmap at offset 8192 read the right page
 LXVMAGAP: a 2MiB mmap next to an unaligned gap
 LXSCM: memfd + SCM_RIGHTS + MAP_SHARED
@@ -322,6 +323,17 @@ LXTHREAD: 4 threads
     # only borrowing. When they did not, the damage landed somewhere else
     # entirely: a page of ld.so's text came up zero-filled and Firefox died at
     # the first instruction of whatever function lived there.
+    # M1987: an anonymous mapping has to REMEMBER that it is read-write.
+    # mprotect()ing its first page splits it, and the tail inherits the
+    # original's recorded protection -- which was nothing at all, i.e.
+    # PROT_NONE. The first touch of a tail page then demand-faulted into a
+    # non-writable PTE and the write faulted again, so the kernel killed the
+    # process for writing to memory it had just granted read-write.
+    if grep -aq "LXMMAP-PROT: the tail of an mprotect-split anonymous mapping is still writable" "$SLOG3"; then
+        echo "  ok: the tail of an mprotect-split anonymous mapping is still writable (the VMA records its own prot)"
+    else
+        echo "  FAIL: an anonymous mapping lost its protection across an mprotect split:"; grep -a "LXMMAP" "$SLOG3" | head -3; f3=1
+    fi
     if grep -aq "LXMEMFD-OK: the memfd's contents SURVIVED munmap" "$SLOG3"; then
         echo "  ok: a memfd's pages survive munmap + 4 MiB of churn -- the process only BORROWS the kernel's heap"
     else

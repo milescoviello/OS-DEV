@@ -250,6 +250,7 @@ static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET soc
 static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
 static volatile int g_wlraw;                  /* -append wlraw: also run the raw handshake client (M1978) */
 
+static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
@@ -498,6 +499,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
+        if (cmdline_has(cl, "lxstress"))   { g_lxabi_test = 1; g_lxstress = 1; }   /* mmap/thread/futex churn, on its own boot (M1987) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
@@ -730,6 +732,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * glib treats a config directory it cannot create as fatal rather than
          * as a reason to skip caching. Made here, not in the image, so a fresh
          * ext2 volume needs no special preparation to run one. */
+        if (g_lxstress) {
+            /* The reproducer for the corruption Firefox dies in, on its own
+             * boot because it is deliberately the heaviest thing here and
+             * nothing else should be competing for the answer. (M1987) */
+            kprintf("[lxabi] STRESS: mmap/thread/futex/signal churn...\n");
+            int strc = app_run_linux_sync("/disk2/lxstress", 0, 0, 900000);
+            kprintf("[lxabi] LXSTRESS exit -> %d\n", strc);
+        }
         vfs_mkdir("/disk2/root");
         vfs_mkdir("/disk2/root/.config");
         vfs_mkdir("/disk2/root/.cache");

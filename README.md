@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1986-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1987-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -870,6 +870,44 @@ Landed so far, all on the from-scratch ext2 driver:
   corruption under real thread and mmap load — the same shape as the
   long-standing intermittent `cc1` crash. That is the next thing to fix, and it
   is a kernel bug, not a missing feature.
+
+- **M1987** — **naming the corruption, and a reproducer that takes a minute.**
+  Firefox died with a page fault whose error code said *instruction fetch, from
+  a user address, in supervisor mode* — SMEP catching the kernel jumping into
+  userspace. `tools/lx/lxstress.c` does what a browser does, deliberately and
+  densely, from six threads: mmap/touch/mprotect/munmap churn at sizes that
+  straddle the page and hugepage boundaries, threads created and joined
+  repeatedly, futex ping-pong, and signals delivered mid-syscall. It reproduces
+  in about **sixty seconds** instead of ten minutes, and it names the phase.
+
+  It found a real bug and named a bigger one.
+
+  **Fixed:** an anonymous mapping never recorded its own protection. `VMA_NEW`
+  zeroed the field and `app_mmap` never set it, so every ordinary `mmap` carried
+  `prot == 0`, which *means* `PROT_NONE`. Two places papered over it —
+  `/proc/self/maps` and `vma_pte_flags` both had a "zero means read-write"
+  fallback — and the one place that read the field literally, the fault
+  handler's permission branch, killed processes for writing to their own
+  read-write memory. Both fallbacks are gone and the field is load-bearing;
+  reverting the default now fails `LXMMAP-PROT` loudly.
+
+  **Named, not yet fixed:** the VMA table is shared by every thread and raced.
+  `app_vma_carve` fills the hole it makes by **moving the last entry down**, so
+  a concurrent `munmap` relocates an unrelated mapping to an index a scan has
+  already walked past — and the scan concludes the address is unmapped. The
+  fault log now proves it: *"no VMA"* for an address that the table dump
+  printed one line later as `vma[22] 108a00000-108c00000`. A per-process
+  spinlock was tried and **removed**: several of these operations block while
+  holding it (`app_msync` writes to disk from inside `app_vma_carve`), and a
+  spinlock held across a blocking call, spun on by cores with interrupts off,
+  hangs the machine instead. The fix is a blocking-call audit plus tombstoned
+  removal so entries never move, and it is the next milestone.
+
+  Diagnostics that made all of this visible, and stay: a ring-3 fault now prints
+  the **bytes at `rip`**, the last 16 Linux syscalls with return values, a user
+  backtrace, and — on an unmapped fault — **the whole VMA table and the thread
+  id**. Plus a recursion guard, because a kernel-stack overflow presents as the
+  kernel executing its own stack, which looks exactly like random corruption.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

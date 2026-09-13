@@ -18,6 +18,7 @@
 #include "fifo.h"    /* named pipes (FIFOs), path-keyed (M1188) */
 #include "bpf.h"     /* seccomp-BPF self-filter (M1190) */
 #include "task.h"
+#include "smp.h"     /* per-core fault-recursion depth (M1987) */
 #include "timer.h"
 #include "interrupts.h"   /* struct registers, for ring-3 signal delivery */
 #include "vmm.h"
@@ -138,7 +139,20 @@ struct app {
  * read-only reservation it replaced, and ld.so faulted zeroing the BSS tail.
  * Resetting the whole slot makes every field opt-in. (M1956) */
 #define VMA_NEW(a) do { for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(a)->nvma])[_b] = 0; \
-                        (a)->vma[(a)->nvma].fidx = -1; (a)->vma[(a)->nvma].mfd = -1; } while (0)   /* 0 is a VALID path/memfd index, so zeroing is not "none" (M1962/M1985) */
+                        (a)->vma[(a)->nvma].fidx = -1; (a)->vma[(a)->nvma].mfd = -1;              \
+                        (a)->vma[(a)->nvma].prot = VMA_PROT_READ | VMA_PROT_WRITE; } while (0)
+/* 0 is a VALID path/memfd index, so zeroing is not "none" (M1962/M1985) -- and
+ * ZERO PROT MEANS PROT_NONE, which is not what any of these regions are.
+ *
+ * app_mmap never set prot at all, so every ordinary anonymous mapping carried
+ * prot 0. The fault handler's MISSING-page path does not consult prot, so this
+ * was invisible for as long as a page could only be absent; the PERMISSION
+ * path reads it literally, and a page that is present-but-read-only under a
+ * prot-0 VMA is reported as "write to a read-only mapping" and the process is
+ * killed. It took mprotect() churn in the same address space to expose, which
+ * is why a compiler and a browser hit it and nothing else did. The default is
+ * now what these mappings actually are; every caller that wants something
+ * narrower still says so. (M1987) */
 
 /* Linux PROT_* bits, as recorded on a VMA and honoured by app_fault_handle (M1956) */
 #define VMA_PROT_READ  0x1
@@ -146,6 +160,18 @@ struct app {
 #define VMA_PROT_EXEC  0x4
     struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fidx indexes the global path table (M1962: an inline 256-byte path made the struct so big the TABLE was the limit, not the address space); prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
     int      nvma;
+    /* THE VMA TABLE IS SHARED BY EVERY THREAD, and until M1987 it was mutated
+     * with no serialisation at all. Two threads mmap()ing at once both wrote
+     * a->vma[a->nvma] and both incremented it; a munmap racing an mmap moved
+     * the last entry down over the one being written. The loser's mapping was
+     * returned to the caller and then did not exist -- so the first write to it
+     * faulted with "no VMA", pages away from anything the program did wrong.
+     * Anonymous, file-backed and memfd mappings all go through here, so this
+     * one lock covers them; it is nested inside cli, like every other lock in
+     * this file. */
+    volatile int vma_lk;
+    void    *vma_owner;                  /* the task holding it; re-entry by the SAME task is allowed */
+    int      vma_depth;
     uint64_t mmap_next;                  /* bump allocator for mmap addresses */
     int      mlock_future;               /* mlockall(MCL_FUTURE): new mmaps are born locked (M1283) */
     uint64_t aslr_mmap_base;             /* ASLR: per-exec randomized mmap-region start (M1287) */
@@ -325,6 +351,18 @@ int app_oom_kill(void);         /* OOM killer (M1275): defined below, called fro
  * touch each other's state and all are rare enough that it costs nothing
  * measurable. Defined this early so every consumer below it (starting with
  * app_waitpid) can see it. */
+/* Per-process VMA-table lock (M1987). Taken at the PUBLIC entry points only:
+ * the static helpers below (vma_find_gap, app_vma_carve, app_vma_split_at)
+ * assume it is already held, which keeps it non-recursive and makes the
+ * ownership obvious at every call site.
+ *
+ * Deliberately NOT held across disk I/O: app_msync and the swap path can block,
+ * and a lock that can be held across a sleep is a lock that serialises the
+ * whole process on one slow read. */
+struct app;
+static inline uint64_t vma_lock(struct app *a);
+static inline void vma_unlock(struct app *a, uint64_t f);
+
 static volatile int app_wake_lock;
 static inline uint64_t irq_save(void) {
     uint64_t f;
@@ -334,6 +372,37 @@ static inline uint64_t irq_save(void) {
 }
 static inline void irq_restore(uint64_t f) {
     __atomic_store_n(&app_wake_lock, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+
+/* NOT A LOCK YET, and saying so is the point (M1987).
+ *
+ * The VMA table IS shared by every thread and IS raced -- see the milestone
+ * notes: app_vma_carve fills the hole it makes by moving the last entry down,
+ * so a concurrent munmap relocates a mapping to an index a scan has already
+ * passed, and the scan concludes the address is unmapped. tools/lx/lxstress.c
+ * reproduces it in about a minute.
+ *
+ * A per-process spinlock was tried here and REMOVED, because it hangs the
+ * machine rather than fixing the race: several of these operations block while
+ * holding it (app_msync writes to disk from inside app_vma_carve; the
+ * file-backed fault path reads through the VFS), and a spinlock held across a
+ * blocking call, taken by other cores with interrupts off, means the holder can
+ * never be rescheduled to release it. That is the same failure M1912 fixed in
+ * the scheduler, and it is worse than the bug it was meant to fix.
+ *
+ * The real fix is a blocking-call audit plus tombstoned removal so entries
+ * never MOVE -- which is the actual hazard -- and it is its own milestone.
+ * These stubs keep the call sites, and the interrupt discipline, in place.
+ */
+static inline uint64_t vma_lock(struct app *a) {
+    (void)a;
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void vma_unlock(struct app *a, uint64_t f) {
+    (void)a;
     __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
 }
 
@@ -690,7 +759,12 @@ int app_format_maps(app_t *a, char *b, int max) {
         /* The lazily-faulted part of the stack is a VMA too; it is reported as
          * part of the single [stack] range below, not twice. */
         if (a->vma[i].start >= stk_lo && a->vma[i].start < stk_hi) continue;
-        int prot = a->vma[i].prot ? a->vma[i].prot : (VMA_PROT_READ | VMA_PROT_WRITE);
+        /* No "0 means rw" fallback any more: VMA_NEW gives every mapping its
+         * real protection now, so this file and the fault handler finally
+         * agree. The fallback here was the bug's camouflage -- /proc/self/maps
+         * read correctly while the fault handler read the same field literally
+         * and killed the process. (M1987) */
+        int prot = a->vma[i].prot;
         p = maps_line(b, p, max, a->vma[i].start, a->vma[i].start + a->vma[i].len,
                       prot, a->vma[i].huge ? "[mmap-huge]" : vma_path((struct app *)a, i));
     }
@@ -2207,7 +2281,7 @@ uint64_t app_aslr_base(int pid) {
  * and must not overlap an existing VMA. Linux's MAP_FIXED silently replaces an
  * existing mapping, which we cannot do safely yet (no partial munmap / VMA
  * splitting), so an overlap is refused rather than half-honoured. */
-uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
+static uint64_t app_mmap_fixed_nl(uint64_t addr, uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
     if (addr & (PAGE_SIZE - 1)) return 0;                       /* must be page-aligned */
@@ -2235,8 +2309,16 @@ uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
+uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mmap_fixed_nl(addr, len);
+    vma_unlock(a_, f_);
+    return r_;
+}
 
-uint64_t app_mmap(uint64_t len) {
+
+static uint64_t app_mmap_nl(uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
     if (a->nvma >= APP_MAXVMA)
@@ -2277,12 +2359,20 @@ uint64_t app_mmap(uint64_t len) {
     a->mmap_next = addr + len + PAGE_SIZE;          /* leave an unmapped guard gap */
     return addr;
 }
+uint64_t app_mmap(uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mmap_nl(len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* Hugepage mmap (M1155): reserve a 2 MiB-aligned, 2 MiB-granular demand-paged
  * region whose first touch maps the whole enclosing 2 MiB with a single PD entry
  * (PS bit) via app_fault_handle — one TLB entry for 512 pages, real x86-64 huge
  * paging. Returns the (2 MiB-aligned) base VA, or 0. */
-uint64_t app_mmap_huge(uint64_t len) {
+static uint64_t app_mmap_huge_nl(uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
     len = (len + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);          /* whole 2 MiB pages */
@@ -2303,6 +2393,14 @@ uint64_t app_mmap_huge(uint64_t len) {
     a->mmap_next = addr + len + HUGE_SIZE;          /* guard gap, preserving 2 MiB alignment */
     return addr;
 }
+uint64_t app_mmap_huge(uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mmap_huge_nl(len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* File-backed mmap (M1136): reserve a demand-paged region whose pages are filled
  * lazily from file `path` (offset 0) on first touch — see app_fault_handle.
@@ -2587,7 +2685,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
     return 0;
 }
 
-int app_munmap(uint64_t addr, uint64_t len) {
+static int app_munmap_nl(uint64_t addr, uint64_t len) {
     struct app *a = cur();
     if (!a) return -1;
     /* Was: "find a VMA starting at exactly addr, free all of it, ignore len".
@@ -2600,6 +2698,14 @@ int app_munmap(uint64_t addr, uint64_t len) {
     if (!len) return -1;
     return app_vma_carve(a, addr, len);
 }
+int app_munmap(uint64_t addr, uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_munmap_nl(addr, len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* mremap (M1179): resize the anonymous mmap region that starts at old_addr.
  *   - shrink: free the tail pages, keep the start.
@@ -2610,7 +2716,7 @@ int app_munmap(uint64_t addr, uint64_t len) {
  * Plain anon only (sealed/file-backed/huge/uffd/locked regions are refused).
  * Returns the (possibly new) base, or (uint64_t)-1. */
 #define MREMAP_MAYMOVE 1
-uint64_t app_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int flags) {
+static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int flags) {
     struct app *a = cur();
     if (!a || new_len == 0) return (uint64_t)-1;
     old_len = (old_len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -2671,9 +2777,17 @@ uint64_t app_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int f
     a->vma[a->nvma].sealed = a->vma[a->nvma].uffd = a->vma[a->nvma].file_backed = a->vma[a->nvma].locked = a->vma[a->nvma].huge = 0;
     a->nvma++;
     a->mmap_next = nbase + new_len + PAGE_SIZE;
-    app_munmap(old_addr, old_len);                        /* free the old region's frames + VMA */
+    app_munmap_nl(old_addr, old_len);                     /* free the old region's frames + VMA (the lock is already held) */
     return nbase;
 }
+uint64_t app_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int flags) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mremap_nl(old_addr, old_len, new_len, flags);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* mseal (M1130): irreversibly seal every mmap region overlapping [addr,addr+len)
  * so its mapping can no longer be changed — munmap and mprotect on it are denied
@@ -2683,7 +2797,7 @@ uint64_t app_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len, int f
  * mprotect/munmap primitive still cannot make that code writable again or swap a
  * fresh page under it. Linux's mseal(2) (2024). Returns the number of regions
  * sealed, or -1 if the range matched no mapping. */
-int app_mseal(uint64_t addr, uint64_t len) {
+static int app_mseal_nl(uint64_t addr, uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return -1;
     uint64_t end = addr + len;
@@ -2695,6 +2809,14 @@ int app_mseal(uint64_t addr, uint64_t len) {
     }
     return sealed ? sealed : -1;
 }
+int app_mseal(uint64_t addr, uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_mseal_nl(addr, len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* ===================== userfaultfd (M1134) =============================== *
  * Userspace page-fault handling. An OWNER process mmap's a region and registers
@@ -2708,7 +2830,7 @@ int app_mseal(uint64_t addr, uint64_t len) {
  * owner≠monitor split is provided by fork(). Reuses the cross-address-space
  * mapping (M1114) and the park/wait rendezvous (M1124). g_uffd is defined up top
  * (above app_reap / app_fault_handle, which reference it). */
-int app_uffd_register(uint64_t addr, uint64_t len) {
+static int app_uffd_register_nl(uint64_t addr, uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return -1;
     uint64_t end = addr + len; if (end < addr) return -1;
@@ -2722,6 +2844,14 @@ int app_uffd_register(uint64_t addr, uint64_t len) {
     g_uffd.pending = 0; g_uffd.monitor = 0; g_uffd.monitor_waiting = 0; g_uffd.faulter = 0;
     return 0;
 }
+int app_uffd_register(uint64_t addr, uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_uffd_register_nl(addr, len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* Monitor: block until the owner faults; returns the faulting page address, or -1. */
 long app_uffd_read(void) {
@@ -2840,7 +2970,7 @@ static int app_collapse(uint64_t addr, uint64_t len) {
 #define MADV_COLD     20   /* deactivate: clear accessed bits so the range is a reclaim candidate (M1158) */
 #define MADV_PAGEOUT  21   /* proactively page the range out to swap (zram) NOW (M1158) */
 #define MADV_COLLAPSE 25   /* synchronously fold the range into 2 MiB hugepage(s) (M1168) */
-int app_madvise(uint64_t addr, uint64_t len, int advice) {
+static int app_madvise_nl(uint64_t addr, uint64_t len, int advice) {
     struct app *a = cur();
     if (!a || len == 0) return -1;
     if (advice == MADV_PAGEOUT)                       /* reclaim NOW by swapping the range out (M1099 swap / M1156 zram) */
@@ -2873,6 +3003,14 @@ int app_madvise(uint64_t addr, uint64_t len, int advice) {
     }
     return dropped;
 }
+int app_madvise(uint64_t addr, uint64_t len, int advice) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_madvise_nl(addr, len, advice);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* process_madvise (M1555): advise about ANOTHER process's memory, named by a
  * pidfd (never a raw pid -- avoids the PID-reuse race a bare integer would
@@ -2912,7 +3050,7 @@ int app_process_madvise(int pidfd, uint64_t addr, uint64_t len, int advice) {
  * (MADV_DONTNEED): userspace can SEE exactly which pages RAM actually backs,
  * proving lazy allocation. `vec` must hold ceil(len/PAGE) bytes (the syscall
  * validates that). Returns 0 on success, -1 on a bad/unaligned/unmapped range. */
-int app_mincore(uint64_t addr, uint64_t len, uint8_t *vec) {
+static int app_mincore_nl(uint64_t addr, uint64_t len, uint8_t *vec) {
     struct app *a = cur();
     if (!a || len == 0) return -1;
     if (addr & (uint64_t)(PAGE_SIZE - 1)) return -1;          /* POSIX: addr must be page-aligned */
@@ -2927,6 +3065,14 @@ int app_mincore(uint64_t addr, uint64_t len, uint8_t *vec) {
     }
     return 0;
 }
+int app_mincore(uint64_t addr, uint64_t len, uint8_t *vec) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_mincore_nl(addr, len, vec);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* mlock/munlock (M1149): pin (lock=1) or unpin (lock=0) the mmap pages that
  * overlap [addr,addr+len) so they are exempt from reclaim — both swap-out
@@ -2936,7 +3082,7 @@ int app_mincore(uint64_t addr, uint64_t len, uint8_t *vec) {
  * page); a not-yet-faulted page simply faults in on first access as usual and
  * is then pinned (its VMA is locked). Returns 0, or -1 if the range overlaps
  * no mmap VMA. Pairs with mincore (M1147) for query+control of residency. */
-static int app_mlock_set(uint64_t addr, uint64_t len, int lock) {
+static int app_mlock_set_nl(uint64_t addr, uint64_t len, int lock) {
     struct app *a = cur();
     if (!a || len == 0) return -1;
     uint64_t start = addr & ~(uint64_t)(PAGE_SIZE - 1);
@@ -2957,12 +3103,20 @@ static int app_mlock_set(uint64_t addr, uint64_t len, int lock) {
     }
     return any ? 0 : -1;
 }
+static int app_mlock_set(uint64_t addr, uint64_t len, int lock) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_mlock_set_nl(addr, len, lock);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 int app_mlock(uint64_t addr, uint64_t len)   { return app_mlock_set(addr, len, 1); }
 int app_munlock(uint64_t addr, uint64_t len) { return app_mlock_set(addr, len, 0); }
 /* mlockall/munlockall (M1283): MCL_CURRENT (1) pins every current VMA;
  * MCL_FUTURE (2) makes subsequent anonymous mmaps born-locked (via mlock_future,
  * honored in app_mmap). munlockall clears both. Returns 0/-1. */
-int app_mlockall(int flags) {
+static int app_mlockall_nl(int flags) {
     struct app *a = cur(); if (!a) return -1;
     if (flags & 1) {
         if (a->rlim_memlock) {              /* RLIMIT_MEMLOCK (M1550): mlock()'s own per-call cap must apply here too */
@@ -2975,17 +3129,33 @@ int app_mlockall(int flags) {
     a->mlock_future = (flags & 2) ? 1 : 0;                                   /* MCL_FUTURE */
     return 0;
 }
-int app_munlockall(void) {
+int app_mlockall(int flags) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_mlockall_nl(flags);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
+static int app_munlockall_nl(void) {
     struct app *a = cur(); if (!a) return -1;
     for (int i = 0; i < a->nvma; i++) a->vma[i].locked = 0;
     a->mlock_future = 0;
     return 0;
 }
+int app_munlockall(void) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_munlockall_nl();
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* mprotect (M1090): change the R/W/X protection of an already-mapped range in
  * the calling app (PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4). Enables W^X and
  * write-then-execute JIT pages. The range must be the app's own user pages. */
-int app_mprotect(uint64_t addr, uint64_t len, int prot) {
+static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
     if (len == 0) return -1;
     uint64_t a0 = addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t end = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -3043,6 +3213,14 @@ int app_mprotect(uint64_t addr, uint64_t len, int prot) {
     app_tlb_sync(a);                    /* same reason as the covered path above (M1963) */
     return 0;
 }
+int app_mprotect(uint64_t addr, uint64_t len, int prot) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    int r_ = app_mprotect_nl(addr, len, prot);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* Magic (mirrored) ring buffer (M1089): reserve `len` bytes of physical frames
  * and map them TWICE, back to back, so the region [base, base+2*len) has its
@@ -3051,7 +3229,7 @@ int app_mprotect(uint64_t addr, uint64_t len, int prot) {
  * same frames. Mapped eagerly (no demand faults); each frame is pmm_addref'd for
  * its second mapping so exit/munmap (which frees every PTE's frame) releases it
  * exactly once. Returns the base VA, or 0. */
-uint64_t app_ringbuf(uint64_t len) {
+static uint64_t app_ringbuf_nl(uint64_t len) {
     struct app *a = cur();
     if (!a || len == 0) return 0;
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -3105,6 +3283,14 @@ uint64_t app_ringbuf(uint64_t len) {
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
+uint64_t app_ringbuf(uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_ringbuf_nl(len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* Map the named shared-memory object `name` (created at `size` on first use)
  * into the caller, returning its base VA (M1108). The object's frames live in
@@ -3236,15 +3422,50 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
 /* PTE flags for a VMA's Linux PROT_* bits. prot == 0 means "not recorded":
  * every VMA creator predating M1956 leaves it zero and gets exactly the old
  * behaviour, read-write and never executable. */
+/* No "0 means read-write" special case any more (M1987). It was the second of
+ * two places papering over a field nothing ever set -- /proc/self/maps had the
+ * other -- and between them they hid the fact that an anonymous mapping had no
+ * recorded protection at all. The one place that read the field LITERALLY was
+ * the permission branch of the fault handler, which therefore saw PROT_NONE and
+ * killed processes for writing to their own read-write memory. VMA_NEW gives
+ * every mapping a real protection now, so zero can mean what it says. */
 static uint64_t vma_pte_flags(uint8_t prot) {
-    if (!prot) return PTE_WRITABLE | PTE_USER | PTE_NX;
     uint64_t f = PTE_USER;
     if (prot & VMA_PROT_WRITE) f |= PTE_WRITABLE;
     if (!(prot & VMA_PROT_EXEC)) f |= PTE_NX;
     return f;
 }
 
+/* FAULT RECURSION GUARD (M1987).
+ *
+ * Resolving a fault can itself fault: the file-backed path reads through the
+ * VFS, vmm_user_ok materialises pages, and a locked caller can re-enter here.
+ * One level of that is normal. Unbounded levels overrun the 256 KiB kernel
+ * stack, and a kernel-stack overflow presents as the kernel EXECUTING ITS OWN
+ * STACK -- a page fault with error_code 0x11 (instruction fetch, supervisor)
+ * at an address that is not code. That is exactly what Firefox produced, and
+ * what it looks like is "random memory corruption", which is a bad place to
+ * start looking.
+ *
+ * Four levels is more than any legitimate chain needs. Beyond it, fail the
+ * fault and SAY SO: killing one process with a named reason beats taking the
+ * machine down with an unnamed one. */
+static volatile int g_fault_depth[16];
+static int app_fault_handle_inner(uint64_t cr2, uint64_t err);
 int app_fault_handle(uint64_t cr2, uint64_t err) {
+    int cpu = (int)(smp_current_cpu() & 15);
+    if (g_fault_depth[cpu] >= 4) {
+        kprintf("[fault] RECURSION: depth %d resolving %lx (err %lx) -- refusing rather than overrunning the kernel stack\n",
+                g_fault_depth[cpu], cr2, err);
+        return 0;
+    }
+    g_fault_depth[cpu]++;
+    int r = app_fault_handle_inner(cr2, err);
+    g_fault_depth[cpu]--;
+    return r;
+}
+
+static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
     struct app *a = cur();
     if (!a) return 0;
     uint64_t fpage = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
@@ -3281,8 +3502,31 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
         a->majflt++;                                /* swapped in from disk => major fault (M1150) */
         return 1;
     }
-    for (int i = 0; i < a->nvma; i++) {
-        if (cr2 >= a->vma[i].start && cr2 < a->vma[i].start + a->vma[i].len) {
+    /* FIND THE VMA IN ONE LOCKED SCAN, then work from a COPY (M1987).
+     *
+     * The scan must not drop the lock between iterations, and the first
+     * version of this fix did. app_vma_carve fills the hole it makes by MOVING
+     * THE LAST ENTRY DOWN into it -- so a concurrent munmap relocates an
+     * unrelated mapping to an index the scan has already walked past, and the
+     * scan concludes the address is unmapped. That is a "no VMA" fault on
+     * memory the process mapped itself and had already written twice, with the
+     * VMA plainly present in the table a moment later.
+     *
+     * The lock is released before the demand-zero / file-read work below,
+     * which can do disk I/O; the copy is what makes that safe to do outside
+     * it. */
+    __typeof__(a->vma[0]) v;
+    int have_vma = 0;
+    {
+        uint64_t fl_ = vma_lock(a);
+        for (int i = 0; i < a->nvma; i++)
+            if (cr2 >= a->vma[i].start && cr2 < a->vma[i].start + a->vma[i].len) {
+                v = a->vma[i]; have_vma = 1; break;
+            }
+        vma_unlock(a, fl_);
+    }
+    {
+        if (have_vma) {
             uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
             uint64_t cpte = vmm_pte_raw(page);
             if (cpte & PTE_PRESENT) {
@@ -3297,11 +3541,11 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                      * mapping is writable per its VMA, the PTE simply predates
                      * an mprotect; otherwise the program really did write to a
                      * read-only mapping and deserves to hear about it. */
-                    if (a->vma[i].prot & VMA_PROT_WRITE) {
-                        vmm_protect(page, vma_pte_flags(a->vma[i].prot));
+                    if (v.prot & VMA_PROT_WRITE) {
+                        vmm_protect(page, vma_pte_flags(v.prot));
                         return 1;
                     }
-                    kprintf("[fault] write to a read-only mapping at %lx (vma prot=%d)\n", page, a->vma[i].prot);
+                    kprintf("[fault] write to a read-only mapping at %lx (vma prot=%d)\n", page, v.prot);
                     return 0;
                 }
                 if (err & 0x10) {
@@ -3311,11 +3555,11 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                      * recorded -- fix it rather than kill the process. Only a
                      * mapping whose VMA genuinely is not executable is an
                      * error worth reporting. (M1962) */
-                    if (a->vma[i].prot & VMA_PROT_EXEC) {
-                        vmm_protect(page, vma_pte_flags(a->vma[i].prot));
+                    if (v.prot & VMA_PROT_EXEC) {
+                        vmm_protect(page, vma_pte_flags(v.prot));
                         return 1;
                     }
-                    kprintf("[fault] instruction fetch from a non-executable mapping at %lx (vma prot=%d)\n", page, a->vma[i].prot);
+                    kprintf("[fault] instruction fetch from a non-executable mapping at %lx (vma prot=%d)\n", page, v.prot);
                     return 0;
                 }
                 /* A "race" the first time is plausible: another core mapped
@@ -3327,7 +3571,7 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                 if (page == a->last_fault_page && err == a->last_fault_err) {
                     if (++a->fault_repeat > 64) {
                         kprintf("[fault] UNRESOLVABLE fault looping at %lx err=%lx pte=%lx (vma prot=%d) -- killing\n",
-                                page, err, cpte, a->vma[i].prot);
+                                page, err, cpte, v.prot);
                         return 0;
                     }
                 } else {
@@ -3335,7 +3579,7 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                 }
                 return 1;                               /* a genuine race: another core mapped it */
             }
-            if (a->vma[i].huge) {                        /* 2 MiB hugepage: map the whole enclosing 2 MiB at once (M1155) */
+            if (v.huge) {                        /* 2 MiB hugepage: map the whole enclosing 2 MiB at once (M1155) */
                 uint64_t hpage = cr2 & ~(HUGE_SIZE - 1);
                 uint64_t phys = pmm_alloc_contiguous(HUGE_SIZE / PAGE_SIZE, HUGE_SIZE / PAGE_SIZE);  /* 512 contiguous, 2 MiB-aligned */
                 if (!phys) return 0;                     /* no contiguous run -> let it fault/die */
@@ -3352,7 +3596,7 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
              * through app_wake_lock (was bare "IF=0 -> atomic (single CPU)", the
              * exact assumption M1531 invalidated: the owner and the monitor are
              * two different processes, routinely on two different cores). */
-            if (a->vma[i].uffd) {
+            if (v.uffd) {
                 uint64_t uf = irq_save();
                 if (g_uffd.active && a == g_uffd.owner) {
                     g_uffd.addr = page;
@@ -3375,9 +3619,9 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
             if (!frame) return 0;                       /* OOM -> let it fault/die */
             uint8_t *z = (uint8_t *)hhdm(frame);
             for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0; /* never leak stale RAM to userspace */
-            if (a->vma[i].file_backed) {                /* fill the page from the backing file (M1136) */
-                uint64_t voff = page - a->vma[i].start;
-                uint64_t fileoff = a->vma[i].foff + voff;
+            if (v.file_backed) {                /* fill the page from the backing file (M1136) */
+                uint64_t voff = page - v.start;
+                uint64_t fileoff = v.foff + voff;
                 /* fvalid bounds how much of this mapping comes from the file.
                  * An ELF data segment's last page holds real bytes up to
                  * filesz and .bss after it -- and the file does NOT end there,
@@ -3386,13 +3630,16 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
                  * segment in the file. 0 means "no limit" (a plain mmap of a
                  * whole file), which is what every pre-M1956 caller wants. */
                 uint64_t want = PAGE_SIZE;
-                if (a->vma[i].fvalid) {
-                    want = (voff >= a->vma[i].fvalid) ? 0 : a->vma[i].fvalid - voff;
+                if (v.fvalid) {
+                    want = (voff >= v.fvalid) ? 0 : v.fvalid - voff;
                     if (want > PAGE_SIZE) want = PAGE_SIZE;
                 }
                 if (want) {
                     __asm__ volatile("sti");            /* the FS read may touch the disk */
-                    vfs_pread(vma_path(a, i), z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
+                    /* The interned path index came out with the copy, so the
+                     * lookup does not have to re-find the VMA. */
+                    vfs_pread((v.fidx >= 0 && v.fidx < g_vma_npath) ? g_vma_paths[v.fidx] : "",
+                              z, want, fileoff);       /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
                     __asm__ volatile("cli");
                 }
                 a->majflt++;                            /* page filled from disk => major fault (M1150) */
@@ -3406,7 +3653,7 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
              * its whole range in eagerly and then fixed the PTEs. Correct, but
              * it means an mmap was never actually lazy; a 42 MB executable
              * would be read in full before its first instruction. (M1956) */
-            vmm_map(page, frame, vma_pte_flags(a->vma[i].prot));
+            vmm_map(page, frame, vma_pte_flags(v.prot));
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
             return 1;
         }
@@ -3417,13 +3664,29 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
      * two neighbours so the gap is visible. (M1965) */
     {
         uint64_t below = 0, below_end = 0, above = ~0ull;
+        uint64_t rfl = vma_lock(a);
         for (int i = 0; i < a->nvma; i++) {
             uint64_t st = a->vma[i].start, en = st + a->vma[i].len;
             if (en <= fpage && en > below_end) { below = st; below_end = en; }
             if (st > fpage && st < above)      { above = st; }
         }
-        kprintf("[fault] UNMAPPED %lx err=%lx: no VMA (nearest below %lx-%lx, next above %lx, %d vmas)\n",
-                fpage, err, below, below_end, above == ~0ull ? 0 : above, a->nvma);
+        vma_unlock(a, rfl);
+        kprintf("[fault] UNMAPPED %lx err=%lx: no VMA (nearest below %lx-%lx, next above %lx, %d vmas, tid %d)\n",
+                fpage, err, below, below_end, above == ~0ull ? 0 : above, a->nvma,
+                task_self() ? task_self()->id : -1);
+        /* The WHOLE table, once. Two neighbours are enough to see that an
+         * address is outside every mapping; they are not enough to see WHY --
+         * whether the region was never recorded, recorded with the wrong
+         * length, or recorded and then carved by another thread. At a couple
+         * of dozen entries this is a few lines, and it only prints on a fault
+         * that is about to kill the process anyway. (M1987) */
+        uint64_t dfl = vma_lock(a);
+        int dn = a->nvma; if (dn > 48) dn = 48;
+        for (int q = 0; q < dn; q++)
+            kprintf("    vma[%d] %lx-%lx prot=%d%s%s\n", q, a->vma[q].start,
+                    a->vma[q].start + a->vma[q].len, a->vma[q].prot,
+                    a->vma[q].file_backed ? " file" : "", a->vma[q].huge ? " huge" : "");
+        vma_unlock(a, dfl);
     }
     return 0;
 }
@@ -4751,7 +5014,7 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
  * object and neither copies a pixel. The frames come from the memfd's own
  * page-aligned buffer, so both mappings resolve to the same physical memory
  * and a write through one is immediately visible through the other. */
-uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
+static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     struct app *a = cur(); if (!a || !len) return 0;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3) return 0;
     struct memfd *m = &memfds[a->fd[fd].obj];
@@ -4805,6 +5068,14 @@ uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
     a->nvma++;
     return base;
 }
+uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mmap_memfd_nl(fd, len, off);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 
 /* Take a passed memfd as an OBJECT rather than as a descriptor (M1979).
  *

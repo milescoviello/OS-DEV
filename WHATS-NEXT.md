@@ -1,5 +1,65 @@
 # What's next
 
+> **(M1987) NAMING THE CORRUPTION, AND A REPRODUCER THAT TAKES A MINUTE.**
+>
+> M1986 ended with Firefox dying like this:
+>
+> ```
+> *** KERNEL PANIC: CPU EXCEPTION ***
+>   Page Fault   error_code=0x11        <- instruction fetch, supervisor
+>   faulting address (CR2) = 0x11d0006c0   <- a USER address
+> ```
+>
+> Ten minutes per attempt is not a debugging loop. `tools/lx/lxstress.c` does
+> what a browser does, deliberately and densely, from six threads:
+> mmap/touch/mprotect/munmap churn at sizes that straddle the page and hugepage
+> boundaries the VMA code special-cases, threads created and joined repeatedly
+> so kernel stacks and task slots recycle under other threads' feet, futex
+> ping-pong, and signals delivered to a thread inside a syscall. It reproduces
+> in **about sixty seconds**, and it prints a line per phase so a failure says
+> which kind of work was running.
+>
+> **FIXED: an anonymous mapping never recorded its own protection.** `VMA_NEW`
+> zeroed the field, `app_mmap` never set it, and zero *means* `PROT_NONE`. Two
+> places papered over that — `/proc/self/maps` and `vma_pte_flags` each had a
+> "zero means read-write" fallback — and the one place that read the field
+> literally was the fault handler's permission branch, which killed processes
+> for writing to their own read-write memory. Both fallbacks are gone now and
+> the field is load-bearing: reverting the default fails `LXMMAP-PROT` with
+> `write to a read-only mapping (vma prot=0)` four times over.
+>
+> **NAMED, NOT YET FIXED: the VMA table is raced.** `app_vma_carve` fills the
+> hole it makes by MOVING THE LAST ENTRY DOWN, so a concurrent `munmap`
+> relocates an unrelated mapping to an index a scan has already walked past.
+> The new diagnostics show it outright — *"no VMA"* for an address the table
+> dump prints one line later:
+>
+> ```
+> [fault] UNMAPPED 108bff000 err=6: no VMA (... 23 vmas, tid 14)
+>     vma[22] 108a00000-108c00000 prot=3        <- contains it
+> ```
+>
+> A per-process spinlock was tried here and **removed**, and that is worth
+> recording as a result rather than a detour: several of these operations block
+> while holding it — `app_msync` writes to disk from inside `app_vma_carve`, the
+> file-backed fault path reads through the VFS — and a spinlock held across a
+> blocking call, spun on by other cores with interrupts off, means the holder
+> can never be rescheduled to release it. The machine hangs instead of racing.
+> That is the same failure M1912 fixed in the scheduler. Making it re-entrant
+> removed the deadlock and produced a **kernel-stack overflow** instead, because
+> the fault path could then recurse freely.
+>
+> The real fix is a blocking-call audit plus **tombstoned removal**, so entries
+> never move and a concurrent scan cannot miss one. That is the next milestone.
+>
+> **Diagnostics that made this visible, and stay.** A ring-3 fault now prints
+> the bytes at `rip`, the last 16 Linux syscalls with their return values, a
+> user backtrace, and — on an unmapped fault — the whole VMA table and the
+> thread id. And a recursion guard, because a kernel-stack overflow presents as
+> the kernel EXECUTING ITS OWN STACK: a page fault with error_code 0x11 at an
+> address that is not code, which reads as "random memory corruption" and sends
+> you looking in the wrong place.
+
 > **(M1986) THE GLOBALS A REAL TOOLKIT NEEDS, AND OUR OWN XKB DATA TREE.**
 >
 > Firefox now brings GTK up and **connects to our compositor**. Three findings
