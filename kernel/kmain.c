@@ -847,6 +847,27 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * image linked at 0x200000, so it is the first thing this OS has
              * ever run that needs the low 1 GiB to belong to the process
              * rather than to the kernel. */
+            /* DEEP FILE READS (M1974). Claude Code's data segment is
+             * demand-paged from file offsets up to 223 MB -- far past anything
+             * else here -- and a read that fails or short-reads at depth does
+             * not raise an error, it silently leaves the page zero-filled.
+             * That would look exactly like what we see: the image loads, runs,
+             * and its allocator finds nonsense. Check it directly against
+             * bytes taken from the host copy. */
+            {
+                static const struct { uint64_t off; const char *want; } deep[] = {
+                    { 0u,         "7f454c46" },
+                    { 67108864u,  "3741b801" },
+                    { 134217728u, "9f404025" },
+                    { 201326592u, "4f662874" },
+                };
+                for (int d = 0; d < 4; d++) {
+                    uint8_t rb[4] = {0,0,0,0};
+                    long got = vfs_pread("/disk2/usr/bin/claude", rb, 4, deep[d].off);
+                    kprintf("[lxclaude] read@%lu -> %ld bytes %02x%02x%02x%02x (want %s)\n",
+                            (unsigned long)deep[d].off, got, rb[0], rb[1], rb[2], rb[3], deep[d].want);
+                }
+            }
             static const char *av_cv1[] = { "--version" };
             kprintf("[lxclaude] running CLAUDE CODE (214 MB non-PIE ET_EXEC at 0x200000)...\n");
             if (g_lxtrace_make) g_lx_systrace = 1;
@@ -1020,6 +1041,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxnode] running JavaScript that uses HTTPS (TLS via Node's OpenSSL)...\n");
             rc = app_run_linux_sync("/disk2/usr/bin/node", av_nt, 2, 900000);
             kprintf("[lxnode] node https -> %d\n", rc);
+
+            /* Does V8 hold up at SCALE? Claude Code is ~50 MB of bundled JS
+             * and sweeps its data segment with 1000+ MADV_WILLNEED calls
+             * before it aborts; every Node test so far has been a one-line
+             * script. Allocate and collect a few hundred MB so the GC, the
+             * page allocator and the demand-fault path are all exercised
+             * properly, and print a number only a working engine produces.
+             * (M1974) */
+            static const char *av_hs[] = { "-e",
+                "let keep=[];let total=0;"
+                "for(let r=0;r<12;r++){let a=[];"
+                "for(let i=0;i<24;i++){a.push(Buffer.alloc(1<<20,r+i));total+=1<<20;}"
+                "keep.push(a[0]);if(global.gc)global.gc();}"
+                "let sum=0;for(const b of keep)sum+=b[0];"
+                "console.log('LXNODEHEAP:',(total>>20),'MiB churned, keep',keep.length,'sum',sum);" };
+            kprintf("[lxnode] running a JavaScript HEAP STRESS (hundreds of MB)...\n");
+            rc = app_run_linux_sync("/disk2/usr/bin/node", av_hs, 2, 900000);
+            kprintf("[lxnode] node heap -> %d\n", rc);
 
             /* PHASE 7 (M1968): Claude Code itself. A single 214 MB
              * dynamically-linked ELF -- a Node single-executable app, runtime

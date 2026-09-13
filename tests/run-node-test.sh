@@ -45,7 +45,7 @@ timeout -s KILL 1800 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 3G -s
 QPID=$!
 i=0
 while [ $i -lt 3600 ]; do
-    grep -aqE "node http ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
+    grep -aqE "node heap ->|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     sleep 0.5; i=$((i+1))
 done
 
@@ -110,6 +110,17 @@ elif grep -aq "LXNODEHTTP-ERR" "$SLOG"; then
     echo "  FAIL: Node's network request failed:"; grep -a "LXNODEHTTP-ERR" "$SLOG" | head -1; f=1
 else
     echo "  SKIP: no network result (host has no internet?)"
+fi
+
+# 6. SCALE (M1974). Every check above runs a one-line script. This one churns
+#    a few hundred MB through V8's GC, so the page allocator, the demand-fault
+#    path and the collector are exercised the way a real program exercises
+#    them -- the numbers are printed by JavaScript, so only a working engine
+#    produces them.
+if grep -aqE "LXNODEHEAP: [0-9]+ MiB churned" "$SLOG"; then
+    echo "  ok: V8's GC and our page allocator held up under load ($(grep -ao 'LXNODEHEAP: [0-9]* MiB churned' "$SLOG" | head -1))"
+elif grep -aq "node heap ->" "$SLOG"; then
+    echo "  FAIL: the heap stress did not complete:"; grep -aE "LXNODEHEAP|node heap ->" "$SLOG" | head -2; f=1
 fi
 
 [ $f -eq 0 ] || { echo "FAIL: Node.js in-guest"; exit 1; }
