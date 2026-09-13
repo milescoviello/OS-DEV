@@ -725,6 +725,31 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * Linux write(2) lands on the kernel console, which is mirrored to serial,
      * unlike ring-3 print() from our own apps. */
     if (g_lxabi_test) {
+        /* HOME, and the XDG directories under it (M1985). A GTK program writes
+         * before it draws -- a profile, a font cache, a dconf directory -- and
+         * glib treats a config directory it cannot create as fatal rather than
+         * as a reason to skip caching. Made here, not in the image, so a fresh
+         * ext2 volume needs no special preparation to run one. */
+        vfs_mkdir("/disk2/root");
+        vfs_mkdir("/disk2/root/.config");
+        vfs_mkdir("/disk2/root/.cache");
+        vfs_mkdir("/disk2/root/.local");
+        vfs_mkdir("/disk2/root/.local/share");
+        vfs_mkdir("/disk2/tmp");
+        vfs_mkdir("/disk2/root/.cache/fontconfig");
+        vfs_mkdir("/disk2/var");
+        vfs_mkdir("/disk2/var/cache");
+        vfs_mkdir("/disk2/var/cache/fontconfig");
+        vfs_mkdir("/disk2/var/lib");
+        vfs_mkdir("/disk2/var/lib/dbus");
+        /* /etc/machine-id. D-Bus and GLib both look for one and complain
+         * loudly without it. A fixed value is correct here: this is one
+         * machine's identity, not a secret, and inventing a random one per
+         * boot would make every cache in the image miss. */
+        vfs_mkdir("/disk2/etc");
+        { const char *mid = "05dev05dev05dev05dev05dev05dev05\n";
+          unsigned long ml = 0; while (mid[ml]) ml++;
+          vfs_write("/disk2/etc/machine-id", mid, ml); }
         /* /etc/resolv.conf, written from the address DHCP actually leased
          * (M1967).
          *
@@ -881,16 +906,6 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * exited. A background task is the next step, once the compositor
              * owns a window. */
             vfs_mkdir("/disk2/run");
-            /* A GTK program writes before it draws: a profile, a font cache, a
-             * dconf directory. HOME and the XDG_*_HOME paths have to EXIST --
-             * glib treats an unwritable config dir as fatal, not as a reason
-             * to skip caching. (M1985) */
-            vfs_mkdir("/disk2/root");
-            vfs_mkdir("/disk2/root/.config");
-            vfs_mkdir("/disk2/root/.cache");
-            vfs_mkdir("/disk2/root/.local");
-            vfs_mkdir("/disk2/root/.local/share");
-            vfs_mkdir("/disk2/tmp");
             if (wl_compositor_init() == 0) {
                 /* The compositor runs as its OWN TASK. Driving it from here in
                  * lockstep with one synchronous client was a scaffold, and a

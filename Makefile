@@ -389,6 +389,30 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl
 	@# launcher is a 600 KB stub with six dependencies, and everything real
 	@# (GTK, cairo, pango, fontconfig, dbus) is libxul's. (M1982)
 	@if [ -d "$(FIREFOX_DIR)" ]; then 	    mkdir -p $(LXROOT)$(FIREFOX_DIR) && cp -a "$(FIREFOX_DIR)/." $(LXROOT)$(FIREFOX_DIR)/ && 	    echo "  STAGE   firefox <- $(FIREFOX_DIR) ($$(du -sh $(FIREFOX_DIR) | cut -f1))"; 	    tools/stage-linux-tool.sh $(LXROOT) libxul "$(FIREFOX_DIR)/libxul.so" >/dev/null 2>&1 || true; 	    n=0; for so in $$(ldd "$(FIREFOX_DIR)/libxul.so" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do 	        r=$$(readlink -f "$$so" 2>/dev/null) || continue; [ -f "$$r" ] || continue; 	        mkdir -p $(LXROOT)$$(dirname "$$so") $(LXROOT)/usr/lib64; 	        cp -f "$$r" $(LXROOT)$$so; cp -f "$$r" $(LXROOT)/usr/lib64/$$(basename "$$so") 2>/dev/null || true; 	        n=$$((n+1)); done; 	    echo "  STAGE   libxul closure (+ $$n shared libs)"; 	 else echo "  SKIP    firefox (not installed; set FIREFOX_DIR=)"; fi
+	@# ...and the DATA FILES a GTK program cannot start without. None of these
+	@# come through ld.so, so nothing above brings them in, and each one fails
+	@# in a way that does not name itself: no fonts.conf and fontconfig reports
+	@# "Cannot load default config file: No such file: (null)"; no compiled
+	@# GSettings schemas and glib aborts on the first g_settings_new(). Fonts
+	@# are limited to DejaVu + Liberation deliberately -- enough for real text
+	@# rendering without putting 40 MB of typefaces in the image. (M1986)
+	@if [ -d /etc/fonts ]; then 	    mkdir -p $(LXROOT)/etc/fonts && cp -a /etc/fonts/. $(LXROOT)/etc/fonts/ && 	    echo "  STAGE   /etc/fonts"; fi
+	@if [ -d /usr/share/fontconfig ]; then 	    mkdir -p $(LXROOT)/usr/share/fontconfig && cp -a /usr/share/fontconfig/. $(LXROOT)/usr/share/fontconfig/; fi
+	@for f in dejavu liberation-fonts; do 	    if [ -d /usr/share/fonts/$$f ]; then mkdir -p $(LXROOT)/usr/share/fonts/$$f && 	      cp -a /usr/share/fonts/$$f/. $(LXROOT)/usr/share/fonts/$$f/ && 	      echo "  STAGE   fonts/$$f ($$(du -sh /usr/share/fonts/$$f | cut -f1))"; fi; done
+	@if [ -f /usr/share/glib-2.0/schemas/gschemas.compiled ]; then 	    mkdir -p $(LXROOT)/usr/share/glib-2.0/schemas && 	    cp -f /usr/share/glib-2.0/schemas/gschemas.compiled $(LXROOT)/usr/share/glib-2.0/schemas/ && 	    echo "  STAGE   compiled GSettings schemas"; fi
+	@# OS-DEV's OWN XKB tree (tools/xkb). libxkbcommon resolves a keymap from
+	@# RMLVO NAMES whenever a toolkit asks for one before the compositor has
+	@# sent it a keymap -- GTK does exactly that during display-open -- and it
+	@# reads those from /usr/share/X11/xkb. Without them it is not a warning:
+	@# GDK calls g_error("Failed to create XKB keymap") and the process aborts.
+	@# This host has no xkeyboard-config installed either, so the tree is ours,
+	@# split out of the same layout kernel/include/xkbmap.h carries. (M1986)
+	@mkdir -p $(LXROOT)/usr/share/X11/xkb && cp -a tools/xkb/. $(LXROOT)/usr/share/X11/xkb/ && 	  echo "  STAGE   OS-DEV's own XKB tree -> /usr/share/X11/xkb"
+	@# A cursor theme. GDK loads one at display-open and warns loudly without
+	@# it; the shapes are real files, not something a protocol provides.
+	@if [ -d /usr/share/icons/Adwaita/cursors ]; then 	    mkdir -p $(LXROOT)/usr/share/icons/Adwaita/cursors && 	    cp -a /usr/share/icons/Adwaita/cursors/. $(LXROOT)/usr/share/icons/Adwaita/cursors/ && 	    cp -f /usr/share/icons/Adwaita/index.theme $(LXROOT)/usr/share/icons/Adwaita/ 2>/dev/null; 	    echo "  STAGE   Adwaita cursors"; fi
+	@if [ -d /usr/lib/locale ]; then mkdir -p $(LXROOT)/usr/lib/locale && 	    cp -a /usr/lib/locale/. $(LXROOT)/usr/lib/locale/ 2>/dev/null || true; fi
+	@for d in /usr/share/mime /usr/share/icons/hicolor /usr/share/X11/locale; do 	    if [ -d $$d ]; then mkdir -p $(LXROOT)$$d && cp -a $$d/. $(LXROOT)$$d/ 2>/dev/null || true; fi; done
 	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
 	@touch $@
 
@@ -1591,4 +1615,9 @@ clean:
 # silently shipped a stale .o — e.g. extending shmath.h didn't rebuild shell.o
 # until a manual `touch` (M780). Placed last so the included .d rules can't
 # hijack the default goal; missing on a clean tree -> ignored.
--include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
+# -type f, and only under the OBJECT directories. `find build -name '*.d'`
+# matched fontconfig's staged /etc/fonts/conf.d DIRECTORY once the guest image
+# started carrying real data files, and make stopped with
+# "build/lxroot/etc/fonts/conf.d: Is a directory" -- which looks like nothing at
+# all if you are filtering the build log for "error". (M1986)
+-include $(shell find $(BUILD) -path '$(BUILD)/lxroot' -prune -o -type f -name '*.d' -print 2>/dev/null)

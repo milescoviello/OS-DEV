@@ -4539,7 +4539,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         if (an == 1 && a->launch_arg[0]) argv0[an++] = a->launch_arg;
         argv0[an] = 0;
         g_pend_lxargc = 0;                   /* one-shot: never leak into a later spawn */
-        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/"; envp0[2] = "TERM=osdev";
+        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/root"; envp0[2] = "TERM=osdev";
         /* We have no /etc/ld.so.cache, so anything outside ld.so's default
          * directories is invisible to it. Naming the non-default library
          * directories explicitly is the portable substitute, and it
@@ -4557,8 +4557,6 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * backend is what stops Firefox from failing on a DISPLAY we will
          * never have -- there is no X server here and there is not going to be
          * one; the display path is our own compositor. (M1985) */
-        envp0[6] = 0;
-        if (0) {
         envp0[6]  = "GDK_BACKEND=wayland";
         envp0[7]  = "MOZ_ENABLE_WAYLAND=1";
         /* Firefox's sandbox is built on Linux namespaces and seccomp-bpf
@@ -4579,8 +4577,14 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         envp0[14] = "XDG_DATA_HOME=/root/.local/share";
         envp0[15] = "FONTCONFIG_PATH=/etc/fonts";
         envp0[16] = "LANG=C.UTF-8";
-        envp0[17] = 0;
-        }
+        /* Firefox PROXIES the Wayland socket for its content processes -- it
+         * listens on one of its own and relays. That is a second socket layer
+         * to get right before anything can be drawn, and it fails closed:
+         * "ProxiedConnection::Process(): Failed to read data from client" and
+         * then "we don't have any display". Talking to the compositor directly
+         * is the same thing minus a hop. (M1986) */
+        envp0[17] = "MOZ_DISABLE_WAYLAND_PROXY=1";
+        envp0[18] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to
          * map its shared libraries first and only then jump to the entry. */
@@ -5571,6 +5575,20 @@ int app_sock_localaddr(int fd, uint8_t ip[4], uint16_t *port) {
         *port = 0; return 0;
     }
     return -1;
+}
+
+/* getpeername(2) for an AF_INET fd (M1986): the REMOTE address. The fd table
+ * already records it -- peer_ip/peer_port are set by connect and by the first
+ * datagram received -- so this only has to report it. Reporting AF_UNIX for an
+ * AF_INET socket is what made glibc abort in M1967; the same trap applies
+ * here. */
+int app_sock_peeraddr(int fd, uint8_t ip[4], uint16_t *port) {
+    struct app *a = cur(); if (!a) return -1;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    if (a->fd[fd].type != 9 && a->fd[fd].type != 10) return -1;
+    for (int i = 0; i < 4; i++) ip[i] = a->fd[fd].peer_ip[i];
+    *port = a->fd[fd].peer_port;
+    return 0;
 }
 
 /* connect(2) for a TCP socket fd (M1268): active-open to ip:port.

@@ -1,0 +1,39 @@
+// Part of OS-DEV's own XKB tree. The host this was built on has no
+// xkeyboard-config installed, and the guest has no X11 at all -- but
+// libxkbcommon still resolves a keymap from RMLVO NAMES when a toolkit
+// asks for one before the compositor has sent it a keymap, and it reads
+// that from these files. Same layout as kernel/include/xkbmap.h, split
+// into the components the rules file names. (M1986)
+default xkb_types "osdev" {
+    virtual_modifiers NumLock,Alt,LevelThree;
+    type "ONE_LEVEL" {
+        modifiers = none;
+        map[none] = Level1;
+        level_name[Level1] = "Any";
+    };
+    type "TWO_LEVEL" {
+        modifiers = Shift;
+        map[none]  = Level1;
+        map[Shift] = Level2;
+        level_name[Level1] = "Base";
+        level_name[Level2] = "Shift";
+    };
+    type "ALPHABETIC" {
+        modifiers = Shift+Lock;
+        map[none]       = Level1;
+        map[Shift]      = Level2;
+        map[Lock]       = Level2;
+        map[Shift+Lock] = Level1;
+        level_name[Level1] = "Base";
+        level_name[Level2] = "Caps";
+    };
+    type "KEYPAD" {
+        modifiers = Shift+NumLock;
+        map[none]           = Level1;
+        map[Shift]          = Level2;
+        map[NumLock]        = Level2;
+        map[Shift+NumLock]  = Level1;
+        level_name[Level1] = "Base";
+        level_name[Level2] = "Number";
+    };
+};

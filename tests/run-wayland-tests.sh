@@ -62,21 +62,32 @@ fi
 # The raw client checks the BYTES independently of libwayland's opinion of
 # them: it parses the handshake by hand, so a framing bug shows up here rather
 # than as a silent stall inside the library.
-if grep -aq "LXWLRAW: 6 complete message(s) in 148 bytes" "$SLOG"; then
-    echo "  ok: the handshake is well-formed on the wire (6 messages, 148 bytes, parsed by hand)"
+# The message COUNT is 2 + one per advertised global (the sync callback's done
+# and the display's delete_id close the handshake), so it moves when a global is
+# added -- read it from the client rather than pinning a number that has to be
+# edited every time. What is asserted is that every byte parsed into a complete
+# message with nothing left over, which is what a framing bug breaks.
+rawn=$(grep -ao "LXWLRAW: [0-9]* complete message(s) in [0-9]* bytes" "$SLOG" | head -1)
+rawg=$(grep -ac "LXWLRAW-MSG: obj=2 op=0" "$SLOG")
+if [ -n "$rawn" ] && [ "$rawg" -ge 7 ]; then
+    echo "  ok: the handshake is well-formed on the wire ($rawn, $rawg globals, parsed by hand)"
 else
-    echo "  FAIL: the raw handshake was malformed:"; grep -a "LXWLRAW" "$SLOG" | head -3; f=1
+    echo "  FAIL: the raw handshake was malformed (globals seen: $rawg):"; grep -a "LXWLRAW" "$SLOG" | head -3; f=1
 fi
 # Every advertised global, by name -- a compositor that sent a malformed string
 # or a wrong length would lose one of these rather than all of them.
-for g in wl_compositor wl_shm wl_seat xdg_wm_base; do
+# Every advertised global, including the three a real TOOLKIT needs and a demo
+# client does not: GDK will not create a seat until wl_data_device_manager has
+# arrived, sizes windows against wl_output, and uses wl_subcompositor for
+# popups. (M1986)
+for g in wl_compositor wl_shm wl_seat xdg_wm_base wl_output wl_data_device_manager wl_subcompositor; do
     if grep -aq "LXWL-GLOBAL: $g " "$SLOG"; then
         echo "  ok: libwayland parsed the $g global"
     else
         echo "  FAIL: $g was not received by libwayland:"; grep -a "LXWL-GLOBAL" "$SLOG" | head -4; f=1
     fi
 done
-if grep -aq "LXWL: connected, 4 globals, wl_compositor bound, 2 roundtrips OK" "$SLOG"; then
+if grep -aq "LXWL: connected, 7 globals, wl_compositor bound, 2 roundtrips OK" "$SLOG"; then
     echo "  ok: A REAL libwayland CLIENT COMPLETED THE HANDSHAKE (bind + 2 roundtrips)"
 else
     echo "  FAIL: the client did not complete:"; grep -aE "LXWL|roundtrip" "$SLOG" | tail -4; f=1

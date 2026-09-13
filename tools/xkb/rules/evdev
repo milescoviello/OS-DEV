@@ -1,0 +1,20 @@
+// OS-DEV's XKB rules. A toolkit asks for a keymap by NAMES -- rules "evdev",
+// model "pc105", layout "us" -- and the rules file is what turns those into the
+// component files to compile. We answer the same components for every
+// model/layout: this is one keyboard layout, and claiming otherwise would mean
+// silently giving a client a US keymap it asked for in another language.
+
+! model = keycodes
+  *     = osdev
+
+! model = types
+  *     = osdev
+
+! model = compat
+  *     = osdev
+
+! model = geometry
+  *     = osdev
+
+! layout = symbols
+  *      = osdev

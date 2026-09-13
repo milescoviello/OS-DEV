@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1985-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1986-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -837,6 +837,39 @@ Landed so far, all on the from-scratch ext2 driver:
   what two hours of reasoning about relocation had not: the instruction was not
   ld.so's code, because ld.so's code was not there. (`00 00` is
   `add %al,(%rax)` — which is exactly the write the fault reported.)
+
+- **M1986** — **the globals a real toolkit needs, and our own XKB data tree.**
+  Firefox now gets GTK up and **connects to our compositor**. Getting there took
+  three findings, none of which the protocol documents:
+
+  - **GDK will not create a seat until `wl_data_device_manager` has been
+    advertised**, and **order matters**: it postpones seat creation until both
+    `wl_compositor` and the manager have arrived, so a compositor announcing
+    `wl_seat` first creates its seat a round trip late. Anything asking for the
+    keyboard before then — GTK asks almost immediately — finds none. Added
+    `wl_output` (a real monitor, from the framebuffer's geometry),
+    `wl_data_device_manager` and `wl_subcompositor`, and **reordered** so the
+    manager precedes the seat.
+  - **libxkbcommon resolves a keymap from RMLVO *names*** when a toolkit asks
+    before the compositor has sent one, reading `/usr/share/X11/xkb` — and GDK
+    treats failure as `g_error`, so it aborts. This host has no
+    xkeyboard-config installed either, so `tools/xkb/` is **our own** rules and
+    component files, split out of the same layout `kernel/include/xkbmap.h`
+    carries, and checked by the same suite.
+  - A GTK program **writes before it draws**: fonts, a compiled GSettings
+    schema, a cursor theme, `/etc/machine-id`, an `XDG_CACHE_HOME` that exists.
+    Each missing one fails in a way that does not name itself.
+
+  Plus the syscalls it asked for and we lacked: `getresuid`/`getresgid` (which
+  must *write* their three outputs), `getpeername`, `statfs`/`fstatfs`,
+  `fallocate` (`EOPNOTSUPP`, not `ENOSYS` — every caller has a fallback for the
+  first and none for the second) and `inotify_init1`.
+
+  **Honest status: Firefox does not paint yet.** It now reaches GTK's display
+  open and dies later, in a heavier phase, with what looks like kernel memory
+  corruption under real thread and mmap load — the same shape as the
+  long-standing intermittent `cc1` crash. That is the next thing to fix, and it
+  is a kernel bug, not a missing feature.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

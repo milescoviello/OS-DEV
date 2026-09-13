@@ -69,3 +69,5 @@ static inline long lx_ret(long native, int fallback) {
 #define LX_ENETUNREACH 101
 #define LX_EADDRINUSE 98
 #define LX_ECONNREFUSED 111
+#define LX_ENOTSOCK    88   /* getpeername on something that is not a socket (M1986) */
+#define LX_EOPNOTSUPP  95   /* a filesystem may legitimately refuse fallocate (M1986) */

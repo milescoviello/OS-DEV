@@ -1,5 +1,66 @@
 # What's next
 
+> **(M1986) THE GLOBALS A REAL TOOLKIT NEEDS, AND OUR OWN XKB DATA TREE.**
+>
+> Firefox now brings GTK up and **connects to our compositor**. Three findings
+> got it there, and the protocol documents none of them.
+>
+> **1. GDK will not create a seat without `wl_data_device_manager` — and the
+> ORDER of the advertisement matters.** `gdk_registry_handle_global` postpones
+> seat creation until `wl_compositor` *and* the data-device manager have both
+> arrived, so a compositor that announces `wl_seat` first has its seat created a
+> round trip late. GTK asks for the keyboard almost immediately, finds none,
+> falls back to building a keymap from names, and aborts. Added `wl_output` (a
+> real monitor, sized from the framebuffer), `wl_data_device_manager` and
+> `wl_subcompositor` — and moved the manager ahead of the seat.
+>
+> **2. libxkbcommon resolves a keymap from RMLVO NAMES**, not only from the
+> descriptor the compositor passes, whenever a toolkit asks before the
+> compositor has sent one. It reads `/usr/share/X11/xkb`, and GDK treats a
+> failure as `g_error` — an abort, not a fallback:
+>
+> ```
+> xkbcommon: ERROR: [XKB-632] Failed to add any default include path
+> (firefox:15): Gdk-ERROR **: Failed to create XKB keymap
+> ```
+>
+> This host has no xkeyboard-config installed either, so `tools/xkb/` is **ours**
+> — rules and component files split out of the same layout
+> `kernel/include/xkbmap.h` carries, checked by the same suite through the same
+> library.
+>
+> **3. A GTK program writes before it draws.** Fonts, a compiled GSettings
+> schema, a cursor theme, `/etc/machine-id`, a cache directory that exists.
+> Every missing one fails in a way that does not name itself.
+>
+> Plus six syscalls it asked for: `getresuid`/`getresgid` (which must *write*
+> their three outputs — an ENOSYS left glib reading uninitialised stack),
+> `getpeername`, `statfs`/`fstatfs`, `fallocate` (**`EOPNOTSUPP`, not
+> `ENOSYS`**: every caller has a fallback for the first and none for the second)
+> and `inotify_init1` (inotify itself has existed since M1266 — only the
+> flags-taking entry point was missing).
+>
+> **Honest status: Firefox does not paint yet.** It reaches GTK's display open
+> and then dies in a heavier phase. The failure is a KERNEL one, and it is worth
+> stating precisely because it is the next milestone:
+>
+> ```
+> *** KERNEL PANIC: CPU EXCEPTION ***
+>   Page Fault   error_code=0x11        <- instruction fetch, supervisor
+>   faulting address (CR2) = 0x11d0006c0   <- a USER address
+> ```
+>
+> The kernel executed user memory from a timer tick, and in the same run Firefox
+> read `0xe5e5e5e5e5e5e5e5` — mozjemalloc's freed-memory poison. That is memory
+> corruption under real thread and mmap load, the same shape as the
+> long-standing intermittent `cc1` crash this plan has carried since Phase 6.
+> Firefox makes it reproducible, which is the first good news about it.
+>
+> Also fixed on the way: `find build -name '*.d'` matched fontconfig's staged
+> `/etc/fonts/conf.d` **directory** once the image started carrying real data
+> files, and make stopped with "Is a directory" — which looks like nothing at
+> all if you are filtering the build log for "error".
+
 > **(M1985) WHO OWNS THE PAGES BEHIND A `memfd` MAPPING.**
 >
 > ```

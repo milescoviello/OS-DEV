@@ -1,0 +1,11 @@
+// Part of OS-DEV's own XKB tree. The host this was built on has no
+// xkeyboard-config installed, and the guest has no X11 at all -- but
+// libxkbcommon still resolves a keymap from RMLVO NAMES when a toolkit
+// asks for one before the compositor has sent it a keymap, and it reads
+// that from these files. Same layout as kernel/include/xkbmap.h, split
+// into the components the rules file names. (M1986)
+default xkb_geometry "osdev" {
+    description = "OS-DEV generic";
+    width = 470;
+    height = 180;
+};

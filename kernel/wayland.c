@@ -33,6 +33,7 @@
 #include "wayland.h"
 #include "unixsock.h"
 #include "console.h"
+#include "fb.h"      /* wl_output reports the real framebuffer geometry (M1986) */
 #include "string.h"
 #include "timer.h"
 #include "task.h"
@@ -46,7 +47,7 @@
 #define WL_SOCK_PATH "/disk2/run/wayland-0"
 
 #define WL_MAXCLIENT 8
-#define WL_INBUF     4096
+#define WL_INBUF     16384
 
 /* Object ids. 1 is always wl_display; a client allocates the rest from 2 up. */
 #define WL_DISPLAY_ID 1
@@ -106,31 +107,73 @@
 #define WL_KEYBOARD_EV_REPEAT    5
 #define WL_KEYBOARD_KEYMAP_NONE  0    /* "no keymap": the client uses raw evdev codes */
 
+/* wl_output -- the MONITOR. A toolkit sizes and scales its windows against
+ * one, and GTK with no output at all has no screen geometry to work from. */
+#define WL_OUTPUT_EV_GEOMETRY    0
+#define WL_OUTPUT_EV_MODE        1
+#define WL_OUTPUT_EV_DONE        2
+#define WL_OUTPUT_EV_SCALE       3
+#define WL_OUTPUT_EV_NAME        4
+#define WL_OUTPUT_EV_DESCRIPTION 5
+#define WL_OUTPUT_MODE_CURRENT   0x1
+#define WL_OUTPUT_MODE_PREFERRED 0x2
+/* wl_data_device_manager -- the CLIPBOARD and drag-and-drop. Nothing here
+ * needs it to move data yet, but GDK refuses to create a seat without it
+ * (gdk_registry_handle_global postpones the seat until wl_compositor AND
+ * wl_data_device_manager have both arrived), and a display with no seat fails
+ * later and somewhere else: gdk_seat_get_keyboard() asserts, GTK falls back to
+ * building an XKB keymap from names, and aborts. */
+#define WL_DDM_CREATE_DATA_SOURCE 0
+#define WL_DDM_GET_DATA_DEVICE    1
+/* wl_subcompositor -- subsurfaces. GTK uses them for tooltips and popups. */
+#define WL_SUBCOMP_GET_SUBSURFACE 1
+
 /* Pixel formats, by the protocol's numbering. These two are the ones every
  * client can produce and the only ones worth claiming until we composite. */
 #define WL_SHM_FORMAT_ARGB8888   0
 #define WL_SHM_FORMAT_XRGB8888   1
-
-struct wl_global { const char *iface; uint32_t version; };
-/* Advertised in this order; `name` is the index + 1. Version numbers are the
- * ones we intend to implement, not the newest that exists -- a client binds at
- * min(its version, ours) and will use features we claim. */
-static const struct wl_global g_globals[] = {
-    { "wl_compositor", 4 },
-    { "wl_shm",        1 },
-    { "wl_seat",       7 },
-    { "xdg_wm_base",   3 },
-};
-#define WL_NGLOBAL (int)(sizeof(g_globals) / sizeof(g_globals[0]))
 
 /* Object kinds, so a request can be routed by what its target IS rather than
  * by guessing from the opcode -- opcode 0 means something different on every
  * interface. */
 enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
                WLK_SURFACE, WLK_SHM_POOL, WLK_BUFFER,
-               WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL, WLK_POINTER, WLK_KEYBOARD };
+               WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL, WLK_POINTER, WLK_KEYBOARD,
+               WLK_OUTPUT, WLK_DDM, WLK_DATA_DEVICE, WLK_DATA_SOURCE,
+               WLK_SUBCOMPOSITOR, WLK_SUBSURFACE };
 
-#define WL_MAXOBJ 64
+struct wl_global { const char *iface; uint32_t version; int kind; };
+/* Advertised in this order; `name` is the index + 1. Version numbers are the
+ * ones we intend to implement, not the newest that exists -- a client binds at
+ * min(its version, ours) and will use features we claim.
+ *
+ * The KIND is stated here rather than derived from the name. It used to be
+ * guessed from two characters of the interface string, which worked for four
+ * globals and is exactly the kind of thing that silently routes a fifth to the
+ * wrong handler. */
+static const struct wl_global g_globals[] = {
+    /* ORDER IS LOAD-BEARING, which the protocol nowhere says. GDK POSTPONES
+     * creating a seat until wl_compositor AND wl_data_device_manager have both
+     * been advertised -- so a compositor that announces wl_seat first has its
+     * seat created in a LATER round trip, and anything that asks for the
+     * keyboard before then (GTK asks almost immediately) finds no keyboard,
+     * falls back to building an XKB keymap from RMLVO names, and aborts with
+     * "Failed to create XKB keymap". Announcing the manager first costs
+     * nothing and is what every real compositor happens to do. (M1986) */
+    { "wl_compositor",           4, WLK_COMPOSITOR },
+    { "wl_subcompositor",        1, WLK_SUBCOMPOSITOR },
+    { "wl_data_device_manager",  3, WLK_DDM },
+    { "wl_shm",                  1, WLK_SHM },
+    { "wl_output",               3, WLK_OUTPUT },
+    { "wl_seat",                 7, WLK_SEAT },
+    { "xdg_wm_base",             3, WLK_XDG_WM_BASE },
+};
+#define WL_NGLOBAL (int)(sizeof(g_globals) / sizeof(g_globals[0]))
+
+/* A demo client makes a dozen objects; GTK makes hundreds before it draws
+ * anything, and running out mid-handshake presents as a client that stops
+ * talking. (M1986) */
+#define WL_MAXOBJ 512
 struct wl_object {
     uint32_t id;
     int      kind;
@@ -296,14 +339,42 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         if (p + 4 > alen) return;
         uint32_t nid = rd32(args + p);
         int kind = WLK_NONE;
-        if (name >= 1 && name <= (uint32_t)WL_NGLOBAL) {
-            const char *i2 = g_globals[name - 1].iface;
-            if      (i2[3] == 'c') kind = WLK_COMPOSITOR;   /* wl_compositor */
-            else if (i2[3] == 's' && i2[4] == 'h') kind = WLK_SHM;
-            else if (i2[3] == 's' && i2[4] == 'e') kind = WLK_SEAT;
-            else kind = WLK_XDG_WM_BASE;
-        }
+        if (name >= 1 && name <= (uint32_t)WL_NGLOBAL) kind = g_globals[name - 1].kind;
         obj_add(c, nid, kind);
+        /* WHAT A CLIENT ACTUALLY BINDS is the single most useful thing this
+         * server can say. A toolkit that binds four of seven globals and then
+         * stops has told you exactly which one it could not live without, and
+         * from outside it looks identical to a client that hung. (M1986) */
+        kprintf("[wl] bind %s -> id %u\n",
+                (name >= 1 && name <= (uint32_t)WL_NGLOBAL) ? g_globals[name - 1].iface : "?", nid);
+        if (kind == WLK_OUTPUT) {
+            /* A monitor announces itself IMMEDIATELY on bind and ends with
+             * `done`: a toolkit treats the description as incomplete until it
+             * arrives, so an output that never sends one is an output that
+             * never exists. Geometry comes from the real framebuffer. */
+            uint32_t ow = fb_width(), oh = fb_height();
+            uint8_t g[96]; int gp = 0;
+            wr32(g + gp, 0); gp += 4;                  /* x */
+            wr32(g + gp, 0); gp += 4;                  /* y */
+            wr32(g + gp, (uint32_t)(ow / 4)); gp += 4; /* physical width, mm (~96 dpi) */
+            wr32(g + gp, (uint32_t)(oh / 4)); gp += 4; /* physical height, mm */
+            wr32(g + gp, 0); gp += 4;                  /* subpixel: unknown */
+            gp = put_string(g, gp, "OS-DEV");          /* make */
+            gp = put_string(g, gp, "Framebuffer");     /* model */
+            wr32(g + gp, 0); gp += 4;                  /* transform: normal */
+            wl_send(c, nid, WL_OUTPUT_EV_GEOMETRY, g, gp);
+            uint8_t m[16]; int mp = 0;
+            wr32(m + mp, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED); mp += 4;
+            wr32(m + mp, ow); mp += 4;
+            wr32(m + mp, oh); mp += 4;
+            wr32(m + mp, 60000); mp += 4;              /* refresh, mHz */
+            wl_send(c, nid, WL_OUTPUT_EV_MODE, m, mp);
+            uint8_t sc[4]; wr32(sc, 1);
+            wl_send(c, nid, WL_OUTPUT_EV_SCALE, sc, 4);
+            uint8_t nb2[64]; int np2 = put_string(nb2, 0, "OSDEV-1");
+            wl_send(c, nid, WL_OUTPUT_EV_NAME, nb2, np2);
+            wl_send(c, nid, WL_OUTPUT_EV_DONE, 0, 0);
+        }
         /* wl_shm MUST advertise its formats on bind. A client asks wl_shm what
          * it supports and will not create a buffer for a format it was never
          * offered, so a silent bind looks to it like a compositor that cannot
@@ -367,12 +438,30 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         bo->format = rd32(args + 20);
         return;
     }
+    if (o->kind == WLK_DDM && opcode == WL_DDM_CREATE_DATA_SOURCE && alen >= 4) {
+        obj_add(c, rd32(args), WLK_DATA_SOURCE);
+        return;
+    }
+    if (o->kind == WLK_DDM && opcode == WL_DDM_GET_DATA_DEVICE && alen >= 8) {
+        /* get_data_device(new_id, seat). We model the object and send nothing:
+         * a data device with no selection and no drag in progress has nothing
+         * to say, and saying nothing is the correct empty clipboard. */
+        obj_add(c, rd32(args + 0), WLK_DATA_DEVICE);
+        return;
+    }
+    if (o->kind == WLK_SUBCOMPOSITOR && opcode == WL_SUBCOMP_GET_SUBSURFACE && alen >= 12) {
+        struct wl_object *ss = obj_add(c, rd32(args + 0), WLK_SUBSURFACE);
+        if (ss) ss->link = rd32(args + 4);            /* the wl_surface it wraps */
+        return;
+    }
     if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_POINTER && alen >= 4) {
         c->pointer = rd32(args); obj_add(c, c->pointer, WLK_POINTER);
+        kprintf("[wl] client asked the seat for a POINTER (id %u)\n", c->pointer);
         return;
     }
     if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_KEYBOARD && alen >= 4) {
         c->keyboard = rd32(args); obj_add(c, c->keyboard, WLK_KEYBOARD);
+        kprintf("[wl] client asked the seat for a KEYBOARD (id %u)\n", c->keyboard);
         /* THE KEYMAP (M1984). wl_keyboard.keymap is (format, fd, size), and a
          * client that never receives one cannot turn a keycode into a
          * character at all -- GTK, and therefore Firefox, does no text input

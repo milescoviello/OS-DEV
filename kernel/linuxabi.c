@@ -188,6 +188,13 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_readlink      89
 #define LXS_sysinfo       99
 #define LXS_getuid       102
+#define LXS_getpeername_  52
+#define LXS_statfs_      137
+#define LXS_fstatfs_     138
+#define LXS_getresuid_   118
+#define LXS_getresgid_   120
+#define LXS_fallocate_   285
+#define LXS_inotify_init1_ 294
 #define LXS_getgid       104
 #define LXS_geteuid      107
 #define LXS_getegid      108
@@ -1577,6 +1584,74 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_getuid: case LXS_geteuid:
     case LXS_getgid: case LXS_getegid:
         r->rax = 0;                          /* single-user: always root */
+        break;
+    case LXS_getresuid_: case LXS_getresgid_: {
+        /* (real*, effective*, saved*). Single-user, so all three are root --
+         * but they must be WRITTEN. glib calls this to decide whether it is
+         * running setuid, and an ENOSYS left it reading its own uninitialised
+         * stack. (M1986) */
+        for (int q = 0; q < 3; q++) {
+            uint64_t up = q == 0 ? r->rdi : (q == 1 ? r->rsi : r->rdx);
+            if (up && vmm_user_ok(up, 4)) *(uint32_t *)up = 0;
+        }
+        r->rax = 0;
+        break;
+    }
+    case LXS_getpeername_: {                /* (fd, sockaddr *, addrlen *) */
+        /* The mirror of getsockname above, and the same trap: an AF_UNIX
+         * answer for an AF_INET socket makes glibc abort rather than fail. */
+        int ty2 = app_fd_type((int)a1);
+        if (!r->rsi || !vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint8_t *o2 = (uint8_t *)r->rsi;
+        for (int i = 0; i < 16; i++) o2[i] = 0;
+        if (ty2 == 9 || ty2 == 10) {
+            uint8_t pip[4] = {0,0,0,0}; uint16_t pport = 0;
+            app_sock_peeraddr((int)a1, pip, &pport);
+            *(uint16_t *)o2 = 2;                                 /* AF_INET */
+            o2[2] = (uint8_t)(pport >> 8); o2[3] = (uint8_t)(pport & 0xFF);
+            for (int i = 0; i < 4; i++) o2[4 + i] = pip[i];
+            if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 16;
+        } else if (ty2 == 12 || ty2 == 13) {
+            *(uint16_t *)o2 = 1;                                 /* AF_UNIX */
+            if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 2;
+        } else { r->rax = (uint64_t)-(long)LX_ENOTSOCK; break; }
+        r->rax = 0;
+        break;
+    }
+    case LXS_statfs_: case LXS_fstatfs_: {
+        /* struct statfs is 120 bytes: f_type, f_bsize, f_blocks, f_bfree,
+         * f_bavail, f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags,
+         * f_spare[4] -- all 8-byte except the fsid pair. glib uses it to decide
+         * whether a directory is on a remote filesystem before it will watch
+         * it; ENOSYS made every path look unwatchable. The numbers are the
+         * ext2 volume's shape, rounded: honest enough for that decision and
+         * not pretending to a precision we do not have. */
+        uint64_t up2 = (r->rax == LXS_statfs_) ? r->rsi : r->rsi;
+        if (!up2 || !vmm_user_ok(up2, 120)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint64_t *f = (uint64_t *)up2;
+        for (int i = 0; i < 15; i++) f[i] = 0;
+        f[0] = 0xEF53;                       /* f_type: EXT2_SUPER_MAGIC */
+        f[1] = 4096;                         /* f_bsize */
+        f[2] = 563200;                       /* f_blocks (2200 MiB / 4 KiB) */
+        f[3] = 280000;                       /* f_bfree */
+        f[4] = 280000;                       /* f_bavail */
+        f[5] = 65536;                        /* f_files */
+        f[6] = 60000;                        /* f_ffree */
+        f[9] = 255;                          /* f_namelen */
+        f[10] = 4096;                        /* f_frsize */
+        r->rax = 0;
+        break;
+    }
+    case LXS_fallocate_:
+        /* (fd, mode, offset, len). Linux lets a filesystem answer EOPNOTSUPP
+         * and every caller has a write-based fallback; ENOSYS is the one answer
+         * that is read as "this kernel is broken". */
+        r->rax = (uint64_t)-(long)LX_EOPNOTSUPP;
+        break;
+    case LXS_inotify_init1_:
+        /* inotify EXISTS here (M1266) -- only the flags-taking entry point was
+         * missing, which is the only one glib uses. */
+        { int ifd = app_inotify_init(); r->rax = ifd < 0 ? (uint64_t)-(long)LX_EMFILE : (uint64_t)ifd; }
         break;
     case LXS_prlimit64:
         /* (pid, resource, new, old). Report "unlimited" for a get and accept a
