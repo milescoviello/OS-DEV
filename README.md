@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1991-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1992-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -997,6 +997,32 @@ Landed so far, all on the from-scratch ext2 driver:
   argument, exactly wrong when walking a half-mapped user stack from inside
   `app_fault_handle`. They use `vmm_translate` now, which answers the same
   question and changes nothing.
+
+- **M1992** — **every syscall Claude Code makes is now implemented.** Driving it
+  past `--version` turned into the mechanical loop the plan describes: run it,
+  read the numbers, implement, repeat. It asked for and got `sched_yield` (39
+  times in one startup — `ENOSYS` had turned a scheduler point into a
+  busy-wait), `stat`/`lstat` (the old by-path spellings glibc still emits — a
+  program that gets `ENOSYS` for `stat` cannot look at a file at all),
+  `fchmod`/`fchmodat`, `fsync`/`fdatasync`, `rename`, and `epoll_pwait2` (which
+  takes a `timespec *`, not a millisecond count — reading the pointer as an
+  integer gives either an instant return or a nonsense deadline).
+
+  Two real bugs behind them. **A trailing slash was not a character the path
+  walker forgave**: `lx_xlate("/")` produced `/disk2/`, so the root — the path a
+  program is most likely to hand us — resolved to nothing. And **stdin on a
+  process nobody is typing at now returns EOF**: `claude -p` checks whether its
+  prompt was piped in before using the one on the command line, and blocked on
+  the console keyboard for a full fifteen-minute budget with zero page faults
+  and no error. A process launched with `linux` from a shell still gets the
+  keyboard.
+
+  `--version` and `--help` are now **reliably 0**, where `--help` used to fail
+  about half the time. `-p` gets as far as loading its config, resolving its
+  managed settings, and **creating and deleting a session file under
+  `~/.claude/sessions/`** — then fails, intermittently, in one of two ways. It
+  makes **zero unimplemented syscalls**, so what remains is not a missing
+  feature.
 
 Still ahead: Firefox actually painting. The honest scale is still months.
 

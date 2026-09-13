@@ -43,6 +43,11 @@ typedef struct task {
                                  * stack and task_t were handed to next: intermittent, and it looked like
                                  * wild-pointer faults inside whichever ring-3 program got the pages.
                                  * Set by the task that runs NEXT on that core. (M1961) */
+    /* How deep this TASK is inside app_fault_handle. Per-task, not per-core:
+     * the fault path enables interrupts to read from disk, so a core can be
+     * running several tasks' faults at once and a per-core counter reads their
+     * sum as one recursion. (M1992) */
+    int           fault_depth;
     int           wake_pending; /* a task_wake() arrived while this task was still RUNNING, i.e. in the
                                  * window between deciding to block and actually blocking. The next
                                  * task_block() consumes it instead of sleeping. Without this the wake is

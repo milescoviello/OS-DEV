@@ -10,6 +10,7 @@
 #include "gdt.h"
 #include "unixsock.h"   /* g_unix_verbose (M1978) */
 #include "wayland.h"    /* Wayland display server (M1978) */
+#include "syscall.h"    /* struct statx, for the root-stat probe (M1992) */
 #include "linuxabi.h"
 #include "interrupts.h"
 #include "timer.h"
@@ -741,11 +742,33 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             int strc = app_run_linux_sync("/disk2/lxstress", 0, 0, 900000);
             kprintf("[lxabi] LXSTRESS exit -> %d\n", strc);
         }
+        {   /* What does the Linux view of "/" actually look like? A program
+             * checks its working directory before it does anything else, and
+             * "Path / does not exist" is a claim about THIS. (M1992) */
+            struct statx rs;
+            if (vfs_stat("/disk2", &rs) == 0)
+                kprintf("[lxabi] root /disk2: mode %o size %lu (dir=%d)\n",
+                        (unsigned)rs.stx_mode, (unsigned long)rs.stx_size,
+                        (rs.stx_mode & 0170000u) == 0040000u);
+            else
+                kprintf("[lxabi] root /disk2: vfs_stat FAILED -- a Linux process cannot stat its own cwd\n");
+        }
         vfs_mkdir("/disk2/root");
         vfs_mkdir("/disk2/root/.config");
         vfs_mkdir("/disk2/root/.cache");
         vfs_mkdir("/disk2/root/.local");
         vfs_mkdir("/disk2/root/.local/share");
+        /* Claude Code's own state tree. It creates these itself, one level at
+         * a time -- but only if their parent exists, and a failed mkdir here is
+         * fatal to it rather than cosmetic. (M1992) */
+        vfs_mkdir("/disk2/root/.claude");
+        vfs_mkdir("/disk2/root/.claude/telemetry");
+        vfs_mkdir("/disk2/root/.claude/plugins");
+        vfs_mkdir("/disk2/root/.claude/projects");
+        vfs_mkdir("/disk2/root/.claude/statsig");
+        vfs_mkdir("/disk2/root/.claude/todos");
+        vfs_mkdir("/disk2/root/.claude/backups");
+        vfs_mkdir("/disk2/root/.claude/skills");
         vfs_mkdir("/disk2/tmp");
         vfs_mkdir("/disk2/root/.cache/fontconfig");
         vfs_mkdir("/disk2/var");

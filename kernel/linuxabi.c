@@ -214,6 +214,11 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_lseek_         8
 #define LXS_getdents64   217
 #define LXS_newfstatat   262
+#define LXS_stat_          4   /* the OLD by-path spelling; Claude Code uses it constantly (M1992) */
+#define LXS_lstat_         6
+#define LXS_fsync_        74
+#define LXS_fdatasync_    75
+#define LXS_rename_       82
 #define LXS_unlink_       87
 #define LXS_unlinkat_    263
 #define LXS_pread64_      17
@@ -237,6 +242,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_time_        201
 #define LXS_getcwd_       79
 #define LXS_chmod_        90
+#define LXS_fchmod_       91   /* same answer as chmod, by fd (M1992) */
+#define LXS_fchmodat_    268
 #define LXS_umask_        95
 #define LXS_clone3_      435
 #define LXS_sysinfo_      99
@@ -278,6 +285,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_epoll_create1_ 291
 #define LXS_epoll_ctl_   233
 #define LXS_epoll_wait_  232
+#define LXS_sched_yield_  24   /* Claude Code calls it in a tight loop; ENOSYS turned that into a busy-wait (M1992) */
+#define LXS_epoll_pwait2_ 441  /* epoll_pwait with a timespec instead of a millisecond count (M1992) */
 #define LXS_epoll_pwait_ 281
 #define LXS_eventfd2_    290
 #define LXS_poll_          7
@@ -338,7 +347,9 @@ void linux_abi_init_this_cpu(void) {
  * the ext2 volume. It is the right abstraction rather than a workaround: a
  * toolchain installed later needs /usr/lib and /usr/include to mean something,
  * and this is how they come to. Relative paths pass through untouched. */
-int g_lx_systrace;                        /* -append lxsystrace: log EVERY Linux syscall (very noisy; for finding where a program blocks) */
+int g_lx_systrace;
+static void lx_trace_on_error(const char *b, unsigned long n);
+static int g_lx_statfail;     /* rate-limit the failed-path report (M1992) */                        /* -append lxsystrace: log EVERY Linux syscall (very noisy; for finding where a program blocks) */
 
 /* Translate a negative app_fd_* return into a Linux errno (M1965).
  *
@@ -385,6 +396,17 @@ static const char *lx_xlate(const char *p, char *out, int max) {
         for (const char *r = LX_ROOT; *r && n < max - 1; r++) out[n++] = *r;
         for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
         out[n] = 0;
+        /* A TRAILING SLASH IS NOT A CHARACTER THE PATH WALKER FORGIVES, and
+         * "/" is the path a program is most likely to hand us: the root itself
+         * became "/disk2/", which resolved to nothing. Claude Code checks its
+         * own working directory before it does anything else and stopped with
+         *
+         *     Error: Can't access working directory /: Path "/" does not exist
+         *
+         * which is true of the translated path and false of the real one. Any
+         * directory named with a trailing slash -- "/tmp/", "foo/bar/" -- hit
+         * the same wall. (M1992) */
+        while (n > 1 && out[n - 1] == '/') out[--n] = 0;
         return out;
     }
     /* RELATIVE. Leaving these alone was wrong: the kernel resolves them against
@@ -404,6 +426,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
     if (n && out[n - 1] != '/' && n < max - 1) out[n++] = '/';
     for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
     out[n] = 0;
+    while (n > 1 && out[n - 1] == '/') out[--n] = 0;      /* same rule for a relative path */
     return out;
 }
 
@@ -523,7 +546,34 @@ void lx_trace_dump_last(const char *why, unsigned long want) {
     }
 }
 
-void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }   /* 0 = the whole ring */
+void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }
+
+/* DUMP THE HISTORY WHEN A PROGRAM SAYS IT IS GIVING UP (M1992).
+ *
+ * Hooking "the first write to fd 2" did not work, and finding that out was
+ * the useful part: a runtime with its own IO layer does not necessarily use
+ * stderr, or write(), or even the fd the message appears on. What is reliable
+ * is the TEXT -- a program announcing an error says so in words, and the ring
+ * holds what it did to get there. One shot per boot, and it costs a substring
+ * scan of output that is already being copied. */
+static int g_err_traced;
+static void lx_trace_on_error(const char *b, unsigned long n) {
+    if (g_err_traced || !b || n < 6 || n > 4096) return;
+    static const char *needles[] = { "Error", "error:", "cannot", "Cannot", "does not exist", 0 };
+    for (int k = 0; needles[k]; k++) {
+        const char *nd = needles[k];
+        for (unsigned long i = 0; i + 5 < n; i++) {
+            unsigned long j = 0;
+            while (nd[j] && i + j < n && b[i + j] == nd[j]) j++;
+            if (!nd[j]) {
+                g_err_traced = 1;
+                kprintf("[linuxabi] the program is reporting an error; the last 20 syscalls were:\n");
+                lx_trace_dump_last("that error", 20);
+                return;
+            }
+        }
+    }
+}   /* 0 = the whole ring */
 
 /*
  * The Linux dispatcher. Mirrors syscall_dispatch's shape (it mutates the same
@@ -599,7 +649,13 @@ void linux_syscall_dispatch(struct registers *r) {
          * ring 3 make the kernel read arbitrary memory and print it. */
         if (a3 < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (a3 && !vmm_user_ok(r->rsi, (uint64_t)a3)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        {   /* Launched from a shell? Then its window is where the output
+        {   /* THE FIRST WRITE TO STDERR is where a program says why it is
+             * about to give up, and the ring holds what it did to get there.
+             * Printing the history at that exact moment is the difference
+             * between "it printed an error" and knowing which call returned
+             * the answer it could not live with. Once per boot. (M1992) */
+            lx_trace_on_error(p2, (unsigned long)a3);
+            /* Launched from a shell? Then its window is where the output
              * belongs -- see app_write_to. Otherwise the console, as before. */
             app_t *dst = app_out_to();
             if (dst) app_write_to(dst, p2, (unsigned)a3);
@@ -643,6 +699,10 @@ void linux_syscall_dispatch(struct registers *r) {
                 total += w;
                 if ((unsigned long)w < n) { r->rax = (uint64_t)total; goto done; }   /* short: stop, don't skip a gap */
             } else {
+                /* Same reason the routing lives here: buffered output goes out
+                 * through writev, so a hook on write() alone never sees the
+                 * error message a program prints before giving up. (M1992) */
+                lx_trace_on_error(b, n);
                 /* glibc's buffered stdio flushes through writev, not write, so
                  * the shell-window routing has to be here too -- fixing only
                  * write() would leave every printf-heavy program invisible. */
@@ -806,7 +866,16 @@ void linux_syscall_dispatch(struct registers *r) {
         if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
         struct statx sx;
-        if (vfs_stat(path, &sx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        if (vfs_stat(path, &sx) != 0) {
+            /* Name BOTH spellings. A stat that fails on a path the program
+             * believes in is nearly always a TRANSLATION problem, and the
+             * translated form is the only place that shows. (M1992) */
+            if (g_lx_statfail < 400) {
+                g_lx_statfail++;
+                kprintf("[linuxabi] statx(\"%s\") -> \"%s\": no such path\n", up, path);
+            }
+            r->rax = (uint64_t)-(long)LX_ENOENT; break;
+        }
         uint8_t *o = (uint8_t *)r->r8;
         for (int i = 0; i < 256; i++) o[i] = 0;
         /* FIELD OFFSETS, and they are not negotiable (fixed M1967).
@@ -1361,9 +1430,30 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)(long)rc2;
         break;
     }
+    case LXS_sched_yield_:
+        /* Not decorative. Claude Code called this thirty-nine times in one
+         * startup and every one returned ENOSYS -- so a cooperative yield
+         * became a spin, on a machine with no spare cores under TCG. A yield
+         * that does nothing is the difference between a scheduler point and a
+         * busy-wait. */
+        task_yield();
+        r->rax = 0;
+        break;
+    case LXS_epoll_pwait2_:
     case LXS_epoll_wait_:
     case LXS_epoll_pwait_: {                /* (epfd, events, maxevents, timeout[, sigmask]) */
         long maxev = (long)r->rdx, timeout = (long)r->r10;
+        /* epoll_pwait2 takes a `struct timespec *`, not a millisecond count --
+         * and NULL means block forever, which is -1 in the millisecond
+         * convention. Reading the pointer as an integer timeout would give a
+         * caller either an instant return or a nonsense deadline. */
+        if (r->rax == LXS_epoll_pwait2_) {
+            if (!r->r10) timeout = -1;
+            else if (vmm_user_ok(r->r10, 16)) {
+                const uint64_t *ts2 = (const uint64_t *)r->r10;
+                timeout = (long)(ts2[0] * 1000ull + ts2[1] / 1000000ull);
+            } else { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        }
         if (maxev <= 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (maxev > 64) maxev = 64;         /* app_epoll_check's own clamp */
         if (!vmm_user_ok(r->rsi, (uint64_t)maxev * 12)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
@@ -1902,6 +1992,16 @@ void linux_syscall_dispatch(struct registers *r) {
         long n = (long)r->rdx;
         if (n < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (n && !vmm_user_ok(r->rsi, (uint64_t)n)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* STDIN ON A PROCESS NOBODY IS TYPING AT IS AT END OF FILE (M1992).
+         *
+         * fd 0 untouched means the console keyboard. For a process the kernel
+         * launched -- no terminal, no window -- nobody will ever type into it,
+         * so a read there blocks forever. It is not a hypothetical: `claude -p`
+         * checks whether its prompt was piped in before it uses the one on the
+         * command line, and hung there for the full fifteen-minute budget with
+         * zero page faults and no error. A process that DOES have a window
+         * (launched with `linux` from a shell) still gets the keyboard. */
+        if (a1 == 0 && !app_fd_is_open(0) && !app_out_to()) { r->rax = 0; break; }
         long got = app_fd_read((int)a1, (void *)r->rsi, (unsigned long)n);
         r->rax = (got < 0) ? (uint64_t)lx_fd_err(got) : (uint64_t)got;
         break;
@@ -1927,13 +2027,34 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)-(long)(app_fd_is_open((int)a1) ? LX_ESPIPE : LX_EBADF);
         break;
     }
+    case LXS_stat_:
+    case LXS_lstat_:
     case LXS_newfstatat: {                  /* (dirfd, path, statbuf, flags) */
-        const char *upath = (const char *)r->rsi;
-        if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* stat(2) and lstat(2) are the same call one argument to the left:
+         * (path, statbuf) rather than (dirfd, path, statbuf, flags). glibc on
+         * x86-64 still emits them, and a program that gets ENOSYS for stat
+         * cannot look at a file at all -- Claude Code issued twelve in a row
+         * before giving up. We have no symlinks to follow differently, so
+         * lstat is the same answer. (M1992) */
+        int by_path = (r->rax == LXS_stat_ || r->rax == LXS_lstat_);
+        uint64_t upath_u = by_path ? r->rdi : r->rsi;
+        uint64_t ubuf_u  = by_path ? r->rsi : r->rdx;
+        const char *upath = (const char *)upath_u;
+        if (!upath || !vmm_user_ok(upath_u, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
-        if (!vmm_user_ok(r->rdx, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!vmm_user_ok(ubuf_u, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        r->rdx = ubuf_u;                    /* the writes below all go through rdx */
         struct statx sx;
-        if (vfs_stat(path, &sx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        if (vfs_stat(path, &sx) != 0) {
+            /* Name BOTH spellings. A stat that fails on a path the program
+             * believes in is nearly always a TRANSLATION problem, and the
+             * translated form is the only place it shows. (M1992) */
+            if (g_lx_statfail < 400) {
+                g_lx_statfail++;
+                kprintf("[linuxabi] stat(\"%s\") -> \"%s\": no such path\n", upath, path);
+            }
+            r->rax = (uint64_t)-(long)LX_ENOENT; break;
+        }
         uint8_t *st = (uint8_t *)r->rdx;
         for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
         int isdir = (sx.stx_mode & 0170000u) == 0040000u;
@@ -1945,6 +2066,25 @@ void linux_syscall_dispatch(struct registers *r) {
         *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;   /* a real inode -- see LXS_fstat (M1955) */
         *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
         r->rax = 0;
+        break;
+    }
+    case LXS_fsync_:
+    case LXS_fdatasync_:
+        /* Every write here is already through to the block layer, so there is
+         * nothing queued to force out. Returning 0 is the truth; ENOSYS made a
+         * program that checkpoints its own state file treat a completed write
+         * as a failed one. (M1992) */
+        r->rax = app_fd_is_open((int)a1) ? 0 : (uint64_t)-(long)LX_EBADF;
+        break;
+    case LXS_rename_: {                     /* (oldpath, newpath) */
+        if (!vmm_user_ok(r->rdi, 1) || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char op[VFS_PATH_MAX], np[VFS_PATH_MAX];
+        char ox[VFS_PATH_MAX], nx[VFS_PATH_MAX];
+        const char *o = lx_xlate((const char *)r->rdi, ox, sizeof ox);
+        const char *n = lx_xlate((const char *)r->rsi, nx, sizeof nx);
+        int k = 0; while (o[k] && k < VFS_PATH_MAX - 1) { op[k] = o[k]; k++; } op[k] = 0;
+        k = 0; while (n[k] && k < VFS_PATH_MAX - 1) { np[k] = n[k]; k++; } np[k] = 0;
+        r->rax = (vfs_rename_path(op, np) == 0) ? 0 : (uint64_t)-(long)LX_ENOENT;
         break;
     }
     case LXS_getdents64: {                  /* (fd, dirp, count) */
@@ -2117,9 +2257,14 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = 022;
         break;
     case LXS_chmod_:
+    case LXS_fchmod_:
+    case LXS_fchmodat_:
         /* Accepted and ignored. Everything runs as root on a volume with no
          * enforced permission bits, so refusing would fail `as`'s attempt to
-         * chmod the object file it just wrote for no gain. */
+         * chmod the object file it just wrote for no gain. The by-fd and
+         * at-relative spellings get the same answer for the same reason --
+         * Claude Code calls fchmod on its own state files and treated ENOSYS
+         * as fatal. (M1992) */
         r->rax = 0;
         break;
     case LXS_fork_:
@@ -2319,7 +2464,14 @@ void linux_syscall_dispatch(struct registers *r) {
         /* Existence only. Everything runs as root here and there are no mode
          * bits on the boot volume, so reporting a permission failure would be
          * inventing one -- ld.so uses this to probe for library paths. */
-        r->rax = (vfs_stat(path, &sx) == 0) ? 0 : (uint64_t)-(long)LX_ENOENT;
+        if (vfs_stat(path, &sx) == 0) r->rax = 0;
+        else {
+            if (g_lx_statfail < 400) {
+                g_lx_statfail++;
+                kprintf("[linuxabi] access(\"%s\") -> \"%s\": no such path\n", up, path);
+            }
+            r->rax = (uint64_t)-(long)LX_ENOENT;
+        }
         break;
     }
     case LXS_exit:
@@ -2331,6 +2483,11 @@ void linux_syscall_dispatch(struct registers *r) {
         /* fall through */
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);
+        /* A NON-ZERO EXIT IS A FAILURE WITH NO FAULT ADDRESS (M1992). The ring
+         * already holds the history; a program that gives up cleanly is
+         * exactly the case where there is otherwise nothing to look at, and
+         * "it printed an error and exited 1" is not a place to start. */
+        if (a1 != 0) lx_trace_dump_last("a non-zero exit", 20);
         /* app_sys_exit, NOT a bare task_exit(). It records the status, marks
          * the app dead AND RELEASES ITS FDS -- and that last part is what makes
          * a pipe signal EOF to the other end. Calling task_exit() directly left

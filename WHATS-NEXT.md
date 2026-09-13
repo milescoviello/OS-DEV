@@ -1,5 +1,51 @@
 # What's next
 
+> **(M1992) EVERY SYSCALL CLAUDE CODE MAKES IS NOW IMPLEMENTED.**
+>
+> Driving it past `--version` turned into exactly the mechanical loop the plan
+> describes -- run it, read the numbers, implement, repeat:
+>
+> - **`sched_yield`** -- called 39 times in one startup, every one `ENOSYS`. A
+>   yield that does nothing is a busy-wait, on a machine with no spare cores.
+> - **`stat` / `lstat`** -- the OLD by-path spellings, which glibc on x86-64
+>   still emits. A program that gets `ENOSYS` for `stat` cannot look at a file
+>   at all; Claude Code issued twelve in a row before giving up.
+> - **`fchmod` / `fchmodat`**, **`fsync` / `fdatasync`**, **`rename`**.
+> - **`epoll_pwait2`**, which takes a `struct timespec *` rather than a
+>   millisecond count -- reading the pointer as an integer timeout gives a
+>   caller either an instant return or a nonsense deadline.
+>
+> **Two real bugs behind them.**
+>
+> A **trailing slash is not a character the path walker forgives**, and `/` is
+> the path a program is most likely to hand us: `lx_xlate("/")` produced
+> `/disk2/`, which resolved to nothing. Every directory named with a trailing
+> slash hit the same wall.
+>
+> **Stdin on a process nobody is typing at is at end of file.** fd 0 untouched
+> means the console keyboard; for a process the kernel launched there is no
+> terminal and no window, so a read there blocks forever. `claude -p` checks
+> whether its prompt was piped in before using the one on the command line, and
+> hung for a full fifteen-minute budget with **zero page faults and no error** --
+> the hardest shape of failure to see. A process launched with `linux` from a
+> shell still gets the keyboard.
+>
+> **Where it actually is now.** `--version` and `--help` are reliably 0, where
+> `--help` used to fail about half the time. `-p` loads its config, reads its
+> managed settings, and **creates and deletes a session file under
+> `~/.claude/sessions/`** before failing -- intermittently, in one of two ways.
+> It makes **zero unimplemented syscalls**, so what is left is not a missing
+> feature; it is the same memory/threading class `lxstress` exercises, and
+> Claude Code is far heavier than `lxstress` is.
+>
+> **Diagnostics added, and one that failed usefully.** A non-zero exit now dumps
+> the last 20 syscalls -- a program that gives up cleanly is exactly the case
+> with no fault address to look at. Hooking "the first write to fd 2" did NOT
+> work and finding that out was worth the run: a runtime with its own IO layer
+> need not use stderr, or `write()`, or even the fd the message appears on. What
+> is reliable is the TEXT, so the dump now triggers on a program announcing an
+> error in words.
+
 > **(M1991) TWO CORES COULD RUN THE SAME TASK'S STACK.**
 >
 > `switch_to_next` carries a CRITICAL note in its own source: never make a

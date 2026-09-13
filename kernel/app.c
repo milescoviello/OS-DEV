@@ -3675,12 +3675,20 @@ static uint64_t vma_pte_flags(uint8_t prot) {
  * Four levels is more than any legitimate chain needs. Beyond it, fail the
  * fault and SAY SO: killing one process with a named reason beats taking the
  * machine down with an unnamed one. */
-static volatile int g_fault_depth[16];
 static volatile uint64_t g_fault_chain[16][6];
 static int app_fault_handle_inner(uint64_t cr2, uint64_t err);
 int app_fault_handle(uint64_t cr2, uint64_t err) {
+    /* PER-TASK depth (M1992). This counted per CORE, which is wrong for the
+     * reason that makes it hard to see: the file-backed path enables
+     * interrupts to read from disk, so a core routinely has several tasks part
+     * way through their own faults at once. Six threads all touching the same
+     * library page produced a "depth 4 recursion" that was really four separate
+     * tasks -- and the guard then killed a process that had done nothing wrong.
+     * The chain print said so plainly once it existed: the same address three
+     * times, which is what concurrent faults on one shared page look like. */
+    task_t *ft = task_self();
     int cpu = (int)(smp_current_cpu() & 15);
-    int d = g_fault_depth[cpu];
+    int d = ft ? ft->fault_depth : 0;
     if (d >= 4) {
         /* Print the WHOLE CHAIN, not just the top. "Depth 4 resolving X" says a
          * recursion happened; the addresses that got us there say WHICH access
@@ -3693,9 +3701,9 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
         return 0;
     }
     if (d < 6) g_fault_chain[cpu][d] = cr2;
-    g_fault_depth[cpu] = d + 1;
+    if (ft) ft->fault_depth = d + 1;
     int r = app_fault_handle_inner(cr2, err);
-    g_fault_depth[cpu] = d;
+    if (ft) ft->fault_depth = d;
     return r;
 }
 
@@ -3872,9 +3880,23 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                     __asm__ volatile("sti");            /* the FS read may touch the disk */
                     /* The interned path index came out with the copy, so the
                      * lookup does not have to re-find the VMA. */
-                    vfs_pread((v.fidx >= 0 && v.fidx < g_vma_npath) ? g_vma_paths[v.fidx] : "",
-                              z, want, fileoff);       /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
+                    const char *fp = (v.fidx >= 0 && v.fidx < g_vma_npath) ? g_vma_paths[v.fidx] : "";
+                    long got = vfs_pread(fp, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
                     __asm__ volatile("cli");
+                    /* A SHORT OR FAILED READ LEAVES THE PAGE ZERO, and nothing
+                     * downstream can tell that from a page the file genuinely
+                     * zeroes. The program starts, runs real code, and dies at
+                     * the first instruction of whatever function happened to
+                     * live in the hole -- which is how a 214 MB demand-paged
+                     * executable presents as "random corruption". Say it here,
+                     * where the cause is. (M1992) */
+                    /* A partial read is NORMAL at end-of-file -- the last
+                     * page of a shared object is short by construction and the
+                     * remainder is legitimately zero. Only NO progress at all
+                     * means the page is a hole nobody will notice. */
+                    if (got <= 0)
+                        kprintf("[fault] EMPTY READ filling %lx from %s+%lx: wanted %lu, got %ld -- the page is a HOLE\n",
+                                page, fp, (unsigned long)fileoff, (unsigned long)want, got);
                 }
                 a->majflt++;                            /* page filled from disk => major fault (M1150) */
             } else {
