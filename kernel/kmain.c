@@ -918,6 +918,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the anonymous-shared-file probe...\n");
         int anonrc = app_run_linux_sync("/disk2/lxanon", 0, 0, 60000);
         kprintf("[lxabi] LXANON exit -> %d\n", anonrc);
+        /* ...and which vector instruction sets can actually EXECUTE here. A
+         * #UD on an instruction CPUID advertised is indistinguishable from a
+         * kernel that forgot to enable its state, and Firefox died on exactly
+         * that. This says which, definitively. (M2007) */
+        kprintf("[lxabi] launching the vector-ISA probe...\n");
+        int isarc = app_run_linux_sync("/disk2/lxisa", 0, 0, 60000);
+        kprintf("[lxabi] LXISA exit -> %d\n", isarc);
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");

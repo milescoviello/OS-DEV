@@ -115,18 +115,82 @@ fpu_enable_xsave:
     mov rax, cr4
     bts rax, 18                 ; CR4.OSXSAVE -- must precede XGETBV/XSETBV,
     mov cr4, rax                ; which themselves #UD without it
+    ; WHICH STATE COMPONENTS DOES THIS CPU ACTUALLY HAVE? (M2007)
+    ;
+    ; We used to enable exactly x87|SSE|AVX and stop there -- while CPUID went
+    ; on advertising AVX-512 to userspace, because nothing here masks CPUID and
+    ; `-cpu max` reports what the emulator can do. A library that dispatches on
+    ; CPUID then issues an AVX-512 instruction, the CPU finds its state disabled
+    ; in XCR0, and the instruction is simply not there:
+    ;
+    ;   [fault] Invalid Opcode (vector 6) at libxul.so + 788f4eb
+    ;
+    ; CPUID says yes and XCR0 says no, and userspace believes CPUID. So enable
+    ; every component the CPU reports, masked to the ones whose state XSAVE can
+    ; carry for us with no extra bookkeeping. fpu_xsave_size then sizes the area
+    ; from XCR0, so the save/restore path follows automatically.
+    mov eax, 0x0D
     xor ecx, ecx
-    xgetbv                      ; EDX:EAX = XCR0
-    or eax, 0x7                 ; bit0 x87 | bit1 SSE | bit2 AVX.
-                                ; x87 and SSE are mandatory whenever AVX is set:
-                                ; XSETBV #GPs on an illegal combination.
+    cpuid                       ; EAX = bitmap of XCR0 bits this CPU supports
+    mov ebx, eax                ; keep the supported mask
+    mov eax, 0x7                ; x87 | SSE | AVX -- the baseline, always
+    ; AVX-512 is bits 5 (opmask), 6 (ZMM_Hi256) and 7 (Hi16_ZMM), and it is ALL
+    ; OR NOTHING: XSETBV #GPs on a subset.
+    mov edx, ebx
+    and edx, 0xE0
+    cmp edx, 0xE0
+    jne .no_avx512
+    or eax, 0xE0
+.no_avx512:
+    and eax, ebx                ; never set a bit the CPU does not have
     xor ecx, ecx
+    xor edx, edx
     xsetbv
     mov eax, 1
     pop rbx
     ret
 .unsupported:
     xor eax, eax
+    pop rbx
+    ret
+
+; uint64_t fpu_xcr0(void) -- the state components actually enabled, so the boot
+; log can say which ones rather than claiming a fixed set. (M2007)
+global fpu_xcr0
+fpu_xcr0:
+    ; XGETBV ITSELF #UDs WHEN CR4.OSXSAVE IS CLEAR. That is not a
+    ; theoretical guard: vexemu_try calls this from the #UD handler to decide
+    ; whether it can emulate, so on a CPU with no XSAVE at all (QEMU's default
+    ; qemu64, which is what several suites boot) the FIRST ring-3 invalid
+    ; opcode took a SECOND #UD inside the handler, in ring 0 -- a kernel panic
+    ; where the correct outcome was "kill that one process".
+    ; Report XCR0 = 0, which every caller already reads as "no such state".
+    push rbx
+    mov rax, cr4
+    test rax, 0x40000           ; CR4.OSXSAVE
+    jz .none
+    xor ecx, ecx
+    xgetbv                      ; EDX:EAX = XCR0
+    shl rdx, 32
+    or rax, rdx
+    pop rbx
+    ret
+.none:
+    xor eax, eax
+    pop rbx
+    ret
+
+; uint32_t fpu_avx_offset(void) -- byte offset of the YMM_Hi128 state component
+; inside an XSAVE area: CPUID.(EAX=0Dh,ECX=2):EBX. Queried, not hardcoded --
+; the layout is the CPU's to choose, and the GFNI emulator has to find YMM's
+; upper halves there. 0 if the CPU has no such component. (M2007)
+global fpu_avx_offset
+fpu_avx_offset:
+    push rbx
+    mov eax, 0x0D
+    mov ecx, 2
+    cpuid
+    mov eax, ebx
     pop rbx
     ret
 

@@ -260,6 +260,14 @@ void isr_dispatch(struct registers *r) {
                 __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
                 if (app_fault_handle(cr2, r->err_code)) return;  /* COW copy / swap-in / mapped a reserved page -> retry */
             }
+            /* An Invalid Opcode may be an instruction the CPU under us simply
+             * does not implement -- every binary on this host is built for a
+             * CPU with GFNI, and the emulator has no GFNI. Complete it in
+             * software and retry rather than killing the process. (M2007) */
+            if (r->int_no == 6) {
+                extern int vexemu_try(struct registers *r);
+                if (vexemu_try(r)) return;
+            }
             if (app_signal_deliver(r, 11)) return;  /* SIGSEGV: a registered handler catches the fault */
             kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) -- terminating it\n",
                     exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2);

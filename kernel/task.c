@@ -112,7 +112,10 @@ void fpu_xsave_arm(void) {
         if (sz < FXSZ) sz = FXSZ;              /* paranoia: never shrink */
         g_fpu_area = sz; g_fpu_align = 64; g_use_xsave = 1;
         fpu_xsave_template(fpu_xtemplate);     /* a CLEAN state, not a zeroed buffer */
-        kprintf("[ ok ] fpu: XSAVE+AVX enabled (XCR0 state area %u bytes)\n", sz);
+        { extern uint64_t fpu_xcr0(void);
+          kprintf("[ ok ] fpu: XSAVE enabled, XCR0=%lx (state area %u bytes)%s\n",
+                  (unsigned long)fpu_xcr0(), sz,
+                  (fpu_xcr0() & 0xE0) == 0xE0 ? " -- incl. AVX-512" : ""); }
     }
 }
 
