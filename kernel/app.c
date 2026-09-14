@@ -211,6 +211,16 @@ struct app {
      * this file. */
     volatile int vma_lk;
     struct app *out_to;                  /* a Linux child writes its stdout into THIS app's window (M1988) */
+    /* REAL vfork (M2006). CLONE_VM|CLONE_VFORK means: share the caller's
+     * address space, and SUSPEND the caller until the child execs or exits.
+     * glibc's posix_spawn is written against exactly that -- its child sets up
+     * signal masks and file actions and then execs, reporting a failure back
+     * through memory the two of them share. We faked it with a copy-on-write
+     * fork, so the child wrote its answer into a private copy nobody read, and
+     * both of the faults that broke self-hosting landed in that code. */
+    int      cr3_borrowed;               /* this cr3 belongs to our vfork PARENT: never destroy it */
+    int      vfork_parent;               /* pid to release when we exec or exit, 0 = none */
+    volatile int vfork_waiting;          /* set on the PARENT while it is suspended */
     unsigned long lxcalls;               /* Linux syscalls this process has made, for the stall watchdog (M2004) */
     unsigned long lxcalls_seen; int stall_ticks, stall_told;
     int      out_announced;              /* the routing has been logged once */
@@ -1783,7 +1793,10 @@ int app_reap(app_t *a) {
          * still mapped is kept alive precisely by this reference. (M1985) */
         for (int vi = 0; vi < a->nvma; vi++)
             if (a->vma[vi].mfd >= 0) { memfd_unref(a->vma[vi].mfd); a->vma[vi].mfd = -1; }
-        vmm_destroy_address_space(a->cr3);   /* free page tables + user frames */
+        /* A vfork child that never exec'd still BORROWS its parent's address
+         * space; freeing it here would free the parent's memory. (M2006) */
+        if (!a->cr3_borrowed) vmm_destroy_address_space(a->cr3);
+        a->cr3_borrowed = 0;
         a->cr3 = 0;
         if (a->gfx) { kfree(a->gfx); a->gfx = 0; }   /* graphics canvas (kernel heap) */
         /* `a` is fully dead from here on (resources above already freed) --
@@ -5245,6 +5258,7 @@ void app_sys_exit(int code) {
     a->exit_code = code; a->exited = 1;
     app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
     app_stop_siblings(a);        /* exit_group(2) ends EVERY thread (M1998) */
+    app_vfork_release((app_t *)a);   /* a vfork child that exits instead of exec'ing (M2006) */
     task_exit();
 }
 /* --- ELF core dump (M1104) -------------------------------------------------
@@ -5369,6 +5383,7 @@ void app_fault_current(struct registers *r) {
          * running in, and one of them is asleep with a timer that will wake it
          * afterwards. */
         app_stop_siblings(a);
+        app_vfork_release((app_t *)a);   /* never leave a vfork parent suspended forever (M2006) */
     }
     task_exit();
 }
@@ -7381,7 +7396,7 @@ static const char *g_pend_env_extra;
  * would be inherited by every program the system ever starts. (M1999) */
 void app_set_next_env(const char *e) { g_pend_env_extra = e; }
 
-long app_fork_at(struct registers *r, uint64_t child_rsp) {
+static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_vm) {
     struct app *p = cur();
     if (!p || !r) return -1;
 
@@ -7405,11 +7420,34 @@ long app_fork_at(struct registers *r, uint64_t child_rsp) {
     a->titlebuf[ti] = 0; a->title = a->titlebuf;
     grid_clear(a);
 
-    /* Build the child's address space as a COW clone of the parent (current). */
+    /* Build the child's address space as a COW clone of the parent (current).
+     *
+     * EVEN FOR vfork (M2006). vfork promises two things -- a shared address
+     * space and a suspended parent -- and they are separable. Sharing it for
+     * real is what a kernel does, and I tried: the child exec's into a fresh
+     * space and the parent keeps the old one, which is correct on paper. In
+     * practice it produced corrupted control flow in freshly-exec'd processes
+     * (instruction fetches at 0x50fff001, 0x237d8, a write to gcc's read-only
+     * text) that I could not account for, so it is not in.
+     *
+     * The SUSPENSION is the half that actually mattered here, and it is safe.
+     * The fault that broke self-hosting was the parent running on after clone
+     * and munmapping the stack the child was still executing on:
+     *
+     *   435 clone3(...) = 161
+     *   11  munmap(0x10315b000, 0x9000)      <- the child's stack
+     *   ...  fault in clone + 0x21a at rsp-8
+     *
+     * A suspended parent cannot do that. What a copy-on-write child loses is
+     * the ability to hand its exec errno back through shared memory -- and
+     * glibc's fallback for that is the child exiting 127, which the parent
+     * already learns through wait4. A worse diagnostic on a rare failure path
+     * is a good trade for memory that cannot be corrupted. */
     a->cr3 = vmm_create_address_space();
     if (!a->cr3) { a->used = 0; return -1; }
     vdso_map(a->cr3);                                   /* the RO vDSO page (shared, RO — not COW) */
     if (vmm_fork_cow(a->cr3) != 0) { vmm_destroy_address_space(a->cr3); a->used = 0; return -1; }
+    if (share_vm) a->vfork_parent = p->pid;             /* suspend the parent until we exec or exit */
 
     /* Inherit the parent's process state (NOT its window/grid/task/identity). */
     a->entry = p->entry; a->ustack = p->ustack; a->heap_end = p->heap_end;
@@ -7463,16 +7501,56 @@ long app_fork_at(struct registers *r, uint64_t child_rsp) {
     if (child_rsp) a->fork_frame.rsp = child_rsp;       /* clone() with a caller-supplied child stack */
     a->fork_frame.rflags |= 0x200;                      /* ensure IF is set in ring 3 */
 
-    a->task = task_create_stack(fork_child_trampoline, a->cr3, a, 256 * 1024);
-    if (!a->task) { vmm_destroy_address_space(a->cr3); a->used = 0; return -1; }
+    /* SUSPENDED: the copies below are what make this a working thread, and a
+     * child that gets scheduled before them runs with %fs = 0. (M2006) */
+    a->task = task_create_stack_suspended(fork_child_trampoline, a->cr3, a, 256 * 1024);
+    if (!a->task) {
+        if (!a->cr3_borrowed) vmm_destroy_address_space(a->cr3);
+        a->used = 0; return -1;
+    }
     /* copy the parent's live FP/SSE state so a child mid-float-computation is correct */
     task_copy_fpu(a->task, p->task);
     task_copy_tls(a->task, p->task);   /* the child must see the parent's %fs base (M1949) */
+    task_cont(a->task);                /* context complete: now it may run */
 
     /* give the child its own window (the WM consumes the pending queue) */
     int n = (pend_h + 1) % MAX_APPS;
     if (n != pend_t) { pending[pend_h] = a; pend_h = n; }
+    if (share_vm) {
+        /* SUSPEND THE PARENT until the child execs or exits -- the other half
+         * of vfork, and the half that makes sharing an address space safe at
+         * all: two processes must not run on one stack at the same time.
+         * Released by app_vfork_release, from execve or from exit. */
+        int child_pid = a->pid;
+        p->vfork_waiting = 1;
+        __asm__ volatile("sti");
+        while (p->vfork_waiting) {
+            if (!app_pid_alive(child_pid)) break;   /* child vanished without telling us */
+            task_sleep_ms(1);
+        }
+        p->vfork_waiting = 0;
+        return child_pid;
+    }
     return a->pid;
+}
+
+long app_fork_at(struct registers *r, uint64_t child_rsp) { return app_fork_common(r, child_rsp, 0); }
+
+/* clone(CLONE_VM|CLONE_VFORK, stack): share the address space AND suspend the
+ * caller. This is what glibc's posix_spawn asks for, and what it is written
+ * against. (M2006) */
+long app_vfork_at(struct registers *r, uint64_t child_rsp) { return app_fork_common(r, child_rsp, 1); }
+
+/* Let a suspended vfork parent run again: the child has exec'd (and so now has
+ * an address space of its own) or has exited. Idempotent -- both paths reach
+ * it, and a child that execs then exits must not release a second parent. */
+void app_vfork_release(app_t *ap) {
+    struct app *a = (struct app *)ap;
+    if (!a || !a->vfork_parent) return;
+    int ppid = a->vfork_parent;
+    a->vfork_parent = 0;
+    for (int i = 0; i < MAX_APPS; i++)
+        if (apps[i].used && apps[i].pid == ppid) { apps[i].vfork_waiting = 0; return; }
 }
 
 long app_fork(struct registers *r) { return app_fork_at(r, 0); }
@@ -7537,7 +7615,11 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
     f->rsp = stack;
     f->rax = 0;                                         /* the child's clone() returns 0 */
     f->rflags |= 0x200;                                 /* IF set in ring 3 */
-    task_t *t = task_create_stack(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app */
+    /* Suspended for the same reason as fork's child (M2006): the TLS base is
+     * set below, and pthread_create's whole purpose is a thread with its OWN
+     * TLS -- one that runs before CLONE_SETTLS is applied reads another
+     * thread's __thread variables, or none at all. */
+    task_t *t = task_create_stack_suspended(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app */
     if (!t) { kfree(f); return -1; }
     t->start_frame = f;
     /* TLS: CLONE_SETTLS carries the new thread's %fs base. Without it a thread
@@ -7551,6 +7633,7 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
      * have run yet. */
     if ((flags & LXC_PARENT_SETTID) && vmm_user_ok(ptid, 4)) *(volatile int *)ptid = t->id;
     a->thr[slot] = t;
+    task_cont(t);                      /* TLS + tid pointers are set: now it may run */
     return t->id;
 }
 
@@ -7719,8 +7802,25 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     }
 
     /* committed: we are now the new program. Free the OLD space (non-active now). */
-    vmm_destroy_address_space(old_cr3);
+    /* A vfork CHILD's old address space is its PARENT's -- destroying it here
+     * would take the parent down with it. exec is also the moment the parent
+     * may run again: the child has its own space now, so the sharing is over.
+     * (M2006) */
+    int was_borrowed = a->cr3_borrowed;
+    a->cr3_borrowed = 0;
+    if (!was_borrowed) vmm_destroy_address_space(old_cr3);
     a->cr3 = new_cr3; a->task->cr3 = new_cr3;
+    /* RELEASE THE vfork PARENT ONLY NOW, with the switch completely done
+     * (M2006). Waking it one line earlier left this task's saved cr3 still
+     * naming the space we had just left while the CPU was already running in
+     * the new one -- so a preemption in that window reloaded the OLD space and
+     * the child executed its new image against the previous address space:
+     *
+     *   err=0x14 (instruction fetch, user) at an unmapped page in the image
+     *
+     * The window existed before; waking another process inside it is what made
+     * it reachable. */
+    if (was_borrowed) app_vfork_release((app_t *)a);
     a->entry = entry; a->ustack = USTACK_BASE + USTACK_PAGES * PAGE_SIZE;
 
     /* A Linux execve needs argc/argv/envp/auxv on the stack, built HERE while

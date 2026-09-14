@@ -175,6 +175,8 @@ long     app_clone_linux(struct registers *r, unsigned long flags, uint64_t stac
 void     app_futex_dump(void);                   /* who is parked on a futex; printed on a sync-run timeout (M1959) */
 int      app_is_main_thread(void);               /* exit(2) ends a thread, but the MAIN thread's exit(2) ends the process (M1959) */
 long     app_fork_at(struct registers *r, uint64_t child_rsp);  /* ... and with the CHILD's rsp overridden: clone(CLONE_VM|CLONE_VFORK, stack), what posix_spawn uses (M1958) */
+long     app_vfork_at(struct registers *r, uint64_t child_rsp);  /* REAL vfork: shared address space + suspended parent (M2006) */
+void     app_vfork_release(app_t *a);                            /* child exec'd or exited: release its vfork parent (M2006) */
 long     app_process_vm_read(int pid, uint64_t raddr, void *local, uint64_t len);  /* read another (same-tree) process's memory; bytes/-1 (M1162) */
 long     app_process_vm_write(int pid, uint64_t raddr, const void *local, uint64_t len);  /* write another (same-tree) process's memory (COW-safe); bytes/-1 (M1165) */
 int      app_setrlimit(int resource, uint64_t val);   /* set a resource limit (RLIMIT_NPROC); 0/-1 (M1163) */

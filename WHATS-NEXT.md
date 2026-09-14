@@ -1,5 +1,44 @@
 # What's next
 
+> **(M2006) OS-DEV BUILDS ITS OWN KERNEL INSIDE ITSELF, AND THAT KERNEL BOOTS.**
+>
+> ```
+> ok: GNU make drove the in-guest gcc/as/ld over the whole kernel tree and exited 0
+> ok: it produced a kernel (built in-guest: 8836744 bytes)
+> ok: self-built kernel reached 'full bring-up complete'
+> ok: self-built kernel reached 'launching the desktop environment'
+> PASS: PHASE 5 -- OS-DEV built its own kernel inside itself, and that kernel BOOTS
+> ```
+>
+> **The blocker was a TLS race, and it was the intermittent `cc1` crash all
+> along.** `task_create_stack` publishes a task as TASK_READY and links it into
+> the run queue; its callers then copy the FPU state and the TLS base. A child
+> that wins that race runs glibc with `%fs = 0`, and the first stack-protected
+> function reads its canary from `%fs:0x28` -- linear address 0x28 with a zero
+> base:
+>
+> ```
+> err=0x4 in a ring-3 task (CR2=0x0000000000000028)
+> posix_spawnattr_setsigmask + 0x57d
+> ```
+>
+> A fault at exactly 0x28 is not a null pointer with an offset; it is a canary
+> read, and it says the thread has no TLS. Fork children and pthread_create
+> threads are now born TASK_STOPPED and released once their context is complete.
+>
+> **Plus real vfork ordering.** CLONE_VM|CLONE_VFORK promises a shared address
+> space AND a suspended parent; those are separable, and the suspension is the
+> half that mattered -- the capture showed the parent munmapping the stack the
+> child was still running on. I implemented the sharing too and **backed it
+> out**: it produced corrupted control flow in freshly-exec'd processes that I
+> could not account for, and a copy-on-write child loses only the ability to
+> report its exec errno through shared memory (glibc falls back to exiting 127,
+> which wait4 already delivers).
+>
+> Of the three standing goals, this one is **done**: Claude Code renders its
+> interface (M2004) but cannot complete its login preflight; Firefox still does
+> not paint; **building the OS inside the OS works and the result boots.**
+
 > **(M2005) A WRITE FAULT ON A WRITABLE PAGE, WHICH WE TREATED AS FATAL.**
 >
 > x86 does not require the TLB to be updated when a PTE is made MORE

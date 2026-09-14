@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2005-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2006-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1535,3 +1535,51 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   space and a suspended parent. glibc is written against the real semantics.
   That is the next milestone, and it is the one the campaign plan named from the
   start.
+
+- **M2006** — **a child could run before it had a TLS base, and that was the
+  intermittent `cc1` crash.** `task_create_stack` publishes a task as
+  `TASK_READY` and links it into the run queue — and then its callers go on to
+  copy the things that make it a working thread:
+
+      a->task = task_create_stack(...);
+      task_copy_fpu(a->task, p->task);
+      task_copy_tls(a->task, p->task);     <- too late if it already ran
+
+  A child that wins that race runs glibc with **`%fs` = 0**, and the first
+  function compiled with a stack protector reads its canary from `%fs:0x28` —
+  which, with a zero base, is the linear address `0x28`:
+
+      err=0x4 in a ring-3 task (CR2=0x0000000000000028)
+      posix_spawnattr_setsigmask + 0x57d
+
+  A fault at exactly 0x28 is not a null pointer with an offset, it is a canary
+  read, and it says the thread has no TLS. Children and `pthread_create`
+  threads are now born `TASK_STOPPED` and released once their context is
+  complete.
+
+  **And real vfork ordering.** `CLONE_VM|CLONE_VFORK` promises two things — a
+  shared address space and a *suspended parent* — and they are separable. The
+  suspension is the half that mattered: the capture showed the parent running
+  on after `clone` and `munmap`ing the stack the child was still executing on
+  (`clone + 0x21a`, faulting at `rsp-8`). A suspended parent cannot do that.
+
+  I did implement the sharing too, and backed it out: the child exec'ing into a
+  fresh space while the parent keeps the old one is correct on paper, and in
+  practice produced corrupted control flow in freshly-exec'd processes
+  (instruction fetches at `0x50fff001`, `0x237d8`, a write to gcc's read-only
+  text) that I could not account for. A copy-on-write child loses only the
+  ability to hand its exec errno back through shared memory, and glibc's
+  fallback for that is exiting 127, which the parent already learns from
+  `wait4`.
+
+  The result is the goal this campaign was named for:
+
+      ok: GNU make drove the in-guest gcc/as/ld over the whole kernel tree and exited 0
+      ok: it produced a kernel (built in-guest: 8836744 bytes)
+      ok: self-built kernel reached 'full bring-up complete'
+      ok: self-built kernel reached 'launching the desktop environment'
+
+  **OS-DEV builds its own kernel inside itself, and that kernel boots.** Not
+  once by luck — `make selfhosttest` passes, and the one failure along the way
+  left its serial log behind because this milestone also stopped that harness
+  deleting it.

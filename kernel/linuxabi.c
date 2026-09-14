@@ -2789,7 +2789,14 @@ void linux_syscall_dispatch(struct registers *r) {
          * process, not a thread -- it execs immediately. Served by a COW fork
          * with the child's rsp overridden; see app_fork_at for why sharing the
          * address space for real would be worse here. (M1958) */
-        if (r->rsi) { r->rax = (uint64_t)app_fork_at(r, r->rsi); break; }
+        if (r->rsi) {
+            /* CLONE_VM|CLONE_VFORK is posix_spawn, and it means what it says:
+             * share the address space and suspend me until the child execs.
+             * Serving it with a copy-on-write fork made the child's exec-failure
+             * report land in memory nobody read. (M2006) */
+            if (r->rdi & LX_CLONE_VM) { r->rax = (uint64_t)app_vfork_at(r, r->rsi); break; }
+            r->rax = (uint64_t)app_fork_at(r, r->rsi); break;
+        }
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
     case LXS_clone3_: {                     /* (struct clone_args *, size) */
@@ -2811,7 +2818,10 @@ void linux_syscall_dispatch(struct registers *r) {
             r->rax = (tid < 0) ? (uint64_t)-(long)LX_EAGAIN : (uint64_t)tid;
             break;
         }
-        if (cstack) { r->rax = (uint64_t)app_fork_at(r, cstack + cssize); break; }
+        if (cstack) {
+            if (cflags & LX_CLONE_VM) { r->rax = (uint64_t)app_vfork_at(r, cstack + cssize); break; }
+            r->rax = (uint64_t)app_fork_at(r, cstack + cssize); break;
+        }
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
     }

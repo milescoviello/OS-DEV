@@ -93,6 +93,7 @@ void    task_finish_switch(void);
  * Both are set before the task can be scheduled (no startup race). */
 task_t *task_create(void (*entry)(void), uint64_t cr3, void *proc);
 task_t *task_create_stack(void (*entry)(void), uint64_t cr3, void *proc, int stack_size);
+task_t *task_create_stack_suspended(void (*entry)(void), uint64_t cr3, void *proc, int stack_size);   /* born TASK_STOPPED: task_cont it once FPU/TLS are copied (M2006) */
 void    schedule(void);                    /* switch to the next ready task */
 void    task_yield(void);                  /* voluntarily give up the CPU */
 void    task_exit(void);                   /* end the current thread (no return) */

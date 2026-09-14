@@ -392,6 +392,41 @@ task_t *task_create(void (*entry)(void), uint64_t cr3, void *proc) {
 /* Like task_create but with an explicit kernel-stack size — for tasks that run
  * deep/heavy code (e.g. the browser fetch worker, which does bignum/RSA crypto
  * that would overflow the default 16 KB stack). */
+/* A TASK THAT CANNOT RUN UNTIL ITS CONTEXT IS COMPLETE (M2006).
+ *
+ * task_create_stack publishes the task as TASK_READY and links it into the run
+ * queue, so another core can pick it up on the next tick. Its callers then go
+ * on to copy the things that make it a working thread -- the FPU state and,
+ * critically, the TLS base:
+ *
+ *     a->task = task_create_stack(...);
+ *     task_copy_fpu(a->task, p->task);
+ *     task_copy_tls(a->task, p->task);     <- too late if it already ran
+ *
+ * A child that wins that race runs glibc with %fs = 0, and the first function
+ * compiled with a stack protector reads its canary from %fs:0x28 -- which,
+ * with a zero base, is the linear address 0x28:
+ *
+ *     err=0x4 in a ring-3 task at ...  (CR2=0x0000000000000028)
+ *     posix_spawnattr_setsigmask + 0x57d
+ *
+ * That is the intermittent posix_spawn/cc1 crash. It was always possible; the
+ * vfork parent-suspension made the child's first instants far more likely to
+ * win, which is how it finally became reproducible. Create it stopped, finish
+ * the context, then task_cont it. */
+task_t *task_create_stack_suspended(void (*entry)(void), uint64_t cr3, void *proc, int stack_size) {
+    task_t *t = task_create_stack(entry, cr3, proc, stack_size);
+    if (!t) return 0;
+    uint64_t f = irq_save();
+    rq_lock_take();
+    /* Only if it has not already been picked up -- and if it has, the caller's
+     * copies are racing anyway, so say nothing and let task_cont be a no-op. */
+    if (t->state == TASK_READY) t->state = TASK_STOPPED;
+    rq_lock_give();
+    irq_restore(f);
+    return t;
+}
+
 task_t *task_create_stack(void (*entry)(void), uint64_t cr3, void *proc, int stack_size) {
     task_t *t = kzalloc(sizeof(task_t));
     if (!t) return 0;                        /* OOM: fail cleanly rather than deref NULL */
