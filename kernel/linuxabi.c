@@ -1270,6 +1270,22 @@ void linux_syscall_dispatch(struct registers *r) {
         if (!vmm_user_ok(r->r10, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         int sv[2];
         if (app_unix_socketpair(sv) != 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        /* THE TYPE'S FLAG BITS ARE PART OF THE REQUEST (M2012). socket() has
+         * passed SOCK_NONBLOCK/SOCK_CLOEXEC through since M1965 and accept4
+         * honours its own flags; socketpair masked them off, so a caller that
+         * asked for a non-blocking pair got a blocking one and was never told.
+         *
+         * Firefox's IPC channel is built exactly this way --
+         *   socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0)
+         * -- and then relies on the property it just asked for. It aborted at
+         * ipc/chromium/src/chrome/common/ipc_channel_posix.cc:128, which is
+         * the channel refusing to run on descriptors that are not what it
+         * created. Same defect class as pipe2's discarded flags (M2009): the
+         * dangerous failure is not refusing the request, it is granting it
+         * silently in name only. */
+        int sp_ty = (int)r->rsi;
+        if (sp_ty & 0x800)   { app_fd_set_nonblock(sv[0], 1); app_fd_set_nonblock(sv[1], 1); }   /* SOCK_NONBLOCK */
+        if (sp_ty & 0x80000) { app_fd_set_cloexec(sv[0], 1);  app_fd_set_cloexec(sv[1], 1);  }   /* SOCK_CLOEXEC */
         ((int *)r->r10)[0] = sv[0]; ((int *)r->r10)[1] = sv[1];
         r->rax = 0;
         break;

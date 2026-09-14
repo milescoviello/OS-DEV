@@ -2193,18 +2193,88 @@ void app_describe_addr(uint64_t addr) {
     kprintf("[fault] %lx is in no mapping of this process\n", addr);
 }
 
+/* WHERE IN THE PROGRAM IS THIS THREAD PARKED (M2012)?
+ *
+ * A kernel wchan says which of OUR functions a thread is blocked in, which for
+ * a stalled Linux process is almost always app_futex -- true, and useless. The
+ * question worth answering is which of THEIR functions asked. Every blocked
+ * thread has a saved ring-3 trap frame, so its user RIP is the return address
+ * into the library that made the syscall, and the VMA table can name the
+ * library and the offset inside it. That offset is resolvable off-box against
+ * the same file the guest mapped.
+ *
+ * Firefox parks a hundred threads on condition variables while it is working
+ * normally, so the useful output is not "who is waiting" -- it is that the
+ * addresses are all the SAME handful when it is idle and a different one when
+ * it is stuck. */
+/* Name the library and offset an address falls in, or 0 if none. */
+static const char *addr_site(struct app *a, uint64_t addr, uint64_t *out_off, int want_exec) {
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        if (addr < a->vma[i].start || addr >= a->vma[i].start + a->vma[i].len) continue;
+        if (want_exec && !(a->vma[i].prot & 4)) return 0;       /* PROT_EXEC */
+        *out_off = addr - a->vma[i].start + a->vma[i].foff;
+        return vma_path(a, i);
+    }
+    return 0;
+}
+static void dump_user_site(struct app *a, task_t *t) {
+    struct registers *uf = task_uframe(t);
+    if (!uf || !uf->rip) return;
+    uint64_t off = 0;
+    const char *lib = addr_site(a, uf->rip, &off, 0);
+    if (lib) kprintf("[app]        at %s + %lx\n", lib, off);
+    else     kprintf("[app]        at %lx (no mapping)\n", uf->rip);
+    /* ...AND WHO CALLED IT. The saved RIP is inside libc's syscall wrapper for
+     * every blocked thread, which is the same answer for all of them and
+     * therefore no answer at all. The frames above it are the ones that name
+     * the subsystem. There are no frame pointers to walk in optimised code, so
+     * scan the stack for words that land in an EXECUTABLE mapping -- the same
+     * technique the fault reporter uses -- and report the first few outside
+     * libc, which are the caller's own code. */
+    /* Read the stack through the HHDM using the TARGET's page tables, not by
+     * dereferencing user pointers: this runs from the window manager's own
+     * context, where the reported process's address space is not the live one,
+     * so a plain read would fault or -- worse -- silently read whatever is at
+     * that address in the CURRENT space. vmm_translate_in answers in the right
+     * space without switching CR3. */
+    if (!uf->rsp) return;
+    int shown = 0;
+    for (int w = 0; w < 256 && shown < 4; w++) {
+        uint64_t sp = uf->rsp + (uint64_t)w * 8;
+        uint64_t ph = vmm_translate_in(a->cr3, sp);
+        if (!ph) { if ((sp & 0xFFF) < 8) break; else continue; }
+        uint64_t v = *(const volatile uint64_t *)hhdm(ph);
+        if (v < 0x10000) continue;
+        uint64_t o2 = 0;
+        const char *l2 = addr_site(a, v, &o2, 1);
+        if (!l2) continue;
+        /* libc frames are the wrapper we already reported; skip them so the
+         * four lines we do print are the interesting ones. */
+        { const char *b = l2; for (const char *q = l2; *q; q++) if (*q == '/') b = q + 1;
+          if (b[0]=='l'&&b[1]=='i'&&b[2]=='b'&&b[3]=='c'&&b[4]=='.') continue;
+          if (b[0]=='l'&&b[1]=='i'&&b[2]=='b'&&b[3]=='p'&&b[4]=='t') continue; }
+        kprintf("[app]        <- %s + %lx\n", l2, o2);
+        shown++;
+    }
+}
+
 void app_dump_threads(int pid) {
     for (int i = 0; i < MAX_APPS; i++) {
         if (!apps[i].used || apps[i].pid != pid) continue;
+        struct app *a = &apps[i];
         kprintf("[app] pid %d main state=%d wchan=%lx\n", pid,
-                apps[i].task ? (int)apps[i].task->state : -1,
-                apps[i].task ? (unsigned long)apps[i].task->wchan : 0UL);
+                a->task ? (int)a->task->state : -1,
+                a->task ? (unsigned long)a->task->wchan : 0UL);
+        if (a->task) dump_user_site(a, a->task);
         for (int k = 0; k < APP_MAXTHREAD; k++)
-            if (apps[i].thr[k])
+            if (a->thr[k]) {
                 kprintf("[app]   thread %d state=%d wchan=%lx wake_pending=%d\n",
-                        apps[i].thr[k]->id, (int)apps[i].thr[k]->state,
-                        (unsigned long)apps[i].thr[k]->wchan,
-                        apps[i].thr[k]->wake_pending);
+                        a->thr[k]->id, (int)a->thr[k]->state,
+                        (unsigned long)a->thr[k]->wchan,
+                        a->thr[k]->wake_pending);
+                dump_user_site(a, a->thr[k]);
+            }
         return;
     }
 }

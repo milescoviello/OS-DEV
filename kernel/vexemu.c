@@ -39,6 +39,7 @@
 #include "task.h"
 #include "console.h"
 #include "interrupts.h"
+#include "smp.h"   /* smp_current_cpu: one scratch area per core (M2012) */
 
 extern void     fpu_xsave_to(void *area64);
 extern void     fpu_xrstor_from(const void *area64);
@@ -193,12 +194,22 @@ int vexemu_try(struct registers *r) {
      * chosen at runtime. */
     uint32_t asz = fpu_xsave_size();
     if (asz < 576 + 256) asz = 576 + 256;
-    static uint8_t area[4096] __attribute__((aligned(64)));
-    static volatile int busy;                      /* emulating is not re-entrant */
-    if (asz > sizeof area) return 0;
+    /* ONE SCRATCH AREA PER CORE, not one shared with a busy flag (M2012).
+     *
+     * A shared buffer needs mutual exclusion, and the only honest answer a
+     * contended emulator can give is "not now" -- which this code reported as
+     * "cannot emulate", so the process was killed for an instruction we know
+     * how to complete. That is not hypothetical with libxul: 702 GFNI sites
+     * across seventy threads on four cores collide constantly.
+     *
+     * Per-core removes the question. Interrupts are already off for the
+     * spill/edit/reload, so nothing else on THIS core can touch this core's
+     * buffer, and no other core can reach it at all. */
+#define VEXEMU_MAXCPUS 16
+    static uint8_t area_pc[VEXEMU_MAXCPUS][4096] __attribute__((aligned(64)));
+    if (asz > sizeof area_pc[0]) return 0;
     uint64_t fl = irq_save();
-    if (busy) { irq_restore(fl); return 0; }
-    busy = 1;
+    uint8_t *area = area_pc[smp_current_cpu() & (VEXEMU_MAXCPUS - 1)];
     for (uint32_t i = 0; i < asz; i++) area[i] = 0;
     fpu_xsave_to(area);
     /* XRSTOR INITIALISES a component whose XSTATE_BV bit is clear instead of
@@ -212,7 +223,6 @@ int vexemu_try(struct registers *r) {
     vreg_write(area, dest, wide, out);
 
     fpu_xrstor_from(area);
-    busy = 0;
     irq_restore(fl);
 
     if (!g_vexemu_count)

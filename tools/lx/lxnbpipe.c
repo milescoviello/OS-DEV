@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 
 static int fails;
 
@@ -138,6 +139,35 @@ int main(void)
             else { printf("LXNB: the fcntl route did not take (rc=%d%s)\n", rc2, rc2 == -1 ? ": IT BLOCKED" : ""); fails++; }
         }
         close(p2[0]); close(p2[1]);
+    }
+
+    /* ...AND THE SAME PROPERTY ON A SOCKETPAIR (M2012). Firefox's IPC channel
+     * asks for it in the socket TYPE rather than with a separate fcntl --
+     *   socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0)
+     * -- and then relies on what it asked for. Granting the request in name
+     * only is worse than refusing it: the channel aborted at
+     * ipc_channel_posix.cc:128 rather than reporting anything about flags.
+     * Both flags are checked through a descriptor QUERY, not by remembering
+     * what was requested, because the request is exactly the part that was
+     * being dropped. */
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sp) != 0) {
+        printf("LXNB: socketpair(SOCK_NONBLOCK|SOCK_CLOEXEC) FAILED errno=%d\n", errno); fails++;
+    } else {
+        int ok = 1;
+        for (int i = 0; i < 2; i++) {
+            int fl = fcntl(sp[i], F_GETFL, 0), fd_fl = fcntl(sp[i], F_GETFD, 0);
+            if (fl < 0 || !(fl & O_NONBLOCK)) { printf("LXNB: socketpair end %d is not O_NONBLOCK (flags 0x%x)\n", i, fl); ok = 0; }
+            if (fd_fl < 0 || !(fd_fl & FD_CLOEXEC)) { printf("LXNB: socketpair end %d is not FD_CLOEXEC (flags 0x%x)\n", i, fd_fl); ok = 0; }
+        }
+        /* ...and the behaviour, not just the bit: an empty non-blocking socket
+         * must answer EAGAIN rather than block, which is what the event loop
+         * on the other side of that channel depends on. */
+        int rc3 = timed(kid_empty_read, sp, 3000);
+        if (rc3 != 0) { printf("LXNB: an empty non-blocking socketpair read did not return EAGAIN (rc=%d%s)\n", rc3, rc3 == -1 ? ": IT BLOCKED" : ""); ok = 0; }
+        if (ok) printf("LXNB: socketpair(SOCK_NONBLOCK|SOCK_CLOEXEC) HONOURS BOTH FLAGS, and an empty read is EAGAIN\n");
+        else fails++;
+        close(sp[0]); close(sp[1]);
     }
 
     printf("LXNB: %d failure(s)\n", fails);

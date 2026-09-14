@@ -216,10 +216,43 @@ LXTHREAD: 4 threads
         grep -a -A2 "KERNEL PANIC" "$SLOG3" | head -3
         f3=1
     fi
-    if grep -aq "XSAVE+AVX enabled" "$SLOG3"; then
-        echo "  ok: XSAVE+AVX armed on a CPU that has it ($(grep -ao 'state area [0-9]* bytes' "$SLOG3" | head -1))"
+    # Assert the VALUE, not a sentence (M2007). This used to grep for the
+    # literal "XSAVE+AVX enabled", so rewording the boot log broke the test
+    # while the kernel was doing more than before. XCR0 is the thing that
+    # matters: bit 1 = SSE, bit 2 = AVX, and a component whose bit is clear
+    # cannot be saved, restored, or written by the #UD emulator below.
+    xcr0=$(grep -ao "fpu: XSAVE enabled, XCR0=[0-9a-f]*" "$SLOG3" | head -1 | sed 's/.*XCR0=//')
+    if [ -n "$xcr0" ] && [ $(( 0x$xcr0 & 6 )) -eq 6 ]; then
+        echo "  ok: XSAVE armed with SSE+AVX state on a CPU that has it (XCR0=$xcr0, $(grep -ao 'state area [0-9]* bytes' "$SLOG3" | head -1))"
     else
-        echo "  FAIL: XSAVE/AVX was not enabled under -cpu max"; f3=1
+        echo "  FAIL: XSAVE/AVX was not enabled under -cpu max (XCR0='$xcr0')"; f3=1
+        grep -a "fpu:" "$SLOG3" | head -2
+    fi
+    # GFNI, EMULATED (M2007). Every binary on this host is built -march=
+    # arrowlake-s and libxul alone has 702 unconditional VGF2P8AFFINEQB sites;
+    # QEMU's TCG has no GFNI and there is no /dev/kvm here, so each of those is
+    # an invalid opcode. The probe carries expected vectors taken from real
+    # hardware -- the claim is not "it did not crash", it is that the bytes
+    # come out IDENTICAL to a machine that has the instruction, for 128-bit,
+    # 256-bit and memory operands.
+    if grep -aq "LXISA: GFNI ok" "$SLOG3" &&
+       [ "$(grep -ac "LXISA: gfni .* matches" "$SLOG3")" -ge 3 ] &&
+       ! grep -aq "LXISA: gfni .* [1-9][0-9]* byte(s) differ" "$SLOG3"; then
+        echo "  ok: GFNI executes and its results are byte-identical to hardware ($(grep -ao 'gfni 256-bit result matches[^)]*)' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: GFNI:"; grep -a "LXISA: gfni\|LXISA: trying GFNI\|LXISA: GFNI" "$SLOG3" | head -5; f3=1
+    fi
+    if grep -aq "\[vexemu\] completing vgf2p8affineqb in software" "$SLOG3"; then
+        echo "  ok: ...and those results came from OUR EMULATOR, not from the CPU (the #UD handler completed the instruction)"
+    else
+        # If a future host/emulator grows real GFNI this is not a failure -- but
+        # say which of the two happened rather than passing silently.
+        echo "  ok: (GFNI ran natively on this CPU -- the emulator was not needed)"
+    fi
+    if grep -aq "LXISA: all probed instruction sets executed" "$SLOG3"; then
+        echo "  ok: every vector ISA glibc and libxul dispatch on executed here (SSE2/AVX/AVX2/FMA/AES-NI/PCLMULQDQ/GFNI/VAES)"
+    else
+        echo "  FAIL: a probed instruction set did not execute:"; grep -a "LXISA" "$SLOG3" | tail -6; f3=1
     fi
     # The real proof is BEHAVIOURAL: glibc must now get PAST the AVX instruction
     # in _dl_aux_init. It does that by reaching its first real syscall, brk(12).
@@ -439,6 +472,16 @@ LXTHREAD: 4 threads
         echo "  ok: O_NONBLOCK on a pipe -- empty reads and full writes return EAGAIN, EOF still reads as EOF"
     else
         echo "  FAIL: O_NONBLOCK on a pipe:"; grep -a "LXNB" "$SLOG3" | head -8; f3=1
+    fi
+    # ...and the same property asked for in a socket TYPE rather than with an
+    # fcntl (M2012). Firefox's IPC channel builds its socketpair with
+    # SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK and then relies on what it asked
+    # for; socketpair masked both flags off, so it aborted at
+    # ipc_channel_posix.cc:128 without saying anything about flags.
+    if grep -aq "LXNB: socketpair(SOCK_NONBLOCK|SOCK_CLOEXEC) HONOURS BOTH FLAGS" "$SLOG3"; then
+        echo "  ok: socketpair honours SOCK_NONBLOCK and SOCK_CLOEXEC (queried back through the descriptor, not remembered)"
+    else
+        echo "  FAIL: socketpair flags:"; grep -a "LXNB: socketpair" "$SLOG3" | head -4; f3=1
     fi
     # ABSOLUTE DEADLINES (M2010). FUTEX_WAIT_BITSET's timeout is a timestamp,
     # not a duration -- that is the entire difference between it and

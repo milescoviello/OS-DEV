@@ -313,6 +313,22 @@ void isr_dispatch(struct registers *r) {
                 }
                 line[16 * 3] = 0;
                 kprintf("[fault] bytes at rip:%s\n", line);
+                /* NAME THE CANARY READ (M2012). `64 48 8b 04 25 28 00 00 00`
+                 * is `mov %fs:0x28,%rax` -- the stack-protector canary, which
+                 * every glibc function with a local buffer does on entry. When
+                 * CR2 is 0x28 the FS base was ZERO, so this is not a wild
+                 * pointer or a corrupted stack: it is a thread running with no
+                 * TLS at all, and the fix is always in clone/CLONE_SETTLS or
+                 * the context switch's FS_BASE restore rather than anywhere
+                 * near the reported address. Worth a line, because the raw
+                 * report reads as a generic null dereference in libc and sends
+                 * you to the wrong place. */
+                if (r->int_no == 14 && cr2 == 0x28 &&
+                    ip[0] == 0x64 && ip[1] == 0x48 && ip[2] == 0x8b &&
+                    ip[3] == 0x04 && ip[4] == 0x25 && ip[5] == 0x28)
+                    kprintf("[fault] that is `mov %%fs:0x28,%%rax` -- the stack-protector canary, "
+                            "read with a ZERO FS BASE: this thread has no TLS (saved fs_base=%p)\n",
+                            (void *)task_fs_base());
             }
             /* The last few syscalls, not the last 256: on a fault the tail is
              * what matters, and the full ring is hundreds of console-locked
