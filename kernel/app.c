@@ -5866,7 +5866,7 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
  * table as type 3 (obj = memfd index). Distinct from mseal (M1153, which seals
  * virtual-ADDRESS ranges): these are FILE objects carrying one-way F_SEAL_* flags
  * (WRITE/SHRINK/GROW/SEAL). Refcounted across fork/dup2 exactly like a pipe. */
-#define NMEMFD 16
+#define NMEMFD 256      /* Firefox wants one /dev/shm object per content process, plus GTK's pools (M2008) */
 #define MEMFD_MAX (16ul * 1024 * 1024)   /* 16 MiB per object (kheap-bounded) */
 /* `raw` is the allocation; `buf` is the PAGE-ALIGNED view inside it, and the
  * capacity is a whole number of pages. Both are needed to mmap a memfd
@@ -5880,7 +5880,13 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
  * freed memory. wl_shm sizes a pool once and then maps it, so refusing is
  * both correct and sufficient. */
 static struct memfd { int used, refs; unsigned seals; unsigned long size, cap;
-                      char *buf, *raw; int mapped; char name[32]; } memfds[NMEMFD];
+                      char *buf, *raw; int mapped; char name[64];
+                      /* POSIX shared memory (M2008): a memfd is anonymous, but
+                       * /dev/shm/NAME is the same object to everyone who opens
+                       * that name. `named` marks the ones that are reachable by
+                       * name, so memfd_create's anonymous objects never collide
+                       * with them. */
+                      int named; } memfds[NMEMFD];
 
 static int memfd_alloc(const char *name) {
     for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used) {
@@ -6560,6 +6566,73 @@ int app_memfd_create(const char *name, int flags) {
     a->fd[fd] = (struct fdent){ 1, 3, 1, idx, {0}, 0 };      /* used, type=memfd, writable, obj=idx */
     return fd;
 }
+/* POSIX SHARED MEMORY: open /dev/shm/NAME (M2008).
+ *
+ * Firefox does not treat this as optional. Its parent and content processes
+ * talk through a shared segment, and when the open failed it crashed on
+ * purpose rather than continue:
+ *
+ *   openat("/dev/shm/org.mozilla.ipc.106.1", O_RDWR|O_CREAT|O_EXCL) = -ENOENT
+ *   ... mov %rcx,(%rax) with rax = 0, then two noreturn calls
+ *
+ * shm_open(3) on Linux IS open("/dev/shm/NAME"), so this needs no new syscall
+ * -- only for that path to resolve to an object two processes can both map. A
+ * memfd is already exactly that object: app_mmap_memfd hands both mappers the
+ * same physical pages, which is what makes wl_shm a zero-copy pixel handoff and
+ * is proven by lxscm. The only thing missing was a NAME to find it by.
+ *
+ * Returns an fd, or a negative Linux errno. */
+int app_shm_fd(const char *name, int o_creat, int o_excl) {
+    struct app *a = cur();
+    if (!a || !name || !name[0]) return -22;   /* EINVAL */
+    /* memfd_alloc TRUNCATES the name it stores, and a truncated name is a name
+     * collision waiting to happen: two segments differing only past the cut
+     * would be the same object to every lookup below. Refuse instead. */
+    int nlen = 0; while (name[nlen]) nlen++;
+    if (nlen >= (int)sizeof memfds[0].name) return -36;   /* ENAMETOOLONG */
+    int idx = -1;
+    for (int i = 0; i < NMEMFD; i++) {
+        if (!memfds[i].used || !memfds[i].named) continue;
+        int k = 0;
+        while (memfds[i].name[k] && memfds[i].name[k] == name[k]) k++;
+        if (!memfds[i].name[k] && !name[k]) { idx = i; break; }
+    }
+    if (idx >= 0 && o_creat && o_excl) return -17;   /* EEXIST */
+    if (idx < 0) {
+        if (!o_creat) return -2;    /* ENOENT */
+        idx = memfd_alloc(name);
+        if (idx < 0) return -28;   /* ENOSPC */
+        memfds[idx].named = 1;
+        memfds[idx].refs++;        /* the NAME is a reference: see app_shm_unlink */
+    } else {
+        memfd_ref(idx);                     /* another descriptor on the same object */
+    }
+    int fd = -1;
+    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }
+    if (fd < 0) { memfd_unref(idx); return -24; }   /* EMFILE */
+    a->fd[fd] = (struct fdent){ 1, 3, 1, idx, {0}, 0 };   /* used, type=memfd, writable */
+    return fd;
+}
+
+/* shm_unlink(3): the NAME goes away now; the object itself lives until the last
+ * descriptor and mapping are gone, which is what POSIX requires. Firefox
+ * creates with O_EXCL and unlinks immediately, so without this the second run
+ * of any process would collide with the first one's name. */
+int app_shm_unlink(const char *name) {
+    if (!name || !name[0]) return -22;   /* EINVAL */
+    for (int i = 0; i < NMEMFD; i++) {
+        if (!memfds[i].used || !memfds[i].named) continue;
+        int k = 0;
+        while (memfds[i].name[k] && memfds[i].name[k] == name[k]) k++;
+        if (!memfds[i].name[k] && !name[k]) {
+            memfds[i].named = 0;
+            memfd_unref(i);         /* drop the name's reference; open fds keep it alive */
+            return 0;
+        }
+    }
+    return -2;    /* ENOENT */
+}
+
 /* Add memfd seals (one-way OR of F_SEAL_*). Returns the new seal set, or -1
  * (bad fd, or already F_SEAL_SEAL'd). `add`==0 just queries the current seals. */
 long app_memfd_seal(int fd, unsigned add) {

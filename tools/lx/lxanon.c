@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 
 #ifndef F_ADD_SEALS
 #define F_ADD_SEALS 1033
@@ -91,6 +92,74 @@ int main(void)
         close(fd2);
     }
     close(fd);
+
+    /* ---- POSIX SHARED MEMORY, between two real processes (M2008) -----------
+     *
+     * This is the part Firefox does not treat as optional: its parent and
+     * content processes address each other through a segment they both open by
+     * NAME, and when the open fails it dereferences a null pointer on purpose.
+     * shm_open(3) is literally open("/dev/shm/NAME"), so what is being tested
+     * here is that the name resolves and that two separate address spaces end
+     * up looking at the SAME bytes -- which is the only claim that matters and
+     * the only one a single-process test cannot make.
+     *
+     * The handshake goes both ways on purpose: a one-way check passes if the
+     * child merely inherited the parent's mapping through fork. */
+    shm_unlink("/osdev-shm-probe");                    /* from a previous run */
+    int sfd = shm_open("/osdev-shm-probe", O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (sfd < 0) {
+        printf("LXANON: shm_open(O_CREAT|O_EXCL) FAILED errno=%d\n", errno); fails++;
+    } else {
+        printf("LXANON: shm_open -> fd %d\n", sfd);
+        /* A second O_EXCL create of a name that exists must be refused -- that
+         * is how two processes decide which of them owns the segment. */
+        int dup_fd = shm_open("/osdev-shm-probe", O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (dup_fd >= 0) { printf("LXANON: O_EXCL did not refuse an existing name\n"); fails++; close(dup_fd); }
+        else if (errno != EEXIST) { printf("LXANON: O_EXCL refused with errno=%d, wanted EEXIST\n", errno); fails++; }
+        else printf("LXANON: a second O_EXCL create is refused with EEXIST\n");
+
+        if (ftruncate(sfd, 4096) != 0) { printf("LXANON: ftruncate on shm FAILED errno=%d\n", errno); fails++; }
+        volatile unsigned *sp = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+        if (sp == MAP_FAILED) { printf("LXANON: mmap of shm FAILED errno=%d\n", errno); fails++; }
+        else {
+            sp[0] = 0; sp[1] = 0;
+            sp[2] = 0xC0FFEE01u;                       /* what the parent says */
+            pid_t kid = fork();
+            if (kid == 0) {
+                /* A FRESH open by name in the child -- not the inherited fd,
+                 * which would prove nothing about the name at all. */
+                int cfd = shm_open("/osdev-shm-probe", O_RDWR, 0600);
+                if (cfd < 0) _exit(11);
+                volatile unsigned *cp = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+                if (cp == MAP_FAILED) _exit(12);
+                if (cp[2] != 0xC0FFEE01u) _exit(13);   /* the parent's write is not visible */
+                cp[3] = 0xD15EA5E2u;                   /* answer in the same pages */
+                cp[0] = 1;
+                _exit(0);
+            }
+            if (kid < 0) { printf("LXANON: fork FAILED errno=%d\n", errno); fails++; }
+            else {
+                int st = 0; waitpid(kid, &st, 0);
+                int cst = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                if (cst != 0) { printf("LXANON: the child failed at step %d\n", cst); fails++; }
+                else if (sp[0] != 1 || sp[3] != 0xD15EA5E2u) {
+                    printf("LXANON: the child's write is not visible to the parent (%u, 0x%x)\n", sp[0], sp[3]); fails++;
+                } else {
+                    printf("LXANON: TWO PROCESSES SHARE ONE /dev/shm SEGMENT BY NAME (0x%x both ways)\n", sp[3]);
+                }
+            }
+            munmap((void *)sp, 4096);
+        }
+        close(sfd);
+        /* The name goes away; the segment itself is still mappable by anyone
+         * holding a descriptor, which is what POSIX promises. */
+        if (shm_unlink("/osdev-shm-probe") != 0) { printf("LXANON: shm_unlink FAILED errno=%d\n", errno); fails++; }
+        else {
+            int gone = shm_open("/osdev-shm-probe", O_RDWR, 0600);
+            if (gone >= 0) { printf("LXANON: the name survived shm_unlink\n"); fails++; close(gone); }
+            else printf("LXANON: shm_unlink removed the name\n");
+        }
+    }
 
     printf("LXANON: %d failure(s)\n", fails);
     return fails ? 1 : 0;

@@ -409,6 +409,25 @@ LXTHREAD: 4 threads
     else
         echo "  FAIL: the anonymous-shared-file chain:"; grep -a "LXANON" "$SLOG3" | head -6; f3=1
     fi
+    # POSIX SHARED MEMORY between two real processes (M2008). Firefox does not
+    # treat this as optional: parent and content processes address each other
+    # through a segment they open BY NAME, and when the open failed it
+    # dereferenced a null pointer on purpose. shm_open(3) is literally
+    # open("/dev/shm/NAME"), so the claim is that the name resolves AND that two
+    # separate address spaces see the same bytes -- the handshake runs both ways
+    # because a one-way check passes if the child merely inherited the mapping
+    # through fork.
+    if grep -aq "LXANON: TWO PROCESSES SHARE ONE /dev/shm SEGMENT BY NAME" "$SLOG3"; then
+        echo "  ok: two processes share one /dev/shm segment found by name ($(grep -ao 'BY NAME ([^)]*)' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: POSIX shared memory:"; grep -a "LXANON: shm\|LXANON: TWO\|LXANON: the child" "$SLOG3" | head -4; f3=1
+    fi
+    if grep -aq "LXANON: a second O_EXCL create is refused with EEXIST" "$SLOG3" && \
+       grep -aq "LXANON: shm_unlink removed the name" "$SLOG3"; then
+        echo "  ok: O_EXCL and shm_unlink -- how two processes agree on which of them owns the segment"
+    else
+        echo "  FAIL: shm naming:"; grep -a "LXANON: shm\|O_EXCL" "$SLOG3" | head -4; f3=1
+    fi
     if grep -aq "LXCAGE: 4GiB/4GiB wrote and read back" "$SLOG3" && \
        grep -aq "LXCAGE: 0 failure(s)" "$SLOG3"; then
         echo "  ok: reserve 8 GiB, align to 4 GiB, trim head and tail -- and the kept region is still writable end to end"

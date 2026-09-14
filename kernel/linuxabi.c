@@ -920,6 +920,19 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)app_set_tid_address(r->rdi);
         break;
     case LXS_unlink_:                       /* (path) */
+        /* shm_unlink(3) is unlink("/dev/shm/NAME"). Firefox creates its segment
+         * with O_EXCL and unlinks it immediately, so without this the next
+         * process to want that name collides with a ghost. (M2008) */
+        if (r->rdi && vmm_user_ok(r->rdi, 1)) {
+            const char *up_ = (const char *)r->rdi;
+            const char *t_ = "/dev/shm/";
+            int k_ = 0; while (t_[k_] && up_[k_] == t_[k_]) k_++;
+            if (!t_[k_] && up_[k_]) {
+                int urc = app_shm_unlink(up_ + k_);
+                r->rax = (urc < 0) ? (uint64_t)(long)urc : 0;
+                break;
+            }
+        }
     case LXS_unlinkat_: {                   /* (dirfd, path, flags) */
         /* unlinkat shifts its arguments one right, exactly like faccessat. */
         uint64_t up = (r->rax == LXS_unlink_) ? r->rdi : r->rsi;
@@ -2575,6 +2588,20 @@ void linux_syscall_dispatch(struct registers *r) {
             if (!t[k] && !upath[k]) {
                 int tfd = app_open_console_alias();
                 r->rax = (tfd < 0) ? (uint64_t)-(long)LX_ENODEV : (uint64_t)tfd;
+                break;
+            }
+        }
+        /* /dev/shm/NAME is POSIX shared memory, and shm_open(3) IS this open.
+         * Firefox's parent and content processes talk through one, and it
+         * crashes on purpose when the open fails. (M2008) */
+        {
+            const char *t = "/dev/shm/";
+            int k = 0; while (t[k] && upath[k] == t[k]) k++;
+            if (!t[k] && upath[k]) {
+                long sflags = (long)r->rdx;
+                int sfd = app_shm_fd(upath + k, (sflags & LXO_CREAT) ? 1 : 0,
+                                     (sflags & 0200 /*O_EXCL*/) ? 1 : 0);
+                r->rax = (sfd < 0) ? (uint64_t)(long)sfd : (uint64_t)sfd;
                 break;
             }
         }

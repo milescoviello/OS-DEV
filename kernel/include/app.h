@@ -165,7 +165,9 @@ int      app_munlock(uint64_t addr, uint64_t len);              /* unpin mmap pa
 int      app_mlockall(int flags);                               /* MCL_CURRENT pins all VMAs, MCL_FUTURE auto-pins new mmaps; 0/-1 (M1283) */
 int      app_munlockall(void);                                  /* unpin all VMAs + clear MCL_FUTURE; 0/-1 (M1283) */
 int      app_swap_out(uint64_t addr, uint64_t len);             /* page out anon pages in range to swap; pages/-1 (M1105) */
-uint64_t app_shm_open(const char *name, uint64_t size);         /* map a named shared-memory object; base VA or 0 (M1108) */
+uint64_t app_shm_open(const char *name, uint64_t size);
+int      app_shm_fd(const char *name, int o_creat, int o_excl);  /* open /dev/shm/NAME as a shareable memfd; fd or -errno (M2008) */
+int      app_shm_unlink(const char *name);                       /* shm_unlink: drop the NAME, keep the object (M2008) */         /* map a named shared-memory object; base VA or 0 (M1108) */
 long     app_futex(uint64_t uaddr, int op, int val, long timeout_ms);  /* FUTEX_WAIT/WAKE on a (possibly shared) user word; timeout_ms<0 = wait forever (M1109, timeout M1578) */
 int      app_fault_handle(uint64_t cr2, uint64_t err); /* #PF hook: COW copy / swap-in / lazily map an mmap page; 1 if handled */
 struct registers;                                   /* (interrupts.h) */

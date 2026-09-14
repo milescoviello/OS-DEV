@@ -517,7 +517,13 @@ static int sysfs_has(const char *abs) {
 
 static int proc_pid_path(const char *abs, int *pid, const char **file);   /* defined below (M1965) */
 int procfs_is_dir(const char *abs) {
-    return peq(abs, "/proc") || peq(abs, "/proc/") || peq(abs, "/dev") || peq(abs, "/dev/");
+    /* /dev/shm is a DIRECTORY -- POSIX shared memory lives in it as named
+     * objects, and a program that means to use shm checks for the directory
+     * before trying. The objects themselves are not files on any filesystem;
+     * openat() intercepts /dev/shm/NAME into a named memfd (M2008), so this
+     * only has to make the directory itself real. */
+    return peq(abs, "/proc") || peq(abs, "/proc/") || peq(abs, "/dev") || peq(abs, "/dev/") ||
+           peq(abs, "/dev/shm") || peq(abs, "/dev/shm/");
 }
 int procfs_owns(const char *abs) {
     return startswith(abs, "/proc/") || startswith(abs, "/dev/") ||
