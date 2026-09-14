@@ -489,6 +489,15 @@ LXTHREAD: 4 threads
         echo "  FAIL: an Invalid Opcode fault occurred (AVX not usable?):"
         grep -a "Invalid Opcode" "$SLOG3" | head -1; f3=1
     fi
+    # KEEP THE EVIDENCE. cleanup3 deletes SLOG3 on the way out, so a failure
+    # that only happens inside `make check` -- where a hundred VMs are running
+    # at once and nothing reproduces by hand -- left nothing at all to look at.
+    # A test that deletes its own log on the one run that matters is a harness
+    # defect, not a tidy one. (M2000)
+    if [ $f3 -ne 0 ]; then
+        cp "$SLOG3" /tmp/osdev-linuxabi-FAIL.log 2>/dev/null && \
+            echo "  (the failing boot's serial log is at /tmp/osdev-linuxabi-FAIL.log)"
+    fi
     [ $f3 -eq 0 ] || { echo "FAIL: XSAVE/AVX test"; exit 1; }
     echo "PASS: a real GLIBC static-PIE binary runs under OS-DEV (AVX via XSAVE, SysV auxv stack, clean exit)"
 

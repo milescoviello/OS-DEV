@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1999-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2000-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1259,3 +1259,60 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   M1998 fixed only for `exit_group`. A process killed by SIGSEGV has to stop its
   siblings for exactly the reason a clean exit does — the same
   `[fault] UNMAPPED ... 4 vmas` came back through the second doorway.
+
+- **M2000** — **Claude Code works, and a 401 came back from the server.** With a
+  deliberately fake key in its environment it resolves `api.anthropic.com` over
+  our DNS, opens a TCP connection on our own stack, completes a TLS handshake,
+  sends a real POST and reads a real reply:
+
+      Failed to authenticate. API Error: 401 API key is invalid.
+
+  That 401 is the whole pipeline, proven from the outside. Without a key it
+  prints its real answer instead — `Not logged in · Please run /login` — and
+  exits 1, three times out of three on four cores. The developer's own
+  credentials are never staged into a guest image, so that is exactly as far as
+  this can honestly be taken.
+
+  Two bugs stood between here and there, and the split that found them was
+  **one core versus four**: single-core runs were correct and four-core runs
+  died dereferencing NULL in a process with a perfectly healthy VMA table.
+
+  **`madvise(MADV_DONTNEED)` freed the frame without telling the other cores.**
+  Every other place that takes a mapping away calls `app_tlb_sync` — `munmap`
+  does, `mprotect` does, M1963 added both for this exact reason — and `madvise`
+  did not. It is the one a JavaScript engine calls constantly: JSC decommits its
+  GC blocks 64 KiB at a time, and the syscall ring is full of it. So core A
+  dropped the PTE and handed the frame back to the allocator while core B still
+  held a cached translation; the frame was reissued immediately and B kept
+  writing to it. **The order matters as much as the shootdown**: unmap a bounded
+  chunk, drop the lock, make every core forget, and only *then* return the
+  frames — anything else leaves a window where the frame belongs to someone
+  else and is still reachable. `MADV_PAGEOUT` came out from under the VMA
+  spinlock at the same time; it writes every page to **disk**, and holding a
+  spinlock across that is the failure M1912 and M1993 both were.
+
+  **`mmap`'s address hint was ignored, and the window was too small to honour
+  it.** mimalloc — which is what Bun allocates with — picks an address in
+  [2 TiB, 30 TiB) and passes it as a hint; Linux honours a free hint, so on
+  Linux its arenas land where it chose. Every such request fell outside our 256
+  GiB window, so everything was packed into the low few gigabytes on top of the
+  region JavaScriptCore had reserved for its pointer cage. The window is now 32
+  TiB — this is 4-level paging with a 48-bit user half, and the PML4 entry for
+  30 TiB is index 61 whose PDPT is allocated on demand exactly like index 0.
+
+  The instructive part is what I got wrong in between: I honoured the hint by
+  calling `app_mmap_fixed`, and **`MAP_FIXED` REPLACES what is already mapped**
+  — that is its defining behaviour and ld.so depends on it. A hint is advice.
+  Routing one through `MAP_FIXED` hands a caller that merely had a preference
+  the power to destroy a mapping it knows nothing about, and the owner dies
+  later with a SIGSEGV that names nothing. `app_mmap_hint` refuses on any
+  overlap and lets the caller fall back, which is what Linux does.
+
+  **And the compositor was dropping messages.** `wl_send` handed a whole message
+  to `unix_send`, which writes what fits in the peer's ring and reports how
+  much — so a busy client got *half a message*, read a header claiming 44 bytes,
+  got 20, and interpreted every byte after that at the wrong offset. Firefox
+  says so out loud: `Wayland protocol error: message too short, object (2),
+  message global(usu)`. Each client now has a real output queue: append the
+  whole message, flush what the ring takes, resume at the exact byte. The stream
+  stays byte-exact however slow the client is.

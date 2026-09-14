@@ -48,6 +48,7 @@
 
 #define WL_MAXCLIENT 8
 #define WL_INBUF     16384
+#define WL_OUTBUF 262144   /* a slow client must never cost us a message (M2000) */
 
 /* Object ids. 1 is always wl_display; a client allocates the rest from 2 up. */
 #define WL_DISPLAY_ID 1
@@ -196,6 +197,24 @@ struct wl_client {
     int      used;
     int      ep;                   /* AF_UNIX endpoint (unixsock.c) */
     uint8_t  in[WL_INBUF];
+    /* AN OUTPUT QUEUE, because a compositor may not drop a message (M2000).
+     * unix_send writes what fits in the peer's ring and reports how much --
+     * and wl_send used to hand it a whole message and move on. A partial write
+     * leaves HALF A MESSAGE in the stream: the client reads a header saying 44
+     * bytes, gets 20, and every byte after that is interpreted at the wrong
+     * offset. Firefox says so out loud --
+     *
+     *   [GFX1-]: Wayland protocol error: message too short, object (2),
+     *            message global(usu)
+     *
+     * -- and then closes the connection, after which every later send returns
+     * -1 and the log fills with failures that are consequences, not causes.
+     *
+     * Queue instead: append the whole message, flush as much as the ring takes,
+     * and resume at the exact byte next time. The stream stays byte-exact
+     * however slow the client is. */
+    uint8_t  out[WL_OUTBUF];
+    int      outlen;
     int      inlen;                /* bytes accumulated but not yet consumed */
     uint32_t registry;             /* the client's wl_registry object id, 0 = none yet */
     uint32_t serial;               /* configure serials, monotonic per client */
@@ -265,6 +284,7 @@ static void wr32(uint8_t *p, uint32_t v) {
 }
 
 /* Build and send one event. `body` is already-marshalled argument bytes. */
+static void wl_flush(struct wl_client *c);
 static void wl_send(struct wl_client *c, uint32_t obj, uint16_t opcode,
                     const uint8_t *body, int blen) {
     uint8_t msg[512];
@@ -273,14 +293,31 @@ static void wl_send(struct wl_client *c, uint32_t obj, uint16_t opcode,
     wr32(msg + 0, obj);
     wr32(msg + 4, ((uint32_t)total << 16) | opcode);
     for (int i = 0; i < blen; i++) msg[8 + i] = body[i];
-    long w = unix_send(c->ep, msg, (unsigned long)total);
-    /* A SHORT send is not a warning here, it is a desynced protocol stream:
-     * the client will read a partial header and every message after it is
-     * garbage. Say so rather than let it look like a hang. */
-    if (w != total)
-        kprintf("[wl] send obj=%u op=%u size=%d -> %ld (SHORT)\n", obj, opcode, total, w);
-    else if (g_wl_verbose)
-        kprintf("[wl] -> obj=%u op=%u size=%d\n", obj, opcode, total);
+    if (c->outlen + total > WL_OUTBUF) {
+        /* 256 KiB behind and still not reading: this is not slowness, and
+         * there is no correct recovery -- the stream cannot skip a message. */
+        kprintf("[wl] output queue FULL (%d bytes): dropping obj=%u op=%u size=%d, "
+                "the connection is now desynced\n", c->outlen, obj, opcode, total);
+        return;
+    }
+    for (int i = 0; i < total; i++) c->out[c->outlen + i] = msg[i];
+    c->outlen += total;
+    if (g_wl_verbose) kprintf("[wl] -> obj=%u op=%u size=%d (queued, %d pending)\n",
+                              obj, opcode, total, c->outlen);
+    wl_flush(c);
+}
+
+/* Push as much of the queue as the peer's ring will take, and keep the rest.
+ * Resuming mid-message is fine and is the whole point: the peer reads a byte
+ * stream, not a datagram sequence. */
+static void wl_flush(struct wl_client *c) {
+    while (c->outlen > 0) {
+        long n = unix_send(c->ep, c->out, (unsigned long)c->outlen);
+        if (n <= 0) break;                       /* ring full, or the peer is gone */
+        if (n >= c->outlen) { c->outlen = 0; break; }
+        for (int i = 0; i + (int)n < c->outlen; i++) c->out[i] = c->out[i + (int)n];
+        c->outlen -= (int)n;
+    }
 }
 
 /* A Wayland string: u32 length INCLUDING the NUL, then the bytes, padded to 4. */
@@ -777,7 +814,7 @@ int wl_compositor_poll(void) {
         for (int i = 0; i < WL_MAXCLIENT; i++) if (!g_cl[i].used) { slot = i; break; }
         if (slot < 0) { unix_close(ep); kprintf("[wl] client table full\n"); break; }
         struct wl_client *c = &g_cl[slot];
-        c->used = 1; c->ep = ep; c->inlen = 0; c->registry = 0; c->nobj = 0;
+        c->used = 1; c->ep = ep; c->inlen = 0; c->outlen = 0; c->registry = 0; c->nobj = 0;
         c->serial = 0; c->title[0] = 0;
         c->pointer = c->keyboard = c->surface = 0;
         c->ptr_in = c->kbd_in = 0;
@@ -789,6 +826,11 @@ int wl_compositor_poll(void) {
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
         if (!c->used) continue;
+        /* FLUSH FIRST, every pass. A client that was behind last time has had a
+         * scheduling quantum to drain its ring, and anything we still hold is
+         * the head of its stream -- it cannot make progress until it arrives.
+         * (M2000) */
+        if (c->outlen) { wl_flush(c); worked++; }
         if (!unix_readable(c->ep)) continue;
         long n = unix_recv(c->ep, c->in + c->inlen, (unsigned long)(WL_INBUF - c->inlen));
         if (n <= 0) {                                /* EOF or error: drop the client */

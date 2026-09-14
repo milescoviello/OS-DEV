@@ -1,5 +1,62 @@
 # What's next
 
+> **(M2000) CLAUDE CODE WORKS, AND A 401 CAME BACK FROM THE SERVER.**
+>
+> ```
+> [lxclaude] running CLAUDE CODE -p WITH a (fake) key: DNS + TLS + HTTP for real...
+> Failed to authenticate. API Error: 401 API key is invalid.
+> [lxclaude] claude -p (fake key) -> 1
+> ```
+>
+> That 401 travelled over the wire: our DNS resolved api.anthropic.com, our TCP
+> stack carried the connection, TLS handshook, a real POST went out and a real
+> HTTP reply came back and was parsed. Without a key it prints its own answer
+> instead -- `Not logged in - Please run /login` -- and exits 1, **3 runs out of
+> 3 on four cores**. The developer's own credentials are never staged into a
+> guest image, so that is as far as this can honestly be taken.
+>
+> **The split that found the bugs was one core versus four.** Single-core runs
+> were correct; four-core runs died dereferencing NULL in a process with a
+> perfectly healthy VMA table.
+>
+> **`madvise(MADV_DONTNEED)` freed the frame without telling the other cores.**
+> munmap calls `app_tlb_sync`, mprotect calls it, M1963 added both for exactly
+> this -- and madvise, the one a JS engine calls constantly, did not. Core A
+> dropped the PTE and returned the frame to the allocator while core B still
+> held a cached translation; the frame was reissued and B kept writing to it.
+> The ORDER matters as much as the shootdown: unmap a chunk, drop the lock,
+> make every core forget, and only then free. `MADV_PAGEOUT` also came out from
+> under the VMA spinlock -- it writes every page to DISK.
+>
+> **`mmap`'s address hint was ignored and the window was too small to honour
+> it.** mimalloc (Bun's allocator) picks an address in [2 TiB, 30 TiB) and
+> expects its arenas there; every such request fell outside our 256 GiB window,
+> so everything packed into the low few gigabytes on top of JavaScriptCore's
+> pointer cage. The window is 32 TiB now.
+>
+> **What I got wrong in between is the part worth keeping.** I honoured the hint
+> by calling `app_mmap_fixed` -- and **MAP_FIXED REPLACES what is already
+> mapped**; that is its defining behaviour and ld.so depends on it. A hint is
+> advice. Routing one through MAP_FIXED lets a caller with a mere preference
+> destroy a mapping it knows nothing about, and the owner dies later with a
+> SIGSEGV that names nothing. `make check` caught it in a forked child two
+> suites away.
+>
+> **The compositor was dropping messages.** `unix_send` writes what fits in the
+> peer's ring and reports how much; `wl_send` handed it a whole message and
+> moved on, so a busy client got half a message and read every byte after it at
+> the wrong offset. Firefox says so: `Wayland protocol error: message too short,
+> object (2), message global(usu)`. Each client now has a real output queue.
+>
+> **Still open, honestly:** Firefox still does not paint -- it now binds every
+> global including `xdg_wm_base`, takes its profile lock and gets its keymap,
+> and still reports that protocol error, so there is at least one more malformed
+> event to find. And `lxbox`'s fork/exec/pipe test fails in roughly 3 of 8 full
+> `make check` runs and has never reproduced by hand -- 8/8 under deliberate
+> host load, 4/4 at the suite's own 256 MiB. The suite used to delete the
+> failing boot's serial log; it now keeps it at
+> `/tmp/osdev-linuxabi-FAIL.log`, so the next occurrence will leave evidence.
+
 > **(M1999) FOUR SYSCALLS THAT WERE ALREADY IMPLEMENTED, AND A `struct stat`
 > THAT NEVER CARRIED THE TIME.**
 >

@@ -228,6 +228,7 @@ long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe f
 int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
 int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
 int  app_fd_type(int fd);
+uint64_t app_mmap_hint(uint64_t addr, uint64_t len);           /* mmap's addr WITHOUT MAP_FIXED: place there only if free, else 0 (M2000) */
 void app_set_next_env(const char *e);                          /* one extra env var for the NEXT Linux spawn only (M1999) */
 int  app_current_pid(void);                                    /* the calling process's pid, or -1 (M1998) */
 void app_epoll_dump(int epfd);                                 /* print an epoll instance's registered fds + readiness (M1998) */                                      /* fd-table type, or -1 if not open (M1965) */

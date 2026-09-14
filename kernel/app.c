@@ -2342,7 +2342,18 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len);
  * The layout below 4 GiB is unchanged: executable at ELF_DYN_BASE, heap,
  * stack, interpreter at 0xB0000000. */
 #define MMAP_BASE  0x100000000ull       /* 4 GiB: clear of the executable, heap, stack and interpreter */
-#define MMAP_TOP   0x4000000000ull   /* 256 GiB. A compiler outgrew 256 MiB (M1961); V8's cage outgrew 1 GiB (M1964) */
+/* 32 TiB (M2000). Not because anything needs 32 TiB of mappings -- because
+ * allocators CHOOSE THEIR OWN ADDRESSES and expect to get them.
+ *
+ * mimalloc, which is what Bun allocates with, computes a hint in [2 TiB, 30
+ * TiB) and passes it to mmap; Linux honours a free hint, so on Linux mimalloc's
+ * arenas land exactly where it picked. Every such request here fell outside a
+ * 256 GiB window, so we ignored the hint and packed everything into the low few
+ * gigabytes instead -- on top of the region JavaScriptCore had reserved for its
+ * pointer cage. This is 4-level paging with a 48-bit user half; the PML4 entry
+ * for 30 TiB is index 61 and its PDPT is allocated on demand, per address
+ * space, exactly like index 0. Reserving address space costs one VMA. */
+#define MMAP_TOP   0x200000000000ull /* 32 TiB. A compiler outgrew 256 MiB (M1961); V8's cage outgrew 1 GiB (M1964); mimalloc picks its own addresses (M2000) */
 
 /* Interned backing-file paths for file-backed VMAs (M1962).
  *
@@ -2522,6 +2533,54 @@ static uint64_t app_mmap_fixed_nl(uint64_t addr, uint64_t len) {
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
+/* PLACE AT AN ADDRESS, BUT NEVER OVER ANYTHING (M2000).
+ *
+ * This is mmap's `addr` WITHOUT MAP_FIXED: advice, not a demand. The
+ * distinction is the whole point and getting it wrong is silent and fatal --
+ * app_mmap_fixed REPLACES what is already mapped, because that is what
+ * MAP_FIXED means and ld.so depends on it. Routing a hint through it hands a
+ * caller that merely had a preference the power to destroy a mapping it knows
+ * nothing about, and the owner of that mapping dies later with a SIGSEGV that
+ * names nothing. (I did exactly that for one build, and `make check` caught it
+ * in a forked child two suites away.)
+ *
+ * So: refuse on ANY overlap and let the caller fall back to a free address,
+ * which is precisely what Linux does. */
+static uint64_t app_mmap_hint_nl(uint64_t addr, uint64_t len) {
+    struct app *a = cur();
+    if (!a || len == 0) return 0;
+    if (addr & (PAGE_SIZE - 1)) return 0;
+    len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (vma_full(a)) return 0;
+    if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;
+    if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
+        if (addr < e && s < addr + len) return 0;      /* occupied: the caller chooses instead */
+    }
+    int vs0; VMA_NEW(a, vs0);
+    a->vma[vs0].start = addr;
+    a->vma[vs0].len   = len;
+    a->vma[vs0].sealed = 0;
+    a->vma[vs0].uffd  = 0;
+    a->vma[vs0].file_backed = 0;
+    a->vma[vs0].locked = a->mlock_future;
+    a->vma[vs0].huge = 0;
+    a->vma[vs0].shared = 0;
+    a->vma[vs0].foff = 0;
+    a->vma[vs0].fidx = -1;
+    if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
+    return addr;
+}
+uint64_t app_mmap_hint(uint64_t addr, uint64_t len) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mmap_hint_nl(addr, len);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 uint64_t app_mmap_fixed(uint64_t addr, uint64_t len) {
     struct app *a_ = cur();
     uint64_t f_ = vma_lock(a_);
@@ -2851,6 +2910,15 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
     for (int i = 0; i < a->nvma; i++) {
         uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
         if (end <= s0 || e0 <= addr) continue;                  /* no overlap */
+        /* WHO TOOK A BITE OUT OF THE CAGE? A JS engine's pointer region is
+         * gigabytes and it is supposed to stay whole; when part of it goes
+         * missing the program dies later reading through a base that used to
+         * be mapped, and nothing in the log connects the two. Name the carve
+         * that touches a very large mapping, with both ranges, so the culprit
+         * is identified at the moment it acts. (M2000) */
+        if (a->vma[i].len >= (256ull << 20))
+            kprintf("[vma] carve %lx-%lx cuts into vma[%d] %lx-%lx (%lu MiB)\n",
+                    addr, end, i, s0, e0, (unsigned long)(a->vma[i].len >> 20));
         if (a->vma[i].sealed) return -1;                        /* mseal'd (M1130) */
         uint64_t cs = addr > s0 ? addr : s0, ce = end < e0 ? end : e0;
         /* A hugepage can only be freed as a whole 2 MiB run, so a carve that
@@ -3235,10 +3303,9 @@ static int app_collapse(uint64_t addr, uint64_t len) {
 static int app_madvise_nl(uint64_t addr, uint64_t len, int advice) {
     struct app *a = cur();
     if (!a || len == 0) return -1;
-    if (advice == MADV_PAGEOUT)                       /* reclaim NOW by swapping the range out (M1099 swap / M1156 zram) */
-        return app_swap_out(addr, len);
-    if (advice == MADV_COLLAPSE)                      /* fold into a 2 MiB hugepage NOW (M1168) */
-        return app_collapse(addr, len);
+    /* PAGEOUT and COLLAPSE are handled by app_madvise BEFORE the lock is taken
+     * -- both write to disk or shoot down TLBs, and neither may be done with a
+     * spinlock held. (M2000) */
     uint64_t start = addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t end   = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (advice == MADV_COLD) {                        /* clear the Accessed bit on resident pages (deactivate) */
@@ -3250,27 +3317,81 @@ static int app_madvise_nl(uint64_t addr, uint64_t len, int advice) {
         return n;
     }
     if (advice != MADV_DONTNEED) return 0;            /* NORMAL/WILLNEED/FREE/etc: accepted no-op */
-    int dropped = 0;
-    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
-        int in_vma = 0, locked = 0;
-        for (int i = 0; i < a->nvma; i++)
-            if (p >= a->vma[i].start && p < a->vma[i].start + a->vma[i].len) { in_vma = 1; locked = a->vma[i].locked; break; }
-        if (!in_vma || locked) continue;              /* demand-paged mmap regions; mlock'd pages are pinned (M1149) */
-        uint64_t ph = vmm_translate(p);
-        if (ph && pmm_refcount(ph) == 0) {            /* single-owner anon page: safe to reclaim */
-            vmm_unmap(p);
-            pmm_free_frame(ph);
-            dropped++;
-        }
-    }
-    return dropped;
+    (void)start; (void)end;
+    return 0;                                        /* DONTNEED is served by app_madvise itself (M2000) */
 }
+
+/* MADV_DONTNEED FREED THE FRAME WITHOUT TELLING THE OTHER CORES (M2000).
+ *
+ * Every other place that takes a mapping away calls app_tlb_sync -- munmap
+ * does, mprotect does, and M1963 added both for exactly this reason. madvise
+ * did not, and it is the one a JavaScript engine calls constantly: JSC
+ * decommits its GC blocks 64 KiB at a time and the syscall ring is full of
+ *
+ *     28(10c760000, 10000, 4) = 0        <- madvise(..., 64 KiB, MADV_DONTNEED)
+ *
+ * So: core A dropped the PTE and handed the frame back to the allocator while
+ * core B still held a cached translation for it. The frame was immediately
+ * reissued to something else, and B kept reading and writing it. The damage
+ * lands wherever that frame went, which is why it presented as Claude Code
+ * dereferencing NULL in a process with a perfectly healthy VMA table -- and
+ * ONLY on more than one core. Single-core runs are correct; four-core runs
+ * die. That split is what named it.
+ *
+ * The ORDER matters as much as the shootdown. Unmapping, freeing and then
+ * shooting down would still leave a window in which the frame belongs to
+ * someone else and B can still reach it. So: unmap a bounded chunk, drop the
+ * lock, make every core forget, and only THEN return the frames. The chunk
+ * keeps the frame list on the stack without bounding how much a caller may
+ * advise at once.
+ *
+ * The lock must be dropped before the IPI: a core spinning for it with
+ * interrupts off can never acknowledge, which is the deadlock M1993 fixed. */
 int app_madvise(uint64_t addr, uint64_t len, int advice) {
     struct app *a_ = cur();
-    uint64_t f_ = vma_lock(a_);
-    int r_ = app_madvise_nl(addr, len, advice);
-    vma_unlock(a_, f_);
-    return r_;
+    if (!a_ || !len) return -1;
+    /* Neither of these may run under the VMA lock: app_swap_out writes every
+     * page to DISK and now shoots down TLBs, and app_collapse allocates. A
+     * spinlock held across either is the failure M1912 and M1993 both were.
+     * (M2000) */
+    if (advice == MADV_PAGEOUT)  return app_swap_out(addr, len);
+    if (advice == MADV_COLLAPSE) return app_collapse(addr, len);
+    if (advice != MADV_DONTNEED) {
+        uint64_t f_ = vma_lock(a_);
+        int r_ = app_madvise_nl(addr, len, advice);
+        vma_unlock(a_, f_);
+        return r_;
+    }
+    uint64_t start = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end   = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (end < start) return -1;
+    int dropped = 0;
+    while (start < end) {
+        uint64_t frames[64]; int nf = 0;
+        uint64_t chunk = start + 64ull * PAGE_SIZE;
+        if (chunk > end || chunk < start) chunk = end;
+        uint64_t f_ = vma_lock(a_);
+        for (uint64_t p = start; p < chunk; p += PAGE_SIZE) {
+            int in_vma = 0, locked = 0;
+            for (int i = 0; i < a_->nvma; i++)
+                if (a_->vma[i].len && p >= a_->vma[i].start &&
+                    p < a_->vma[i].start + a_->vma[i].len) { in_vma = 1; locked = a_->vma[i].locked; break; }
+            if (!in_vma || locked) continue;          /* demand-paged mmap regions; mlock'd pages are pinned (M1149) */
+            uint64_t ph = vmm_translate(p);
+            if (ph && pmm_refcount(ph) == 0) {        /* single-owner anon page: safe to reclaim */
+                vmm_unmap(p);
+                frames[nf++] = ph;
+            }
+        }
+        vma_unlock(a_, f_);
+        if (nf) {
+            app_tlb_sync(a_);                         /* no core may still reach these frames */
+            for (int i = 0; i < nf; i++) pmm_free_frame(frames[i]);
+            dropped += nf;
+        }
+        start = chunk;
+    }
+    return dropped;
 }
 
 
@@ -4086,6 +4207,11 @@ int app_swap_out(uint64_t addr, uint64_t len) {
         int slot = swap_out(phys);
         if (slot < 0) break;                         /* swap full / error */
         vmm_set_raw(p, ((uint64_t)slot << 12) | PTE_SWAP);   /* PRESENT=0, marker + slot */
+        /* THE SAME RULE AS madvise (M2000): the frame goes back to the
+         * allocator here, so no core may still hold a translation for it. One
+         * IPI per page is not the cost that matters on this path -- the page
+         * was just written to DISK. */
+        app_tlb_sync(a);
         pmm_free_frame(phys);
         n++;
     }

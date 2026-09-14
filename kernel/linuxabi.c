@@ -1798,8 +1798,24 @@ void linux_syscall_dispatch(struct registers *r) {
          * address needs that address. Still refused if the range is
          * unaligned, outside the window, or overlaps an existing VMA, because
          * Linux's silent-replace needs VMA splitting we do not have yet. */
-        uint64_t base = (flags & LX_MAP_FIXED) ? app_mmap_fixed(r->rdi, (uint64_t)len)
-                                              : app_mmap((uint64_t)len);
+        uint64_t base;
+        if (flags & LX_MAP_FIXED) base = app_mmap_fixed(r->rdi, (uint64_t)len);
+        else {
+            /* HONOUR THE ADDRESS HINT (M2000). Without MAP_FIXED the `addr`
+             * argument is advice, and Linux takes it whenever the range is
+             * free. Allocators rely on that: mimalloc -- Bun's allocator --
+             * picks an address in the terabytes and expects its arenas there,
+             * and packing them low instead puts them on top of the region
+             * JavaScriptCore reserved for its pointer cage.
+             *
+             * Advice, not a demand: if the hint is unaligned, outside the mmap
+             * window, or already occupied, fall back to choosing an address
+             * ourselves, which is exactly what Linux does. */
+            base = 0;
+            if (r->rdi && !(r->rdi & (PAGE_SIZE - 1)))
+                base = app_mmap_hint(r->rdi, (uint64_t)len);   /* NEVER app_mmap_fixed: that REPLACES */
+            if (!base) base = app_mmap((uint64_t)len);
+        }
         /* A HUGE reservation is always structural, never incidental, and it is
          * worth a line in the log whether or not tracing is on. JSC reserves
          * `size + alignment` of PROT_NONE address space for its pointer cage
