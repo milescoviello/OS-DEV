@@ -70,6 +70,38 @@ done
 #
 # Anything else dlopen'd by a program we stage will have the same shape of
 # problem, and the same fix: name it here, because no tool can derive it.
+# Firefox dlopen's its GRAPHICS backend by soname and falls back when it is
+# absent -- so a missing libEGL is not an error anywhere, it is a browser
+# quietly deciding it has no GPU path. The serial log showed it walking the
+# whole search path for libEGL.so.1 over and over:
+#
+#   257(...) = -2  "/usr/lib64/firefox/libEGL.so.1"
+#   257(...) = -2  "/usr/lib64/firefox/glibc-hwcaps/x86-64-v3/libEGL.so.1"
+#
+# These need their OWN closures (libEGL pulls in GLdispatch, glapi, drm, xcb),
+# so stage each one the same way the main binary is staged rather than copying
+# a single file. (M2000)
+for extra in libEGL.so.1 libGLdispatch.so.0 libglapi.so.0 libgbm.so.1 \
+             libwayland-egl.so.1 libdrm.so.2 libGL.so.1; do
+    for d in /lib64 /usr/lib64 /lib/x86_64-linux-gnu; do
+        [ -f "$d/$extra" ] || continue
+        r=$(readlink -f "$d/$extra") || continue
+        mkdir -p "$ROOT/usr/lib64" "$ROOT/lib64"
+        cp -f "$r" "$ROOT/usr/lib64/$extra" 2>/dev/null || true
+        cp -f "$r" "$ROOT/lib64/$extra"     2>/dev/null || true
+        for so in $(ldd "$r" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
+            rr=$(readlink -f "$so" 2>/dev/null) || continue
+            [ -f "$rr" ] || continue
+            mkdir -p "$ROOT$(dirname "$so")"
+            cp -f "$rr" "$ROOT$so" 2>/dev/null || true
+            cp -f "$rr" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
+            n=$((n+1))
+        done
+        n=$((n+1))
+        break
+    done
+done
+
 for extra in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
     for d in /lib64 /usr/lib64 /lib/x86_64-linux-gnu; do
         [ -f "$d/$extra" ] || continue

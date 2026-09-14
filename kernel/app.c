@@ -5532,6 +5532,26 @@ static int memfd_alloc(const char *name) {
     return -1;
 }
 static void memfd_ref(int idx) { if (idx >= 0 && idx < NMEMFD && memfds[idx].used) memfds[idx].refs++; }
+
+/* A memfd's current size, or -1 if this fd is not one (M2000).
+ *
+ * fstat had no memfd case, so a memfd fell into the catch-all that reports
+ * S_IFIFO -- and glibc's posix_fallocate starts by fstat-ing and returns
+ * ESPIPE for a FIFO WITHOUT TRYING ANYTHING. That is exactly how every Wayland
+ * client sizes its shared-memory pool, so the pool was never sized, the mmap
+ * that followed failed, and GDK reported the whole chain as
+ *
+ *     Gdk-WARNING: Failed to load cursor theme Adwaita
+ *
+ * A memfd is a regular file on Linux -- an unlinked tmpfs one -- and saying so
+ * is both correct and what unblocks it. */
+long app_memfd_size(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3) return -1;
+    int idx = a->fd[fd].obj;
+    if (idx < 0 || idx >= NMEMFD || !memfds[idx].used) return -1;
+    return (long)memfds[idx].size;
+}
 static void memfd_unref(int idx) {
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used) return;
     if (--memfds[idx].refs > 0) return;

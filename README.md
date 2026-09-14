@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2000-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2001-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1316,3 +1316,46 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   message global(usu)`. Each client now has a real output queue: append the
   whole message, flush what the ring takes, resume at the exact byte. The stream
   stays byte-exact however slow the client is.
+
+- **M2001** — **one 2 KiB buffer, shared by every task on every core, in the
+  middle of `recvmsg`.** `static uint8_t sbuf[2048]` — and the same on the send
+  side — with no lock, in a syscall two tasks can be executing at once. Two
+  concurrent `recvmsg` calls overwrite each other's bytes, and for a **stream**
+  socket those bytes are already gone from the ring, so a client gets someone
+  else's data spliced into its own and its message framing is permanently
+  offset. libwayland reports the wreckage as
+
+      Wayland protocol error: message too short, object (2), message global(usu)
+
+  — a `wl_registry.global` 24 bytes long, which is shorter than any global this
+  compositor can emit. The syscall trace is what named it: `recvmsg(fd 10) = 24`
+  where the message that should have been there is 28 bytes at minimum.
+  Intermittent, because it needs two readers to overlap: Firefox has several
+  threads and several processes on the socket, and the demo client has one,
+  which is why the test suite never saw it. **3 of 4 Firefox runs errored
+  before; 0 of 4 after.**
+
+  I had also reasoned my way to two wrong answers first — that a partial
+  `unix_send` was truncating messages (real, fixed in M2000, not this), and that
+  the output queue's two writers were racing (also real, also fixed, also not
+  this). Both were true bugs and neither was the one. The thing that settled it
+  was **dumping the bytes we actually put on the wire** and finding every one of
+  them correct, which moves the question to who else is writing to that buffer.
+
+  **And the cursor theme, which was four candidate causes behind one warning.**
+  `Failed to load cursor theme Adwaita` is GDK's report for the whole of
+  libwayland-cursor's `memfd_create` → `F_ADD_SEALS` → `posix_fallocate` →
+  `mmap` chain. Two links were broken: `fstat` had no memfd case, so a memfd
+  fell into the catch-all that reports **S_IFIFO** — and glibc's
+  `posix_fallocate` starts by `fstat`-ing and returns ESPIPE for a FIFO *without
+  attempting anything*, so the pool was never sized and the mmap after it
+  failed; and `F_ADD_SEALS`/`F_GET_SEALS` answered EBADF although
+  `app_memfd_seal` has enforced seals since M1212. A memfd is a regular file on
+  Linux — an unlinked tmpfs one — and saying so is both correct and what unblocks
+  it. `tools/lx/lxanon.c` now walks that chain step by step, so the next time it
+  breaks the log says which link.
+
+  Firefox now binds every global, **creates a `wl_shm` pool from its own memfd**
+  and receives its keymap without a single protocol error. It still does not
+  paint. `libEGL.so.1` is staged too — it is `dlopen`'d, so `ldd` cannot see it
+  and the closure staging had no way to know.

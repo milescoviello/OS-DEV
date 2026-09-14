@@ -892,6 +892,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the reserve/align/trim (pointer cage) probe...\n");
         int cagerc = app_run_linux_sync("/disk2/lxcage", 0, 0, 120000);
         kprintf("[lxabi] LXCAGE exit -> %d\n", cagerc);
+        /* ...and the one a Wayland client makes before it can show a cursor:
+         * memfd + seals + posix_fallocate + MAP_SHARED. GDK reports the whole
+         * chain as one warning that names none of its four possible causes.
+         * (M2000) */
+        kprintf("[lxabi] launching the anonymous-shared-file probe...\n");
+        int anonrc = app_run_linux_sync("/disk2/lxanon", 0, 0, 60000);
+        kprintf("[lxabi] LXANON exit -> %d\n", anonrc);
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");

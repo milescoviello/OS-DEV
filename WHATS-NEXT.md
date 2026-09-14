@@ -1,5 +1,46 @@
 # What's next
 
+> **(M2001) ONE 2 KiB BUFFER, SHARED BY EVERY TASK ON EVERY CORE, IN THE MIDDLE
+> OF `recvmsg`.**
+>
+> `static uint8_t sbuf[2048]` -- and the same on the send side -- with no lock,
+> in a syscall two tasks can be executing at once. Two concurrent `recvmsg`
+> calls overwrite each other's bytes, and for a STREAM socket those bytes are
+> already gone from the ring, so a client gets someone else's data spliced into
+> its own and its framing is permanently offset:
+>
+> ```
+> [GFX1-]: Wayland protocol error: message too short, object (2), message global(usu)
+> ```
+>
+> A `wl_registry.global` 24 bytes long -- shorter than any global this
+> compositor can emit. `recvmsg(fd 10) = 24` in the syscall trace is what named
+> it. Intermittent, because it needs two readers to overlap: Firefox has several
+> threads and several processes on that socket and the demo client has one,
+> which is why the suite never saw it. **3 of 4 Firefox runs errored before, 0
+> of 4 after.**
+>
+> **I reasoned my way to two wrong answers first**, and both were real bugs: a
+> partial `unix_send` truncating a message (fixed in M2000) and the new output
+> queue's two writers racing (also fixed). Neither was this one. What settled it
+> was dumping **the bytes we actually put on the wire** and finding every one of
+> them correct -- which moves the question from "what did we encode" to "who
+> else is writing to that buffer".
+>
+> **The cursor theme was four candidate causes behind one warning.** `Failed to
+> load cursor theme Adwaita` is GDK's report for the whole of
+> libwayland-cursor's `memfd_create` -> `F_ADD_SEALS` -> `posix_fallocate` ->
+> `mmap` chain. `fstat` had no memfd case, so a memfd fell into the catch-all
+> that reports **S_IFIFO** -- and glibc's `posix_fallocate` `fstat`s first and
+> returns ESPIPE for a FIFO *without attempting anything*. The pool was never
+> sized and the mmap failed. A memfd is a regular file on Linux; saying so is
+> both correct and what unblocks it. `tools/lx/lxanon.c` walks the chain step by
+> step now.
+>
+> Firefox binds every global, **creates a wl_shm pool from its own memfd** and
+> takes its keymap with no protocol errors. It still does not paint -- it has
+> not created a `wl_surface` yet. That is the next thing.
+
 > **(M2000) CLAUDE CODE WORKS, AND A 401 CAME BACK FROM THE SERVER.**
 >
 > ```

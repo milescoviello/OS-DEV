@@ -284,6 +284,34 @@ static void wr32(uint8_t *p, uint32_t v) {
 }
 
 /* Build and send one event. `body` is already-marshalled argument bytes. */
+/* THE OUTPUT QUEUE HAS TWO WRITERS (M2000).
+ *
+ * wl_send is called from the compositor task (protocol replies) AND from the
+ * window manager task (wl_pointer/wl_keyboard events, via wl_post_*). They are
+ * different tasks on different cores, and the queue's append is
+ * read-modify-write on c->outlen -- two of them interleaved splice one message
+ * into the middle of another, which is exactly the desync libwayland reports as
+ *
+ *   Wayland protocol error: message too short, object (2), message global(usu)
+ *
+ * Intermittently, which is what a race looks like from outside. unix_send was
+ * already atomic per call, so before the queue existed the equivalent hazard
+ * was a SHORT write leaving half a message behind; the queue fixed that one and
+ * opened this one. A message must reach the wire whole and in order, and that
+ * is a property of the queue, not of the socket underneath it. */
+static volatile int g_wl_out_lock;
+static inline uint64_t wl_out_take(void) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    while (__atomic_exchange_n(&g_wl_out_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return fl;
+}
+static inline void wl_out_give(uint64_t fl) {
+    __atomic_store_n(&g_wl_out_lock, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
+}
+
+static void wl_flush_locked(struct wl_client *c);
 static void wl_flush(struct wl_client *c);
 static void wl_send(struct wl_client *c, uint32_t obj, uint16_t opcode,
                     const uint8_t *body, int blen) {
@@ -293,24 +321,40 @@ static void wl_send(struct wl_client *c, uint32_t obj, uint16_t opcode,
     wr32(msg + 0, obj);
     wr32(msg + 4, ((uint32_t)total << 16) | opcode);
     for (int i = 0; i < blen; i++) msg[8 + i] = body[i];
+    uint64_t ofl = wl_out_take();
     if (c->outlen + total > WL_OUTBUF) {
         /* 256 KiB behind and still not reading: this is not slowness, and
          * there is no correct recovery -- the stream cannot skip a message. */
         kprintf("[wl] output queue FULL (%d bytes): dropping obj=%u op=%u size=%d, "
                 "the connection is now desynced\n", c->outlen, obj, opcode, total);
+        wl_out_give(ofl);
         return;
     }
     for (int i = 0; i < total; i++) c->out[c->outlen + i] = msg[i];
     c->outlen += total;
-    if (g_wl_verbose) kprintf("[wl] -> obj=%u op=%u size=%d (queued, %d pending)\n",
-                              obj, opcode, total, c->outlen);
-    wl_flush(c);
+    if (g_wl_verbose) {
+        /* THE ACTUAL BYTES. Firefox rejects a wl_registry.global as "message
+         * too short" while our own raw client parses the same burst with
+         * nothing left over, so one of the two is wrong about what was sent
+         * and reasoning about the encoder has not settled it. Print the wire
+         * form and decode it by hand. (M2000) */
+        kprintf("[wl] -> obj=%u op=%u size=%d :", obj, opcode, total);
+        for (int i = 0; i < total; i++) kprintf(" %02x", msg[i]);
+        kprintf("\n");
+    }
+    wl_flush_locked(c);
+    wl_out_give(ofl);
 }
 
 /* Push as much of the queue as the peer's ring will take, and keep the rest.
  * Resuming mid-message is fine and is the whole point: the peer reads a byte
  * stream, not a datagram sequence. */
 static void wl_flush(struct wl_client *c) {
+    uint64_t fl = wl_out_take();
+    wl_flush_locked(c);
+    wl_out_give(fl);
+}
+static void wl_flush_locked(struct wl_client *c) {
     while (c->outlen > 0) {
         long n = unix_send(c->ep, c->out, (unsigned long)c->outlen);
         if (n <= 0) break;                       /* ring full, or the peer is gone */

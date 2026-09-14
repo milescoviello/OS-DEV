@@ -1273,7 +1273,11 @@ void linux_syscall_dispatch(struct registers *r) {
             /* Gather the iovecs. A datagram is ONE packet, so they have to be
              * concatenated before it goes out -- sending them separately would
              * turn one query into several. */
-            static uint8_t gbuf[2048];
+            /* PER CALL, NOT static -- see the note on recvmsg's sbuf below.
+             * Two tasks gathering into one shared buffer splice one client's
+             * outgoing message into another's. (M2000) */
+            uint8_t *gbuf = kmalloc(2048);
+            if (!gbuf) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
             unsigned long tot = 0;
             const struct lx_iovec *v = (const struct lx_iovec *)iovptr;
             int bad = 0;
@@ -1281,12 +1285,12 @@ void linux_syscall_dispatch(struct registers *r) {
                 unsigned long n = v[i].iov_len;
                 if (!n) continue;
                 if (!v[i].iov_base || !vmm_user_ok((uint64_t)v[i].iov_base, n)) { bad = 1; break; }
-                if (tot + n > sizeof gbuf) n = sizeof gbuf - tot;
+                if (tot + n > 2048) n = 2048 - tot;
                 for (unsigned long k = 0; k < n; k++) gbuf[tot + k] = ((const uint8_t *)v[i].iov_base)[k];
                 tot += n;
-                if (tot >= sizeof gbuf) break;
+                if (tot >= 2048) break;
             }
-            if (bad) break;
+            if (bad) { kfree(gbuf); break; }
             /* SCM_RIGHTS: hand any descriptors in msg_control to the peer
              * BEFORE the bytes, so they are already queued when it reads.
              *
@@ -1323,6 +1327,7 @@ void linux_syscall_dispatch(struct registers *r) {
             } else {
                 sn = app_fd_write((int)a1, gbuf, tot);   /* connected socket */
             }
+            kfree(gbuf);
             if (sn < 0) break;
             if (first < 0) first = sn;
             if (is_mm) *(uint32_t *)(h + 56) = (uint32_t)sn;   /* msg_len, per message */
@@ -1350,8 +1355,30 @@ void linux_syscall_dispatch(struct registers *r) {
             if (!vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) break;
             const struct lx_iovec *v = (const struct lx_iovec *)iovptr;
             /* Receive into a staging buffer and SCATTER: a datagram arrives
-             * whole and then fills the iovecs in order. */
-            static uint8_t sbuf[2048];
+             * whole and then fills the iovecs in order.
+             *
+             * PER CALL, NOT static (M2000). This buffer was one 2 KiB array
+             * shared by every task on every core, with no lock, in the middle
+             * of a syscall two of them can be executing at once. Two concurrent
+             * recvmsg calls overwrite each other's bytes, and for a STREAM
+             * socket those bytes are already consumed from the ring -- so a
+             * client gets someone else's data spliced into its own and its
+             * message framing is permanently offset. libwayland reports the
+             * wreckage as
+             *
+             *   Wayland protocol error: message too short, object (2),
+             *   message global(usu)
+             *
+             * -- a `global` event 24 bytes long, which is shorter than any
+             * global this compositor can produce. Intermittent, because it
+             * needs two readers to overlap. Firefox has several threads and
+             * several processes on the socket; the demo client has one, which
+             * is why the test suite never saw it.
+             *
+             * The send side had the identical bug with gbuf. */
+            uint8_t *sbuf = kmalloc(2048);
+            if (!sbuf) { r->rax = (uint64_t)-(long)LX_ENOMEM; goto msgdone; }
+            #define sbuf_free() kfree(sbuf)
             /* NEVER read more than the caller can take. Reading into a staging
              * buffer and scattering means anything past the end of the iovecs
              * is DROPPED -- and for a stream socket those bytes are gone from
@@ -1361,8 +1388,8 @@ void linux_syscall_dispatch(struct registers *r) {
              * (M1978) */
             unsigned long want = 0;
             for (uint64_t i = 0; i < iovlen; i++) want += v[i].iov_len;
-            if (want > sizeof sbuf) want = sizeof sbuf;
-            if (!want) break;
+            if (want > 2048) want = 2048;
+            if (!want) { sbuf_free(); break; }
             uint8_t sip[4] = {0,0,0,0}; uint16_t sp = 0;
             long gn;
             /* MSG_DONTWAIT (0x40) makes THIS CALL non-blocking regardless of
@@ -1377,8 +1404,8 @@ void linux_syscall_dispatch(struct registers *r) {
             else                            gn = app_fd_read((int)a1, sbuf, want);
             if (rflags & 0x40) app_fd_set_nonblock((int)a1, nb_save);
             if (g_wl_verbose) kprintf("[sock] recvmsg(fd %ld) want=%lu -> %ld\n", a1, want, gn);
-            if (gn == APP_FD_EAGAIN) { if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; goto msgdone; } break; }
-            if (gn < 0) break;
+            if (gn == APP_FD_EAGAIN) { sbuf_free(); if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; goto msgdone; } break; }
+            if (gn < 0) { sbuf_free(); break; }
             unsigned long off = 0;
             for (uint64_t i = 0; i < iovlen && off < (unsigned long)gn; i++) {
                 unsigned long n = v[i].iov_len;
@@ -1424,10 +1451,12 @@ void linux_syscall_dispatch(struct registers *r) {
                 *(uint64_t *)(h + 40) = wrote;            /* msg_controllen: what we actually filled */
             }
             *(uint32_t *)(h + 48) = 0;                    /* msg_flags: nothing truncated */
+            sbuf_free();
             if (first < 0) first = (long)off;
             if (is_mm) *(uint32_t *)(h + 56) = (uint32_t)off;
             done++;
         }
+        #undef sbuf_free
         if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }
         r->rax = is_mm ? (uint64_t)done : (uint64_t)first;
         msgdone: break;
@@ -1941,12 +1970,31 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = 0;
         break;
     }
-    case LXS_fallocate_:
-        /* (fd, mode, offset, len). Linux lets a filesystem answer EOPNOTSUPP
-         * and every caller has a write-based fallback; ENOSYS is the one answer
-         * that is read as "this kernel is broken". */
+    case LXS_fallocate_: {                  /* (fd, mode, offset, len) */
+        /* ALLOCATE FOR REAL WHEN WE CAN (M2000).
+         *
+         * Answering EOPNOTSUPP is legal -- Linux filesystems do, and glibc's
+         * posix_fallocate falls back to writing the range by hand. But that
+         * fallback needs pread/pwrite on the fd, and for a MEMFD it got ENOSYS
+         * and gave up. Every Wayland client sizes its shared-memory pool with
+         * exactly this call, so the pool stayed zero-length and the mmap after
+         * it failed -- reported by GDK as one warning about a cursor theme.
+         *
+         * A memfd is an in-RAM file that ftruncate can already grow, which is
+         * precisely what mode-0 fallocate means: make sure the bytes exist.
+         * Do that, and keep EOPNOTSUPP for everything else, where the caller's
+         * fallback is the right answer. */
+        long foff = (long)r->rdx, flen = (long)r->r10;
+        if ((int)r->rsi == 0 && foff >= 0 && flen > 0 && app_memfd_size((int)a1) >= 0) {
+            long want = foff + flen;
+            long have = app_memfd_size((int)a1);
+            long tr = (have >= want) ? 0 : app_ftruncate((int)a1, want);
+            r->rax = (uint64_t)(tr == 0 ? 0 : -(long)LX_ENOSPC);
+            break;
+        }
         r->rax = (uint64_t)-(long)LX_EOPNOTSUPP;
         break;
+    }
     case LXS_inotify_add_watch_: {          /* (fd, path, mask) -> a watch descriptor */
         /* inotify_init1 landed in M1986 and these did not, which is the worst
          * half to implement: a program gets a working inotify fd, cannot put a
@@ -2062,6 +2110,25 @@ void linux_syscall_dispatch(struct registers *r) {
                  * S_IFIFO is also the truthful answer for the pipe case, which
                  * is the one a shell pipeline depends on. */
                 if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+                /* EXCEPT A MEMFD, which is a REGULAR FILE -- an unlinked tmpfs
+                 * one -- and every Wayland client depends on that being said.
+                 * glibc's posix_fallocate fstat()s first and returns ESPIPE for
+                 * a FIFO without attempting anything, so the shared-memory pool
+                 * libwayland-cursor sizes that way was never sized at all, the
+                 * mmap after it failed, and GDK reported the entire chain as
+                 * one warning: "Failed to load cursor theme Adwaita". (M2000) */
+                long mfsz = app_memfd_size((int)a1);
+                if (mfsz >= 0) {
+                    *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFREG | 0600u;
+                    *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                    *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)mfsz;
+                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                    *(int64_t  *)(st + LXST_O_BLOCKS)  = (mfsz + 511) / 512;
+                    *(uint64_t *)(st + LXST_O_INO)     = 0x2000ull + (uint64_t)a1;
+                    *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+                    r->rax = 0;
+                    break;
+                }
                 *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
                 *(uint64_t *)(st + LXST_O_NLINK)   = 1;
                 *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
@@ -2651,6 +2718,23 @@ void linux_syscall_dispatch(struct registers *r) {
          * file it just opened, and glibc's stdio calls F_GETFL to learn a
          * stream's access mode. */
         long cmd = (long)r->rsi, arg = (long)r->rdx;
+        /* F_ADD_SEALS(1033) / F_GET_SEALS(1034). app_memfd_seal has existed
+         * since M1212 and enforced F_SEAL_WRITE and F_SEAL_GROW; only the
+         * Linux spelling was missing, so it answered EBADF. Every Wayland
+         * client that passes a buffer to a compositor seals it first --
+         * F_SEAL_SHRINK is how a compositor knows the pool it mapped cannot be
+         * truncated out from under it, which is a real protection and not a
+         * formality. libwayland ignores the return, but a kernel that cannot
+         * be ASKED is a different thing from one that declines. (M2000) */
+        if (cmd == 1033 || cmd == 1034) {
+            long sl = app_memfd_seal((int)a1, cmd == 1033 ? (unsigned)arg : 0u);
+            /* F_ADD_SEALS returns 0 on success; only F_GET_SEALS returns the
+             * set. Returning the set from both would make a caller that checks
+             * `!= 0` treat a successful seal as a failure. */
+            r->rax = (sl < 0) ? (uint64_t)-(long)LX_EINVAL
+                              : (cmd == 1034 ? (uint64_t)sl : 0ull);
+            break;
+        }
         if (cmd == 3) {                     /* F_GETFL */
             /* O_RDWR, plus O_NONBLOCK if it is actually set. We do not record
              * per-fd access modes, and claiming read-write is the permissive

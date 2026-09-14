@@ -386,6 +386,29 @@ LXTHREAD: 4 threads
     # range, not on the return values. A wrong split here does not fail at the
     # call: it fails much later, reading through a base that is not mapped,
     # with no syscall anywhere near the crash.
+    # M2000: the anonymous shared file every Wayland client makes, step by step.
+    # GDK reports this entire chain as ONE warning -- "Failed to load cursor
+    # theme Adwaita" -- which names none of its four possible causes. Two were
+    # real: fstat reported a memfd as a FIFO, so glibc's posix_fallocate
+    # returned ESPIPE without attempting anything and the pool was never sized;
+    # and F_ADD_SEALS answered EBADF although app_memfd_seal has enforced seals
+    # since M1212. Each step is asserted separately because they fail
+    # independently and the aggregate alone would hide which.
+    if grep -aq "LXANON: posix_fallocate(4096) ok" "$SLOG3"; then
+        echo "  ok: posix_fallocate sizes a memfd (a memfd is a regular FILE, not a FIFO -- fstat has to say so)"
+    else
+        echo "  FAIL: sizing a memfd:"; grep -a "LXANON" "$SLOG3" | head -5; f3=1
+    fi
+    if grep -aq "LXANON: F_ADD_SEALS ok and F_GET_SEALS reads it back" "$SLOG3"; then
+        echo "  ok: F_ADD_SEALS/F_GET_SEALS on a memfd (how a client promises a compositor its pool cannot shrink)"
+    else
+        echo "  FAIL: memfd seals:"; grep -a "LXANON: F_" "$SLOG3" | head -3; f3=1
+    fi
+    if grep -aq "LXANON: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: memfd + seals + posix_fallocate + MAP_SHARED -- the whole wl_shm pool path a cursor theme needs"
+    else
+        echo "  FAIL: the anonymous-shared-file chain:"; grep -a "LXANON" "$SLOG3" | head -6; f3=1
+    fi
     if grep -aq "LXCAGE: 4GiB/4GiB wrote and read back" "$SLOG3" && \
        grep -aq "LXCAGE: 0 failure(s)" "$SLOG3"; then
         echo "  ok: reserve 8 GiB, align to 4 GiB, trim head and tail -- and the kept region is still writable end to end"
