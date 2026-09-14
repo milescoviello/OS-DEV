@@ -264,6 +264,7 @@ void isr_dispatch(struct registers *r) {
             kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) -- terminating it\n",
                     exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2);
             app_describe_addr(r->rip);   /* which library, and where inside it (M2003) */
+            if (r->int_no == 14) app_describe_fault_addr();   /* ...and what the FAULTING page is (M2005) */
             /* Dump the registers for a ring-3 fault too (M1945). The panic path
              * has always done this, but a userspace fault printed a single line
              * -- which is exactly the case where you most need to know WHICH

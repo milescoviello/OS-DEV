@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2004-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2005-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1496,3 +1496,42 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   application reads every byte of it (3870 then 807). It then abandons the
   connection and retries three times. What it dislikes is the answer, not the
   transport.
+
+- **M2005** — **a write fault on a writable page, which we treated as fatal.**
+  x86 does not require the TLB to be updated when a PTE is made **more**
+  permissive, so a stale entry can fault on an access the page tables already
+  allow. The only correct response is to invalidate that entry and retry —
+  Linux has a function for exactly this case. We fell through to the bottom of
+  the fault handler and killed the process.
+
+  It is the long-standing *"`cc1` crashes intermittently"* that has blocked
+  self-hosting since M1962, and the report that finally named it is one this
+  milestone added: the fault handler now describes **the faulting page**, not
+  just the address:
+
+      [fault] err=0x7 (present+write+user) at 0x103163ff8
+      [fault] the faulting page 100e5f000: pte=...007 (present=1 write=1 user=1 cow=0)
+      [fault]   inside vma[16] 100e57000-100e60000 prot=3
+
+  A write fault on a page that is present, writable and user-accessible is
+  unreachable by any other route, and the existing report only dumped the VMA
+  table for *not-present* faults — so the one fact that identifies the bug was
+  the one fact never printed. The COW handler immediately above had just made
+  that page writable; this core's TLB had not caught up.
+
+  With it fixed, the in-guest build of OS-DEV's own kernel gets from `kheap.o`
+  to `virtio_blk.o` — dozens of translation units further.
+
+  Also: a ring-3 fault resolves `rip` to **its library and offset**
+  (`libc.so.6 + 11548a` → `clone + 0x21a` against the host's symbol table), and
+  `run-selfhost-test.sh` no longer deletes the failing boot's serial log —
+  the same harness defect the Linux-ABI suite had, and an in-guest build takes
+  fifteen minutes to reproduce.
+
+  **Still failing, and now precisely located:** self-hosting dies in glibc's
+  `posix_spawn`. Both faults land there — `clone + 0x21a` and the child helper
+  — and it is the one place we *fake* `CLONE_VM|CLONE_VFORK`, serving it with a
+  copy-on-write fork and an overridden child stack instead of a shared address
+  space and a suspended parent. glibc is written against the real semantics.
+  That is the next milestone, and it is the one the campaign plan named from the
+  start.

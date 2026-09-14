@@ -1,5 +1,38 @@
 # What's next
 
+> **(M2005) A WRITE FAULT ON A WRITABLE PAGE, WHICH WE TREATED AS FATAL.**
+>
+> x86 does not require the TLB to be updated when a PTE is made MORE
+> permissive, so a stale entry can fault on an access the tables already allow.
+> The only correct response is to invalidate and retry; Linux has a function for
+> exactly this. We fell through the fault handler and killed the process.
+>
+> This is the long-standing **"cc1 crashes intermittently"** that has blocked
+> self-hosting since M1962. What named it was a report this milestone added --
+> the handler now describes the faulting PAGE, not just the address:
+>
+> ```
+> [fault] the faulting page 100e5f000: pte=...007 (present=1 write=1 user=1 cow=0)
+> [fault]   inside vma[16] 100e57000-100e60000 prot=3
+> ```
+>
+> A write fault on a page that is present, writable and user-accessible is
+> unreachable any other way -- and the old report only dumped the VMA table for
+> NOT-present faults, so the one fact that identified the bug was the one fact
+> never printed.
+>
+> With it fixed the in-guest kernel build gets from `kheap.o` to
+> `virtio_blk.o` -- dozens of translation units further.
+>
+> **NEXT, and precisely located: real vfork semantics.** Self-hosting now dies
+> in glibc's `posix_spawn`, and both faults land there (`clone + 0x21a` and the
+> child helper). It is the one place we FAKE `CLONE_VM|CLONE_VFORK` -- served by
+> a copy-on-write fork with an overridden child stack, instead of a shared
+> address space and a parent suspended until the child execs. glibc is written
+> against the real thing. The campaign plan named this from the start ("an
+> execve that detaches the mm so an exec'ing thread cannot tear down the address
+> space its siblings are running in").
+
 > **(M2004) YOU TYPE `claude` AND CLAUDE CODE TAKES OVER THE TERMINAL.**
 >
 > Its interface renders in the OS-DEV shell window -- theme picker, syntax

@@ -80,6 +80,14 @@ static uint64_t read_cr3(void) {
     return v;
 }
 
+/* Drop this core's cached translation for one page. Exposed because the page
+ * fault handler needs it for a SPURIOUS fault -- an access the PTE already
+ * permits, faulting because a stale TLB entry has not caught up with a PTE that
+ * was made more permissive. x86 allows exactly that, and the only correct
+ * response is to invalidate and retry. (M2005) */
+void vmm_invlpg_one(uint64_t virt) {
+    __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+}
 static void invlpg(uint64_t virt) {
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }

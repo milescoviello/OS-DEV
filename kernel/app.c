@@ -2117,6 +2117,37 @@ int app_last_spawn_pid(void) { return g_last_spawn_pid; }
  * usually past the cap. The file plus the offset is what `addr2line -e` on the
  * host resolves, which is the difference between "a fault somewhere in libxul"
  * and a function name. (M2003) */
+/* Describe the page a fault happened ON: its VMA, its recorded protection, and
+ * the actual PTE bits. An err=0x7 fault (present + write + user) is a write to
+ * a read-only page, and there are three quite different reasons for that -- a
+ * copy-on-write page the handler declined, a VMA whose prot really is
+ * read-only, and a page present in the tables with no VMA at all. The bare
+ * address cannot tell them apart and the existing report only dumps the VMA
+ * table for NOT-PRESENT faults. (M2005) */
+void app_describe_fault_addr(void) {
+    struct app *a = cur();
+    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t pte = vmm_pte_raw(page);
+    kprintf("[fault] the faulting page %lx: pte=%lx (present=%d write=%d user=%d cow=%d) phys=%lx refs=%d\n",
+            page, pte, !!(pte & PTE_PRESENT), !!(pte & PTE_WRITABLE), !!(pte & PTE_USER),
+            !!(pte & PTE_COW), pte & 0x000FFFFFFFFFF000ull,
+            (pte & PTE_PRESENT) ? pmm_refcount(pte & 0x000FFFFFFFFFF000ull) : -1);
+    if (!a) return;
+    uint64_t fl = vma_lock(a);
+    int found = 0;
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        if (page < a->vma[i].start || page >= a->vma[i].start + a->vma[i].len) continue;
+        kprintf("[fault]   inside vma[%d] %lx-%lx prot=%d%s%s\n", i, a->vma[i].start,
+                a->vma[i].start + a->vma[i].len, a->vma[i].prot,
+                a->vma[i].file_backed ? " file" : "", a->vma[i].shared ? " shared" : "");
+        found = 1; break;
+    }
+    vma_unlock(a, fl);
+    if (!found) kprintf("[fault]   in NO VMA of this process (%d vmas)\n", a->nvma);
+}
+
 void app_describe_addr(uint64_t addr) {
     struct app *a = cur();
     if (!a) return;
@@ -4104,6 +4135,7 @@ static uint64_t vma_pte_flags(uint8_t prot) {
  * fault and SAY SO: killing one process with a named reason beats taking the
  * machine down with an unnamed one. */
 static volatile uint64_t g_fault_chain[16][6];
+unsigned long g_spurious_faults;   /* stale-TLB faults invalidated and retried (M2005) */
 static int app_fault_handle_inner(uint64_t cr2, uint64_t err);
 int app_fault_handle(uint64_t cr2, uint64_t err) {
     /* PER-TASK depth (M1992). This counted per CORE, which is wrong for the
@@ -4206,6 +4238,39 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                  * again forever. That is a hang with no diagnostic at all,
                  * which is exactly what honouring VMA prot first produced.
                  * (M1956) */
+                /* A SPURIOUS FAULT: everything this access needed is
+                 * already permitted by the PTE (M2005).
+                 *
+                 * That is not a contradiction, it is architecture. When a PTE
+                 * is made MORE permissive, x86 does not require the TLB to be
+                 * updated, and a stale entry may fault even though the table
+                 * now allows the access. The only correct response is to
+                 * invalidate the entry and retry -- Linux has a function for
+                 * exactly this case. We instead fell through to the bottom and
+                 * killed the process, which is the long-standing "cc1 crashes
+                 * intermittently" that has blocked self-hosting since M1962:
+                 *
+                 *   err=0x7 (present+write+user) on a page reported
+                 *   present=1 write=1 user=1 cow=0
+                 *
+                 * -- a write fault on a writable page, which is impossible to
+                 * reach any other way. The COW handler above had just made the
+                 * page writable; this core's TLB had not caught up.
+                 *
+                 * Retrying is safe and cannot loop: app_fault_handle's own
+                 * recursion guard bounds it, and an invlpg'd entry is reloaded
+                 * from the table that already permits the access. */
+                int wants_write = (err & 2) != 0, wants_exec = (err & 0x10) != 0;
+                if ((!wants_write || (cpte & PTE_WRITABLE)) &&
+                    (!wants_exec  || !(cpte & PTE_NX)) &&
+                    (cpte & PTE_USER)) {
+                    vmm_invlpg_one(page);
+                    if (!g_spurious_faults)
+                        kprintf("[fault] SPURIOUS fault at %lx: err=%lx but pte=%lx already permits it "
+                                "-- stale TLB entry, invalidated and retried (M2005)\n", page, err, cpte);
+                    g_spurious_faults++;
+                    return 1;
+                }
                 if ((err & 2) && !(cpte & PTE_WRITABLE)) {
                     /* MAP_PRIVATE means a write gets a private copy. If the
                      * mapping is writable per its VMA, the PTE simply predates
@@ -5468,11 +5533,18 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * pointing at nothing. Claude Code writes its output to a dup, so
          * every word of it went missing. Give them entries from the start and
          * dup, dup2 and fork all do the right thing for free. */
-        if (g_pend_out_to) for (int q = 0; q < 3; q++) {
-            a->fd[q].used = 1; a->fd[q].type = 14; a->fd[q].obj = 0;
-            a->fd[q].off = 0; a->fd[q].cloexec = 0; a->fd[q].nonblock = 0;
-        }
         g_pend_out_to = 0; g_pend_parent = 0;
+    }
+    /* EVERY Linux process gets real descriptors for 0/1/2, window or not
+     * (M2005). Doing this only for the ones with a window fixed the case I was
+     * looking at and left the others exactly as broken: a program launched
+     * from the kernel still had fd 1 that was "the console" by virtue of not
+     * existing, so a dup of it pointed at nothing and its output vanished.
+     * Firefox dups its stdio like everything else. With no window behind them
+     * these route to the kernel console, which is where that output belongs. */
+    if (g_pend_linux) for (int q = 0; q < 3; q++) {
+        a->fd[q].used = 1; a->fd[q].type = 14; a->fd[q].obj = 0;
+        a->fd[q].off = 0; a->fd[q].cloexec = 0; a->fd[q].nonblock = 0;
     }
     /* copy the title into our own buffer (the caller's string — e.g. a filename
      * from another address space — may not outlive this call). Done here, before

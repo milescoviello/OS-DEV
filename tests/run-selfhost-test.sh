@@ -56,6 +56,11 @@ if grep -aq "\[lxbuild\] make -> 0" "$SLOG"; then
 else
     echo "  FAIL: the in-guest build did not complete:"
     grep -aE "\[lxbuild\]|Error [0-9]|undefined reference|TRUNCATED" "$SLOG" | head -6; f=1
+    # KEEP THE EVIDENCE (M2005). cleanup() deletes SLOG on the way out, so the
+    # one run that matters left nothing to look at -- and an in-guest build
+    # takes fifteen minutes to reproduce. Same defect the linuxabi suite had.
+    cp "$SLOG" /tmp/osdev-selfhost-FAIL.log 2>/dev/null && \
+        echo "  (the failing boot's serial log is at /tmp/osdev-selfhost-FAIL.log)"
 fi
 # The SIZE is the claim, not just the marker: an empty or truncated ELF would
 # still let make exit 0 if the link had silently produced one.

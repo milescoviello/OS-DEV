@@ -81,6 +81,7 @@ int      vmm_clear_accessed(uint64_t cr3);
  * from an unmapped one. vmm_set_raw requires the page table to already exist. */
 #define PTE_SWAP (1ull << 9)   /* software bit: this not-present page is swapped out */
 #define PTE_COW  (1ull << 10)  /* software bit: this PRESENT page is copy-on-write (shared by a fork); a write faults + copies (M1116) */
+void vmm_invlpg_one(uint64_t virt);   /* drop this core's TLB entry for one page: spurious-fault retry (M2005) */
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ull  /* the physical frame address bits of a PTE */
 uint64_t vmm_pte_raw(uint64_t virt);
 void     vmm_set_raw(uint64_t virt, uint64_t pte);
