@@ -23,7 +23,11 @@ echo "running ELF-loader regression + fuzz..."
 # loadable".
 REAL=""
 for e in build/*.elf; do
-    case "$e" in build/kernel*.elf) continue ;; esac
+    # ...and selfbuilt-kernel32.elf, the kernel OS-DEV builds INSIDE ITSELF
+    # (M2006). Same reasoning, but the name does not start with "kernel", so
+    # the pattern above missed it and this test started failing the moment the
+    # self-host demo had been run -- on an artifact it is right to reject.
+    case "$e" in *kernel*.elf) continue ;; esac
     [ -f "$e" ] && REAL="$REAL $e"
 done
 if /tmp/osdev_elf_test $REAL; then

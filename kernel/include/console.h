@@ -13,6 +13,8 @@ void console_putc(char c);
 void console_write(const char *s);
 void console_write_n(const char *s, unsigned long n);   /* n bytes, console lock held ONCE -- no mid-string splicing (M1952) */
 void console_enable_gfx(void);   /* route output to the framebuffer console */
+void console_gfx_release(void);  /* the window manager owns the framebuffer: stop DRAWING the log (serial + /proc/kmsg unaffected) (M2011) */
+void console_gfx_reclaim(void);  /* take the screen back -- a panic has to be visible (M2011) */
 
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void kvprintf(const char *fmt, va_list ap);

@@ -12,6 +12,7 @@
  * userspace process (see app.c) — its text grid is drawn here and keystrokes
  * are delivered to it when it's focused.
  */
+#include "console.h"   /* console_gfx_release: the log must not scroll the desktop (M2011) */
 #include "desktop.h"
 #include "wayland.h"   /* draw a committed Wayland surface (M1980) */
 #include "fb.h"
@@ -1964,6 +1965,9 @@ static int in_rect(int px, int py, int x, int y, int w, int h) {
 }
 
 void desktop_run(void) {
+    /* The framebuffer is ours from here. Kernel log lines drawn into it scroll
+     * the whole desktop up a row at a time -- see console_gfx_release. (M2011) */
+    console_gfx_release();
     screen_w = fb_width();
     screen_h = fb_height();
     backbuffer = kmalloc((size_t)screen_w * screen_h * 4);

@@ -602,7 +602,11 @@ static const uint32_t app_palette[16] = {
 };
 
 /* apps awaiting a window from the window manager */
-static struct app *pending[MAX_APPS];
+/* Spawned-but-windowless apps, waiting for the window manager's next pass.
+ * The PID is carried alongside the pointer on purpose (M2011): `apps[]` slots
+ * are recycled, so a bare pointer cannot tell "the app I queued" from "whatever
+ * moved into its slot afterwards". */
+static struct { struct app *a; int pid; } pending[MAX_APPS];
 static int pend_h, pend_t;
 
 /* the embedded programs (see kernel/asm/user_blob.asm) */
@@ -5825,7 +5829,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
 
     /* queue it for the window manager to give it a window */
     int n = (pend_h + 1) % MAX_APPS;
-    if (n != pend_t) { pending[pend_h] = a; pend_h = n; }
+    if (n != pend_t) { pending[pend_h].a = a; pending[pend_h].pid = a->pid; pend_h = n; }
     g_last_spawn_pid = a->pid;           /* so a kernel-context caller can wait for it (M1955) */
     return a;
 
@@ -7622,7 +7626,7 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
 
     /* give the child its own window (the WM consumes the pending queue) */
     int n = (pend_h + 1) % MAX_APPS;
-    if (n != pend_t) { pending[pend_h] = a; pend_h = n; }
+    if (n != pend_t) { pending[pend_h].a = a; pending[pend_h].pid = a->pid; pend_h = n; }
     if (share_vm) {
         /* SUSPEND THE PARENT until the child execs or exits -- the other half
          * of vfork, and the half that makes sharing an address space safe at
@@ -8626,11 +8630,30 @@ int app_list_names(char *buf, int max) {
 }
 
 /* The window manager calls this to claim freshly-spawned apps. */
+/* A WINDOW FOR A PROCESS THAT IS ALREADY GONE IS A WINDOW NOBODY GETS BACK
+ * (M2011).
+ *
+ * app_run_linux_sync collects its child itself (`used = 0`) because nothing
+ * else reaps during the boot demos -- so by the time the window manager starts,
+ * every probe binary that ran at boot is still sitting in this queue pointing
+ * at a slot that is free or has been reused. The WM gave each one a window, the
+ * reap loop could not drop them (app_reap on an already-collected app never
+ * reports success), and the table filled with corpses: adding two probes to the
+ * boot sequence took win_count to exactly MAX_WINDOWS and the Wayland demo's
+ * surface then had no slot to be drawn in. It failed as "the surface never
+ * appeared on screen", naming neither the queue nor the probes.
+ *
+ * An app that has EXITED but not yet been reaped still gets its window -- it
+ * may have printed something worth reading, and the reap loop will close it a
+ * moment later. What is skipped is a slot that is no longer the app we queued. */
 app_t *app_take_pending(void) {
-    if (pend_t == pend_h) return 0;
-    app_t *a = pending[pend_t];
-    pend_t = (pend_t + 1) % MAX_APPS;
-    return a;
+    while (pend_t != pend_h) {
+        struct app *a = pending[pend_t].a;
+        int pid = pending[pend_t].pid;
+        pend_t = (pend_t + 1) % MAX_APPS;
+        if (a && a->used && a->pid == pid) return a;
+    }
+    return 0;
 }
 
 /* pending browse-URL requests (shell `browse <url>` -> WM opens a browser). */

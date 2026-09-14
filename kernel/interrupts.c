@@ -322,6 +322,7 @@ void isr_dispatch(struct registers *r) {
         }
 
         interrupts_disable();
+        console_gfx_reclaim();   /* a panic has to be on the SCREEN, desktop or no desktop (M2011) */
         kprintf("\n*** KERNEL PANIC: CPU EXCEPTION ***\n");
         kprintf("  %s (vector %lu)", exception_names[r->int_no], r->int_no);
         kprintf("   error_code=0x%lx\n", r->err_code);

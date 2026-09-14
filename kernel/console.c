@@ -23,6 +23,20 @@
 #include <stdbool.h>
 
 static bool gfx_console;
+/* THE DESKTOP AND THE FRAMEBUFFER CONSOLE ARE THE SAME PIXELS (M2011).
+ *
+ * fbcon draws into the linear framebuffer and SCROLLS it when it reaches the
+ * bottom -- which means every kernel log line printed after the window manager
+ * takes over shifts the whole desktop up by one text row, until the WM's next
+ * full redraw puts it back. Reported as "the desktop jumped around a lot, like
+ * the whole thing moving", and it is exactly that: a 43-line stall dump moved
+ * the desktop up 690 pixels in one go.
+ *
+ * Nothing is lost by stopping: every byte still goes to the serial port (which
+ * is what every headless test greps) and into the /proc/kmsg ring (which is
+ * what `dmesg` reads). Only the drawing stops. A panic takes the screen back,
+ * because a panic nobody can see is worse than a scrolled desktop. */
+static bool gfx_owned;
 
 /* ---- kernel log ring buffer (M1071) -----------------------------------------
  * Every byte that goes to the console is also captured into a fixed circular
@@ -82,11 +96,13 @@ void console_init(void) {
 void console_enable_gfx(void) {
     gfx_console = true;
 }
+void console_gfx_release(void) { gfx_owned = true; }    /* the WM owns the screen: log to serial only */
+void console_gfx_reclaim(void) { gfx_owned = false; }   /* a panic/exception must be visible on screen */
 
 void console_putc(char c) {
-    if (gfx_console)
-        fbcon_putc(c);       /* framebuffer console */
-    else
+    if (gfx_console) {
+        if (!gfx_owned) fbcon_putc(c);   /* framebuffer console (silent while the WM owns it) */
+    } else
         vga_putc(c);         /* legacy VGA text mode */
     klog_putc(c);            /* capture into the kernel log ring (M1071) */
     if (g_cap && g_cap_n < g_cap_max - 1) g_cap[g_cap_n++] = c;   /* netcon capture (M1870) */
