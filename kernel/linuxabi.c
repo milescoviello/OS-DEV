@@ -284,6 +284,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_statx_       332
 #define LXS_sched_getaffinity_ 204
 #define LXS_sched_setparam_    142
+#define LXS_getpriority_ 140
+#define LXS_setpriority_ 141
 #define LXS_sched_getparam_    143
 #define LXS_sched_setscheduler_ 144
 #define LXS_sched_getscheduler_ 145
@@ -471,10 +473,15 @@ static int64_t lx_realtime_sec(void) {
 /* The last LXRING_N Linux syscalls, for post-mortem on a process that dies
  * without saying anything. (M1970) */
 #define LXRING_N 256
-struct lxring_ent { uint32_t nr; uint64_t a1, a2, a3, ret; char path[56]; };
+/* WHICH THREAD MADE THE CALL (M2003). The ring is global -- it has to be, a
+ * process's threads interleave and the interleaving is often the point -- but
+ * that makes the history of the thread that actually FAULTED unreadable when
+ * five others are busy. Firefox crashes with two threads in the same
+ * instruction and ~470 mappings; without a tid the sixteen calls before it come
+ * from six different places and mean nothing. */
+struct lxring_ent { uint32_t nr; int tid; uint64_t a1, a2, a3, ret; char path[56]; };
 static struct lxring_ent g_lxring[LXRING_N];
 static unsigned long g_lxring_i;
-static struct lxring_ent *g_lxring_cur;
 
 /* Which argument of a syscall is a pathname, if any: 1 = rdi, 2 = rsi, 0 = none.
  * Captured AT RECORD TIME, not at dump time -- by the time a process aborts,
@@ -561,12 +568,22 @@ void lx_trace_dump_last(const char *why, unsigned long want) {
         /* The RETURN VALUE is the point. Arguments alone show what a program
          * asked for; only the result shows which answer it could not live
          * with, and a negative return here is a Linux errno. */
-        if (e->path[0]) kprintf("    %3u(%lx, %lx, %lx) = %lx  \"%s\"\n", e->nr, e->a1, e->a2, e->a3, e->ret, e->path);
-        else            kprintf("    %3u(%lx, %lx, %lx) = %lx\n", e->nr, e->a1, e->a2, e->a3, e->ret);
+        if (e->path[0]) kprintf("   t%d %u(%lx, %lx, %lx) = %lx  \"%s\"\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret, e->path);
+        else            kprintf("   t%d %u(%lx, %lx, %lx) = %lx\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret);
     }
 }
 
 void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }
+
+/* The depth a RING-3 FAULT dumps at. 64 entries with a tid on each is what made
+ * Firefox's faulting thread readable among five busy ones -- and it is ~120
+ * extra lines of byte-at-a-time serial output per fault, which pushed the
+ * console-lock regression boot past its budget. Deep on demand, modest by
+ * default: the flag that asks for syscall tracing is asking for exactly this.
+ * (M2003) */
+void lx_trace_dump_fault(void) {
+    lx_trace_dump_last("a ring-3 fault", g_lx_systrace ? 64 : 20);
+}
 
 /* DUMP THE HISTORY WHEN A PROGRAM SAYS IT IS GIVING UP (M1992).
  *
@@ -632,6 +649,21 @@ int g_poll_trace;
 static int g_poll_reports;
 
 void linux_syscall_dispatch(struct registers *r) {
+    /* WHICH RING SLOT THIS CALL OWNS -- a LOCAL, not a shared cursor (M2003).
+     *
+     * g_lxring_cur was a single global pointer set on entry and patched with
+     * the result on exit. With two threads in the syscall path at once -- which
+     * is the normal state of any threaded program -- the second overwrites it,
+     * and the first patches the SECOND's slot with its own return value. The
+     * ring then attributes one thread's answer to another thread's call, and
+     * the dump reads as a syscall returning something it cannot possibly
+     * return: a futex wait reporting ENOENT, which sent me looking for a bug in
+     * the futex code that was never there.
+     *
+     * A diagnostic that lies is worse than no diagnostic. This is the same
+     * shared-mutable-global class as the recvmsg staging buffer in M2001 --
+     * worth grepping the whole file for. */
+    unsigned long ring_slot;
     lx_syscall_count++;
     /* Always record; print only on demand. The rate-limited trace below is for
      * finding a SPIN (the same call repeating), and deliberately samples one in
@@ -642,8 +674,12 @@ void linux_syscall_dispatch(struct registers *r) {
      * The ring costs one store per syscall and is dumped by lx_trace_dump on an
      * abnormal exit. (M1970) */
     {
-        struct lxring_ent *re = &g_lxring[g_lxring_i & (LXRING_N - 1)];
-        re->nr = (uint32_t)r->rax; re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
+        /* Claim the slot ATOMICALLY: a plain post-increment shared by every
+         * thread hands two of them the same entry, and one overwrites the
+         * other's call. (M2003) */
+        ring_slot = __atomic_fetch_add(&g_lxring_i, 1, __ATOMIC_RELAXED);
+        struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
+        re->nr = (uint32_t)r->rax; re->tid = task_current_id(); re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
         re->path[0] = 0;
         int pa = lx_path_arg(re->nr);
         if (pa) {
@@ -655,8 +691,7 @@ void linux_syscall_dispatch(struct registers *r) {
                 re->path[ci] = 0;
             }
         }
-        g_lxring_cur = re;          /* patched with the result once the dispatch returns */
-        g_lxring_i++;
+
     }
     if (g_lx_systrace && (lx_syscall_count & 0xFFF) == 0)
         kprintf("[sys] %ld(%lx,%lx,%lx)\n", (long)r->rax, r->rdi, r->rsi, r->rdx);
@@ -767,7 +802,21 @@ void linux_syscall_dispatch(struct registers *r) {
     }
     done: break;
     case LXS_getpid:
-        r->rax = (uint64_t)task_current_id();
+        /* THE PROCESS's id, NOT THE CALLING THREAD's (M2003).
+         *
+         * On Linux every thread of a process reports the same getpid() -- that
+         * is the difference between getpid and gettid, and it is load-bearing.
+         * This returned task_current_id(), so each thread got its own answer.
+         * It went unnoticed for as long as nothing threaded got far enough to
+         * care: a program that records getpid() at startup and re-checks it
+         * later to find out whether it has been forked concludes that it HAS
+         * been, on every thread, and takes its post-fork teardown path.
+         *
+         * It was also inconsistent with its own neighbours: fork() hands the
+         * parent the child's APP pid, getppid() returns an app pid, and
+         * /proc/<pid> is keyed on app pids. getpid() was the one that answered
+         * in a different namespace. */
+        r->rax = (uint64_t)app_current_pid();
         break;
     case LXS_arch_prctl:
         /* musl sets up its thread pointer here before main; refusing it is
@@ -1510,6 +1559,26 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)sz;              /* Linux returns the size written */
         break;
     }
+    case LXS_getpriority_:                  /* (which, who) */
+        /* THE ONLY UNIMPLEMENTED SYSCALL LEFT IN A FIREFOX RUN (M2003), and it
+         * is on the startup path of every thread it creates -- the trace of the
+         * thread that faulted is set_robust_list, rt_sigprocmask, gettid,
+         * getpriority, prctl(PR_SET_NAME), and then it dies.
+         *
+         * NOTE THE ENCODING. The raw syscall returns 20 - nice, not the nice
+         * value, precisely so that a legitimate nice of -1 is not confused with
+         * an error; glibc's wrapper subtracts it back. Returning 0 here would
+         * therefore claim a nice of 20 -- the lowest priority there is --
+         * rather than "normal". Everything runs at one priority here, so 20 is
+         * the honest answer and 0 is a silently wrong one. */
+        r->rax = 20;                        /* 20 - nice, with nice == 0 */
+        break;
+    case LXS_setpriority_:                  /* (which, who, prio) */
+        /* Accepted and ignored: there is one scheduling priority here, and a
+         * failure makes a runtime think the system is broken rather than
+         * uniform. */
+        r->rax = 0;
+        break;
     case LXS_sched_getparam_:                /* (pid, struct sched_param *) */
         /* struct sched_param is a single int, the priority. SCHED_OTHER
          * threads have priority 0, which is what we run everything at.
@@ -2857,7 +2926,7 @@ void linux_syscall_dispatch(struct registers *r) {
     }
     /* Patch the ring entry with what we actually answered. Recorded here rather
      * than at entry because the whole value of the record is the RESULT. */
-    if (g_lxring_cur) { g_lxring_cur->ret = r->rax; g_lxring_cur = 0; }
+    g_lxring[ring_slot & (LXRING_N - 1)].ret = r->rax;
 }
 
 /* ---- the System V initial process stack (M1939) --------------------------

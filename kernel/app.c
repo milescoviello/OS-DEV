@@ -1978,6 +1978,30 @@ int app_last_spawn_pid(void) { return g_last_spawn_pid; }
  * either, because a thread blocked INSIDE a call makes no new entries. The
  * wchan is the return address of whoever called task_block, so it names the
  * kernel function each thread is waiting in. */
+/* Name the mapping an address falls in: the FILE and the offset inside it.
+ *
+ * A ring-3 fault prints a bare `rip`, and the VMA table printed with it is
+ * capped -- a browser has hundreds of mappings and the one that matters is
+ * usually past the cap. The file plus the offset is what `addr2line -e` on the
+ * host resolves, which is the difference between "a fault somewhere in libxul"
+ * and a function name. (M2003) */
+void app_describe_addr(uint64_t addr) {
+    struct app *a = cur();
+    if (!a) return;
+    uint64_t fl = vma_lock(a);
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        if (addr < a->vma[i].start || addr >= a->vma[i].start + a->vma[i].len) continue;
+        kprintf("[fault] %lx is in %s + %lx (mapping %lx-%lx prot=%d)\n",
+                addr, vma_path(a, i), addr - a->vma[i].start + a->vma[i].foff,
+                a->vma[i].start, a->vma[i].start + a->vma[i].len, a->vma[i].prot);
+        vma_unlock(a, fl);
+        return;
+    }
+    vma_unlock(a, fl);
+    kprintf("[fault] %lx is in no mapping of this process\n", addr);
+}
+
 void app_dump_threads(int pid) {
     for (int i = 0; i < MAX_APPS; i++) {
         if (!apps[i].used || apps[i].pid != pid) continue;
@@ -5329,7 +5353,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * all. gcc creates its intermediate .s exactly that way. (M1960) */
         vfs_cwd_set_for(a, "/disk2");
         { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
-        static const char *argv0[2 + LX_PEND_ARGS], *envp0[24];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[32];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
          * re-execs itself by argv[0] (lxbox does) would otherwise ask for
@@ -5391,10 +5415,24 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * then "we don't have any display". Talking to the compositor directly
          * is the same thing minus a hop. (M1986) */
         envp0[17] = "MOZ_DISABLE_WAYLAND_PROXY=1";
+        /* NO GPU, AND SAYING SO IS BETTER THAN LETTING IT FIND OUT (M2003).
+         *
+         * There is no DRM device here and no Mesa vendor library, so the whole
+         * EGL/glvnd path has nothing to bind to. Firefox probes it anyway --
+         * the trace shows it loading libGLdispatch.so.0 -- and a dispatch layer
+         * that resolves no vendor hands back null function tables. Software
+         * rendering is not a degraded mode we are settling for: it is the mode
+         * whose output is a shared-memory buffer, which is exactly what wl_shm
+         * and this compositor are built to carry. */
+        envp0[18] = "LIBGL_ALWAYS_SOFTWARE=1";
+        envp0[19] = "MOZ_ACCELERATED=0";
+        envp0[20] = "MOZ_X11_EGL=0";
+        envp0[21] = "MOZ_DISABLE_GPU_PROCESS=1";
+        envp0[22] = "MOZ_WEBRENDER_SOFTWARE=1";
         /* One extra entry, one-shot, for a caller that needs to hand a specific
          * program something the whole system should NOT have -- see
          * app_set_next_env. (M1999) */
-        int en = 18;
+        int en = 23;
         if (g_pend_env_extra) { envp0[en++] = g_pend_env_extra; g_pend_env_extra = 0; }
         envp0[en] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a

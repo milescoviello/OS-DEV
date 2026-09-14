@@ -232,6 +232,7 @@ long app_memfd_size(int fd);                                   /* a memfd's size
 uint64_t app_mmap_hint(uint64_t addr, uint64_t len);           /* mmap's addr WITHOUT MAP_FIXED: place there only if free, else 0 (M2000) */
 void app_set_next_env(const char *e);                          /* one extra env var for the NEXT Linux spawn only (M1999) */
 int  app_current_pid(void);                                    /* the calling process's pid, or -1 (M1998) */
+void app_describe_addr(uint64_t addr);                          /* print the file+offset an address maps to, for a fault report (M2003) */
 void app_epoll_dump(int epfd);                                 /* print an epoll instance's registered fds + readiness (M1998) */                                      /* fd-table type, or -1 if not open (M1965) */
 int  app_fd_set_cloexec(int fd, int on);                       /* FD_CLOEXEC, for MFD_CLOEXEC/SOCK_CLOEXEC (M1977) */
 long app_pread(int fd, void *buf, unsigned long max, long off);        /* read a FILE fd without moving its cursor; bytes/0 EOF/-1 (M1572) */

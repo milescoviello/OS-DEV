@@ -263,6 +263,7 @@ void isr_dispatch(struct registers *r) {
             if (app_signal_deliver(r, 11)) return;  /* SIGSEGV: a registered handler catches the fault */
             kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) -- terminating it\n",
                     exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2);
+            app_describe_addr(r->rip);   /* which library, and where inside it (M2003) */
             /* Dump the registers for a ring-3 fault too (M1945). The panic path
              * has always done this, but a userspace fault printed a single line
              * -- which is exactly the case where you most need to know WHICH
@@ -307,7 +308,7 @@ void isr_dispatch(struct registers *r) {
             /* The last few syscalls, not the last 256: on a fault the tail is
              * what matters, and the full ring is hundreds of console-locked
              * lines. abort() still dumps the whole thing. */
-            if (lx_syscalls_made()) { lx_trace_dump_last("a ring-3 fault", 16); lx_user_backtrace(r); }
+            if (lx_syscalls_made()) { lx_trace_dump_fault(); lx_user_backtrace(r); }
             app_fault_current(r);  /* dump a core, mark the app exited + task_exit(); does not return */
         }
 

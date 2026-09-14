@@ -254,6 +254,7 @@ static volatile int g_wlraw;                  /* -append wlraw: also run the raw
 static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
+static volatile int g_ffshot;                 /* -append ffshot: Firefox headless, --screenshot to a real PNG (M2003) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
@@ -509,6 +510,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
+        if (cmdline_has(cl, "ffshot"))     { g_lxabi_test = 1; g_ffshot = 1; }   /* Firefox HEADLESS, rendering a page to a PNG (M2003) */
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
@@ -1077,6 +1079,36 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 if (wl_messages_handled() < 4) lx_trace_dump("a stalled Wayland client");
                 kprintf("[wl] summary: %u client(s), %u message(s), %u global(s) sent\n",
                         wl_clients_connected(), wl_messages_handled(), wl_globals_sent());
+            }
+        }
+        if (g_ffshot) {
+            /* FIREFOX HEADLESS, RENDERING A REAL PAGE TO A REAL PNG (M2003).
+             *
+             * Two things at once. As a DEMO it is the whole browser -- parse,
+             * style, lay out, paint, encode -- producing a file we can look at,
+             * with no compositor involved at all. As a DIAGNOSTIC it splits the
+             * question in half: Firefox dies 30 seconds into startup writing
+             * through a null pointer, and if it dies the same way with no
+             * display then the display is not what is wrong.
+             *
+             * Synchronous: the assertion is on the PNG existing afterwards. */
+            vfs_mkdir("/disk2/tmp");
+            static const char *av_fs[] = { "--headless", "--no-remote", "--new-instance",
+                                           "--screenshot", "/tmp/ffshot.png",
+                                           "--window-size", "800,600",
+                                           "file:///etc/hosts" };
+            kprintf("[ff] FIREFOX HEADLESS: rendering a page to /tmp/ffshot.png...\n");
+            int src = app_run_linux_sync("/disk2/usr/lib64/firefox/firefox", av_fs, 8, 1500000);
+            kprintf("[ff] firefox --screenshot -> %d\n", src);
+            struct statx sx;
+            if (vfs_stat("/disk2/tmp/ffshot.png", &sx) == 0 && sx.stx_size > 0) {
+                uint8_t hdr[8]; long got = vfs_pread("/disk2/tmp/ffshot.png", hdr, 8, 0);
+                kprintf("[ff] FFSHOT: %lu bytes, first 8 = %02x %02x %02x %02x %02x %02x %02x %02x (want 89 50 4e 47)\n",
+                        (unsigned long)sx.stx_size, hdr[0], hdr[1], hdr[2], hdr[3],
+                        hdr[4], hdr[5], hdr[6], hdr[7]);
+                (void)got;
+            } else {
+                kprintf("[ff] FFSHOT: no PNG was written\n");
             }
         }
         if (g_lxclaude_test) {

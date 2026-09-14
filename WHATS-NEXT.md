@@ -1,5 +1,39 @@
 # What's next
 
+> **(M2003) `getpid()` RETURNED THE CALLING THREAD'S ID.**
+>
+> On Linux every thread of a process reports the same `getpid()` -- that is the
+> entire difference between it and `gettid()`. This returned
+> `task_current_id()`, so each thread got its own answer. A program that records
+> its pid at startup and re-checks it later to learn whether it has been forked
+> concludes that it HAS been, on every thread, and takes its post-fork teardown
+> path. It was inconsistent with its own neighbours too: `fork()` hands back an
+> APP pid, `getppid()` returns an app pid, `/proc/<pid>` is keyed on app pids.
+>
+> **Firefox died 30 seconds into startup, every run, writing through a null
+> pointer. With this fixed it does not crash at all.**
+>
+> **And the diagnostic was lying.** The syscall ring kept ONE global "current
+> entry" pointer, set on entry and patched with the result on exit -- so with
+> two threads in the syscall path the second overwrote it and the first patched
+> the second's slot with its own return value. I went looking for a futex bug
+> because the dump showed `FUTEX_WAIT_BITSET` returning ENOENT, which it cannot.
+> The slot is a local now, claimed atomically, and every entry carries the
+> **tid**. Same shared-mutable-global class as M2001's `recvmsg` buffer.
+>
+> Also: a ring-3 fault prints **which library rip is in and the offset**
+> (`libxul.so + 2caf323`), since the VMA table printed with it is capped and a
+> browser's hundreds of mappings put the interesting one past the cap;
+> `getpriority`/`setpriority` are implemented (the raw syscall returns
+> `20 - nice`, so returning 0 would claim the LOWEST priority, not "normal");
+> and `-append ffshot` runs Firefox **headless** to a PNG with no compositor --
+> which proved the crash had nothing to do with the display by reproducing at
+> the identical offset without one.
+>
+> **Where Firefox is now:** it no longer crashes. It sits idle -- zero page
+> faults for thirteen minutes -- so it is blocked on something rather than dying
+> of something. That is a better problem, and the next one.
+
 > **(M2002) A FILE DESCRIPTOR IS A REFERENCE, AND AF_UNIX NEVER GOT THE MEMO.**
 >
 > `app_fd_fork` takes a reference for every shared object a child inherits --

@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2002-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2003-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1388,3 +1388,45 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
 
   Firefox now keeps its connection across its forks, binds a second registry,
   and a third client connects. It still creates no `wl_surface`.
+
+- **M2003** — **`getpid()` returned the calling thread's id.** On Linux every
+  thread of a process reports the same `getpid()` — that is the whole difference
+  between it and `gettid()`, and it is load-bearing. This returned
+  `task_current_id()`, so each thread got a different answer. A program that
+  records its pid at startup and re-checks it later to find out whether it has
+  been forked concludes that it **has** been, on every thread, and takes its
+  post-fork teardown path. It was also inconsistent with its own neighbours:
+  `fork()` hands the parent the child's **app** pid, `getppid()` returns an app
+  pid, and `/proc/<pid>` is keyed on app pids — `getpid()` was the one answering
+  in a different namespace. It went unnoticed for as long as nothing threaded
+  got far enough to care.
+
+  Firefox died 30 seconds into startup, every run, writing through a null
+  pointer. With this fixed it does not crash at all.
+
+  **And a diagnostic that was lying.** The syscall-history ring kept a single
+  global "current entry" pointer, set on entry and patched with the result on
+  exit. With two threads in the syscall path — the normal state of any threaded
+  program — the second overwrites it and the first patches the *second's* slot
+  with its own return value. The ring then reports one thread's answer against
+  another thread's call, and I spent a while looking for a bug in the futex code
+  because the dump showed `FUTEX_WAIT_BITSET` returning **ENOENT**, which it
+  cannot. The slot is a local now, claimed atomically, and every entry records
+  the **tid** that made the call — which is what finally made the faulting
+  thread's own history readable among five busy ones. Same shared-mutable-global
+  class as M2001's `recvmsg` buffer; it is worth grepping for.
+
+  Supporting work, all of it earning its keep in the same hunt: a ring-3 fault
+  now prints **which library `rip` is in and the offset inside it**
+  (`libxul.so + 2caf323`), because the VMA table printed with it is capped and a
+  browser's hundreds of mappings put the relevant one past the cap;
+  `getpriority`/`setpriority` are implemented (note the encoding — the raw
+  syscall returns `20 - nice`, so 0 would claim the *lowest* priority rather
+  than "normal"); and `-append ffshot` runs Firefox **headless**, rendering to a
+  PNG with no compositor at all — as a demo it is the whole browser, and as a
+  diagnostic it proved the crash had nothing to do with the display by
+  reproducing at the identical offset without one.
+
+  Firefox no longer crashes. It now sits idle instead — zero page faults for
+  thirteen minutes — so it is blocked on something rather than dying of
+  something. That is a better problem.
