@@ -671,8 +671,9 @@ $(BUILD)/imgdec.elf: user/imgdec.c kernel/png.c kernel/gif.c kernel/jpeg.c kerne
 	$(IMGDEC_CC) -w -c kernel/webp.c    -o $(BUILD)/imgdec_webp.o
 	$(IMGDEC_CC) -w -c kernel/inflate.c -o $(BUILD)/imgdec_inflate.o
 	$(IMGDEC_CC) -w -c kernel/font.c    -o $(BUILD)/imgdec_font.o
+	$(IMGDEC_CC) -w -c kernel/fontext.c -o $(BUILD)/imgdec_fontext.o
 	$(IMGDEC_CC) -Wall -c user/imgdec.c -o $(BUILD)/imgdec_app.o
-	$(LD) -T user/user.ld -o $@ $(BUILD)/imgdec_app.o $(BUILD)/imgdec_png.o $(BUILD)/imgdec_gif.o $(BUILD)/imgdec_jpeg.o $(BUILD)/imgdec_bmp.o $(BUILD)/imgdec_svg.o $(BUILD)/imgdec_webp.o $(BUILD)/imgdec_inflate.o $(BUILD)/imgdec_font.o $(BUILD)/user_ulib.o $(BUILD)/user_umalloc.o
+	$(LD) -T user/user.ld -o $@ $(BUILD)/imgdec_app.o $(BUILD)/imgdec_png.o $(BUILD)/imgdec_gif.o $(BUILD)/imgdec_jpeg.o $(BUILD)/imgdec_bmp.o $(BUILD)/imgdec_svg.o $(BUILD)/imgdec_webp.o $(BUILD)/imgdec_inflate.o $(BUILD)/imgdec_font.o $(BUILD)/imgdec_fontext.o $(BUILD)/user_ulib.o $(BUILD)/user_umalloc.o
 	@echo "Built $@ (ring-3 image decoders)"
 
 # gpaint links the from-scratch PNG encoder (kernel/png_encode.c + its DEFLATE)
@@ -714,7 +715,7 @@ $(BUILD)/imgview.elf: user/imgview.c kernel/png.c kernel/gif.c kernel/jpeg.c ker
 # here, in ring 3). Plain http:// still uses SYS_http (no crypto/X.509 there). SSE:
 # js.c uses IEEE-754 doubles; the integer-only crypto is built -mgeneral-regs-only.
 WEBVIEW_CC = $(CC) -ffreestanding -nostdlib -fno-pic -fno-pie -mno-red-zone -std=gnu11 -O2 -msse2 -mfpmath=sse -Ikernel/include -Iuser -w
-WEBVIEW_PARSERS = png gif jpeg bmp svg webp inflate font http cssprop color url htmlentity htmlattr reader
+WEBVIEW_PARSERS = png gif jpeg bmp svg webp inflate font fontext http cssprop color url htmlentity htmlattr reader
 # Ring-3 TLS 1.3 + crypto + X.509 for the browser's HTTPS fetch (M1863). Same set +
 # flags httpget uses (integer-only -> -mgeneral-regs-only). url.c is already linked
 # via WEBVIEW_PARSERS, so tls.c's url_host_port() resolves without adding it here.

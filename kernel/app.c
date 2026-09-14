@@ -283,6 +283,10 @@ struct app {
     uint8_t  esc;                        /* ANSI escape state: 0 normal, 1 saw ESC, 2 in CSI */
     uint8_t  csilen;                     /* bytes buffered in csi[] */
     char     csi[24];                    /* CSI parameter bytes (between '[' and the final letter) */
+    /* UTF-8 decoder state (M2015): bytes still owed on the current character,
+     * and the code point built so far. One code point becomes one cell. */
+    uint8_t  u8need;
+    unsigned long u8cp;
     int      cx, cy;
     char     sb[SB_ROWS][APP_COLS_MAX];  /* scrollback: lines that scrolled off */
     int      sb_count;                   /* how many scrollback lines are stored */
@@ -2411,13 +2415,44 @@ int app_console_size(int *cols, int *rows) {
  * was printed as literal text: Claude Code's interface arrived as thousands of
  * visible "ESC[38;5;246m" instead of coloured, positioned characters. The
  * terminal existed; one of its two entry points simply did not use it. */
+/* THE TERMINAL IS UTF-8 NOW (M2015).
+ *
+ * It used to store one BYTE per cell, which is two bugs at once. The visible
+ * one is that a 3-byte box-drawing character renders as three garbage glyphs.
+ * The one that actually breaks a TUI is the COLUMN ACCOUNTING: those three
+ * bytes advance the cursor three cells, so every line containing a box
+ * character is two or three times too wide, wraps early, and overwrites the
+ * line below. Claude Code's onboarding came out as fields of '?' with the
+ * login prompt written on top of the theme list, and the second symptom is the
+ * one that made it unusable rather than merely ugly.
+ *
+ * One code point, one cell. Continuation bytes are folded into the code point
+ * instead of being drawn; font_cp_to_glyph then maps it onto a real glyph, a
+ * readable ASCII stand-in, or nothing (zero-width). A malformed sequence is
+ * dropped rather than resynchronised into text: a terminal that prints the
+ * pieces of a broken character is noisier than one that prints nothing. */
 void grid_write(struct app *a, const char *buf, unsigned len) {
     if (!a) return;
     for (unsigned i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)buf[i];
         if (a->esc == 0) {
-            if (ch == 0x1B) a->esc = 1;          /* ESC: maybe a sequence */
-            else grid_putc(a, (char)ch);
+            if (a->u8need) {                     /* mid-character */
+                if ((ch & 0xC0) == 0x80) {
+                    a->u8cp = (a->u8cp << 6) | (ch & 0x3F);
+                    if (--a->u8need == 0) {
+                        unsigned char g = font_cp_to_glyph(a->u8cp);
+                        if (g) grid_putc(a, (char)g);
+                    }
+                    continue;
+                }
+                a->u8need = 0;                   /* truncated: drop it and re-read this byte */
+            }
+            if (ch == 0x1B) { a->esc = 1; continue; }
+            if (ch < 0x80) { grid_putc(a, (char)ch); continue; }
+            if ((ch & 0xE0) == 0xC0)      { a->u8cp = ch & 0x1F; a->u8need = 1; }
+            else if ((ch & 0xF0) == 0xE0) { a->u8cp = ch & 0x0F; a->u8need = 2; }
+            else if ((ch & 0xF8) == 0xF0) { a->u8cp = ch & 0x07; a->u8need = 3; }
+            /* else: a stray continuation or 0xFE/0xFF -- not a character, drop it */
         } else if (a->esc == 1) {                /* after ESC */
             if (ch == '[') { a->esc = 2; a->csilen = 0; }
             else a->esc = 0;                     /* unsupported ESC x: consume + drop */

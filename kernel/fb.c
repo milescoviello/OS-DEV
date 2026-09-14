@@ -371,8 +371,8 @@ void fb_row(int x, int y, int w, const uint32_t *colors) {
 
 void fb_glyph(int x, int y, char c, uint32_t fg, uint32_t bg) {
     unsigned char uc = (unsigned char)c;
-    if (uc >= 128) uc = '?';
-    const unsigned char *g = font_glyphs[uc];
+    /* 0x80+ is the extended TUI set now, not an error (M2015) */
+    const unsigned char *g = font_row(uc);
     /* fast path: the whole glyph is on-screen → write directly, no per-pixel
      * bounds test or target branch. This is the hot path for window text. */
     if (x >= clip_x0 && y >= clip_y0 && x + font_width <= clip_x1 && y + font_height <= clip_y1 &&
@@ -395,8 +395,8 @@ void fb_glyph(int x, int y, char c, uint32_t fg, uint32_t bg) {
  * untouched. Used for UI labels drawn over an existing scene. */
 void fb_glyph_fg(int x, int y, char c, uint32_t fg) {
     unsigned char uc = (unsigned char)c;
-    if (uc >= 128) uc = '?';
-    const unsigned char *g = font_glyphs[uc];
+    /* 0x80+ is the extended TUI set now, not an error (M2015) */
+    const unsigned char *g = font_row(uc);
     if (x >= clip_x0 && y >= clip_y0 && x + font_width <= clip_x1 && y + font_height <= clip_y1 &&
         x >= 0 && y >= 0 && x + font_width <= fb_w && y + font_height <= fb_h) {
         uint32_t *dst = target ? target : (uint32_t *)lfb;
@@ -416,8 +416,8 @@ void fb_glyph_fg(int x, int y, char c, uint32_t fg) {
 void fb_text(int x, int y, const char *s, uint32_t color, int scale) {
     for (int i = 0; s[i]; i++) {
         unsigned char uc = (unsigned char)s[i];
-        if (uc >= 128) uc = '?';
-        const unsigned char *g = font_glyphs[uc];
+        /* 0x80+ is the extended TUI set now, not an error (M2015) */
+        const unsigned char *g = font_row(uc);
         for (int row = 0; row < font_height; row++)
             for (int col = 0; col < font_width; col++)
                 if (g[row] & (0x80 >> col))

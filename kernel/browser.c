@@ -14,6 +14,7 @@
  * But it turns live HTML from the internet into readable, styled, scrollable,
  * clickable pages — the first real step toward a browser.
  */
+#include "font.h"   /* font_row: the extended TUI glyphs (M2015) */
 #include "browser.h"
 #include "net.h"
 #include "fb.h"
@@ -4015,11 +4016,10 @@ static void browser_canvas_op(const char *id, int op, int a, int by, int c, int 
         int adx=dx<0?-dx:dx, ady=dy<0?-dy:dy, sx=dx<0?-1:1, sy=dy<0?-1:1, err=(adx>ady?adx:-ady)/2;
         for (;;) { PEN(x0,y0); if(x0==x1&&y0==y1) break; int e2=err; if(e2>-adx){err-=ady;x0+=sx;} if(e2<ady){err+=adx;y0+=sy;} }
     } else if (op == 4 && text) {                            /* M1798: fillText(text, a=x, by=baseline y) in fillStyle, 8x16 bitmap font */
-        extern const unsigned char font_glyphs[128][16];
         int pen = a;
         for (const char *t = text; *t; t++) {
-            unsigned char uc = (unsigned char)*t; if (uc >= 128) uc = '?';
-            const unsigned char *g = font_glyphs[uc];
+            unsigned char uc = (unsigned char)*t;
+            const unsigned char *g = font_row(uc);   /* 0x80+ = the extended TUI set (M2015) */
             for (int row = 0; row < 16; row++) { unsigned char bits = g[row]; int yy = by - 13 + row;   /* by is the text baseline */
                 for (int col = 0; col < 8; col++) if (bits & (0x80 >> col)) CVPX(pen + col, yy); }
             pen += 8;
