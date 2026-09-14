@@ -876,10 +876,25 @@ int wl_compositor_poll(void) {
          * (M2000) */
         if (c->outlen) { wl_flush(c); worked++; }
         if (!unix_readable(c->ep)) continue;
-        long n = unix_recv(c->ep, c->in + c->inlen, (unsigned long)(WL_INBUF - c->inlen));
-        if (n <= 0) {                                /* EOF or error: drop the client */
+        /* NEVER ASK FOR ZERO BYTES. unix_recv returns what it read, and a
+         * zero-length request reads zero -- which this loop treats as EOF and
+         * uses to drop a perfectly healthy client. Reachable whenever the
+         * input buffer is full of a partial message, i.e. exactly when a
+         * client is busiest. (M2002) */
+        int room = WL_INBUF - c->inlen;
+        if (room <= 0) {
+            kprintf("[wl] input buffer full (%d bytes) with no complete message: dropping client\n", c->inlen);
             unix_close(c->ep); c->used = 0;
-            kprintf("[wl] client disconnected\n");
+            continue;
+        }
+        long n = unix_recv(c->ep, c->in + c->inlen, (unsigned long)room);
+        if (n <= 0) {                                /* EOF or error: drop the client */
+            /* WHICH of the two, and with how much still queued for it. "client
+             * disconnected" was true of both a client that hung up and a
+             * receive that errored, and those need different fixes. (M2002) */
+            kprintf("[wl] client disconnected (ep %d, recv -> %ld, %d byte(s) still queued to send)\n",
+                    c->ep, n, c->outlen);
+            unix_close(c->ep); c->used = 0;
             continue;
         }
         c->inlen += (int)n;

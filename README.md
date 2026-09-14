@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2001-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2002-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1359,3 +1359,32 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   and receives its keymap without a single protocol error. It still does not
   paint. `libEGL.so.1` is staged too — it is `dlopen`'d, so `ldd` cannot see it
   and the closure staging had no way to know.
+
+- **M2002** — **a file descriptor is a reference, and AF_UNIX never got the
+  memo.** `app_fd_fork` takes a reference for every shared object a child
+  inherits — pipes since M1187, memfds since M1212, epoll since M1220, inotify
+  and TCP sockets since M1603 — and AF_UNIX endpoints were simply never added to
+  that list. So a forked child's socket *was* the parent's socket, and the first
+  `close()` in either process hung up both ends. Every child closes its
+  inherited descriptors after `exec`, and `posix_spawn` does it explicitly.
+
+  Firefox forks its content processes. Its display connection died moments after
+  it had bound every global, created a `wl_shm` pool and taken its keymap — and
+  from the compositor's side it looked like a clean, voluntary hangup by a
+  client that had not gone anywhere:
+
+      [wl] client disconnected (ep 3, recv -> 0, 0 byte(s) still queued to send)
+
+  That line is itself part of the fix: "client disconnected" used to be printed
+  for both a peer that hung up and a receive that errored, which are different
+  problems with different causes. Saying *which*, and how much was still queued,
+  is what pointed at the peer rather than at us. `app_fd_release` (process exit)
+  had the same omission in the other direction — with references it would have
+  leaked the connection forever instead of closing it early.
+
+  Also: the compositor could ask `recv` for **zero bytes** whenever its input
+  buffer held a partial message, and a zero-length read returns zero, which that
+  loop read as EOF — dropping a healthy client precisely when it was busiest.
+
+  Firefox now keeps its connection across its forks, binds a second registry,
+  and a third client connects. It still creates no `wl_surface`.

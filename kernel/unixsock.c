@@ -71,6 +71,23 @@ struct uconn {
      * saw EOF, its connection handle stayed open, and the event loop had
      * nothing left to do but could not exit -- a hang with no error. */
     int a_wr_closed, b_wr_closed;
+    /* HOW MANY FILE DESCRIPTORS NAME EACH END (M2002).
+     *
+     * An endpoint used to be closed by the first close() that reached it, and
+     * fork COPIES the whole fd table -- so a child that inherited a socket and
+     * then closed it (which every child does after exec, and which posix_spawn
+     * does explicitly) hung up the PARENT'S live connection. Firefox forks its
+     * content processes, so its display connection died moments after it had
+     * bound every global and taken its keymap, and the compositor saw a clean
+     * EOF from a client that had not gone anywhere:
+     *
+     *     [wl] client disconnected (ep 3, recv -> 0, 0 byte(s) still queued)
+     *
+     * A descriptor is a reference. Only the last one closes the end. This is
+     * the same refcount pipes, memfds, epoll instances, inotify instances and
+     * TCP sockets already had in app_fd_fork -- AF_UNIX was the one type never
+     * added to that list. */
+    int a_refs, b_refs;
     task_t *a_waiter, *b_waiter;  /* side A blocked reading b2a; side B blocked reading a2b */
 };
 static struct uconn conns[U_CONN];
@@ -136,6 +153,7 @@ int unix_connect(const char *path) {
     struct uconn *c = &conns[ci];
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
     c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
+    c->a_refs = c->b_refs = 1;                     /* one descriptor per end to begin with (M2002) */
     lis[li].pend[lis[li].np++] = ci;               /* enqueue for the server to accept */
     if (lis[li].waiter) { task_wake(lis[li].waiter); lis[li].waiter = 0; }
     usock_irq_restore(fl);
@@ -237,10 +255,23 @@ int unix_shutdown(int ep, int how) {
 }
 
 int g_unix_verbose;     /* -append unixverbose: trace closes and EOF decisions */
+/* Another descriptor now names this endpoint (fork, dup, SCM_RIGHTS). */
+int unix_ref(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s); if (!c) { usock_irq_restore(fl); return -1; }
+    if (s) c->b_refs++; else c->a_refs++;
+    usock_irq_restore(fl);
+    return 0;
+}
+
 int unix_close(int ep) {
     uint64_t fl = usock_irq_save();
     int s; struct uconn *c = ep_conn(ep, &s); if (!c) { usock_irq_restore(fl); return -1; }
-    if (g_unix_verbose) kprintf("[usock] close(ep %d side %d)\n", ep, s);
+    if (g_unix_verbose) kprintf("[usock] close(ep %d side %d) refs=%d\n", ep, s, s ? c->b_refs : c->a_refs);
+    /* Drop ONE reference; the end stays open while any descriptor names it. */
+    int *rp = s ? &c->b_refs : &c->a_refs;
+    if (*rp > 1) { (*rp)--; usock_irq_restore(fl); return 0; }
+    *rp = 0;
     if (s) c->b_closed = 1; else c->a_closed = 1;
     task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer so its recv returns EOF */
     if (*pw) { task_wake(*pw); *pw = 0; }
@@ -333,6 +364,7 @@ int unix_socketpair(int *a, int *b) {
     struct uconn *c = &conns[ci];
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
     c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
+    c->a_refs = c->b_refs = 1;                     /* one descriptor per end to begin with (M2002) */
     *a = (ci << 1) | 0;                             /* side A */
     *b = (ci << 1) | 1;                             /* side B */
     usock_irq_restore(fl);

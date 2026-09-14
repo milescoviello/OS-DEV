@@ -1,5 +1,37 @@
 # What's next
 
+> **(M2002) A FILE DESCRIPTOR IS A REFERENCE, AND AF_UNIX NEVER GOT THE MEMO.**
+>
+> `app_fd_fork` takes a reference for every shared object a child inherits --
+> pipes (M1187), memfds (M1212), epoll (M1220), inotify and TCP sockets (M1603).
+> AF_UNIX endpoints were never added to that list, so a forked child's socket
+> *was* the parent's socket and the first `close()` in either process hung up
+> both ends. Every child closes its inherited descriptors after `exec`;
+> `posix_spawn` does it explicitly.
+>
+> Firefox forks its content processes, so its display connection died moments
+> after it had bound every global, created a `wl_shm` pool and taken its keymap
+> -- and from the compositor's side it looked like a clean, voluntary hangup:
+>
+> ```
+> [wl] client disconnected (ep 3, recv -> 0, 0 byte(s) still queued to send)
+> ```
+>
+> That line is part of the fix. "client disconnected" used to cover both a peer
+> that hung up and a receive that errored -- different problems, different
+> causes. Saying which, and how much was still queued, is what pointed away from
+> us and at the peer. `app_fd_release` had the same omission in the other
+> direction: with references it would have leaked the connection instead of
+> closing it early.
+>
+> Also: the compositor could ask `recv` for ZERO bytes whenever its input buffer
+> held a partial message, and a zero-length read returns zero, which that loop
+> read as EOF -- dropping a healthy client exactly when it was busiest.
+>
+> **Where Firefox is now:** it keeps its connection across its forks, binds a
+> second registry, gets its keymap and cursor pool, and reports no errors of any
+> kind. It still creates no `wl_surface`, so there is nothing to draw yet.
+
 > **(M2001) ONE 2 KiB BUFFER, SHARED BY EVERY TASK ON EVERY CORE, IN THE MIDDLE
 > OF `recvmsg`.**
 >

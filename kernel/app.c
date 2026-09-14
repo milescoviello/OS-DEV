@@ -6021,12 +6021,14 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].used && a->fd[newfd].type == 6) epoll_unref(a->fd[newfd].obj);   /* (M1220) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 8) inotify_free(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 10) net_tcp_sock_close(a->fd[newfd].obj); /* (M1603) */
+    else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
     a->fd[newfd] = a->fd[oldfd];                                  /* newfd now references the same end */
     if (a->fd[newfd].type == 1) pipe_open_end(a->fd[newfd].obj, a->fd[newfd].write_end);
     else if (a->fd[newfd].type == 3) memfd_ref(a->fd[newfd].obj);   /* (M1212) */
     else if (a->fd[newfd].type == 6) epoll_ref(a->fd[newfd].obj);   /* (M1220) */
     else if (a->fd[newfd].type == 8) inotify_ref(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].type == 10) net_tcp_sock_ref(a->fd[newfd].obj); /* (M1603) */
+    else if (a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_ref(a->fd[newfd].obj); /* AF_UNIX: a descriptor is a reference (M2002) */
     return newfd;
 }
 /* mkfifo(path): create a named pipe (M1188). 0/-1. */
@@ -6912,6 +6914,14 @@ static void app_fd_fork(struct app *child, struct app *parent) {
         else if (parent->fd[i].used && parent->fd[i].type == 6) epoll_ref(parent->fd[i].obj);   /* epoll inherited (M1220) */
         else if (parent->fd[i].used && parent->fd[i].type == 8) inotify_ref(parent->fd[i].obj);        /* inotify inherited (M1603) */
         else if (parent->fd[i].used && parent->fd[i].type == 10) net_tcp_sock_ref(parent->fd[i].obj);  /* TCP socket inherited (M1603) */
+        /* AF_UNIX WAS THE ONE TYPE MISSING FROM THIS LIST (M2002). Without a
+         * reference, the child's inherited socket was the SAME endpoint as the
+         * parent's and the first close() in either process hung up both. Every
+         * child closes its inherited descriptors after exec, so a program that
+         * forks lost its own live connection moments later -- which is exactly
+         * how Firefox's display connection died right after it had bound every
+         * global and taken its keymap. */
+        else if (parent->fd[i].used && parent->fd[i].type == 12) unix_ref(parent->fd[i].obj);   /* AF_UNIX endpoint inherited (M2002) */
     }
 }
 /* exit/reap: close every fd the process still held. Must mirror app_fd_close's
@@ -6929,6 +6939,13 @@ static void app_fd_release(struct app *a) {
         else if (a->fd[i].type == 6) epoll_unref(a->fd[i].obj);
         else if (a->fd[i].type == 8) inotify_free(a->fd[i].obj);
         else if (a->fd[i].type == 10) net_tcp_sock_close(a->fd[i].obj);
+        /* AF_UNIX, which this never handled either (M2002). Harmless while an
+         * endpoint was closed by whoever got there first; now that a descriptor
+         * is a REFERENCE, an exiting process that skipped its sockets would
+         * leave the connection open forever -- the peer never sees EOF and the
+         * compositor's client table fills with the dead. */
+        else if (a->fd[i].type == 12) { if (a->fd[i].obj >= 0) unix_close(a->fd[i].obj); }
+        else if (a->fd[i].type == 13) unix_unlisten(a->fd[i].obj);
         a->fd[i].used = 0;
     }
 }
