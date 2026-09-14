@@ -884,6 +884,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the root-directory probe...\n");
         int cwdrc = app_run_linux_sync("/disk2/lxcwd", 0, 0, 60000);
         kprintf("[lxabi] LXCWD exit -> %d\n", cwdrc);
+        /* ...and the memory shape a JS engine actually needs: reserve twice
+         * what you want, round up to an alignment, give back the head and the
+         * tail, then use what is left. Both trims report success either way --
+         * the claim being tested is that the KEPT range is still there.
+         * (M1999) */
+        kprintf("[lxabi] launching the reserve/align/trim (pointer cage) probe...\n");
+        int cagerc = app_run_linux_sync("/disk2/lxcage", 0, 0, 120000);
+        kprintf("[lxabi] LXCAGE exit -> %d\n", cagerc);
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");
@@ -1117,6 +1125,28 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxclaude] running CLAUDE CODE -p (config + DNS + TLS + HTTP)...\n");
             int crc3 = app_run_linux_sync("/disk2/usr/bin/claude", av_cp, 2, 300000);
             kprintf("[lxclaude] claude -p -> %d\n", crc3);
+            /* AND THE NETWORK PATH, which the run above never reaches (M1999).
+             *
+             * "Not logged in - Please run /login" is the correct answer for an
+             * image with no credentials, but it is a LOCAL check: Claude Code
+             * short-circuits there before any DNS lookup, TCP connect or TLS
+             * handshake happens, so exiting cleanly says nothing at all about
+             * whether this kernel can carry an HTTPS request.
+             *
+             * Hand it a DELIBERATELY FAKE key and it stops short-circuiting:
+             * it resolves api.anthropic.com over our DNS, opens a TCP
+             * connection over our stack, completes a TLS handshake with
+             * Node's bundled OpenSSL, sends a real POST and reads a real
+             * response. The server answers 401, which is exactly right for a
+             * key that is not a key -- and a 401 that came back over the wire
+             * proves every layer underneath it.
+             *
+             * The key is a placeholder, in the source, carrying nothing. The
+             * developer's own ~/.claude is never staged into a guest image. */
+            app_set_next_env("ANTHROPIC_API_KEY=sk-ant-api03-osdev-placeholder-this-is-not-a-real-key");
+            kprintf("[lxclaude] running CLAUDE CODE -p WITH a (fake) key: DNS + TLS + HTTP for real...\n");
+            int crc4 = app_run_linux_sync("/disk2/usr/bin/claude", av_cp, 2, 300000);
+            kprintf("[lxclaude] claude -p (fake key) -> %d\n", crc4);
         }
         if (g_lxinet_test) {
             /* AF_INET through the ABI (M1967): a DNS lookup over UDP and an

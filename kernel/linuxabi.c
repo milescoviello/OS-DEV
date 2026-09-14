@@ -219,6 +219,12 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_fsync_        74
 #define LXS_fdatasync_    75
 #define LXS_rename_       82
+#define LXS_link_         86
+#define LXS_symlink_      88
+#define LXS_linkat_      265
+#define LXS_symlinkat_   266
+#define LXS_utimensat_   280
+#define LXS_pidfd_open_  434
 #define LXS_unlink_       87
 #define LXS_unlinkat_    263
 #define LXS_pread64_      17
@@ -327,6 +333,18 @@ void linux_abi_init_this_cpu(void) {
 #define LXST_O_SIZE    48
 #define LXST_O_BLKSIZE 56
 #define LXST_O_BLOCKS  64
+/* THE TIMESTAMPS, which this struct never carried (M1999). Every file a Linux
+ * program stat'd here reported 1 January 1970, because these three fields were
+ * simply left as the zeroes the caller's buffer was cleared to.
+ *
+ * That is not cosmetic. `make` decides what to rebuild by comparing an output's
+ * mtime with its inputs' -- with every file equally ancient it cannot order
+ * anything, which is the self-hosting path. git uses mtime to decide whether a
+ * working-tree file needs re-hashing. And utimensat appeared to do nothing at
+ * all: it set the time correctly and stat could not read it back. */
+#define LXST_O_ATIME   72
+#define LXST_O_MTIME   88
+#define LXST_O_CTIME  104
 #define LX_S_IFCHR  0020000
 #define LX_S_IFREG  0100000
 
@@ -805,6 +823,75 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = 0;
         break;
     }
+    case LXS_link_:                         /* (oldpath, newpath) */
+    case LXS_linkat_: {                     /* (olddirfd, old, newdirfd, new, flags) */
+        /* HARD LINKS. ext2_link_path has existed since M1207 and vfs_link
+         * since then; this entry point simply never existed, so every attempt
+         * came back ENOSYS. Firefox makes them -- a profile writes its files
+         * by linking a temporary into place, which is how an update is made
+         * atomic. An allocator of atomicity that cannot link falls back to
+         * copy-and-rename or gives up. (M1999) */
+        uint64_t uo = (r->rax == LXS_link_) ? r->rdi : r->rsi;
+        uint64_t un = (r->rax == LXS_link_) ? r->rsi : r->r10;
+        if (!uo || !un || !vmm_user_ok(uo, 1) || !vmm_user_ok(un, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xo[VFS_PATH_MAX], xn[VFS_PATH_MAX];
+        const char *op = lx_xlate((const char *)uo, xo, sizeof xo);
+        const char *np = lx_xlate((const char *)un, xn, sizeof xn);
+        r->rax = (uint64_t)(vfs_link(op, np) == 0 ? 0 : -(long)LX_EPERM);
+        break;
+    }
+    case LXS_symlink_:                      /* (target, linkpath) */
+    case LXS_symlinkat_: {                  /* (target, newdirfd, linkpath) */
+        /* SYMLINKS, same story: vfs_symlink creates real on-disk ext2 symlinks
+         * (M1146) and readlink has read them since M1998. Note the argument
+         * ORDER -- symlink(2) is (target, linkpath), the opposite way round
+         * from link(2)'s (old, new) in the sense that the FIRST argument is
+         * the contents of the link, not an existing path that must resolve.
+         * Getting it backwards produces links that point at themselves. */
+        uint64_t ut = r->rdi;
+        uint64_t ul = (r->rax == LXS_symlink_) ? r->rsi : r->rdx;
+        if (!ut || !ul || !vmm_user_ok(ut, 1) || !vmm_user_ok(ul, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xl[VFS_PATH_MAX];
+        const char *lp = lx_xlate((const char *)ul, xl, sizeof xl);
+        /* The TARGET is not translated: it is the link's contents, a string
+         * interpreted later in the process's own view of the filesystem, and
+         * rewriting it into /disk2/... would bake our mount point into a file
+         * on disk. */
+        r->rax = (uint64_t)(vfs_symlink(lp, (const char *)ut) == 0 ? 0 : -(long)LX_EPERM);
+        break;
+    }
+    case LXS_utimensat_: {                  /* (dirfd, path, struct timespec[2], flags) */
+        /* Set a file's times. app_utimens has existed since M1230 and was
+         * reachable only through the native entry point. Claude Code calls
+         * this on every file it writes; a build system calls it to make an
+         * output look older or newer than its input, so this is the
+         * self-hosting path too. NULL times means "now" for both.
+         *
+         * UTIME_NOW is 0x3fffffff and UTIME_OMIT is 0x3ffffffe, in the
+         * NANOSECONDS field -- a value that is not a time at all, which is why
+         * they have to be recognised before the seconds are used. */
+        if (!r->rsi || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xu[VFS_PATH_MAX];
+        const char *up2 = lx_xlate((const char *)r->rsi, xu, sizeof xu);
+        long at = -1, mt = -1;                       /* -1 = leave alone */
+        if (!r->rdx) { at = (long)(rtc_unix()); mt = at; }
+        else if (vmm_user_ok(r->rdx, 32)) {
+            const int64_t *ts = (const int64_t *)r->rdx;
+            long now = (long)rtc_unix();
+            at = (ts[1] == 0x3fffffff) ? now : (ts[1] == 0x3ffffffe ? -1 : (long)ts[0]);
+            mt = (ts[3] == 0x3fffffff) ? now : (ts[3] == 0x3ffffffe ? -1 : (long)ts[2]);
+        } else { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        r->rax = (uint64_t)(vfs_utimes(up2, at, mt) == 0 ? 0 : -(long)LX_ENOENT);
+        break;
+    }
+    case LXS_pidfd_open_: {                 /* (pid, flags) */
+        /* A pollable handle to a process's exit. app_pidfd_open has backed
+         * fd type 7 since M1222; a runtime that manages child processes uses
+         * this instead of SIGCHLD because it composes with an event loop. */
+        int pfd = app_pidfd_open((int)a1);
+        r->rax = (pfd < 0) ? (uint64_t)-(long)LX_ESRCH : (uint64_t)pfd;
+        break;
+    }
     case LXS_rmdir_: {                      /* (path) */
         const char *upath = (const char *)r->rdi;
         if (!upath || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
@@ -933,7 +1020,8 @@ void linux_syscall_dispatch(struct registers *r) {
         *(uint32_t *)(o + 0)  = 0x7ff;                     /* stx_mask: what we filled in */
         *(uint32_t *)(o + 4)  = 4096;                      /* stx_blksize */
         *(uint32_t *)(o + 16) = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);  /* stx_nlink -- the real count (M1998) */
-        *(uint16_t *)(o + 28) = (uint16_t)(isdir ? (0040000u | 0755u) : (0100000u | 0644u));  /* stx_mode */
+        *(uint16_t *)(o + 28) = (uint16_t)((sx.stx_mode & 07777u) ? sx.stx_mode
+                                           : (isdir ? (0040000u | 0755u) : (0100000u | 0644u)));  /* stx_mode, real when we have it (M1999) */
         *(uint64_t *)(o + 32) = sx.stx_ino;                /* stx_ino */
         *(uint64_t *)(o + 40) = sx.stx_size;               /* stx_size */
         *(uint64_t *)(o + 48) = (sx.stx_size + 511) / 512; /* stx_blocks */
@@ -1501,8 +1589,8 @@ void linux_syscall_dispatch(struct registers *r) {
             if (g_poll_trace && !etold && (long)(timer_ms() - start) > 3000 &&
                 g_poll_reports < 24) {
                 etold = 1; g_poll_reports++;
-                kprintf("[poll] pid %d STALLED in epoll_wait(%d), timeout %ld:\n",
-                        app_current_pid(), (int)a1, timeout);
+                kprintf("[poll] pid %d tid %d STALLED in epoll_wait(%d), timeout %ld:\n",
+                        app_current_pid(), task_current_id(), (int)a1, timeout);
                 app_epoll_dump((int)a1);
             }
             task_sleep_ms(10);
@@ -1551,8 +1639,8 @@ void linux_syscall_dispatch(struct registers *r) {
             if (g_poll_trace && !told && (long)(timer_ms() - start) > 3000 &&
                 g_poll_reports < 24) {
                 told = 1; g_poll_reports++;
-                kprintf("[poll] pid %d STALLED on %ld fd(s), timeout %ld:\n",
-                        app_current_pid(), nfds, timeout);
+                kprintf("[poll] pid %d tid %d STALLED on %ld fd(s), timeout %ld:\n",
+                        app_current_pid(), task_current_id(), nfds, timeout);
                 for (long i = 0; i < nfds; i++) {
                     int fd = *(const int32_t *)(fds + i * 8);
                     short want = *(const int16_t *)(fds + i * 8 + 4);
@@ -1712,6 +1800,19 @@ void linux_syscall_dispatch(struct registers *r) {
          * Linux's silent-replace needs VMA splitting we do not have yet. */
         uint64_t base = (flags & LX_MAP_FIXED) ? app_mmap_fixed(r->rdi, (uint64_t)len)
                                               : app_mmap((uint64_t)len);
+        /* A HUGE reservation is always structural, never incidental, and it is
+         * worth a line in the log whether or not tracing is on. JSC reserves
+         * `size + alignment` of PROT_NONE address space for its pointer cage
+         * and then aligns the result up by hand -- 32 GiB of cage means a 64
+         * GiB request, and the base it computes is the first 32 GiB-aligned
+         * address inside whatever it got back. If the reservation is short, or
+         * it is trimmed wrong afterwards, the program does not fail here: it
+         * fails much later, reading through a pointer built from a base that
+         * was never mapped. (M1999) */
+        if (len >= (1L << 30))
+            kprintf("[lxmmap] BIG anon request: addr=%lx len=%lx (%ld MiB) prot=%ld flags=%lx -> %lx\n",
+                    (unsigned long)r->rdi, (unsigned long)len, len >> 20, prot,
+                    (unsigned long)flags, (unsigned long)base);
         if (g_lx_mmap_trace)
             kprintf("[lxmmap] anon addr=%lx len=%lx prot=%ld fixed=%d -> %lx\n",
                     (unsigned long)r->rdi, (unsigned long)len, prot,
@@ -1738,9 +1839,22 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)(mrc == 0 ? 0 : -(long)LX_EINVAL);
         break;
     }
-    case LXS_munmap:
-        r->rax = (uint64_t)(app_munmap(r->rdi, r->rsi) == 0 ? 0 : -(long)LX_EINVAL);
+    case LXS_munmap: {
+        long urc = app_munmap(r->rdi, r->rsi);
+        /* The other half of the huge-reservation story (M1999): JSC trims its
+         * over-sized reservation down to the aligned window it wants by
+         * munmapping the head and the tail. A trim that removes the wrong
+         * range, or that FAILS and leaves the caller believing it succeeded,
+         * is indistinguishable from the reservation never having happened --
+         * and it only shows up much later, as a read through a cage base that
+         * is not mapped. */
+        if ((long)r->rsi >= (1L << 30))
+            kprintf("[lxmmap] BIG munmap: addr=%lx len=%lx (%ld MiB) -> %ld\n",
+                    (unsigned long)r->rdi, (unsigned long)r->rsi,
+                    (long)r->rsi >> 20, urc);
+        r->rax = (uint64_t)(urc == 0 ? 0 : -(long)LX_EINVAL);
         break;
+    }
     case LXS_set_robust_list:
     case LXS_rseq:
         /* Both are pure optimisations: the robust-futex list only matters if a
@@ -1945,7 +2059,13 @@ void linux_syscall_dispatch(struct registers *r) {
             }
             if (vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
             int isdir = (sx.stx_mode & 0170000u) == 0040000u;
-            *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
+            /* The REAL mode when the filesystem reported one -- ext2 does. An
+             * executable bit that is not reported is an executable that cannot be
+             * run, and a mode of 0644 on every file makes chmod look broken.
+             * (M1999) */
+            *(uint32_t *)(st + LXST_O_MODE)    = (sx.stx_mode & 07777u)
+                                                 ? sx.stx_mode
+                                                 : (isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u));
             /* The REAL link count, not a constant 1 (M1998). A directory
              * always has at least two links ("." and its entry in its parent);
              * find(1) subtracts 2 from st_nlink to decide how many
@@ -1953,6 +2073,9 @@ void linux_syscall_dispatch(struct registers *r) {
              * them. A hardlinked file reported 1 too, so nothing could tell
              * that two names were the same file. */
             *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);
+            *(int64_t  *)(st + LXST_O_ATIME)   = (int64_t)sx.stx_mtime;
+            *(int64_t  *)(st + LXST_O_MTIME)   = (int64_t)sx.stx_mtime;
+            *(int64_t  *)(st + LXST_O_CTIME)   = (int64_t)sx.stx_mtime;
             *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
             *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
             *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
@@ -2170,8 +2293,17 @@ void linux_syscall_dispatch(struct registers *r) {
         uint8_t *st = (uint8_t *)r->rdx;
         for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
         int isdir = (sx.stx_mode & 0170000u) == 0040000u;
-        *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
+        /* The REAL mode when the filesystem reported one -- ext2 does. An
+         * executable bit that is not reported is an executable that cannot be
+         * run, and a mode of 0644 on every file makes chmod look broken.
+         * (M1999) */
+        *(uint32_t *)(st + LXST_O_MODE)    = (sx.stx_mode & 07777u)
+                                             ? sx.stx_mode
+                                             : (isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u));
         *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);   /* the real count -- see LXS_fstat (M1998) */
+        *(int64_t  *)(st + LXST_O_ATIME)   = (int64_t)sx.stx_mtime;   /* real times -- see LXST_O_MTIME (M1999) */
+        *(int64_t  *)(st + LXST_O_MTIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_CTIME)   = (int64_t)sx.stx_mtime;
         *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
         *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
         *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);  /* 512-byte units, as Linux defines it */

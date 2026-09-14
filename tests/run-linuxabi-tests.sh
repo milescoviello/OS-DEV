@@ -349,10 +349,48 @@ LXTHREAD: 4 threads
     else
         echo "  FAIL: nested mkdir:"; grep -a "LXCWD: mkdir\|LXCWD: rmdir" "$SLOG3" | head -5; f3=1
     fi
+    # M1999: symlink(2), link(2) and utimensat(2) all returned ENOSYS while the
+    # VFS had implemented every one of them years earlier -- vfs_symlink since
+    # M1146, vfs_link since M1207, vfs_utimes since M1230. Only the Linux entry
+    # points were missing. Firefox links a temporary into place to make a
+    # profile write atomic; Claude Code stamps every file it writes.
+    if grep -aq "LXCWD: open() FOLLOWED our symlink" "$SLOG3" && \
+       grep -aq "LXCWD: opened the cursor through its symlink" "$SLOG3"; then
+        echo "  ok: symlink(2) creates a real ext2 symlink, and open() follows one"
+    else
+        echo "  FAIL: symlinks:"; grep -a "LXCWD: .*symlink\|LXCWD: cursor" "$SLOG3" | head -4; f3=1
+    fi
+    if grep -aq "LXCWD: hard link shares the inode" "$SLOG3"; then
+        echo "  ok: link(2) makes a hard link, and both names report the same inode ($(grep -ao 'shares the inode ([0-9]*)' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: hard links:"; grep -a "LXCWD: .*link" "$SLOG3" | head -3; f3=1
+    fi
+    # The timestamp is the one that matters for self-hosting: `make` decides
+    # what to rebuild by comparing mtimes, and every file here reported the
+    # epoch because ext2_stat_path read the inode and threw the time away.
+    if grep -aq "LXCWD: utimensat set mtime and stat read it back" "$SLOG3"; then
+        echo "  ok: utimensat(2) sets a file's mtime AND stat reads the real value back (what make compares)"
+    else
+        echo "  FAIL: file timestamps:"; grep -a "LXCWD: utimensat" "$SLOG3" | head -2; f3=1
+    fi
     if grep -aq "LXCWD: 0 probe(s) failed" "$SLOG3"; then
         echo "  ok: every root-directory probe answered (stat/lstat/statx/access/O_DIRECTORY/opendir/realpath/O_PATH/fstatat/chdir/mkdir)"
     else
         echo "  FAIL: the root-directory probe:"; grep -a "LXCWD" "$SLOG3" | grep -a "FAILED" | head -4; f3=1
+    fi
+    # M1999: the memory shape a JS engine needs. JavaScriptCore reserves TWICE
+    # the address space it wants, rounds the result up to a large alignment,
+    # and munmaps the head and the tail -- then builds every pointer it owns as
+    # `base + 32-bit offset` into what is left. Both trims report success
+    # whatever they actually removed, so the assertion is on USING the kept
+    # range, not on the return values. A wrong split here does not fail at the
+    # call: it fails much later, reading through a base that is not mapped,
+    # with no syscall anywhere near the crash.
+    if grep -aq "LXCAGE: 4GiB/4GiB wrote and read back" "$SLOG3" && \
+       grep -aq "LXCAGE: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: reserve 8 GiB, align to 4 GiB, trim head and tail -- and the kept region is still writable end to end"
+    else
+        echo "  FAIL: the pointer-cage shape:"; grep -a "LXCAGE" "$SLOG3" | head -6; f3=1
     fi
     if grep -aq "LXSCM: memfd + SCM_RIGHTS + MAP_SHARED" "$SLOG3"; then
         echo "  ok: fd passing + shared memory ($(grep -ao 'fd [0-9]* passed as [0-9]*, [0-9]* KiB shared both ways' "$SLOG3" | head -1))"

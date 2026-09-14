@@ -291,7 +291,8 @@ int ext2_isdir_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char 
  * reading the size field the inode buffer already has. 0 on success, -1 if
  * absent -- feeds vfs_stat's /diskN dispatch via blockdev_mount_stat. */
 int ext2_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
-                   uint32_t *out_size, int *out_isdir, uint32_t *out_ino) {
+                   uint32_t *out_size, int *out_isdir, uint32_t *out_ino,
+                   uint32_t *out_mtime, uint32_t *out_nlink, uint32_t *out_mode) {
     ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     uint8_t inode[256]; int isdir = 0;
     /* walk() already returns the inode NUMBER; it was simply being discarded.
@@ -303,6 +304,15 @@ int ext2_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *
     if (out_size)  *out_size  = e_rd32(inode + 4);
     if (out_isdir) *out_isdir = isdir;
     if (out_ino)   *out_ino   = ino;
+    /* THE FIELDS THAT WERE ALREADY IN HAND AND WERE THROWN AWAY (M1999). The
+     * inode is right here, fully read: i_mode at 0, i_links_count at 26,
+     * i_mtime at 16. e_stamp has been WRITING the timestamps since M1175 and
+     * nothing could read one back, so every file a Linux program stat'd
+     * reported 1 January 1970 -- which is what `make` compares to decide what
+     * to rebuild, and what git compares to decide what to re-hash. */
+    if (out_mtime) *out_mtime = e_rd32(inode + 16);
+    if (out_nlink) *out_nlink = e_rd16(inode + 26);
+    if (out_mode)  *out_mode  = e_rd16(inode + 0);
     return 0;
 }
 

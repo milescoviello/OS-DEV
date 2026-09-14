@@ -1,5 +1,38 @@
 # What's next
 
+> **(M1999) FOUR SYSCALLS THAT WERE ALREADY IMPLEMENTED, AND A `struct stat`
+> THAT NEVER CARRIED THE TIME.**
+>
+> `symlink`(88), `link`(86), `utimensat`(280) and `pidfd_open`(434) returned
+> ENOSYS while `vfs_symlink` (M1146), `vfs_link` (M1207), `app_utimens` (M1230)
+> and `app_pidfd_open` (M1222) sat behind the native entry point doing exactly
+> that work. Only the Linux doorway was missing.
+>
+> **`struct stat` never carried a timestamp.** The offsets were not defined, so
+> the fields kept the zeroes the buffer was cleared to and every file reported 1
+> January 1970. Underneath, `ext2_stat_path` read the whole inode and threw away
+> `i_mtime`, `i_links_count` and `i_mode` -- it had been *writing* the timestamps
+> since M1175 and nothing could read one back. `utimensat` set the time
+> correctly and `stat` could not see it.
+>
+> That is the self-hosting path, not a detail: **`make` decides what to rebuild
+> by comparing mtimes**, and with every file equally ancient it cannot order
+> anything. `chmod` looked broken for the same reason -- the mode was
+> synthesised from "is it a directory".
+>
+> **`tools/lx/lxcage.c`** reproduces the memory shape a JS engine needs, taken
+> verbatim from this kernel's trace of Bun doing it: reserve 8 GiB, round the
+> result up to a 4 GiB boundary, `munmap` the head and the tail, then write and
+> read back 65 points across the 4 GiB that is left. Both trims return 0
+> whatever they actually removed, so the return values are not the claim.
+> **Mutation-proven**: making a head trim drop the whole VMA turns the probe
+> into a SIGSEGV -- the same exit status Claude Code was giving. The path is
+> clean; the probe is what makes that a fact instead of a belief.
+>
+> Also: `app_fault_current` now ends a dying process's other threads too.
+> M1998 fixed that for `exit_group` and left the second doorway open -- a
+> process killed by SIGSEGV must stop its siblings for the same reason.
+
 > **(M1998) CLAUDE CODE RUNS. IT SAYS "Not logged in · Please run /login".**
 >
 > Not `--version`, not `--help` -- the whole program. It loads its config and

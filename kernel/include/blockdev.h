@@ -129,7 +129,7 @@ long blockdev_mount_getxattr(int i, const char *path, const char *name, void *ou
 long blockdev_mount_listxattr(int i, const char *path, char *out, unsigned long max);  /* NUL-sep xattr names (ext2 only); total/-1 (M1182) */
 long blockdev_mount_removexattr(int i, const char *path, const char *name);  /* remove a user.* xattr (ext2 only); 0/-1 (M1182) */
 int  blockdev_mount_isdir(int i, const char *path);   /* is path a directory on mount i? */
-int  blockdev_mount_stat(int i, const char *path, uint32_t *out_size, int *out_isdir, uint32_t *out_ino);  /* size + isdir + inode on mount i (out_ino 0 = no inodes); 0/-1 (M1624, ino M1955) */
+int  blockdev_mount_stat(int i, const char *path, uint32_t *out_size, int *out_isdir, uint32_t *out_ino, uint32_t *out_mtime, uint32_t *out_nlink, uint32_t *out_mode);  /* size + isdir + inode + mtime/nlink/mode on mount i (0 = this fs has none); 0/-1 (M1624, ino M1955, times M1999) */
 int  blockdev_mounts_format(char *out, int max);  /* list the mounts as text (the `mount` command) */
 /* losetup (M1107): register a loop mount backed by the RAM image `data` (len
  * bytes; ownership transferred). Detects FAT32/ext2 and mounts it as the next

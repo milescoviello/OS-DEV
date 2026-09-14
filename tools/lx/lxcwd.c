@@ -125,6 +125,83 @@ static void mkchain(void) {
         if (rmdir(dirs[i]) != 0) { printf("LXCWD: rmdir %s FAILED errno=%d\n", dirs[i], errno); fails++; }
 }
 
+/* SYMLINKS ON THE REAL FILESYSTEM. Firefox says
+ *
+ *     Gdk-WARNING: Failed to load cursor theme Adwaita
+ *
+ * and the Adwaita cursor directory is almost entirely symlinks -- left_ptr is
+ * a link to "default". readlink() on a real file was ENOENT until M1998, and
+ * whether open() FOLLOWS one is a separate question with a separate answer.
+ * A cursor theme that will not load is not cosmetic: GDK treats the result as
+ * a theme it does not have. (M1999) */
+static void symlinks(void) {
+    const char *cur = "/usr/share/icons/Adwaita/cursors/left_ptr";
+    char tgt[256];
+    ssize_t n = readlink(cur, tgt, sizeof tgt - 1);
+    if (n > 0) { tgt[n] = 0; printf("LXCWD: readlink %s -> %s\n", cur, tgt); }
+    else printf("LXCWD: readlink %s -> errno=%d (not a symlink here?)\n", cur, errno);
+
+    /* Whatever it is, opening it must produce an Xcursor file: "Xcur" magic.
+     * That is the whole question -- does a path THROUGH a symlink resolve. */
+    int fd = open(cur, O_RDONLY);
+    if (fd < 0) { printf("LXCWD: open %s FAILED errno=%d\n", cur, errno); fails++; return; }
+    char magic[4] = {0, 0, 0, 0};
+    ssize_t r = read(fd, magic, 4);
+    close(fd);
+    if (r == 4 && magic[0] == 'X' && magic[1] == 'c' && magic[2] == 'u' && magic[3] == 'r')
+        printf("LXCWD: opened the cursor through its symlink and read the Xcur magic\n");
+    else {
+        printf("LXCWD: cursor read %zd bytes, magic %02x%02x%02x%02x (want 'Xcur')\n",
+               r, magic[0], magic[1], magic[2], magic[3]);
+        fails++;
+    }
+    /* ...and one we make ourselves, so the test does not depend on staging. */
+    unlink("/root/lxcwd-link");
+    unlink("/root/lxcwd-hard");
+    if (symlink("/etc/machine-id", "/root/lxcwd-link") != 0) {
+        printf("LXCWD: symlink() FAILED errno=%d\n", errno); fails++; return;
+    }
+    char own[256];
+    n = readlink("/root/lxcwd-link", own, sizeof own - 1);
+    if (n > 0) { own[n] = 0; printf("LXCWD: our own symlink reads back as %s\n", own); }
+    else { printf("LXCWD: readlink of our own symlink FAILED errno=%d\n", errno); fails++; }
+    fd = open("/root/lxcwd-link", O_RDONLY);
+    if (fd >= 0) { char b[8]; ssize_t k = read(fd, b, 8); close(fd);
+        if (k > 0) printf("LXCWD: open() FOLLOWED our symlink (%zd bytes)\n", k);
+        else { printf("LXCWD: open followed the link but read nothing\n"); fails++; } }
+    else { printf("LXCWD: open of our own symlink FAILED errno=%d\n", errno); fails++; }
+    unlink("/root/lxcwd-link");
+
+    /* A HARD LINK, and TIMESTAMPS. Firefox links a temporary into place to make
+     * a profile write atomic, and Claude Code sets times on the files it
+     * writes; both syscalls returned ENOSYS while the VFS had done the work
+     * since M1207 and M1230. (M1999) */
+    if (link("/etc/machine-id", "/root/lxcwd-hard") == 0) {
+        struct stat a1s, b1s;
+        if (stat("/etc/machine-id", &a1s) == 0 && stat("/root/lxcwd-hard", &b1s) == 0 &&
+            a1s.st_ino == b1s.st_ino && a1s.st_ino != 0)
+            printf("LXCWD: hard link shares the inode (%llu)\n", (unsigned long long)a1s.st_ino);
+        else { printf("LXCWD: hard link did not share an inode\n"); fails++; }
+        unlink("/root/lxcwd-hard");
+    } else { printf("LXCWD: link() FAILED errno=%d\n", errno); fails++; }
+
+    int tfd = open("/root/lxcwd-times", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (tfd >= 0) {
+        write(tfd, "t\n", 2); close(tfd);
+        struct timespec ts[2];
+        ts[0].tv_sec = 1000000000; ts[0].tv_nsec = 0;      /* 2001-09-09 */
+        ts[1].tv_sec = 1000000000; ts[1].tv_nsec = 0;
+        if (utimensat(AT_FDCWD, "/root/lxcwd-times", ts, 0) == 0) {
+            struct stat us;
+            if (stat("/root/lxcwd-times", &us) == 0 && us.st_mtime == 1000000000)
+                printf("LXCWD: utimensat set mtime and stat read it back\n");
+            else { printf("LXCWD: utimensat claimed success, mtime is %ld\n",
+                          (long)(stat("/root/lxcwd-times", &us) == 0 ? us.st_mtime : -1)); fails++; }
+        } else { printf("LXCWD: utimensat FAILED errno=%d\n", errno); fails++; }
+        unlink("/root/lxcwd-times");
+    } else { printf("LXCWD: could not create a file to time-stamp errno=%d\n", errno); fails++; }
+}
+
 int main(void) {
     char cwd[4096];
     if (getcwd(cwd, sizeof cwd)) printf("LXCWD: getcwd -> %s\n", cwd);
@@ -150,6 +227,7 @@ int main(void) {
     } else { printf("LXCWD: chdir(/) FAILED errno=%d\n", errno); fails++; }
 
     mkchain();
+    symlinks();
 
     printf("LXCWD: %d probe(s) failed\n", fails);
     return fails ? 1 : 0;

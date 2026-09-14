@@ -696,13 +696,20 @@ static int vfs_stat_inner(const char *path, struct statx *st) {
                 return 0;
             }
             uint32_t fsize; int fisdir; uint32_t fino = 0;
-            if (blockdev_mount_stat(midx, fpath, &fsize, &fisdir, &fino) != 0) return -1;
+            uint32_t fmtime = 0, fnlink = 0, fmode = 0;
+            if (blockdev_mount_stat(midx, fpath, &fsize, &fisdir, &fino, &fmtime, &fnlink, &fmode) != 0) return -1;
             st->stx_mode = (unsigned)(fisdir ? S_IFDIR : S_IFREG) | (fisdir ? 0755u : 0644u);
             st->stx_size = fsize; st->stx_blocks = (fsize + 511) / 512;
             /* The real ext2 inode when the filesystem has one; a path hash
              * otherwise. Hash the FULL path, not fpath, so the same name on
              * two different mounts gets two different inodes. */
             st->stx_ino = fino ? fino : path_ino(path);
+            /* The real on-disk times and link count when the filesystem has
+             * them. Reported as 0 before M1999, so every file looked like it
+             * was last modified at the epoch. */
+            if (fmtime) st->stx_mtime = fmtime;
+            if (fnlink) st->stx_nlink = fnlink;
+            if (fmode)  st->stx_mode  = fmode;      /* the REAL permission bits, not a constant 0755/0644 */
             return 0;
         }
     }

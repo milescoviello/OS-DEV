@@ -230,6 +230,11 @@ $(LXROOT)/lxstress: tools/lx/lxstress.c
 	$(CC) -O2 -o $@ $< -lpthread
 	@echo "  HOSTCC  $@ (mmap/thread/futex/signal churn: the shape Firefox dies in)"
 
+$(LXROOT)/lxcage: tools/lx/lxcage.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (reserve, align, trim, and then USE it: JSC's pointer cage)"
+
 $(LXROOT)/lxcwd: tools/lx/lxcwd.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -290,7 +295,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

@@ -513,7 +513,9 @@ static char g_pend_arg[128];             /* arg for the next app_spawn, copied i
  * and Node reported a SyntaxError about source it had never been given. */
 #define LX_PEND_ARGLEN 1024
 static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
+static void app_stop_siblings(struct app *a);   /* end every OTHER thread of a dying process (M1999) */
 static int  g_pend_lxargc;
+static const char *g_pend_env_extra;   /* one extra env var for the next Linux spawn (M1999) */
 static int  g_last_spawn_pid;            /* pid of the last successful app_spawn (M1955) */
 /* One-shot: when set, app_spawn MAPS the executable's PT_LOADs from this path
  * instead of copying them out of a buffer the caller had to slurp whole.
@@ -1820,7 +1822,7 @@ void app_request_kill(app_t *a) {
  * does on a->kill. Called every frame, so the close lands within ~one frame. */
 void app_kill_check(void) {
     struct app *a = cur();
-    if (a && a->kill) { a->exited = 1; task_exit(); }
+    if (a && a->kill) { a->exited = 1; app_stop_siblings(a); task_exit(); }   /* threads die with it (M1999) */
 }
 
 /* WM polls this: returns 1 (and clears) if the app's grid changed since asked. */
@@ -2067,7 +2069,7 @@ static int tty_raw_read(struct app *a, char *buf, unsigned max) {
     unsigned n = 0;
     while (n < max) {
         uint64_t f = irq_save();
-        if (a->kill) { irq_restore(f); a->exited = 1; task_exit(); }
+        if (a->kill) { irq_restore(f); a->exited = 1; app_stop_siblings(a); task_exit(); }   /* threads die with it (M1999) */
         int c = iq_get(a);
         if (c < 0) {
             irq_restore(f);           /* release BEFORE blocking (M1612) -- holding a real cross-core
@@ -2095,7 +2097,7 @@ int app_sys_read(char *buf, unsigned max) {
     a->hist_pos = a->hist_n;                        /* start just past the newest */
     while (n < max) {
         uint64_t f = irq_save();                    /* check kill + queue + block ATOMICALLY: if the kill check sat outside this region, a kill+task_wake from the WM landing between the check and task_block() would be lost (the wake no-ops on a not-yet-blocked task) -> the app sleeps forever and its window is never reaped */
-        if (a->kill) { irq_restore(f); a->exited = 1; task_exit(); }  /* WM asked us to close: exit cleanly (WM then reaps) */
+        if (a->kill) { irq_restore(f); a->exited = 1; app_stop_siblings(a); task_exit(); }   /* threads die with it (M1999) */  /* WM asked us to close: exit cleanly (WM then reaps) */
         int c = iq_get(a);
         if (c < 0) { irq_restore(f); task_block(); continue; }  /* sleep until woken (incl. by a kill request); release BEFORE
                                                                   * blocking (M1612) -- see tty_raw_read's sibling comment */
@@ -4794,28 +4796,42 @@ int  app_sys_getpid(void) { return cur()->pid; }
 int  app_sys_getppid(void) { struct app *a = cur(); return a ? a->parent : 0; }   /* parent pid (M1236) */
 void app_sys_clear(void)  { grid_clear(cur()); }
 void app_setcolor(int idx) { struct app *a = cur(); if (a) a->curcol = (uint8_t)(idx & 15); }
-void app_sys_exit(int code) {
-    struct app *a = cur();
-    a->exit_code = code; a->exited = 1;
-    app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
-    /* exit_group(2) ENDS EVERY THREAD, and this ended exactly one (M1998).
-     *
-     * The siblings kept running -- and kept being woken by the timer -- in the
-     * window between here and app_reap, which runs on the window manager's
-     * schedule and can be many milliseconds later. Worse, a thread parked in
-     * poll() or nanosleep() survived task_stop entirely until the fix in
-     * task.c, so it woke up AFTER the address space was freed. Stopping them
-     * here is what the syscall actually means, and it closes the window rather
-     * than relying on the reaper to win a race.
-     *
-     * Safe from this context: task_stop only changes scheduling eligibility.
-     * A sibling holding a spinlock holds it with interrupts off and cannot be
-     * descheduled mid-hold, and a sibling blocked in a syscall holds no
-     * spinlock -- this kernel's rule is never to block with one held. */
+/* END EVERY OTHER THREAD OF THIS PROCESS, NOW.
+ *
+ * Every way a process can die has to come through here, and until M1998/M1999
+ * none of them did -- each one exited the calling task and left the siblings
+ * running until app_reap got round to them, which is the window manager's
+ * schedule, not the process's. A sibling parked in poll() or nanosleep()
+ * outlived even that (see task_stop in task.c) and woke up after the address
+ * space had been freed, executing user code whose pages were gone:
+ *
+ *     [fault] UNMAPPED 110910000 err=6: no VMA (... 4 vmas, tid 44)
+ *
+ * -- and the "4 vmas" are the NEXT process's, because the slot had already
+ * been reused. That kills an unrelated program.
+ *
+ * There were two doorways, and fixing one left the other open: exit_group(2)
+ * and dying on a fault. A process killed by SIGSEGV must end its threads for
+ * exactly the same reason a process that exits cleanly must.
+ *
+ * Safe from any of these contexts: task_stop only changes scheduling
+ * eligibility. A sibling holding a spinlock holds it with interrupts off and
+ * cannot be descheduled mid-hold; a sibling blocked in a syscall holds no
+ * spinlock, because this kernel's rule is never to block with one held. */
+static void app_stop_siblings(struct app *a) {
+    if (!a) return;
     for (int i = 0; i < APP_MAXTHREAD; i++) {
         task_t *t = a->thr[i];
         if (t && t != task_self()) { app_futex_forget(t); task_stop(t); }
     }
+    if (a->task && a->task != task_self()) { app_futex_forget(a->task); task_stop(a->task); }
+}
+
+void app_sys_exit(int code) {
+    struct app *a = cur();
+    a->exit_code = code; a->exited = 1;
+    app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
+    app_stop_siblings(a);        /* exit_group(2) ends EVERY thread (M1998) */
     task_exit();
 }
 /* --- ELF core dump (M1104) -------------------------------------------------
@@ -4920,8 +4936,10 @@ void app_core_dump(struct registers *r) {
 }
 
 /* A ring-3 task hit a CPU exception (divide error, page fault, …). Write a core
- * dump, mark its app exited so the WM tears down the window, then terminate just
- * this task — the kernel and the rest of the desktop keep running. No return. */
+ * dump, mark its app exited so the WM tears down the window, then terminate the
+ * whole process — the kernel and the rest of the desktop keep running. Its
+ * SIBLING THREADS end here too (M1999): they are about to have their address
+ * space freed out from under them. No return. */
 void app_fault_current(struct registers *r) {
     struct app *a = (struct app *)task_self()->proc;
     if (a && r) app_core_dump(r);
@@ -4932,6 +4950,12 @@ void app_fault_current(struct registers *r) {
          * a fault reported SUCCESS to anything that waited on it -- which is
          * how a crashed `as` came back as "as --version -> 0". (M1956) */
         a->exit_code = 139;
+        /* ...and its threads die with it (M1999). A process killed by SIGSEGV
+         * has to end its siblings for exactly the reason a process that exits
+         * cleanly does: app_reap is about to free the address space they are
+         * running in, and one of them is asleep with a timer that will wake it
+         * afterwards. */
+        app_stop_siblings(a);
     }
     task_exit();
 }
@@ -5241,7 +5265,12 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * then "we don't have any display". Talking to the compositor directly
          * is the same thing minus a hop. (M1986) */
         envp0[17] = "MOZ_DISABLE_WAYLAND_PROXY=1";
-        envp0[18] = 0;
+        /* One extra entry, one-shot, for a caller that needs to hand a specific
+         * program something the whole system should NOT have -- see
+         * app_set_next_env. (M1999) */
+        int en = 18;
+        if (g_pend_env_extra) { envp0[en++] = g_pend_env_extra; g_pend_env_extra = 0; }
+        envp0[en] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to
          * map its shared libraries first and only then jump to the entry. */
@@ -6776,6 +6805,18 @@ static void app_fd_release(struct app *a) {
  * writing an errno into memory the parent can see, and a COW copy loses that
  * write. The child still _exit(127)s, so a failed exec surfaces in the wait
  * status -- which is what make actually reports on. */
+static const char *g_pend_env_extra;
+/* An extra environment variable for the NEXT Linux spawn only, then forgotten.
+ *
+ * The case that needs it: proving Claude Code's network path. "Not logged in"
+ * is a LOCAL check -- it short-circuits before any DNS, TCP or TLS happens, so
+ * a clean exit there says nothing about whether this kernel can carry an HTTPS
+ * request. Handing that one process a deliberately FAKE key makes it do the
+ * whole round trip and get a 401 back from the server, which exercises every
+ * layer and proves them. One-shot because an API key in the global environment
+ * would be inherited by every program the system ever starts. (M1999) */
+void app_set_next_env(const char *e) { g_pend_env_extra = e; }
+
 long app_fork_at(struct registers *r, uint64_t child_rsp) {
     struct app *p = cur();
     if (!p || !r) return -1;

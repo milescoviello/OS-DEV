@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1998-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1999-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1220,3 +1220,42 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   readiness, when they sit for seconds with nothing ready. That is what
   identified Firefox's stall as an event loop waiting on an eventfd and an
   inotify watch rather than on the display.
+
+- **M1999** — **four syscalls that were already implemented, and a struct that
+  never carried the time.** Firefox and Claude Code were both asking for things
+  this kernel has been able to do for hundreds of milestones, through entry
+  points that did not exist.
+
+  `symlink`(88), `link`(86), `utimensat`(280) and `pidfd_open`(434) all returned
+  **ENOSYS** while `vfs_symlink` (M1146), `vfs_link` (M1207), `app_utimens`
+  (M1230) and `app_pidfd_open` (M1222) sat behind the native entry point doing
+  exactly that work. Firefox links a temporary into place to make a profile
+  write atomic; Claude Code stamps every file it writes.
+
+  And the one that matters most: **`struct stat` never carried a timestamp.**
+  `LXST_O_ATIME`/`MTIME`/`CTIME` were not defined, so the fields kept the zeroes
+  the buffer was cleared to and every file a Linux program stat'd reported 1
+  January 1970. Underneath, `ext2_stat_path` *read the whole inode* and threw
+  away `i_mtime`, `i_links_count` and `i_mode` — it had been writing the
+  timestamps since M1175 and nothing could read one back. That is the
+  self-hosting path: **`make` decides what to rebuild by comparing mtimes**, and
+  with every file equally ancient it cannot order anything. `chmod` looked
+  broken for the same reason — the mode was synthesised as 0755/0644 from
+  "is it a directory".
+
+  The other half of the milestone is **`tools/lx/lxcage.c`**, which reproduces
+  the memory shape a JS engine actually needs: reserve twice the address space
+  you want, round up to a large alignment, `munmap` the head and the tail, and
+  then *use* what is left. That is JavaScriptCore's pointer cage, taken verbatim
+  from this kernel's own trace of Bun doing it — an 8 GiB reservation trimmed
+  down to 4 GiB at a 4 GiB boundary. Both trims return 0 whatever they actually
+  removed, so the assertion is on writing and reading back 65 points across the
+  kept region rather than on a return value. **Mutation-proven**: making a head
+  trim drop the whole VMA turns the probe into a SIGSEGV — the same exit status
+  Claude Code was giving. The path itself is clean; the probe is what makes that
+  a fact rather than a belief.
+
+  Also: `app_fault_current` now ends a dying process's **other threads**, which
+  M1998 fixed only for `exit_group`. A process killed by SIGSEGV has to stop its
+  siblings for exactly the reason a clean exit does — the same
+  `[fault] UNMAPPED ... 4 vmas` came back through the second doorway.
