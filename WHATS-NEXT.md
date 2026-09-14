@@ -1,5 +1,58 @@
 # What's next
 
+> **(M2014-M2016) CLAUDE CODE'S ONBOARDING RUNS IN OS-DEV, AND THE RETURN KEY
+> WAS WHY IT DIDN'T.**
+>
+> The login screen was never the problem. `TCSETS` had been accepted and
+> discarded since the Linux ABI grew an ioctl -- our console already delivers
+> keys one at a time, so there was "nothing to change". The FLAGS were the
+> thing: a terminal delivers **CR** for Return and only turns it into NL while
+> `ICRNL` is set, and Ink (what Claude Code draws with) maps `\r` to
+> `key.return` and nothing else does. The theme picker drew, the arrow keys
+> moved the selection, and Enter did nothing at all, forever. It reads as a
+> broken keyboard and it is a dropped flag.
+>
+> ```
+> [tty] pid 101 set termios: RAW, echo off, signals off, Return -> CR
+>
+> Select login method:
+>   1. Claude account with subscription
+>   2. Anthropic Console account
+>   3. 3rd-party platform
+> ```
+>
+> **The terminal is UTF-8 now (M2015).** It stored one BYTE per cell, so a
+> 3-byte box-drawing character ate three columns: every boxed line was two or
+> three times too wide, wrapped early and overwrote the line below. The visible
+> half was fields of `?`; the half that broke it was the arithmetic.
+> `kernel/fontext.c` adds 128 glyphs -- box drawing, blocks, shades, arrows,
+> marks, and the ten braille frames Ink's spinner uses -- **generated from
+> ASCII art** by `tools/genfont.py`, because a box-drawing set is only correct
+> if the pieces JOIN and you check that by looking.
+>
+> **Two busy loops (M2016).** `EPOLLONESHOT` was ignored, and a console is
+> always writable -- so an epoll that kept saying yes span the event loop at
+> full speed while the socket it was waiting on sat untouched. And an empty
+> `inotify` read returned 0, which means "there will never be more", so the
+> file watcher asked again forever. Both cost a core; neither was visible from
+> outside.
+>
+> **The instruments are the other half of this arc.** `-append lxnettrace`
+> (socket byte counts), a quiet-socket watchdog that dumps the syscall ring and
+> the epoll interest sets when nothing has touched a socket in five seconds, a
+> QEMU wire capture, and `tools/ccdrive.py` -- a VM that stays up while you
+> poke at it, screenshot, decide, and poke again. The syscall ring also
+> **stopped lying**: 256 entries shared by a hundred threads meant a blocked
+> call's slot was recycled before it returned, so its late result landed on a
+> stranger's entry.
+>
+> Still open: Claude Code's connectivity preflight. The wire capture proves our
+> stack delivers every byte the server sends, with proper ACKs and a healthy
+> window, and the server never closes -- the request goes out and nothing comes
+> back. Firefox still does not paint.
+
+---
+
 > **(M2007-M2013) SEVEN BUGS BETWEEN FIREFOX AND A WINDOW, and the desktop
 > stopped jumping around.**
 >
