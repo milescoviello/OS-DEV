@@ -587,6 +587,32 @@ static void lx_trace_on_error(const char *b, unsigned long n) {
  * something and exit. Everything else returns -ENOSYS, which is the honest
  * answer and exactly what musl expects for a call the kernel lacks.
  */
+/* -append polltrace: when a poll/epoll_wait sits for seconds without a single
+ * ready fd, print the WHOLE fd set with each fd's type and readiness. A stalled
+ * event loop looks exactly like a hung process from outside, and the fd set is
+ * the only thing that names which descriptor the program waits on and which
+ * layer owes it an event. (M1998) */
+/* "/proc/self/<tail>" or "/proc/<our own pid>/<tail>" -> <tail>, else 0. A
+ * process asking about another process's descriptors is not something anything
+ * we run does, and answering it wrongly is worse than saying no. (M1998) */
+static int str_eq_lx(const char *a, const char *b) {
+    int i = 0; while (a[i] && a[i] == b[i]) i++;
+    return a[i] == b[i];
+}
+static const char *lx_proc_self_tail(const char *p) {
+    const char *pre = "/proc/";
+    int i = 0; while (pre[i]) { if (p[i] != pre[i]) return 0; i++; }
+    const char *q = p + i;
+    if (q[0] == 's' && q[1] == 'e' && q[2] == 'l' && q[3] == 'f' && q[4] == '/') return q + 5;
+    int v = 0, k = 0;
+    while (q[k] >= '0' && q[k] <= '9') { v = v * 10 + (q[k] - '0'); k++; }
+    if (k && q[k] == '/' && v == app_current_pid()) return q + k + 1;
+    return 0;
+}
+
+int g_poll_trace;
+static int g_poll_reports;
+
 void linux_syscall_dispatch(struct registers *r) {
     lx_syscall_count++;
     /* Always record; print only on demand. The rate-limited trace below is for
@@ -906,7 +932,7 @@ void linux_syscall_dispatch(struct registers *r) {
         int isdir = (sx.stx_mode & 0170000u) == 0040000u;
         *(uint32_t *)(o + 0)  = 0x7ff;                     /* stx_mask: what we filled in */
         *(uint32_t *)(o + 4)  = 4096;                      /* stx_blksize */
-        *(uint32_t *)(o + 16) = 1;                         /* stx_nlink */
+        *(uint32_t *)(o + 16) = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);  /* stx_nlink -- the real count (M1998) */
         *(uint16_t *)(o + 28) = (uint16_t)(isdir ? (0040000u | 0755u) : (0100000u | 0644u));  /* stx_mode */
         *(uint64_t *)(o + 32) = sx.stx_ino;                /* stx_ino */
         *(uint64_t *)(o + 40) = sx.stx_size;               /* stx_size */
@@ -1467,10 +1493,18 @@ void linux_syscall_dispatch(struct registers *r) {
         uint64_t start = timer_ms();
         long k = 0;
         __asm__ volatile("sti");            /* this loop sleeps on the timer */
+        int etold = 0;
         for (;;) {
             k = app_epoll_check((int)a1, tmp, (int)maxev);
             if (k != 0) break;
             if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
+            if (g_poll_trace && !etold && (long)(timer_ms() - start) > 3000 &&
+                g_poll_reports < 24) {
+                etold = 1; g_poll_reports++;
+                kprintf("[poll] pid %d STALLED in epoll_wait(%d), timeout %ld:\n",
+                        app_current_pid(), (int)a1, timeout);
+                app_epoll_dump((int)a1);
+            }
             task_sleep_ms(10);
         }
         __asm__ volatile("cli");
@@ -1501,6 +1535,7 @@ void linux_syscall_dispatch(struct registers *r) {
         uint8_t *fds = (uint8_t *)r->rdi;
         uint64_t start = timer_ms();
         long ready = 0;
+        int told = 0;
         __asm__ volatile("sti");
         for (;;) {
             ready = 0;
@@ -1513,6 +1548,19 @@ void linux_syscall_dispatch(struct registers *r) {
             }
             if (ready) break;
             if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
+            if (g_poll_trace && !told && (long)(timer_ms() - start) > 3000 &&
+                g_poll_reports < 24) {
+                told = 1; g_poll_reports++;
+                kprintf("[poll] pid %d STALLED on %ld fd(s), timeout %ld:\n",
+                        app_current_pid(), nfds, timeout);
+                for (long i = 0; i < nfds; i++) {
+                    int fd = *(const int32_t *)(fds + i * 8);
+                    short want = *(const int16_t *)(fds + i * 8 + 4);
+                    kprintf("[poll]   fd %d type %d want %x -> %x\n", fd,
+                            fd < 0 ? -1 : app_fd_type(fd), (unsigned)(want & 0xffff),
+                            fd < 0 ? 0 : app_fd_ready(app_current(), fd, want));
+                }
+            }
             task_sleep_ms(10);
         }
         __asm__ volatile("cli");
@@ -1898,7 +1946,13 @@ void linux_syscall_dispatch(struct registers *r) {
             if (vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
             int isdir = (sx.stx_mode & 0170000u) == 0040000u;
             *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
-            *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+            /* The REAL link count, not a constant 1 (M1998). A directory
+             * always has at least two links ("." and its entry in its parent);
+             * find(1) subtracts 2 from st_nlink to decide how many
+             * subdirectories are left to visit and walks a negative number of
+             * them. A hardlinked file reported 1 too, so nothing could tell
+             * that two names were the same file. */
+            *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);
             *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
             *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
             *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
@@ -1915,36 +1969,71 @@ void linux_syscall_dispatch(struct registers *r) {
     }
     case LXS_readlinkat:
     case LXS_readlink: {
-        /* /proc/self/exe is REAL now (M1970).
+        /* readlink answers three different questions and we used to answer one.
          *
-         * Returning ENOENT was defensible while the only caller was glibc
-         * probing it and falling back on argv[0]. It is not defensible for a
-         * Node single-executable application: the runtime and the JS are one
-         * image, and it finds its own embedded payload by reading
-         * /proc/self/exe and opening the result. With no answer, Claude Code
-         * called abort() during startup -- printing nothing, leaving no fault
-         * address, and naming nothing. The syscall ring is what showed
-         * gettid/getpid/tgkill(SIGABRT) right after the probe.
+         * 1. /proc/self/exe (M1970). A Node/Bun single-executable application
+         *    is runtime and JS in one image and finds its own embedded payload
+         *    by reading this. With no answer Claude Code called abort() during
+         *    startup, printing nothing.
          *
-         * The path has to be translated back OUT of the compat root: the
-         * process believes it is /usr/bin/claude, not /disk2/usr/bin/claude. */
+         * 2. /proc/self/cwd and /proc/self/fd/<n> (M1998). THIS IS HOW ZIG --
+         *    and therefore Bun, and therefore Claude Code -- resolves a path.
+         *    It does not call realpath(3): it opens the path O_PATH and reads
+         *    back the magic link for the descriptor. Both returned ENOENT, so
+         *    Claude Code decided its own working directory did not exist:
+         *
+         *        Error: Can't access working directory /: Path "/" does not exist
+         *
+         *    Every glibc route to the same question worked, which is why a
+         *    glibc probe passed while the real program failed -- see
+         *    tools/lx/lxcwd.c, which now asks BOTH ways.
+         *
+         * 3. A REAL SYMLINK on the filesystem. ext2 has had symlinks since
+         *    M1233 and vfs_readlink since then, and this entry point never
+         *    called it -- so every symlink in the compat root read as ENOENT.
+         *
+         * Paths are translated back OUT of the compat root before they are
+         * returned: the process believes it is /usr/bin/claude, not
+         * /disk2/usr/bin/claude. */
         uint64_t up  = (r->rax == LXS_readlinkat) ? r->rsi : r->rdi;
         uint64_t ub  = (r->rax == LXS_readlinkat) ? r->rdx : r->rsi;
         uint64_t usz = (r->rax == LXS_readlinkat) ? r->r10 : r->rdx;
         const char *upath = (const char *)up;
         if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        int is_exe = 0;
-        { const char *a_ = "/proc/self/exe"; int k = 0;
-          while (a_[k] && upath[k] == a_[k]) k++;
-          is_exe = (!a_[k] && !upath[k]); }
-        if (!is_exe) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
-        const char *ep = app_exe_str(app_current());
-        if (!ep || ep[0] != '/') { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
-        /* Strip LX_ROOT if it is there, so the answer is in the process's own
-         * view of the filesystem. */
+
+        const char *vis = 0;                 /* the answer, in the process's own view */
+        char lbuf[VFS_PATH_MAX];             /* ...when it has to be read off disk */
+
+        /* /proc/<self|pid>/... -- only "self" and the caller's own pid are
+         * interesting here, and both name the calling process. */
+        const char *pp = lx_proc_self_tail(upath);
+        if (pp) {
+            if (str_eq_lx(pp, "exe"))      vis = app_exe_str(app_current());
+            else if (str_eq_lx(pp, "cwd")) vis = app_cwd_str(app_current());
+            else if (str_eq_lx(pp, "root")) vis = "/";
+            else if (pp[0] == 'f' && pp[1] == 'd' && pp[2] == '/') {
+                int fd = 0, k = 3, any = 0;
+                while (pp[k] >= '0' && pp[k] <= '9') { fd = fd * 10 + (pp[k] - '0'); k++; any = 1; }
+                if (any && !pp[k]) vis = app_fd_path(fd);
+            }
+            if (!vis) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        } else {
+            /* A real symlink. */
+            const char *xp = lx_xlate(upath, lbuf, (int)sizeof lbuf);
+            char tgt[VFS_PATH_MAX];
+            long tn = vfs_readlink(xp, tgt, sizeof tgt - 1);
+            if (tn < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            if (tn > (long)sizeof tgt - 1) tn = (long)sizeof tgt - 1;
+            tgt[tn] = 0;
+            for (long k = 0; k <= tn; k++) lbuf[k] = tgt[k];
+            vis = lbuf;
+        }
+        if (!vis || !vis[0]) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        /* Strip LX_ROOT if it is there. "/disk2" alone becomes "/". */
         int rl = 0; while (LX_ROOT[rl]) rl++;
-        int match = 1; for (int k = 0; k < rl; k++) if (ep[k] != LX_ROOT[k]) { match = 0; break; }
-        const char *vis = (match && ep[rl] == '/') ? ep + rl : ep;
+        int match = 1; for (int k = 0; k < rl; k++) if (vis[k] != LX_ROOT[k]) { match = 0; break; }
+        if (match && vis[rl] == '/')     vis = vis + rl;
+        else if (match && vis[rl] == 0)  vis = "/";
         long vn = 0; while (vis[vn]) vn++;
         if ((long)usz < vn) vn = (long)usz;          /* readlink TRUNCATES, it does not NUL-terminate */
         if (vn < 0 || !vmm_user_ok(ub, (uint64_t)vn)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
@@ -2082,7 +2171,7 @@ void linux_syscall_dispatch(struct registers *r) {
         for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
         int isdir = (sx.stx_mode & 0170000u) == 0040000u;
         *(uint32_t *)(st + LXST_O_MODE)    = isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u);
-        *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+        *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);   /* the real count -- see LXS_fstat (M1998) */
         *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
         *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
         *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);  /* 512-byte units, as Linux defines it */

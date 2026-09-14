@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-1997-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-1998-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1160,3 +1160,63 @@ journaling with replay-on-mount, proven under host fault-injection *and* in-gues
 on real hardware. Extending the journal to `rm`/`mkdir`/`rename`/overwrite is
 mechanical follow-on. The one remaining SMP loose end is that the boot-time
 compute job pool has no steady-state caller — a narrow cosmetic gap.)
+
+- **M1998** — **Claude Code runs, and says what it actually wants: "Not logged
+  in · Please run /login".** Not `--version`, not `--help` — the real program,
+  through config, settings, plugins, rules, git detection, MCP, session files
+  and TLS certificates, to its own authentication check, exiting 1 like it
+  would anywhere. Three separate bugs stood between it and that line, and none
+  of them were in Claude Code.
+
+  **A blocked thread survived `task_stop`, and woke up in a freed address
+  space.** `app_reap`'s own comment says it stops live threads so "they must
+  never run once we free the shared address space just below" — and `task_stop`
+  checked for `TASK_READY` or `TASK_RUNNING`, which a thread parked in `poll()`,
+  `nanosleep()` or a timed futex is neither. It was left BLOCKED with a
+  deadline, the process was torn down, and the timer's sleeper scan made it
+  `READY` again right on schedule. It then executed user code whose pages no
+  longer existed:
+
+      [fault] UNMAPPED 103085000 err=6: no VMA (... 0 vmas, tid 15)
+
+  A fault in a process with **zero mappings**, at the same instruction in both
+  runs, long after that process had exited — and, the first time, in a slot
+  already reused by the *next* process, which is what killed it. Deterministic
+  on one core (2/2), which is what made it findable: a sleeping thread wakes
+  reliably. `exit_group` now also ends its siblings itself rather than leaving
+  them running until the window manager gets round to reaping.
+
+  **`readlink` answered one question out of three.** `/proc/self/exe` worked
+  since M1970; `/proc/self/cwd` and `/proc/self/fd/<n>` returned ENOENT, and so
+  did every real symlink on the filesystem — `vfs_readlink` has existed since
+  M1233 and this entry point never called it. That is not a cosmetic gap:
+  **Zig, and therefore Bun, and therefore Claude Code, does not call
+  `realpath(3)`.** It opens a path `O_PATH` and reads back the descriptor's
+  magic link. So Claude Code concluded its own working directory did not exist:
+
+      Error: Can't access working directory /: Path "/" does not exist
+
+  while stat, lstat, statx, access, `open(O_DIRECTORY)`, opendir, realpath and
+  chdir on `/` all worked perfectly. A probe written in C would have passed.
+
+  **`stat` on a mount root returned inode 0, and every `st_nlink` was 1.** Zero
+  is not an inode, it is "this file has no identity" — anything keyed on
+  `(dev, ino)` collides across every such directory. And a directory has at
+  least two links; `find(1)` subtracts 2 from `st_nlink` and walks a negative
+  number of subdirectories.
+
+  `tools/lx/lxcwd.c` is the tool that found all of it, and it runs on every
+  Linux-ABI boot now: it asks about the root directory **every way a runtime
+  knows how**, both the glibc routes and the Zig ones, and builds a nested
+  directory tree one component at a time. The glibc half passed from the start.
+  That is the whole lesson — a probe that only asks the way *you* would ask
+  tells you the gap is somewhere else.
+
+  Also here: the compositor now refuses to send an event newer than the version
+  a client bound (`wl_output.name` is version 4, `wl_pointer.frame` is 5,
+  `wl_keyboard.repeat_info` is 4) and **says so when a request has no handler**,
+  because silently ignoring one is indistinguishable from a hang; and `poll`/
+  `epoll_wait` print the whole fd set, with each descriptor's type and
+  readiness, when they sit for seconds with nothing ready. That is what
+  identified Firefox's stall as an event loop waiting on an eventfd and an
+  inotify watch rather than on the display.

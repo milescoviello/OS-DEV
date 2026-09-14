@@ -615,7 +615,31 @@ static unsigned path_ino(const char *p) {
     return h ? h : 1u;                          /* 0 means "none", so never return it */
 }
 
+static int vfs_stat_inner(const char *path, struct statx *st);
+
+/* Normalise what the filesystems report into what a Linux program is entitled
+ * to assume. Two fields were wrong everywhere and only showed up under a real
+ * runtime (M1998):
+ *
+ *   stx_ino = 0 -- the mount-point directory itself returned before it set an
+ *     inode, so stat("/") gave inode ZERO. Zero is not an inode; it is what a
+ *     program reads as "this has no identity". Anything that keys a cache on
+ *     (dev, ino), compares two paths for sameness, or detects a hardlink gets a
+ *     collision between every such directory. Linux's root is inode 2.
+ *
+ *   stx_nlink = 1 on a directory -- a directory always has at least 2 links
+ *     ("." and its entry in its parent). find(1)'s leaf optimisation subtracts
+ *     2 from it and walks a negative number of subdirectories. */
 int vfs_stat(const char *path, struct statx *st) {
+    int rc = vfs_stat_inner(path, st);
+    if (rc == 0) {
+        if ((st->stx_mode & 0170000u) == 0040000u && st->stx_nlink < 2) st->stx_nlink = 2;
+        if (!st->stx_ino) st->stx_ino = 2;          /* the root's inode on every real Linux */
+    }
+    return rc;
+}
+
+static int vfs_stat_inner(const char *path, struct statx *st) {
     for (unsigned i = 0; i < sizeof(*st); i++) ((char *)st)[i] = 0;
     st->stx_blksize = 512; st->stx_nlink = 1;
     /* bind mounts (M1622 follow-up) -- every other vfs_* function does this;

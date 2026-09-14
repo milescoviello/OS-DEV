@@ -501,6 +501,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
+        if (cmdline_has(cl, "polltrace")) { extern int g_poll_trace; g_poll_trace = 1; }     /* name the fds a stalled poll waits on (M1998) */
         if (cmdline_has(cl, "vmaaudit"))   { extern int g_vma_audit; g_vma_audit = 1; }   /* check the no-overlap invariant on every mmap/munmap (M1988) */
         if (cmdline_has(cl, "lxstress"))   { g_lxabi_test = 1; g_lxstress = 1; }   /* mmap/thread/futex churn, on its own boot (M1987) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
@@ -748,7 +749,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * "Path / does not exist" is a claim about THIS. (M1992) */
             struct statx rs;
             if (vfs_stat("/disk2", &rs) == 0)
-                kprintf("[lxabi] root /disk2: mode %o size %lu (dir=%d)\n",
+                kprintf("[lxabi] root /disk2: mode 0%x size %lu (dir=%d)\n",
                         (unsigned)rs.stx_mode, (unsigned long)rs.stx_size,
                         (rs.stx_mode & 0170000u) == 0040000u);
             else
@@ -869,6 +870,20 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * exactly the shape that used to deadlock on the console lock and
          * swallow the report. The suite asserts the [fault] line appears AND
          * that the boot still runs to completion. */
+        /* THE ROOT DIRECTORY, asked about every way a runtime knows how.
+         * Claude Code stops at startup with
+         *
+         *     Error: Can't access working directory /: Path "/" does not exist
+         *
+         * and the syscall trace cannot say which question failed, because it
+         * only prints calls that fail BY PATH. stat/lstat/statx/access/
+         * open(O_DIRECTORY)/opendir/realpath/chdir all reach different code
+         * here, and a program only has to be told "no" by one of them. Runs on
+         * every lxabi boot: it costs a second and it is the shape of question
+         * that every ported program asks before it does anything. (M1998) */
+        kprintf("[lxabi] launching the root-directory probe...\n");
+        int cwdrc = app_run_linux_sync("/disk2/lxcwd", 0, 0, 60000);
+        kprintf("[lxabi] LXCWD exit -> %d\n", cwdrc);
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");
@@ -1018,10 +1033,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                              * only way to tell "waiting for the compositor"
                              * from "waiting for a file that will never
                              * appear". */
-                            if (t == 7 || t == 15 || t == 23) {
+                            /* EVERY tick, not every eighth: correlating a
+                             * thread dump with a RIP sample taken from outside
+                             * requires them to describe the SAME moment, and
+                             * combining two different runs is how I convinced
+                             * myself of something that was not true. (M1998) */
+                            app_dump_threads(fpid);
+                            if (t == 7 || t == 15 || t == 23)
                                 lx_trace_dump_last("the Firefox heartbeat", 24);
-                                app_dump_threads(fpid);
-                            }
                         }
                     }
                 }

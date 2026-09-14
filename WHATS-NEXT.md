@@ -1,5 +1,68 @@
 # What's next
 
+> **(M1998) CLAUDE CODE RUNS. IT SAYS "Not logged in · Please run /login".**
+>
+> Not `--version`, not `--help` -- the whole program. It loads its config and
+> settings, detects git, scans plugins, rules, skills, agents and MCP config,
+> writes a session file, reads the TLS certificate store, reaches its own
+> authentication check and exits 1, exactly as it would anywhere. There are
+> deliberately no credentials in this image, so that line IS the correct answer.
+>
+> Three bugs stood in the way, none of them in Claude Code.
+>
+> **1. A blocked thread survived `task_stop` and woke up in a freed address
+> space.** `app_reap` stops a dying process's threads so "they must never run
+> once we free the shared address space just below" -- and `task_stop` only
+> handled `TASK_READY` and `TASK_RUNNING`. A thread parked in `poll()`,
+> `nanosleep()` or a timed futex is neither. It stayed BLOCKED with a deadline,
+> the process was torn down, and the timer's sleeper scan woke it on schedule:
+>
+> ```
+> [fault] UNMAPPED 103085000 err=6: no VMA (... 0 vmas, tid 15)
+> ```
+>
+> A fault in a process with **zero mappings**, at the same instruction in both
+> runs, long after that process exited -- and the first occurrence landed in a
+> slot already reused by the *next* process, killing it. **Deterministic on one
+> core, 2/2**, which is what made it findable: a sleeping thread wakes reliably,
+> while on four cores the timing scattered it into something that looked random.
+> `exit_group` now ends its siblings itself instead of leaving them running
+> until the window manager reaps.
+>
+> **2. `readlink` answered one question out of three.** `/proc/self/exe` worked;
+> `/proc/self/cwd`, `/proc/self/fd/<n>` and *every real symlink on the
+> filesystem* returned ENOENT -- `vfs_readlink` has existed since M1233 and this
+> entry point never called it. **Zig, and therefore Bun, and therefore Claude
+> Code, does not call `realpath(3)`**: it opens a path `O_PATH` and reads back
+> the descriptor's magic link. So Claude Code decided its own working directory
+> did not exist:
+>
+> ```
+> Error: Can't access working directory /: Path "/" does not exist
+> ```
+>
+> while stat, lstat, statx, access, `open(O_DIRECTORY)`, opendir, realpath and
+> chdir on `/` all worked.
+>
+> **3. `stat` on a mount root returned inode 0, and every `st_nlink` was 1.**
+> Zero is not an inode, it is "no identity" -- anything keyed on `(dev, ino)`
+> collides across every such directory. And `find(1)` subtracts 2 from a
+> directory's `st_nlink`.
+>
+> **The method, and the thing worth keeping:** `tools/lx/lxcwd.c` asks about the
+> root directory **every way a runtime knows how** -- the glibc routes *and* the
+> Zig ones -- and builds a nested directory tree one component at a time. The
+> glibc half passed from the first run. A probe that only asks the way you would
+> ask tells you the gap is somewhere else. It now runs on every Linux-ABI boot.
+>
+> Also here: the compositor refuses to send an event newer than the version a
+> client bound (`wl_output.name` is v4, `wl_pointer.frame` v5,
+> `wl_keyboard.repeat_info` v4) and **reports any request it has no handler
+> for**, since silently ignoring one is indistinguishable from a hang; and
+> `poll`/`epoll_wait` dump the whole fd set with each descriptor's type and
+> readiness when they sit for seconds with nothing ready. That is what showed
+> Firefox is stalled on an **eventfd and an inotify watch**, not on the display.
+
 > **(M1997) THE FUTEX LAYER IS NOT THE PROBLEM, AND NOW THERE IS EVIDENCE.**
 >
 > Firefox stalls with three threads parked in `app_futex`, so the obvious theory

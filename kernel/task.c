@@ -995,8 +995,31 @@ uint32_t task_get_affinity(void) {
 void task_stop(task_t *t) {
     uint64_t f = irq_save();
     rq_lock_take();
-    if (t && t != current && (t->state == TASK_READY || t->state == TASK_RUNNING))
+    /* A BLOCKED TASK HAD TO BE COVERED TOO, and was not (M1998).
+     *
+     * The only caller that matters is app_reap, whose own comment says "STOP
+     * any still alive so the scheduler skips them -- they must never run once
+     * we free the shared address space just below". READY and RUNNING were the
+     * two states it checked, and a thread parked in poll(), nanosleep() or a
+     * timed futex is in neither: it is BLOCKED with a deadline. It was left
+     * alone, the process's address space was freed, and then the timer's
+     * sleeper scan made it READY again on schedule. It resumed executing user
+     * code whose pages no longer existed:
+     *
+     *   [fault] UNMAPPED 103085000 err=6: no VMA (... 0 vmas, tid 15)
+     *
+     * -- a fault in a process with ZERO mappings, at the same instruction in
+     * both runs, long after that process had exited. Claude Code dies this way
+     * every time on a single core, because it leaves threads sleeping and the
+     * sleep reliably expires.
+     *
+     * TASK_DEAD is the one state to leave alone: a dead task is already on its
+     * way out and app_reap keys its FREEING decision on that exact state. */
+    if (t && t != current && t->state != TASK_DEAD && t->state != TASK_STOPPED) {
         t->state = TASK_STOPPED;
+        t->wake_at = 0;             /* cancel any deadline the sleeper scan would honour */
+        t->wake_pending = 0;        /* ...and any remembered wake the next block would consume */
+    }
     rq_lock_give();
     irq_restore(f);
 }

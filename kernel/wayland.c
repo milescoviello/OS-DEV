@@ -164,7 +164,7 @@ static const struct wl_global g_globals[] = {
     { "wl_subcompositor",        1, WLK_SUBCOMPOSITOR },
     { "wl_data_device_manager",  3, WLK_DDM },
     { "wl_shm",                  1, WLK_SHM },
-    { "wl_output",               3, WLK_OUTPUT },
+    { "wl_output",               4, WLK_OUTPUT },
     { "wl_seat",                 7, WLK_SEAT },
     { "xdg_wm_base",             3, WLK_XDG_WM_BASE },
 };
@@ -182,6 +182,13 @@ struct wl_object {
     uint8_t *base; unsigned long size;
     uint32_t off, width, height, stride, format;
     uint32_t attached;             /* wl_surface: the wl_buffer id last attached */
+    /* THE VERSION THE CLIENT BOUND AT. A compositor may not send an event that
+     * is newer than the interface version its client asked for: the client's
+     * proxy has no listener slot for the opcode, and libwayland treats an
+     * out-of-range opcode as a fatal protocol error rather than something to
+     * skip. It kills the connection, and a client whose display is dead just
+     * stops -- which from outside is indistinguishable from a hang. (M1998) */
+    uint32_t version;
     uint32_t link;                 /* xdg_surface -> its wl_surface; xdg_toplevel -> its xdg_surface */
 };
 
@@ -198,6 +205,7 @@ struct wl_client {
                                     * keyboard focus follows the WINDOW -- they are separate in
                                     * Wayland, and a client ignores input for a surface it has
                                     * not been told it has. */
+    uint32_t seat_version;         /* what the client bound wl_seat at: wl_pointer.frame is v5, wl_keyboard.repeat_info is v4 (M1998) */
     char     title[64];            /* xdg_toplevel.set_title, for the window's titlebar */
     struct wl_object obj[WL_MAXOBJ]; int nobj;
 };
@@ -297,6 +305,54 @@ static void send_global(struct wl_client *c, int idx) {
     g_nglobal++;
 }
 
+/* An unhandled request is the one failure mode this protocol gives you NO
+ * signal for. `if (!o) return;` and falling off the end of wl_dispatch are both
+ * correct-by-design -- killing the connection over a request we do not model
+ * yet would turn a missing feature into a crash -- but they are also silent,
+ * and a client that asked for something and got nothing back waits forever
+ * having done nothing wrong. That reads from outside as "the program hung".
+ *
+ * So: name the gap. Report each (object kind, opcode) pair ONCE, which keeps a
+ * chatty client from flooding the log while still printing every distinct
+ * request we do not implement. (M1998) */
+static const char *wl_kind_name(int k) {
+    switch (k) {
+    case WLK_COMPOSITOR: return "wl_compositor";
+    case WLK_SHM: return "wl_shm";
+    case WLK_SHM_POOL: return "wl_shm_pool";
+    case WLK_BUFFER: return "wl_buffer";
+    case WLK_SURFACE: return "wl_surface";
+    case WLK_SEAT: return "wl_seat";
+    case WLK_POINTER: return "wl_pointer";
+    case WLK_KEYBOARD: return "wl_keyboard";
+    case WLK_XDG_WM_BASE: return "xdg_wm_base";
+    case WLK_XDG_SURFACE: return "xdg_surface";
+    case WLK_XDG_TOPLEVEL: return "xdg_toplevel";
+    case WLK_OUTPUT: return "wl_output";
+    case WLK_DDM: return "wl_data_device_manager";
+    case WLK_DATA_DEVICE: return "wl_data_device";
+    case WLK_DATA_SOURCE: return "wl_data_source";
+    case WLK_SUBCOMPOSITOR: return "wl_subcompositor";
+    case WLK_SUBSURFACE: return "wl_subsurface";
+    case WLK_NONE: return "an object we never created";
+    default: return "?";
+    }
+}
+static struct { int kind; int op; } g_unhandled[64];
+static int g_nunhandled;
+static void wl_unhandled(int kind, uint32_t obj, int opcode) {
+    for (int i = 0; i < g_nunhandled; i++)
+        if (g_unhandled[i].kind == kind && g_unhandled[i].op == opcode) return;
+    if (g_nunhandled < 64) {
+        g_unhandled[g_nunhandled].kind = kind;
+        g_unhandled[g_nunhandled].op = opcode;
+        g_nunhandled++;
+    }
+    kprintf("[wl] UNHANDLED request: %s(id %u).opcode %d -- the client gets no reply\n",
+            wl_kind_name(kind), obj, opcode);
+}
+unsigned wl_unhandled_count(void) { return (unsigned)g_nunhandled; }
+
 /* Handle one complete message. Returns 0 always (an unknown object or opcode is
  * ignored rather than fatal: a client may create objects we do not model yet,
  * and killing the connection would turn a missing feature into a hang). */
@@ -335,12 +391,15 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         if (p + 4 > alen) return;
         uint32_t slen = rd32(args + p); p += 4;
         p += (int)((slen + 3) & ~3u);
+        uint32_t ver = (p + 4 <= alen) ? rd32(args + p) : 1;
         p += 4;                                      /* version */
         if (p + 4 > alen) return;
         uint32_t nid = rd32(args + p);
         int kind = WLK_NONE;
         if (name >= 1 && name <= (uint32_t)WL_NGLOBAL) kind = g_globals[name - 1].kind;
-        obj_add(c, nid, kind);
+        struct wl_object *bo = obj_add(c, nid, kind);
+        if (bo) bo->version = ver;
+        if (kind == WLK_SEAT) c->seat_version = ver;   /* wl_pointer/wl_keyboard inherit it */
         /* WHAT A CLIENT ACTUALLY BINDS is the single most useful thing this
          * server can say. A toolkit that binds four of seven globals and then
          * stops has told you exactly which one it could not live without, and
@@ -371,8 +430,14 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             wl_send(c, nid, WL_OUTPUT_EV_MODE, m, mp);
             uint8_t sc[4]; wr32(sc, 1);
             wl_send(c, nid, WL_OUTPUT_EV_SCALE, sc, 4);
-            uint8_t nb2[64]; int np2 = put_string(nb2, 0, "OSDEV-1");
-            wl_send(c, nid, WL_OUTPUT_EV_NAME, nb2, np2);
+            /* name/description are wl_output version 4. Sending them to a
+             * version-3 proxy is the protocol error described on wl_object. */
+            if (ver >= 4) {
+                uint8_t nb2[64]; int np2 = put_string(nb2, 0, "OSDEV-1");
+                wl_send(c, nid, WL_OUTPUT_EV_NAME, nb2, np2);
+                uint8_t db[64]; int dp = put_string(db, 0, "OS-DEV built-in display");
+                wl_send(c, nid, WL_OUTPUT_EV_DESCRIPTION, db, dp);
+            }
             wl_send(c, nid, WL_OUTPUT_EV_DONE, 0, 0);
         }
         /* wl_shm MUST advertise its formats on bind. A client asks wl_shm what
@@ -387,8 +452,10 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             uint8_t cb2[4];
             wr32(cb2, WL_SEAT_CAP_POINTER | WL_SEAT_CAP_KEYBOARD);
             wl_send(c, nid, WL_SEAT_EV_CAPABILITIES, cb2, 4);
-            uint8_t nb[64]; int np = put_string(nb, 0, "osdev-seat0");
-            wl_send(c, nid, WL_SEAT_EV_NAME, nb, np);
+            if (ver >= 2) {                     /* wl_seat.name arrived in version 2 */
+                uint8_t nb[64]; int np = put_string(nb, 0, "osdev-seat0");
+                wl_send(c, nid, WL_SEAT_EV_NAME, nb, np);
+            }
         }
         if (kind == WLK_SHM) {
             uint8_t b[4];
@@ -399,7 +466,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     }
 
     struct wl_object *o = obj_find(c, obj);
-    if (!o) return;                                  /* an object we do not model: ignore, never fatal */
+    if (!o) { wl_unhandled(WLK_NONE, obj, opcode); return; }   /* an object we do not model: ignore, never fatal -- but SAY SO */
 
     if (o->kind == WLK_COMPOSITOR && opcode == WL_COMPOSITOR_CREATE_SURFACE && alen >= 4) {
         uint32_t sid = rd32(args);
@@ -491,7 +558,8 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         }
         uint8_t ri[8];
         wr32(ri + 0, 25); wr32(ri + 4, 400); /* repeat: 25/s after 400 ms */
-        wl_send(c, c->keyboard, WL_KEYBOARD_EV_REPEAT, ri, 8);
+        if (c->seat_version >= 4)      /* repeat_info arrived in wl_keyboard version 4 */
+            wl_send(c, c->keyboard, WL_KEYBOARD_EV_REPEAT, ri, 8);
         return;
     }
     if (o->kind == WLK_XDG_WM_BASE && opcode == XDG_WM_BASE_GET_XDG_SURFACE && alen >= 8) {
@@ -558,6 +626,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         }
         return;
     }
+    wl_unhandled(o->kind, obj, opcode);
 }
 
 int wl_compositor_init(void) {
@@ -607,7 +676,7 @@ static void wl_ptr_enter(struct wl_client *c, int x, int y) {
     wr32(b + p, wl_fixed(x)); p += 4;
     wr32(b + p, wl_fixed(y)); p += 4;
     wl_send(c, c->pointer, WL_POINTER_EV_ENTER, b, p);
-    wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+    if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
     c->ptr_in = 1;
 }
 
@@ -646,7 +715,7 @@ void wl_post_pointer_leave(void) {
         wr32(b + p, ++c->serial); p += 4;
         wr32(b + p, c->surface);  p += 4;
         wl_send(c, c->pointer, WL_POINTER_EV_LEAVE, b, p);
-        wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
         c->ptr_in = 0;
     }
 }
@@ -661,7 +730,7 @@ void wl_post_motion(int x, int y) {
         wr32(b + p, wl_fixed(x)); p += 4;
         wr32(b + p, wl_fixed(y)); p += 4;
         wl_send(c, c->pointer, WL_POINTER_EV_MOTION, b, p);
-        wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
         g_ptr_sent++;
     }
 }
@@ -677,7 +746,7 @@ void wl_post_button(int x, int y, unsigned button, int pressed) {
         wr32(b + p, button);       p += 4;     /* evdev: BTN_LEFT is 0x110 */
         wr32(b + p, pressed ? 1u : 0u); p += 4;
         wl_send(c, c->pointer, WL_POINTER_EV_BUTTON, b, p);
-        wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
         g_ptr_sent++;
     }
 }

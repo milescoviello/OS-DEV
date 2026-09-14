@@ -25,6 +25,7 @@ void wl_server_task(void);      /* the display server's own task (M1978) */
 unsigned wl_clients_connected(void);
 unsigned wl_messages_handled(void);
 unsigned wl_globals_sent(void);
+unsigned wl_unhandled_count(void);  /* distinct requests we had no handler for (M1998) */
 unsigned wl_commits(void);      /* surfaces committed with a readable buffer (M1979) */
 uint32_t wl_last_pixel(void);   /* top-left pixel of the last commit */
 uint32_t wl_last_width(void);

@@ -311,6 +311,49 @@ LXTHREAD: 4 threads
     # DESCRIPTOR over the socket, and both sides map it. The assertion is on
     # SHARING (a write through one mapping seen through the other), not just on
     # the transfer: a private copy would pass everything else.
+    # M1998: THE ROOT DIRECTORY, asked every way a runtime knows how. Claude
+    # Code refused to start with
+    #     Error: Can't access working directory /: Path "/" does not exist
+    # while every glibc route to the same question -- stat, lstat, statx,
+    # access, open(O_DIRECTORY), opendir, realpath, chdir -- already worked.
+    # Bun is Zig, and Zig resolves a path by opening it O_PATH and reading back
+    # /proc/self/fd/<n>; it also reads /proc/self/cwd. Both returned ENOENT.
+    # The two named checks are separate from the aggregate because they are the
+    # two that were broken: an aggregate alone would let one regress silently.
+    if grep -aq "LXCWD: readlink /proc/self/cwd -> /" "$SLOG3"; then
+        echo "  ok: /proc/self/cwd is a readable magic link (how Zig/Bun asks where it is)"
+    else
+        echo "  FAIL: /proc/self/cwd:"; grep -a "LXCWD: readlink" "$SLOG3" | head -3; f3=1
+    fi
+    if grep -aqE "LXCWD: readlink /proc/self/fd/[0-9]+ -> /" "$SLOG3"; then
+        echo "  ok: /proc/self/fd/<n> resolves a descriptor back to its path (how Zig/Bun does realpath)"
+    else
+        echo "  FAIL: /proc/self/fd/<n>:"; grep -a "LXCWD: readlink" "$SLOG3" | head -3; f3=1
+    fi
+    # An inode of ZERO is not an inode, it is "this file has no identity", and
+    # the mount-point directory returned before it set one. Anything keyed on
+    # (dev, ino) -- a realpath cache, a hardlink check, "is this the same file"
+    # -- collides across every such directory.
+    if grep -aqE "LXCWD: stat ok mode=755 dir=1 size=[0-9]+ nlink=[2-9][0-9]* ino=[1-9]" "$SLOG3"; then
+        echo "  ok: the root directory reports a real inode and a link count of at least 2 ($(grep -ao 'nlink=[0-9]* ino=[0-9]*' "$SLOG3" | head -1))"
+    else
+        echo "  FAIL: the root's stat fields:"; grep -a "LXCWD: stat ok" "$SLOG3" | head -2; f3=1
+    fi
+    # mkdir -p, one component at a time, with a component named "-" -- Claude
+    # Code's own path (/root/.claude/projects/-/memory) and the shape every
+    # Makefile uses to build into an output tree, so this is the self-hosting
+    # path too.
+    if grep -aq "LXCWD: mkdir /root/lxcwd/projects/-/memory ok" "$SLOG3" && \
+       grep -aq "LXCWD: wrote a file into the deepest directory" "$SLOG3"; then
+        echo "  ok: a nested directory tree can be created one level at a time and written into"
+    else
+        echo "  FAIL: nested mkdir:"; grep -a "LXCWD: mkdir\|LXCWD: rmdir" "$SLOG3" | head -5; f3=1
+    fi
+    if grep -aq "LXCWD: 0 probe(s) failed" "$SLOG3"; then
+        echo "  ok: every root-directory probe answered (stat/lstat/statx/access/O_DIRECTORY/opendir/realpath/O_PATH/fstatat/chdir/mkdir)"
+    else
+        echo "  FAIL: the root-directory probe:"; grep -a "LXCWD" "$SLOG3" | grep -a "FAILED" | head -4; f3=1
+    fi
     if grep -aq "LXSCM: memfd + SCM_RIGHTS + MAP_SHARED" "$SLOG3"; then
         echo "  ok: fd passing + shared memory ($(grep -ao 'fd [0-9]* passed as [0-9]*, [0-9]* KiB shared both ways' "$SLOG3" | head -1))"
     else

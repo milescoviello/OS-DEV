@@ -227,7 +227,9 @@ long app_fd_read(int fd, void *buf, unsigned long max);        /* read a pipe fd
 long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe fd; bytes/-1 EPIPE (M1187) */
 int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
 int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
-int  app_fd_type(int fd);                                      /* fd-table type, or -1 if not open (M1965) */
+int  app_fd_type(int fd);
+int  app_current_pid(void);                                    /* the calling process's pid, or -1 (M1998) */
+void app_epoll_dump(int epfd);                                 /* print an epoll instance's registered fds + readiness (M1998) */                                      /* fd-table type, or -1 if not open (M1965) */
 int  app_fd_set_cloexec(int fd, int on);                       /* FD_CLOEXEC, for MFD_CLOEXEC/SOCK_CLOEXEC (M1977) */
 long app_pread(int fd, void *buf, unsigned long max, long off);        /* read a FILE fd without moving its cursor; bytes/0 EOF/-1 (M1572) */
 long app_pwrite(int fd, const void *buf, unsigned long len, long off); /* write a FILE fd without moving its cursor; bytes/-1 (M1572) */

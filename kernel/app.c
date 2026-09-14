@@ -4798,6 +4798,24 @@ void app_sys_exit(int code) {
     struct app *a = cur();
     a->exit_code = code; a->exited = 1;
     app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
+    /* exit_group(2) ENDS EVERY THREAD, and this ended exactly one (M1998).
+     *
+     * The siblings kept running -- and kept being woken by the timer -- in the
+     * window between here and app_reap, which runs on the window manager's
+     * schedule and can be many milliseconds later. Worse, a thread parked in
+     * poll() or nanosleep() survived task_stop entirely until the fix in
+     * task.c, so it woke up AFTER the address space was freed. Stopping them
+     * here is what the syscall actually means, and it closes the window rather
+     * than relying on the reaper to win a race.
+     *
+     * Safe from this context: task_stop only changes scheduling eligibility.
+     * A sibling holding a spinlock holds it with interrupts off and cannot be
+     * descheduled mid-hold, and a sibling blocked in a syscall holds no
+     * spinlock -- this kernel's rule is never to block with one held. */
+    for (int i = 0; i < APP_MAXTHREAD; i++) {
+        task_t *t = a->thr[i];
+        if (t && t != task_self()) { app_futex_forget(t); task_stop(t); }
+    }
     task_exit();
 }
 /* --- ELF core dump (M1104) -------------------------------------------------
@@ -5792,6 +5810,8 @@ int app_fd_set_cloexec(int fd, int on) {
     a->fd[fd].cloexec = on ? 1 : 0;
     return 0;
 }
+int app_current_pid(void) { struct app *a = cur(); return a ? a->pid : -1; }
+
 int app_fd_type(int fd) {
     struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
     return a->fd[fd].type;
@@ -6474,6 +6494,23 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
  * won't fire again until app_fd_ready sees it go not-ready and then ready
  * again. last_ready tracks that per-item, independent of level/edge mode, so
  * switching an item's mode (via EPOLL_CTL_MOD) starts from a clean edge. */
+/* The registered set of an epoll instance, for the poll-stall diagnostic: a
+ * program blocked in epoll_wait is waiting on fds it registered at some earlier
+ * point, and nothing else in the log says which ones. (M1998) */
+void app_epoll_dump(int epfd) {
+    struct app *a = cur();
+    if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) {
+        kprintf("[poll]   (fd %d is not an epoll instance)\n", epfd);
+        return;
+    }
+    struct epollobj *e = &epolls[a->fd[epfd].obj];
+    for (int i = 0; i < e->n; i++)
+        kprintf("[poll]   fd %d type %d want %x -> %x%s\n", e->items[i].fd,
+                app_fd_type(e->items[i].fd), (unsigned)e->items[i].events,
+                app_fd_ready((app_t *)a, e->items[i].fd, e->items[i].events & ~(int)EPOLLET),
+                e->items[i].last_ready ? " (edge already reported)" : "");
+}
+
 int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
     struct app *a = cur();
     if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -1;
