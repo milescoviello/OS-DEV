@@ -100,6 +100,15 @@ require "vfs_stat resolves /dev/null as a character device"       "/dev nodes re
 require "vfs_stat still reports a missing /dev node as absent"    "the /dev existence check does not over-claim"
 require "vfs_pread served /proc/meminfo -- this is what open()+read() goes through" "/proc files are readable through the VFS"
 require "/dev/urandom yields more at a large offset: a char device is a stream, not a file" "char devices stream instead of hitting EOF"
+# THE FS_BASE RESTORE INVARIANT (M2013). FS_BASE is the thread pointer: every
+# TLS access goes through it and the stack-protector canary is read from
+# %fs:0x28, so a thread running with the wrong one dies on its first function
+# call, arbitrarily far from the cause. load_fs_base() used to skip the wrmsr
+# when this core's record already matched -- a record that has to stay true
+# about a register three assembly stubs zero as a side effect, across a
+# scheduler that migrates tasks between cores. It did not.
+require "FS_BASE: loading an FS selector really does zero it"     "the hazard itself is real: an FS selector write clears FS_BASE"
+require "FS_BASE: reloading the SAME base after the register was zeroed behind us still writes it" "FS_BASE is restored unconditionally (this FAILS if the per-core cache comes back)"
 
 # And the summary must report zero failures.
 if grep -qE "ipc self-test: [0-9]+ passed, 0 failed" "$SLOG"; then

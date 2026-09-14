@@ -249,10 +249,17 @@ static long gen_filesystems(char *b, int max) {
     b[p] = 0; return p;
 }
 static long gen_mounts(char *b, int max) {
+    /* This used to say fat32 was mounted on /, which is true for the NATIVE
+     * side and false for every Linux process -- they see the ext2 volume as
+     * their root. Two different answers to the same question in the same
+     * kernel is the kind of thing a program resolves by believing the wrong
+     * one, so this now matches /proc/self/mounts exactly. (M2013) */
     int p = sapp(b, 0, max,
-        "fat32 / fat32 rw 0 0\n"
-        "procfs /proc procfs ro 0 0\n"
-        "devfs /dev devfs ro 0 0\n");
+        "/dev/sda2 / ext2 rw,relatime 0 0\n"
+        "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+        "devtmpfs /dev devtmpfs rw,nosuid,mode=755 0 0\n"
+        "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
+        "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n");
     b[p] = 0; return p;
 }
 static long gen_interrupts(char *b, int max) {
@@ -566,7 +573,7 @@ int procfs_exists(const char *abs, int *chardev) {
          * absent. (M1971) */
         static const char *pid_files[] = {
             "auxv", "cgroup", "cmdline", "comm", "cwd", "exe", "fd", "io",
-            "limits", "maps", "oom_score", "oom_score_adj", "pagemap", "regs",
+            "limits", "maps", "mountinfo", "mounts", "oom_score", "oom_score_adj", "pagemap", "regs",
             "root", "sigfd", "smaps", "sstrace", "stat", "statm", "status",
             "strace", "wchan", "wss", "ctl", 0
         };
@@ -862,6 +869,40 @@ long procfs_read(const char *abs, void *buf, unsigned long max) {
              * how Linux says "the root of the unified hierarchy" -- which is
              * the truth here. A runtime reads this to discover a container
              * memory limit; the answer means "not in a container". (M1970) */
+            /* /proc/self/mountinfo (M2013). Gecko reads it before it will
+             * trust the profile directory: mozilla::GetFilesystemType asks
+             * which filesystem a path is on, because that decides whether
+             * SQLite may use WAL, whether the cache may memory-map, and
+             * whether shared memory is available. ENOENT is the one answer it
+             * cannot act on -- it has no fallback for "there are no mounts".
+             *
+             * The mount-id/parent-id/major:minor fields are made up, and that
+             * is fine: nothing reads them for identity. The FSTYPE column is
+             * the load-bearing one, and /dev/shm being tmpfs is the specific
+             * fact a program checks before using POSIX shared memory. */
+            if (peq(file, "mountinfo")) {
+                const char *c =
+                    "15 1 8:1 / / rw,relatime - ext2 /dev/sda2 rw\n"
+                    "16 15 0:15 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+                    "17 15 0:16 / /dev rw,nosuid - devtmpfs devtmpfs rw,mode=755\n"
+                    "18 17 0:17 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n"
+                    "19 15 0:18 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n";
+                int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; }
+                ((char *)buf)[n] = 0; return n;
+            }
+            /* ...and the older per-process view of the same thing, which is
+             * what code that predates mountinfo reads. Same list, /etc/mtab
+             * format, and it must AGREE with the one above. */
+            if (peq(file, "mounts")) {
+                const char *c =
+                    "/dev/sda2 / ext2 rw,relatime 0 0\n"
+                    "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+                    "devtmpfs /dev devtmpfs rw,nosuid,mode=755 0 0\n"
+                    "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
+                    "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
+                int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; }
+                ((char *)buf)[n] = 0; return n;
+            }
             if (peq(file, "cgroup")) { const char *c = "0::/\n"; int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; } ((char *)buf)[n] = 0; return n; }
             if (peq(file, "wss"))     return gen_pid_wss((char *)buf, (int)max, pid, proc);
             if (peq(file, "oom_score")) return gen_pid_oom((char *)buf, (int)max, proc);            /* OOM victim score (M1277) */

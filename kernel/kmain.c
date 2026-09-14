@@ -802,14 +802,29 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         vfs_mkdir("/disk2/var/cache/fontconfig");
         vfs_mkdir("/disk2/var/lib");
         vfs_mkdir("/disk2/var/lib/dbus");
-        /* /etc/machine-id. D-Bus and GLib both look for one and complain
-         * loudly without it. A fixed value is correct here: this is one
-         * machine's identity, not a secret, and inventing a random one per
-         * boot would make every cache in the image miss. */
+        /* /etc/machine-id -- AND IT MUST BE 32 LOWERCASE HEX DIGITS (M2013).
+         *
+         * It used to read "05dev05dev05dev05dev05dev05dev05": the right
+         * length, and spelling "osdev" in it was a nice touch, except that `v`
+         * is not a hex digit. D-Bus validates the file and rejects it, which
+         * is not a cosmetic complaint -- GDBus then cannot autolaunch a
+         * session bus, and Firefox's MAIN THREAD parked in a glib condition
+         * variable inside libgio waiting for a bus that could never appear:
+         *
+         *   Failed to create DBus proxy for org.a11y.Bus: Cannot spawn a
+         *   message bus without a machine-id: Invalid machine ID in
+         *   /var/lib/dbus/machine-id or /etc/machine-id
+         *
+         * printed as a WARNING, forty minutes before the process stopped
+         * making syscalls. A fixed value is still correct: this is one
+         * machine's identity, not a secret, and a random one per boot would
+         * make every cache in the image miss. Both paths are written, because
+         * D-Bus checks /var/lib/dbus/machine-id first and only then /etc. */
         vfs_mkdir("/disk2/etc");
-        { const char *mid = "05dev05dev05dev05dev05dev05dev05\n";
+        { const char *mid = "05de05de05de05de05de05de05de05de\n";
           unsigned long ml = 0; while (mid[ml]) ml++;
-          vfs_write("/disk2/etc/machine-id", mid, ml); }
+          vfs_write("/disk2/etc/machine-id", mid, ml);
+          vfs_write("/disk2/var/lib/dbus/machine-id", mid, ml); }
         /* /etc/resolv.conf, written from the address DHCP actually leased
          * (M1967).
          *
@@ -1069,7 +1084,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * code that is waiting. Firefox can: MOZ_LOG prints the
                      * widget and Wayland layers' own view of what they are
                      * doing, to stderr, which is our console. (M2010) */
-                    if (g_ffmozlog) app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,WidgetWayland:5,nsWindow:5,WaylandBackend:5,Event:4");
+                    if (g_ffmozlog) {
+                        app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,nsWindow:5,Event:4,DBus:5");
+                        app_set_next_env("G_MESSAGES_DEBUG=all");
+                        app_set_next_env("GIO_USE_VFS=local");
+                    }
                     kprintf("[ff] spawning FIREFOX against our compositor...\n");
                     int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_fw, 5);
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());

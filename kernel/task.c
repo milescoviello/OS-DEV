@@ -203,11 +203,26 @@ static inline void load_cr3(uint64_t v) {
 #define MSR_FS_BASE 0xC0000100u
 #define FSBASE_MAXCPUS 16
 static uint64_t loaded_fs_base[FSBASE_MAXCPUS];
+/* THE CACHE IS GONE (M2013). It skipped the wrmsr when this core's recorded
+ * value already matched, which is a micro-optimisation standing guard over a
+ * correctness-critical MSR -- and the guard has to be right about a value the
+ * hardware holds, across a scheduler that migrates tasks between cores.
+ *
+ * It was not right. Firefox died reading %fs:0x28 with CR2 = 0x28 in a thread
+ * whose SAVED fs_base was a perfectly good 0x1274846c0, and the report (M2012)
+ * showed the live MSR at 0 with this core's cache also at 0 -- so the skip
+ * decision, not the value, was what was wrong. Anything that zeroes FS_BASE
+ * without telling this array (loading an FS selector does exactly that, from
+ * three different stubs) makes every later skip a silent corruption of the
+ * thread pointer, and the failure lands arbitrarily far away in someone
+ * else's library.
+ *
+ * The cost of being right is one wrmsr per context switch. `loaded_fs_base`
+ * stays, written but never read for decisions, purely so the fault reporter
+ * can say what we last loaded versus what the CPU actually has. */
 static void load_fs_base(uint64_t b) {
-    int c = mycore();
-    if (b == loaded_fs_base[c]) return;
     __asm__ volatile("wrmsr" : : "c"(MSR_FS_BASE), "a"((uint32_t)b), "d"((uint32_t)(b >> 32)));
-    loaded_fs_base[c] = b;
+    loaded_fs_base[mycore()] = b;
 }
 /* Set the CURRENT thread's TLS base (live + saved for restore). M1140. */
 void task_set_fs_base(uint64_t b) { current->fs_base = b; load_fs_base(b); }
@@ -224,6 +239,26 @@ void task_set_fs_base(uint64_t b) { current->fs_base = b; load_fs_base(b); }
  * the low identity map but has no PTE_USER. This affects ANY task that uses
  * TLS and forks, not only Linux ones. */
 uint64_t task_fs_base(void) { return current ? current->fs_base : 0; }
+/* What the CPU ACTUALLY has, versus what we think we gave it (M2013).
+ *
+ * A ring-3 fault reading %fs:0x28 with CR2 = 0x28 says the FS base was zero
+ * when the instruction ran. The saved value being right at the same moment
+ * means the restore did not happen, not that the thread never had a TLS
+ * block -- two completely different bugs that look identical in the report.
+ * `cached` is what load_fs_base believes this core's MSR holds; if it differs
+ * from `live`, the skip-if-unchanged cache is the culprit. */
+uint64_t task_fs_base_live_value(void) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_FS_BASE));
+    return ((uint64_t)hi << 32) | lo;
+}
+void task_fs_base_live(uint64_t *live, uint64_t *cached, int *core) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_FS_BASE));
+    if (live) *live = ((uint64_t)hi << 32) | lo;
+    if (core) *core = mycore();
+    if (cached) *cached = loaded_fs_base[mycore()];
+}
 
 void task_copy_tls(task_t *dst, task_t *src) {
     if (!dst || !src) return;

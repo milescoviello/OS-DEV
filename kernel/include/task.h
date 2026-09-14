@@ -118,6 +118,8 @@ void    task_wake(task_t *t);              /* mark a blocked task runnable again
 static inline task_state_t task_state_of(task_t *t) { return t->state; }   /* never wake a DEAD task (M1990) */
 void    task_sleep_ms(uint64_t ms);        /* sleep the current task off-CPU until the timer wakes it */
 void    task_wake_sleepers(void);          /* timer IRQ: wake tasks whose sleep deadline passed */
+uint64_t task_fs_base_live_value(void);                                  /* the CPU's real FS base, read straight from the MSR (M2013) */
+void    task_fs_base_live(uint64_t *live, uint64_t *cached, int *core);  /* the CPU's real FS base vs what we think we loaded (M2013) */
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */
 struct registers *task_uframe(task_t *t);  /* the task's most recent ring-3 trap frame, or 0 (M1119) */
 void    task_stop(task_t *t);              /* suspend another task (READY/RUNNING -> STOPPED); not self */

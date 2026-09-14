@@ -38,6 +38,7 @@
 #include "eventfd.h"
 #include "syscall.h"   /* O_CREAT/O_EXCL, struct sembuf, IPC_* / GET-SETVAL */
 #include "tmpfs.h"
+#include "task.h"   /* task_set_fs_base / task_fs_base_live_value (M2013) */
 #include "unixsock.h"
 #include "sysvipc.h"
 #include "procfs.h"
@@ -52,6 +53,49 @@ static int ipc_pass, ipc_fail;
 static void ck(int cond, const char *what) {
     if (cond) { ipc_pass++; kprintf("[ ok ] ipc: %s\n", what); }
     else      { ipc_fail++; kprintf("[FAIL] ipc: %s\n", what); }
+}
+
+/* --- the FS_BASE restore invariant (M2013) ---------------------------------
+ *
+ * FS_BASE is the thread pointer. Every TLS access in every glibc program goes
+ * through it, and the stack-protector canary is read from %fs:0x28 on entry to
+ * most functions -- so a thread running with the wrong FS_BASE does not
+ * misbehave subtly, it dies on its first function call.
+ *
+ * load_fs_base() used to SKIP the wrmsr when this core's recorded value
+ * already matched the one being loaded. The flaw is not the idea, it is that
+ * the record has to stay true about a register three assembly stubs zero as a
+ * side effect (loading any FS selector clears FS_BASE on x86-64), across a
+ * scheduler that migrates tasks between cores. It did not stay true: Firefox
+ * died reading %fs:0x28 with CR2 = 0x28 in a thread whose SAVED base was a
+ * perfectly good pointer, and the live MSR was zero while the per-core record
+ * claimed zero as well -- the skip decision, not the value, was wrong.
+ *
+ * This reproduces exactly that, deterministically and in three lines: load a
+ * base, zero the register the way those stubs do, ask for the SAME base again,
+ * and read the hardware back. With the cache the second request is skipped and
+ * the register stays zero. The test therefore FAILS if the cache is restored,
+ * which is the whole point of it existing. */
+static void test_fsbase(void) {
+    uint64_t saved = task_fs_base_live_value();
+    const uint64_t probe = 0x0000700011223000ull;   /* canonical, page-aligned, ours */
+
+    task_set_fs_base(probe);
+    ck(task_fs_base_live_value() == probe, "FS_BASE: setting a thread pointer reaches the hardware");
+
+    /* What gdt_flush, ap_trampoline and return_to_kernel each do, and what the
+     * cache could not know about: writing the FS SELECTOR clears FS_BASE. */
+    __asm__ volatile("mov $0x10, %%ax; mov %%ax, %%fs" ::: "ax");
+    ck(task_fs_base_live_value() == 0, "FS_BASE: loading an FS selector really does zero it");
+
+    /* The same value again. A cache keyed on "what we last loaded" says there
+     * is nothing to do here; the hardware disagrees. */
+    task_set_fs_base(probe);
+    ck(task_fs_base_live_value() == probe,
+       "FS_BASE: reloading the SAME base after the register was zeroed behind us still writes it");
+
+    task_set_fs_base(saved);
+    ck(task_fs_base_live_value() == saved, "FS_BASE: and the caller's own base is put back");
 }
 
 /* --- POSIX message queues -------------------------------------------------- */
@@ -441,6 +485,7 @@ void ipc_selftest(void) {
     ipc_pass = ipc_fail = 0;
     kprintf("[ipc] POSIX IPC self-test (mqueue / sem / shm / pty / flock / inotify / eventfd\n");
     kprintf("[ipc]                        / tmpfs / unixsock / sysvipc / procfs)\n");
+    test_fsbase();
     test_mqueue();
     test_sem();
     test_shm();

@@ -538,7 +538,8 @@ static char g_pend_arg[128];             /* arg for the next app_spawn, copied i
 static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
 static void app_stop_siblings(struct app *a);   /* end every OTHER thread of a dying process (M1999) */
 static int  g_pend_lxargc;
-static const char *g_pend_env_extra;   /* one extra env var for the next Linux spawn (M1999) */
+#define LX_PEND_ENV 4
+static const char *g_pend_env_extra[LX_PEND_ENV];
 /* WHERE THE NEXT SPAWNED LINUX PROCESS'S OUTPUT GOES, and whose child it is.
  *
  * Both used to be set AFTER app_spawn returned, which is a race the child wins
@@ -5741,7 +5742,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * all. gcc creates its intermediate .s exactly that way. (M1960) */
         vfs_cwd_set_for(a, "/disk2");
         { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
-        static const char *argv0[2 + LX_PEND_ARGS], *envp0[32];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[40];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
          * re-execs itself by argv[0] (lxbox does) would otherwise ask for
@@ -5838,11 +5839,39 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * restrict non-essential traffic, and the preflight is exactly that.
          * (M2004) */
         envp0[23] = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1";
+        /* THERE IS NO D-BUS HERE, AND THE WAY TO SAY SO IS PER-SUBSYSTEM
+         * (M2013).
+         *
+         * GTK's accessibility bridge opens a SECOND bus (org.a11y.Bus) by
+         * asking the session bus for its address, and GDBus's own diagnosis of
+         * the failure went past unnoticed as a warning:
+         *
+         *   Failed to create DBus proxy for org.a11y.Bus: Cannot spawn a
+         *   message bus without a machine-id
+         *
+         * Firefox's MAIN THREAD then sat in a glib condition variable inside
+         * libgio -- thirty threads idle behind it and no syscalls at all --
+         * because the reply it was waiting for can never arrive. NO_AT_BRIDGE
+         * and GTK_A11Y are the documented way to tell GTK not to try; a
+         * deliberately unusable bus address makes anything that still asks
+         * fail at connect() instead of waiting for an autolaunch that cannot
+         * happen; and GTK_USE_PORTAL=0 keeps the file-chooser and settings
+         * portals off the same road.
+         *
+         * The honest framing: this is not a stub pretending a bus exists. It
+         * is telling each subsystem the truth up front, so it takes its own
+         * documented no-bus path instead of blocking. */
+        envp0[24] = "NO_AT_BRIDGE=1";
+        envp0[25] = "GTK_A11Y=none";
+        envp0[26] = "GTK_USE_PORTAL=0";
+        envp0[27] = "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus-absent";
+        envp0[28] = "MOZ_DISABLE_A11Y=1";
         /* One extra entry, one-shot, for a caller that needs to hand a specific
          * program something the whole system should NOT have -- see
          * app_set_next_env. (M1999) */
-        int en = 24;
-        if (g_pend_env_extra) { envp0[en++] = g_pend_env_extra; g_pend_env_extra = 0; }
+        int en = 29;
+        for (int k = 0; k < LX_PEND_ENV; k++)
+            if (g_pend_env_extra[k]) { envp0[en++] = g_pend_env_extra[k]; g_pend_env_extra[k] = 0; }
         envp0[en] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to
@@ -7565,7 +7594,6 @@ static void app_fd_release(struct app *a) {
  * writing an errno into memory the parent can see, and a COW copy loses that
  * write. The child still _exit(127)s, so a failed exec surfaces in the wait
  * status -- which is what make actually reports on. */
-static const char *g_pend_env_extra;
 /* An extra environment variable for the NEXT Linux spawn only, then forgotten.
  *
  * The case that needs it: proving Claude Code's network path. "Not logged in"
@@ -7575,7 +7603,13 @@ static const char *g_pend_env_extra;
  * whole round trip and get a 401 back from the server, which exercises every
  * layer and proves them. One-shot because an API key in the global environment
  * would be inherited by every program the system ever starts. (M1999) */
-void app_set_next_env(const char *e) { g_pend_env_extra = e; }
+/* Up to LX_PEND_ENV one-shot entries (M2013): diagnosing a program that has
+ * stopped talking usually means turning on two or three of ITS logging
+ * switches at once, and one slot made that a choice between them. */
+void app_set_next_env(const char *e) {
+    for (int k = 0; k < LX_PEND_ENV; k++)
+        if (!g_pend_env_extra[k]) { g_pend_env_extra[k] = e; return; }
+}
 
 static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_vm) {
     struct app *p = cur();
@@ -8554,17 +8588,15 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
             if (maj == prev_maj && min == prev_min && !stall_told) {
                 stall_told = 1;
                 kprintf("[runsync] NOTHING has faulted in 60s -- every thread, and what it waits on:\n");
+                /* app_dump_threads, not a second copy of the same loop: it
+                 * also names WHERE IN THE PROGRAM each thread is parked
+                 * (M2012), and a wchan of app_futex for every thread -- which
+                 * is what this used to print -- answers nothing. */
                 for (int i = 0; i < MAX_APPS; i++) {
                     if (!apps[i].used) continue;
-                    kprintf("[runsync]   pid %d '%s' state=%d wchan=%lx exited=%d\n",
-                            apps[i].pid, apps[i].title ? apps[i].title : "?",
-                            apps[i].task ? (int)apps[i].task->state : -1,
-                            apps[i].task ? (unsigned long)apps[i].task->wchan : 0UL, apps[i].exited);
-                    for (int k = 0; k < APP_MAXTHREAD; k++)
-                        if (apps[i].thr[k])
-                            kprintf("[runsync]     thread %d state=%d wchan=%lx wake_pending=%d\n",
-                                    apps[i].thr[k]->id, (int)apps[i].thr[k]->state,
-                                    (unsigned long)apps[i].thr[k]->wchan, apps[i].thr[k]->wake_pending);
+                    kprintf("[runsync]   pid %d '%s' exited=%d\n",
+                            apps[i].pid, apps[i].title ? apps[i].title : "?", apps[i].exited);
+                    app_dump_threads(apps[i].pid);
                 }
                 app_futex_dump();
                 lx_trace_dump_last("the stall", 220);
