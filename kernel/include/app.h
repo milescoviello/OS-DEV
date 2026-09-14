@@ -237,6 +237,9 @@ int  app_pipe(int *out);               /* pipe(): out[0]=read fd, out[1]=write f
 #define APP_FD_EPIPE  (-32)   /* peer closed;  the value is Linux's EPIPE  */
 long app_fd_read(int fd, void *buf, unsigned long max);        /* read a pipe fd; bytes/0 EOF/-1 (M1187) */
 long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe fd; bytes/-1 EPIPE (M1187) */
+int  app_termios_get(uint32_t *ifl, uint32_t *ofl, uint32_t *cfl, uint32_t *lfl, uint8_t *cc);  /* the terminal settings this app asked for (M2014) */
+int  app_termios_set(uint32_t ifl, uint32_t ofl, uint32_t cfl, uint32_t lfl, const uint8_t *cc); /* ...and TCSETS, stored for real */
+int  app_tio_echo(void);                                      /* is ECHO on? (M2014) */
 int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
 int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
 int  app_fd_obj(int fd);                                       /* the object index behind an fd (pipe no., memfd idx), or -1 (M2004) */

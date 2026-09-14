@@ -296,6 +296,15 @@ struct app {
     int      hist_n, hist_pos;
     volatile int gdirty;                 /* grid changed -> WM should repaint */
     int      caret_off;                  /* 1 = suppress the system caret (app draws its own) */
+    /* THE TERMINAL SETTINGS A PROGRAM ASKED FOR (M2014). TCSETS used to be
+     * accepted and discarded, on the reasoning that our console already
+     * delivers keys one at a time so there was nothing to change. There is:
+     * the FLAGS say how the keys should be encoded, and getting that wrong
+     * makes a TUI unusable in a way that looks like the keyboard not working.
+     * Zeroed = never set; the cooked defaults are filled in on first use. */
+    uint32_t tio_iflag, tio_oflag, tio_cflag, tio_lflag;
+    uint8_t  tio_cc[19];
+    int      tio_valid;
     int      sel_on;                     /* a text selection is shown/in progress */
     int      sel_r0, sel_c0;             /* selection anchor (visible-grid cell) */
     int      sel_r1, sel_c1;             /* selection end (visible-grid cell) */
@@ -1869,12 +1878,92 @@ int app_dirty_clear(app_t *a) { int d = a->gdirty; a->gdirty = 0; return d; }
 
 /* ---- input queue (filled by the WM, drained by SYS_read) ---- */
 #define SIGINT 2
+/* --- termios, for real (M2014) ---------------------------------------------
+ *
+ * Linux's cooked defaults, which is what a fresh terminal reports. ICRNL is
+ * the load-bearing one: it says "translate the Return key's CR into NL", and
+ * a program that CLEARS it is telling us it wants the raw CR.
+ *
+ * Our keyboard produces NL for Return natively, because every OS-DEV app
+ * expects that. So the translation runs the other way here: cooked stays NL,
+ * and raw becomes CR. Getting this backwards is exactly what stopped Claude
+ * Code's login -- Ink maps \r to `key.return` and nothing else does, so the
+ * selection list could be moved but never chosen. The onboarding rendered
+ * perfectly and the Enter key did nothing. */
+#define TIO_ICRNL  0x0100u          /* c_iflag */
+#define TIO_ISIG   0x0001u          /* c_lflag */
+#define TIO_ICANON 0x0002u
+#define TIO_ECHO   0x0008u
+static void tio_defaults(struct app *a) {
+    if (!a || a->tio_valid) return;
+    a->tio_iflag = 0x0500;   /* ICRNL | IXON */
+    a->tio_oflag = 0x0005;   /* OPOST | ONLCR */
+    a->tio_cflag = 0x00BF;   /* B38400 | CS8 | CREAD */
+    a->tio_lflag = 0x8A3B;   /* ISIG ICANON ECHO ECHOE ECHOK ECHOCTL IEXTEN */
+    for (int i = 0; i < 19; i++) a->tio_cc[i] = 0;
+    a->tio_cc[0] = 3; a->tio_cc[1] = 28; a->tio_cc[2] = 127; a->tio_cc[3] = 21;
+    a->tio_cc[4] = 4; a->tio_cc[6] = 1;  a->tio_cc[8] = 17;  a->tio_cc[9] = 19;
+    a->tio_cc[10] = 26;
+    a->tio_valid = 1;
+}
+int app_termios_get(uint32_t *ifl, uint32_t *ofl, uint32_t *cfl, uint32_t *lfl, uint8_t *cc) {
+    struct app *a = cur(); if (!a) return -1;
+    tio_defaults(a);
+    if (ifl) *ifl = a->tio_iflag; if (ofl) *ofl = a->tio_oflag;
+    if (cfl) *cfl = a->tio_cflag; if (lfl) *lfl = a->tio_lflag;
+    if (cc) for (int i = 0; i < 19; i++) cc[i] = a->tio_cc[i];
+    return 0;
+}
+int app_termios_set(uint32_t ifl, uint32_t ofl, uint32_t cfl, uint32_t lfl, const uint8_t *cc) {
+    struct app *a = cur(); if (!a) return -1;
+    tio_defaults(a);
+    /* REPORT THE MODE CHANGE ONCE. "The keyboard does nothing" and "the program
+     * never asked for raw mode" are indistinguishable from the outside, and one
+     * line separates them. */
+    if (((a->tio_iflag ^ ifl) & TIO_ICRNL) || ((a->tio_lflag ^ lfl) & (TIO_ICANON | TIO_ECHO | TIO_ISIG)))
+        kprintf("[tty] pid %d set termios: %s, echo %s, signals %s, Return -> %s\n",
+                a->pid, (lfl & TIO_ICANON) ? "canonical" : "RAW",
+                (lfl & TIO_ECHO) ? "on" : "off", (lfl & TIO_ISIG) ? "on" : "off",
+                (ifl & TIO_ICRNL) ? "NL" : "CR");
+    a->tio_iflag = ifl; a->tio_oflag = ofl; a->tio_cflag = cfl; a->tio_lflag = lfl;
+    if (cc) for (int i = 0; i < 19; i++) a->tio_cc[i] = cc[i];
+    return 0;
+}
+/* Does this app want the Return key as CR rather than NL? */
+static int tio_wants_cr(struct app *a) {
+    if (!a) return 0;
+    tio_defaults(a);
+    return (a->tio_iflag & TIO_ICRNL) ? 0 : 1;
+}
+/* ...and should Ctrl-C be a SIGNAL, or the byte 0x03? A raw-mode TUI handles
+ * its own interrupt key: Claude Code cancels a running turn with it. */
+static int tio_wants_isig(struct app *a) {
+    if (!a) return 1;
+    tio_defaults(a);
+    return (a->tio_lflag & TIO_ISIG) ? 1 : 0;
+}
+int app_tio_echo(void) {
+    struct app *a = cur(); if (!a) return 1;
+    tio_defaults(a);
+    return (a->tio_lflag & TIO_ECHO) ? 1 : 0;
+}
+
 void app_key(app_t *a, char c) {
     /* Ctrl-C (0x83): if this app installed a SIGINT handler, raise it asynchronously
      * (interrupting even a runaway compute loop) instead of queueing the key. Opt-in,
      * so the shell — which polls 0x83 to break its own loops — is unaffected. M1083. */
-    if ((unsigned char)c == 0x83 && fg_pgid) { app_killpg(fg_pgid, SIGINT); return; }   /* job control: ^C -> the foreground group (M1176) */
-    if ((unsigned char)c == 0x83 && a->sig_handler[SIGINT]) { app_request_signal(a, SIGINT); return; }
+    if ((unsigned char)c == 0x83 && !tio_wants_isig(a)) {
+        /* ISIG cleared: the program asked to see the interrupt character
+         * ITSELF rather than be signalled by it (M2014). A raw-mode TUI
+         * always does -- Claude Code cancels a running turn on Ctrl-C -- and
+         * signalling it instead kills the program the user was trying to
+         * interrupt. Fall through as the byte 0x03, which is what a terminal
+         * in raw mode actually delivers. */
+        c = 0x03;
+    } else {
+        if ((unsigned char)c == 0x83 && fg_pgid) { app_killpg(fg_pgid, SIGINT); return; }   /* job control: ^C -> the foreground group (M1176) */
+        if ((unsigned char)c == 0x83 && a->sig_handler[SIGINT]) { app_request_signal(a, SIGINT); return; }
+    }
     /* PgUp/PgDn scroll the scrollback for ordinary terminals; a full-screen app
      * that draws its own view (caret_off, e.g. the editor) gets them as keys to
      * page its own content instead. */
@@ -2264,14 +2353,15 @@ void app_dump_threads(int pid) {
     for (int i = 0; i < MAX_APPS; i++) {
         if (!apps[i].used || apps[i].pid != pid) continue;
         struct app *a = &apps[i];
-        kprintf("[app] pid %d main state=%d wchan=%lx\n", pid,
+        kprintf("[app] pid %d main '%s' state=%d wchan=%lx\n", pid,
+                a->task ? task_name_of(a->task) : "",
                 a->task ? (int)a->task->state : -1,
                 a->task ? (unsigned long)a->task->wchan : 0UL);
         if (a->task) dump_user_site(a, a->task);
         for (int k = 0; k < APP_MAXTHREAD; k++)
             if (a->thr[k]) {
-                kprintf("[app]   thread %d state=%d wchan=%lx wake_pending=%d\n",
-                        a->thr[k]->id, (int)a->thr[k]->state,
+                kprintf("[app]   thread %d '%s' state=%d wchan=%lx wake_pending=%d\n",
+                        a->thr[k]->id, task_name_of(a->thr[k]), (int)a->thr[k]->state,
                         (unsigned long)a->thr[k]->wchan,
                         a->thr[k]->wake_pending);
                 dump_user_site(a, a->thr[k]);
@@ -4722,7 +4812,10 @@ void app_request_signal(app_t *a, int signo) {
      * is a no-op on self, which is correct: a group ^C/^Z from the foreground
      * reader stops the OTHER group members. */
     if (signo == SIGCONT) { task_cont((task_t *)ap->task); return; }
-    if (signo == SIGSTOP || signo == SIGTSTP) { task_stop((task_t *)ap->task); return; }
+    if (signo == SIGSTOP || signo == SIGTSTP) {
+        kprintf("[app] pid %d STOPPED by signal %d\n", ap->pid, signo);
+        task_stop((task_t *)ap->task); return;
+    }
     /* opted in via a handler, OR routed to signalfd (M1126) — else ignore, the
      * existing default for handler-less signals. */
     int sigfd = ap->sigfd_armed && (ap->sigfd_mask & (1u << signo));
@@ -4854,7 +4947,10 @@ static void sigq_drop(struct app *a, int i) {
 static int app_sigqueue_to(struct app *t, int signo, uint64_t value, int code) {
     if (!t || signo <= 0 || signo >= APP_NSIG) return -1;
     if (signo == SIGCONT) { task_cont((task_t *)t->task); return 0; }
-    if (signo == SIGSTOP || signo == SIGTSTP) { task_stop((task_t *)t->task); return 0; }
+    if (signo == SIGSTOP || signo == SIGTSTP) {
+        kprintf("[app] pid %d STOPPED by signal %d (queued)\n", t->pid, signo);
+        task_stop((task_t *)t->task); return 0;
+    }
     int sigfd = t->sigfd_armed && (t->sigfd_mask & (1u << signo));
     if (!t->sig_handler[signo] && !sigfd) return -1;     /* not opted in -> ignored, like app_request_signal */
     if (t->sig_handler[signo]) {                          /* payload only matters for a handler */
@@ -5332,6 +5428,13 @@ void app_setcolor(int idx) { struct app *a = cur(); if (a) a->curcol = (uint8_t)
  * spinlock, because this kernel's rule is never to block with one held. */
 static void app_stop_siblings(struct app *a) {
     if (!a) return;
+    /* SAY SO (M2014). exit_group ending every thread is correct, and it is also
+     * indistinguishable -- from the outside -- from the bug where a process
+     * loses eighty threads and keeps running. One line naming the pid and the
+     * caller's own thread separates them at a glance. */
+    if (a->lxcalls)
+        kprintf("[app] pid %d: exit_group from thread %d -- stopping every sibling\n",
+                a->pid, task_current_id());
     for (int i = 0; i < APP_MAXTHREAD; i++) {
         task_t *t = a->thr[i];
         if (t && t != task_self()) { app_futex_forget(t); task_stop(t); }
@@ -5866,10 +5969,20 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         envp0[26] = "GTK_USE_PORTAL=0";
         envp0[27] = "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus-absent";
         envp0[28] = "MOZ_DISABLE_A11Y=1";
+        /* ...and the two GLib subsystems that reach a bus WITHOUT being asked
+         * to (M2014). GSettings' default backend is dconf, which talks to the
+         * session bus the first time anything reads a key -- and GTK reads keys
+         * during startup, on the main thread. GIO's default VFS is gvfs, same
+         * story. Naming the local/in-memory implementations is not a stub: they
+         * are real GLib backends, and they are the correct ones for a machine
+         * with no bus and no gvfs daemon. */
+        envp0[29] = "GSETTINGS_BACKEND=memory";
+        envp0[30] = "GIO_USE_VFS=local";
+        envp0[31] = "GVFS_DISABLE_FUSE=1";
         /* One extra entry, one-shot, for a caller that needs to hand a specific
          * program something the whole system should NOT have -- see
          * app_set_next_env. (M1999) */
-        int en = 29;
+        int en = 32;
         for (int k = 0; k < LX_PEND_ENV; k++)
             if (g_pend_env_extra[k]) { envp0[en++] = g_pend_env_extra[k]; g_pend_env_extra[k] = 0; }
         envp0[en] = 0;
@@ -5959,6 +6072,18 @@ static void fork_child_trampoline(void) {
 static void thread_trampoline(void) {
     task_finish_switch();   /* complete whoever we just preempted (M1531) — see task.h */
     task_t *t = task_self();
+    /* A SHARED TRAMPOLINE DEFENDS ITSELF (M2014). Three different callers
+     * build a task that starts here, and each has to store `start_frame`
+     * before the task becomes runnable. Two of them got that wrong at some
+     * point, and the cost of being wrong was a NULL dereference IN RING 0 --
+     * a kernel panic for a mistake whose blast radius should be one thread.
+     * Refusing to run is the correct answer and it names the condition. */
+    if (!t || !t->start_frame) {
+        kprintf("[task] thread %d reached its trampoline with no start frame -- "
+                "it was made runnable before its context was complete (M2014)\n",
+                t ? t->id : -1);
+        task_exit();
+    }
     struct registers f = *t->start_frame;          /* copy out before freeing */
     kfree(t->start_frame);
     t->start_frame = 0;
@@ -6310,7 +6435,22 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
         if (!a->out_to && !src->cols) return 0;        /* genuinely no terminal */
         for (;;) {
             int c = iq_get(src);
-            if (c >= 0) { ((char *)buf)[0] = (char)c; return 1; }
+            if (c >= 0) {
+                /* RETURN IS CR IN RAW MODE (M2014). See tio_wants_cr: our
+                 * keyboard produces NL because every native app expects it,
+                 * and a program that cleared ICRNL is asking for the CR a
+                 * real terminal would have delivered. */
+                if (c == '\n' && tio_wants_cr(a)) c = '\r';
+                ((char *)buf)[0] = (char)c;
+                /* ECHO, when the program asked for it (M2014). A cooked-mode
+                 * Linux program expects the TERMINAL to show what was typed;
+                 * a raw one draws its own and must not be doubled. */
+                if ((a->tio_valid ? (a->tio_lflag & TIO_ECHO) : 1) && !a->out_to) {
+                    char e = (char)((c == '\r') ? '\n' : c);
+                    if ((unsigned char)e >= 0x20 || e == '\n' || e == '\t') grid_write(a, &e, 1);
+                }
+                return 1;
+            }
             /* O_NONBLOCK means DO NOT WAIT. An event loop sets it on stdin and
              * reads until EAGAIN; blocking there instead is the same deadlock
              * the poll predicate above describes. */
@@ -7806,8 +7946,20 @@ static int app_thr_slot(struct app *a) {
  * caller's live trap frame (we inherit its user segment selectors + rflags).
  *
  * No window, no new app_t: the thread shares the caller's window for output.
- * Race-free because the int-0x80 gate keeps IF=0 through here, so the new task
- * can't be scheduled until we've stored its start_frame and returned. */
+ *
+ * BORN SUSPENDED (M2014). This used to say it was "race-free because the
+ * int-0x80 gate keeps IF=0 through here, so the new task can't be scheduled
+ * until we've stored its start_frame" -- which was true on one core and has
+ * not been true since M1531. IF=0 stops THIS core; another core picks the task
+ * out of the ready ring the instant it is published, runs thread_trampoline,
+ * and dereferences a start_frame that is still NULL:
+ *
+ *   *** KERNEL PANIC: CPU EXCEPTION ***
+ *     Page Fault (vector 14)  CR2 = 0x0  at thread_trampoline+0x33
+ *
+ * Four of them at once, from a desktop spawning native apps beside a Firefox
+ * with eighty threads. M2006 fixed exactly this for the Linux clone path and
+ * for fork children; this is the third caller of the same trampoline. */
 long app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg) {
     struct app *a = cur();
     if (!a || !r || !fn || !stack) return -1;
@@ -7816,10 +7968,11 @@ long app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg) {
     *f = *r;
     f->rip = fn; f->rsp = stack; f->rdi = arg; f->rax = 0;
     f->rflags |= 0x200;                                 /* IF set in ring 3 */
-    task_t *t = task_create_stack(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app. 256K (was 64K): a clone'd thread that calls sys_https runs the bignum/RSA TLS handshake on THIS kernel stack — the ring-3 browser's async fetch worker does exactly that, and 64K overflowed (corrupting the task ring -> task_wake_sleepers GPF). Matches the in-kernel browser worker's 256K. */
+    task_t *t = task_create_stack_suspended(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app. 256K (was 64K): a clone'd thread that calls sys_https runs the bignum/RSA TLS handshake on THIS kernel stack — the ring-3 browser's async fetch worker does exactly that, and 64K overflowed (corrupting the task ring -> task_wake_sleepers GPF). Matches the in-kernel browser worker's 256K. */
     if (!t) { kfree(f); return -1; }
     t->start_frame = f;
     { int sl = app_thr_slot(a); if (sl >= 0) a->thr[sl] = t; }   /* track for join/reap (M1139); reclaims finished slots (M2009) */
+    task_cont(t);                      /* the start frame is stored: NOW it may run (M2014) */
     return t->id;
 }
 

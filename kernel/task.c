@@ -247,6 +247,19 @@ uint64_t task_fs_base(void) { return current ? current->fs_base : 0; }
  * block -- two completely different bugs that look identical in the report.
  * `cached` is what load_fs_base believes this core's MSR holds; if it differs
  * from `live`, the skip-if-unchanged cache is the culprit. */
+/* WHAT THE THREAD CALLS ITSELF (M2014).
+ *
+ * Every Gecko thread announces its own name with prctl(PR_SET_NAME) -- "IPC
+ * I/O Parent", "Compositor", "JS Helper" -- and we were throwing it away as
+ * cosmetic. It is the opposite of cosmetic when eighty threads are parked and
+ * the question is WHICH of them. Sixteen bytes, which is the Linux limit. */
+void task_set_name(const char *n) {
+    task_t *t = current; if (!t || !n) return;
+    int i = 0; for (; i < (int)sizeof t->name - 1 && n[i]; i++) t->name[i] = n[i];
+    t->name[i] = 0;
+}
+const char *task_name_of(task_t *t) { return t ? t->name : ""; }
+
 uint64_t task_fs_base_live_value(void) {
     uint32_t lo = 0, hi = 0;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_FS_BASE));

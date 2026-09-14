@@ -17,6 +17,7 @@ typedef struct task {
     int           id;
     task_state_t  state;
     uint8_t      *fxbuf;       /* FXSAVE area (512B + slack, aligned to 16 at use) */
+    char         name[16];     /* prctl(PR_SET_NAME): what the THREAD calls itself (M2014) */
     uint64_t      run_ms;      /* total ms this task has been RUNNING (CPU time)   */
     uint64_t      last_in;     /* timer_ms() when it last became `current`         */
     uint64_t      nswitch;     /* times it has been scheduled in (context switches) */
@@ -118,6 +119,8 @@ void    task_wake(task_t *t);              /* mark a blocked task runnable again
 static inline task_state_t task_state_of(task_t *t) { return t->state; }   /* never wake a DEAD task (M1990) */
 void    task_sleep_ms(uint64_t ms);        /* sleep the current task off-CPU until the timer wakes it */
 void    task_wake_sleepers(void);          /* timer IRQ: wake tasks whose sleep deadline passed */
+void    task_set_name(const char *n);      /* record prctl(PR_SET_NAME) for the current thread (M2014) */
+const char *task_name_of(task_t *t);       /* ...and read it back; "" if the thread never named itself */
 uint64_t task_fs_base_live_value(void);                                  /* the CPU's real FS base, read straight from the MSR (M2013) */
 void    task_fs_base_live(uint64_t *live, uint64_t *cached, int *core);  /* the CPU's real FS base vs what we think we loaded (M2013) */
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */

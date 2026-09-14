@@ -1755,8 +1755,14 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_prctl_:
         /* Node calls PR_SET_NAME(15) for its threads and PR_SET_VMA
          * (0x53564d41, "AMVS") to label V8's heap regions for /proc/maps.
-         * Both are purely cosmetic to us -- there is nothing to name -- and
-         * accepting them is what Linux does when the option is understood. */
+         *
+         * PR_SET_NAME is NOT cosmetic here, and calling it that cost real time
+         * (M2014): when eighty Gecko threads are parked on condition variables,
+         * "which thread" is the whole question, and every one of them announces
+         * its own answer -- "IPC I/O Parent", "Compositor", "JS Helper". Keep
+         * it and print it in the thread dump. PR_SET_VMA really is advisory. */
+        if (a1 == 15 /*PR_SET_NAME*/ && r->rsi && vmm_user_ok(r->rsi, 1))
+            task_set_name((const char *)r->rsi);
         r->rax = 0;
         break;
     case LXS_clock_getres_: {               /* (clk_id, struct timespec *) */
@@ -2052,48 +2058,40 @@ void linux_syscall_dispatch(struct registers *r) {
          *     [linuxabi] ioctl(fd 0, 0x802c542a) type=14
          *
          * termios2 is termios plus c_ispeed/c_ospeed, so 44 bytes not 36. */
-        if (req == 0x802c542a /*TCGETS2*/) {
-            if (!vmm_user_ok(r->rdx, 44)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* TCGETS/TCGETS2 must report what TCSETS LAST SET, not a constant
+         * (M2014). glibc's cfmakeraw is a read-modify-write: tcgetattr,
+         * clear the flags, tcsetattr. If the read always answers "canonical,
+         * echo on, ICRNL" then a program that just turned raw mode ON is told
+         * it is still off, and any code that trusts the round trip -- or
+         * restores the "previous" settings on exit -- is working from
+         * fiction. */
+        if (req == 0x802c542a /*TCGETS2*/ || req == 0x5401 /*TCGETS*/) {
+            int sz = (req == 0x5401) ? 36 : 44;
+            if (!vmm_user_ok(r->rdx, (uint64_t)sz)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             uint8_t *t = (uint8_t *)r->rdx;
-            for (int i = 0; i < 44; i++) t[i] = 0;
-            *(uint32_t *)(t + 0)  = 0x0500;      /* c_iflag: ICRNL | IXON */
-            *(uint32_t *)(t + 4)  = 0x0005;      /* c_oflag: OPOST | ONLCR */
-            *(uint32_t *)(t + 8)  = 0x00BF;      /* c_cflag: B38400 | CS8 | CREAD */
-            *(uint32_t *)(t + 12) = 0x8A3B;      /* c_lflag: ISIG ICANON ECHO ECHOE ECHOK ECHOCTL IEXTEN */
-            t[17 + 0] = 3; t[17 + 1] = 28; t[17 + 2] = 127; t[17 + 3] = 21;
-            t[17 + 4] = 4; t[17 + 6] = 1; t[17 + 8] = 17; t[17 + 9] = 19; t[17 + 10] = 26;
-            *(uint32_t *)(t + 36) = 38400;       /* c_ispeed */
-            *(uint32_t *)(t + 40) = 38400;       /* c_ospeed */
+            for (int i = 0; i < sz; i++) t[i] = 0;
+            uint32_t ifl = 0, ofl = 0, cfl = 0, lfl = 0; uint8_t cc[19];
+            if (app_termios_get(&ifl, &ofl, &cfl, &lfl, cc) != 0) { r->rax = (uint64_t)-(long)LX_ENOTTY; break; }
+            *(uint32_t *)(t + 0) = ifl; *(uint32_t *)(t + 4) = ofl;
+            *(uint32_t *)(t + 8) = cfl; *(uint32_t *)(t + 12) = lfl;
+            for (int i = 0; i < 19; i++) t[17 + i] = cc[i];
+            if (sz == 44) { *(uint32_t *)(t + 36) = 38400; *(uint32_t *)(t + 40) = 38400; }
             r->rax = 0; break;
         }
-        if (req == 0x402c542b || req == 0x402c542c || req == 0x402c542d) {   /* TCSETS2/W2/F2 */
-            r->rax = 0; break;                   /* see TCSETS below: accepted */
-        }
-        if (req == 0x5401 /*TCGETS*/) {
-            /* struct termios: 4 x u32 flags, c_line, then 19 c_cc bytes. */
+        if (req == 0x402c542b || req == 0x402c542c || req == 0x402c542d ||   /* TCSETS2/W2/F2 */
+            req == 0x5402 || req == 0x5403 || req == 0x5404) {               /* TCSETS/W/F */
+            /* STORED, NOT DISCARDED (M2014). This was "accepted and ignored"
+             * because our console already delivers keys one at a time -- which
+             * is true and is not the point. The flags say how those keys should
+             * be ENCODED, and the one that matters is ICRNL: cleared, it means
+             * the program wants the Return key as CR. Ink (which is what Claude
+             * Code draws with) maps \r to `key.return` and NOTHING else does,
+             * so discarding the flag left a TUI whose selection list could be
+             * moved but never chosen. */
             if (!vmm_user_ok(r->rdx, 36)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-            uint8_t *t = (uint8_t *)r->rdx;
-            for (int i = 0; i < 36; i++) t[i] = 0;
-            *(uint32_t *)(t + 0)  = 0x0500;      /* c_iflag: ICRNL | IXON */
-            *(uint32_t *)(t + 4)  = 0x0005;      /* c_oflag: OPOST | ONLCR */
-            *(uint32_t *)(t + 8)  = 0x00BF;      /* c_cflag: B38400 | CS8 | CREAD */
-            *(uint32_t *)(t + 12) = 0x8A3B;      /* c_lflag: ISIG ICANON ECHO ECHOE ECHOK ECHOCTL IEXTEN */
-            t[17 + 0] = 3;    /* VINTR  ^C */
-            t[17 + 1] = 28;   /* VQUIT  ^\ */
-            t[17 + 2] = 127;  /* VERASE DEL */
-            t[17 + 3] = 21;   /* VKILL  ^U */
-            t[17 + 4] = 4;    /* VEOF   ^D */
-            t[17 + 6] = 1;    /* VMIN   1 */
-            t[17 + 8] = 17;   /* VSTART ^Q */
-            t[17 + 9] = 19;   /* VSTOP  ^S */
-            t[17 + 10] = 26;  /* VSUSP  ^Z */
-            r->rax = 0; break;
-        }
-        if (req == 0x5402 || req == 0x5403 || req == 0x5404) {   /* TCSETS/W/F */
-            /* Accepted and ignored. A TUI turns echo and canonical mode OFF to
-             * read keys one at a time; our console already delivers them that
-             * way, so there is nothing to change -- but REFUSING makes the
-             * program conclude it cannot control the terminal and give up. */
+            const uint8_t *t = (const uint8_t *)r->rdx;
+            app_termios_set(*(const uint32_t *)(t + 0), *(const uint32_t *)(t + 4),
+                            *(const uint32_t *)(t + 8), *(const uint32_t *)(t + 12), t + 17);
             r->rax = 0; break;
         }
         if (req == 0x5413 /*TIOCGWINSZ*/) {
