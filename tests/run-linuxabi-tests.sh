@@ -428,6 +428,18 @@ LXTHREAD: 4 threads
     else
         echo "  FAIL: shm naming:"; grep -a "LXANON: shm\|O_EXCL" "$SLOG3" | head -4; f3=1
     fi
+    # O_NONBLOCK ON A PIPE (M2009): the pipe was the LAST fd type here that
+    # ignored it, and Firefox's main thread blocked forever in the final read of
+    # its self-pipe drain loop -- taking 33 futex-waiting threads with it,
+    # because only that thread could ever post their work. The probe makes every
+    # would-block call in a forked child with a parent timeout, so a regression
+    # reports "IT BLOCKED" instead of becoming the hang it tests for.
+    if grep -aq "LXNB: THE SELF-PIPE DRAIN LOOP TERMINATES" "$SLOG3" && \
+       grep -aq "LXNB: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: O_NONBLOCK on a pipe -- empty reads and full writes return EAGAIN, EOF still reads as EOF"
+    else
+        echo "  FAIL: O_NONBLOCK on a pipe:"; grep -a "LXNB" "$SLOG3" | head -8; f3=1
+    fi
     if grep -aq "LXCAGE: 4GiB/4GiB wrote and read back" "$SLOG3" && \
        grep -aq "LXCAGE: 0 failure(s)" "$SLOG3"; then
         echo "  ok: reserve 8 GiB, align to 4 GiB, trim head and tail -- and the kept region is still writable end to end"

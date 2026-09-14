@@ -925,6 +925,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the vector-ISA probe...\n");
         int isarc = app_run_linux_sync("/disk2/lxisa", 0, 0, 60000);
         kprintf("[lxabi] LXISA exit -> %d\n", isarc);
+        /* ...and O_NONBLOCK on a pipe, which is how every event loop wakes
+         * itself up. Firefox's main thread blocked in the drain loop's final
+         * read and took 33 futex-waiting threads down with it; the pipe was
+         * the last fd type here that ignored O_NONBLOCK. (M2009) */
+        kprintf("[lxabi] launching the non-blocking-pipe probe...\n");
+        int nbrc = app_run_linux_sync("/disk2/lxnbpipe", 0, 0, 60000);
+        kprintf("[lxabi] LXNB exit -> %d\n", nbrc);
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");

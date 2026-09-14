@@ -131,7 +131,15 @@ long pipe_read(int idx, void *buf, unsigned long max) {
     }
 }
 
-long pipe_write(int idx, const void *buf, unsigned long len) {
+/* pipe_write_ex(..., nb): the write side of O_NONBLOCK (M2009).
+ *
+ * A PARTIAL write is the whole point here, and it is why this could not be a
+ * readiness check in front of pipe_write: a caller asking for 4096 bytes into a
+ * ring with 100 free is "writable", writes 100, and then has to come back with
+ * the count rather than block on the rest. POSIX says exactly that -- a
+ * non-blocking write transfers what it can and reports how much. Only a write
+ * that could move NOTHING is -EAGAIN. */
+long pipe_write_ex(int idx, const void *buf, unsigned long len, int nb) {
     struct kpipe *p = pp(idx); if (!p) return -1;
     const unsigned char *d = (const unsigned char *)buf;
     unsigned long done = 0;
@@ -144,12 +152,16 @@ long pipe_write(int idx, const void *buf, unsigned long len) {
             pipe_irq_restore(fl);
             continue;
         }
+        if (nb) { pipe_irq_restore(fl); return done ? (long)done : PIPE_EAGAIN; }
         p->ww = task_self();
         pipe_irq_restore(fl);
         task_block();                                            /* ring full: wait for a reader to drain */
         p = pp(idx); if (!p) return done ? (long)done : -1;
     }
     return (long)done;
+}
+long pipe_write(int idx, const void *buf, unsigned long len) {
+    return pipe_write_ex(idx, buf, len, 0);
 }
 
 /* Move up to `max` bytes from pipe `in` to pipe `out`, ring-to-ring, with no

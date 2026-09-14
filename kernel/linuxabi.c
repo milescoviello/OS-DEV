@@ -325,6 +325,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXO_CREAT   0100
 #define LXO_TRUNC  01000
 #define LXO_APPEND 02000
+#define LXO_NONBLOCK 04000        /* Linux O_NONBLOCK (M2009) */
+#define LXO_CLOEXEC 02000000      /* Linux O_CLOEXEC */
 
 /* Linux's x86-64 `struct stat` -- 144 bytes, and the field OFFSETS are the ABI.
  * Writing our own struct layout here would compile fine and hand glibc
@@ -3031,7 +3033,16 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_pipe2_: {                      /* (int fds[2] [, flags]) */
         if (!vmm_user_ok(r->rdi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         int fds[2];
-        if (app_pipe2(fds, 0) < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        /* pipe2's FLAGS were being discarded (M2009). O_CLOEXEC and
+         * O_NONBLOCK both arrive here and both were dropped, so
+         * pipe2(fds, O_NONBLOCK) handed back a pipe that blocks -- which is
+         * the worst possible answer, because the caller now believes it can
+         * read the pipe dry. That is exactly how Firefox's main thread
+         * stopped: its self-pipe drain loop asked for a non-blocking pipe,
+         * got a blocking one, and never came back out of the last read. */
+        long pf = (r->rax == LXS_pipe2_) ? (long)r->rsi : 0;
+        if (app_pipe2(fds, (pf & LXO_CLOEXEC) ? O_CLOEXEC : 0) < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        if (pf & LXO_NONBLOCK) { app_fd_set_nonblock(fds[0], 1); app_fd_set_nonblock(fds[1], 1); }
         ((int *)r->rdi)[0] = fds[0]; ((int *)r->rdi)[1] = fds[1];
         r->rax = 0;
         break;

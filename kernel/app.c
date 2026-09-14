@@ -107,7 +107,14 @@ struct app {
     int         used;
     int         pid;
     task_t     *task;
-#define APP_MAXTHREAD 32   /* 16 -> 32 (M1936) */
+/* 16 -> 32 (M1936) -> 192 (M2009).
+ *
+ * Firefox's PARENT process alone wants more than 32, and what it does when a
+ * thread cannot be created is crash on purpose: the last syscall before it
+ * died was clone3 returning EAGAIN, from a process that already had exactly 32
+ * threads. Thread creation is not a place a browser accepts "no" -- a compositor
+ * thread or an IPC I/O thread that does not exist has no fallback behaviour. */
+#define APP_MAXTHREAD 192
     task_t     *thr[APP_MAXTHREAD];      /* worker threads (M1138/M1139); 0 = free slot */
     const char *title;
     char        titlebuf[24];            /* persistent copy of the title */
@@ -129,7 +136,11 @@ struct app {
  * memory exhausted" having run out of SLOTS with a gigabyte of address space
  * still free. Affordable only because the backing-file path is interned
  * (see fpaths) rather than stored inline per region. */
-#define APP_MAXVMA 1024
+/* 1024 -> 4096 (M2009). Firefox's parent process reached 833 regions before it
+ * died of something else; a browser with content processes and a JIT routinely
+ * wants thousands, and running OUT of slots does not report as "out of slots"
+ * -- it reports as mmap failing with a gigabyte of address space free. */
+#define APP_MAXVMA 4096
 #define HUGE_SIZE  0x200000ull           /* 2 MiB hugepage (M1155) */
 /* Zero the next free VMA slot before filling it. Slots are RECYCLED -- the
  * carve compacts the list by swapping the last entry down -- so a field a
@@ -6228,6 +6239,21 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 13) return -1;  /* a listener is not readable */
     int idx = fd_pipe_idx(a, fd, 0); if (idx < 0) return -1;
+    /* THE PIPE WAS THE LAST FD TYPE THAT IGNORED O_NONBLOCK, and it wedged
+     * Firefox's main thread permanently (M2009).
+     *
+     * Every event loop of this shape owns a self-pipe: another thread writes
+     * one byte to wake the poll, and the loop then DRAINS the pipe by reading
+     * until EAGAIN. The last read of that drain is expected to find the pipe
+     * empty -- that is how the loop knows it is done. Blocking there instead
+     * stops the one thread that services the loop, so every other thread ends
+     * up futex-waiting on work it will now never post: 33 threads asleep
+     * because of one read that should have returned -EAGAIN.
+     *
+     * pipe_readable() is the same predicate poll() answers with, so a
+     * non-blocking read agrees with the poll that preceded it -- including on
+     * EOF, which must still read as 0 rather than EAGAIN. */
+    if (app_fd_nonblock(fd) && !pipe_readable(idx)) return APP_FD_EAGAIN;
     return pipe_read(idx, buf, max);
 }
 /* Shared by app_fd_write's FILE-fd case and app_pwrite (M1572): the whole
@@ -6344,7 +6370,15 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
         return (w < 0) ? APP_FD_EPIPE : w;
     }
     int idx = fd_pipe_idx(a, fd, 1); if (idx < 0) return -1;
-    long pw = pipe_write(idx, buf, len);
+    /* ...and the write side, for the same reason (M2009): the thread POSTING a
+     * wakeup must not block because the pipe is full -- it is full precisely
+     * because a wakeup is already pending, so the correct answer is a short
+     * count (or EAGAIN when nothing at all fits) and the caller drops the
+     * redundant byte. This cannot be a readiness check in FRONT of the write:
+     * a 4096-byte write into a ring with 100 bytes free must move those 100 and
+     * say so, not block on the remainder. */
+    long pw = pipe_write_ex(idx, buf, len, app_fd_nonblock(fd));
+    if (pw == PIPE_EAGAIN) return APP_FD_EAGAIN;
     if (pw == -1) app_request_signal(a, SIGPIPE);   /* no readers left (EPIPE) -> also SIGPIPE, like real POSIX (M1581) */
     return pw;
 }
@@ -7628,6 +7662,33 @@ void app_vfork_release(app_t *ap) {
 
 long app_fork(struct registers *r) { return app_fork_at(r, 0); }
 
+/* Claim a thread-table slot, RECLAIMING finished ones first (M2009).
+ *
+ * Slots were only ever released by an explicit join or by process teardown, so
+ * a DETACHED thread that ran to completion held its slot for the life of the
+ * process. That makes the table a lifetime budget rather than a concurrency
+ * limit: Firefox's thread pools create and retire threads continuously, so it
+ * ran out of slots with a handful of threads actually running, and what it does
+ * when a thread cannot be created is crash on purpose.
+ *
+ * Only a task that is DEAD *and* off_cpu is freed -- a dead task may still be
+ * finishing its final context_switch on another core, and freeing its stack
+ * underneath that is the bug M1961 fixed elsewhere. Returns a slot index, or
+ * -1 when every slot really is a live thread. */
+static int app_thr_slot(struct app *a) {
+    for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) return i;
+    for (int i = 0; i < APP_MAXTHREAD; i++) {
+        task_t *t = a->thr[i];
+        if (!t || t->state != TASK_DEAD) continue;
+        if (!__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) continue;
+        app_futex_forget(t);
+        a->thr[i] = 0;
+        task_free(t);
+        return i;
+    }
+    return -1;
+}
+
 /* clone (M1138): create a THREAD — a task sharing this process's address space
  * (same CR3, same app_t) that begins in ring 3 at fn(arg) on `stack`. Unlike
  * fork (a separate COW address space), threads share ALL memory, so they can
@@ -7650,7 +7711,7 @@ long app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg) {
     task_t *t = task_create_stack(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app. 256K (was 64K): a clone'd thread that calls sys_https runs the bignum/RSA TLS handshake on THIS kernel stack — the ring-3 browser's async fetch worker does exactly that, and 64K overflowed (corrupting the task ring -> task_wake_sleepers GPF). Matches the in-kernel browser worker's 256K. */
     if (!t) { kfree(f); return -1; }
     t->start_frame = f;
-    for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) { a->thr[i] = t; break; }   /* track for join/reap (M1139) */
+    { int sl = app_thr_slot(a); if (sl >= 0) a->thr[sl] = t; }   /* track for join/reap (M1139); reclaims finished slots (M2009) */
     return t->id;
 }
 
@@ -7678,8 +7739,7 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
     if (!a || !r || !stack) return -1;
     /* Refuse when the thread table is full rather than creating a task nothing
      * can join or reap. */
-    int slot = -1;
-    for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) { slot = i; break; }
+    int slot = app_thr_slot(a);
     if (slot < 0) return -1;
 
     struct registers *f = kmalloc(sizeof *f);
