@@ -450,7 +450,7 @@ static const struct pf proc_files[] = {
     { "bcache", gen_bcache }, { "measure", gen_measure }, { "cas", gen_cas }, { "fw", gen_fw },
     { "notify", gen_notify }, { "swaps", gen_swaps }, { "shm", gen_shm }, { "events", gen_events }, { "bpf", gen_bpf }, { "syscalls", gen_syscalls },
 };
-static const char *dev_files[] = { "null", "zero", "random", "urandom", "full", "clipboard", "kmsg" };
+static const char *dev_files[] = { "null", "zero", "random", "urandom", "full", "clipboard", "kmsg", "tty" };   /* tty: the controlling terminal, opened specially by the Linux ABI (M2004) */
 
 /* --- NESTED /proc/sys and /sys nodes (M1970) --------------------------------
  *

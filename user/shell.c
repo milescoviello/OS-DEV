@@ -20,6 +20,8 @@
 #include "shtxt.h"    /* tr_expand()/cut_sel(): `tr`/`cut` text helpers, host-tested by tests/shtxt */
 #include "patchcore.h" /* patch_apply(): apply a unified-diff patch (the `patch` builtin), host-tested by tests/diff */
 
+static long sh_run_linux_fg(const char *line, const char *prog);   /* PATH lookup + foreground run of a Linux binary (M2004) */
+
 static void perr(const char *s);   /* print an error label in red (defined below); forward-declared for early use (M1379) */
 
 static void jobtest_sigint(int s) { (void)s; sys_exit(42); }   /* job-control demo: a group SIGINT exits the child 42 (M1176) */
@@ -7518,6 +7520,7 @@ static int run_command(char *line, char *cwd) {
             while (*p == ' ') p++;
             char arg[64]; int ai = 0; while (*p && *p != ' ' && ai < 63) arg[ai++] = *p++; arg[ai] = 0; sh_unprot_buf(arg);
             long rc = arg[0] ? sys_spawn_arg(prog, arg) : sys_spawn(prog);
+            if (rc < 0) rc = sh_run_linux_fg(line, prog);        /* a Linux binary on PATH? (M2004) */
             if (rc < 0) {
                 sys_setcolor(2); print("unknown command: ");      /* errors in red so they stand out (M1378) */
                 print(line);
@@ -7527,6 +7530,60 @@ static int run_command(char *line, char *cwd) {
         }
     } while (0);
     return 0;
+}
+
+/* A COMMAND THAT IS NOT OURS MIGHT STILL BE A PROGRAM (M2004).
+ *
+ * Typing `claude` should run Claude Code. Making a person type
+ * `linux /usr/bin/claude` instead is not a compatibility layer, it is a
+ * confession -- the whole point of the Linux ABI is that those binaries are
+ * just programs on this system. So: if no builtin and no native app matches,
+ * look the name up the way a shell does, on a PATH.
+ *
+ * And run it in the FOREGROUND. The old `linux` command spawned and returned
+ * immediately, so the prompt came back while the program was still starting;
+ * its output arrived over whatever you typed next, and an interactive program
+ * had a shell competing with it for the keyboard. A command you typed should
+ * own the terminal until it is done.
+ *
+ * Returns the exit status, or -1 if there is no such program (so the caller can
+ * print "unknown command" exactly as before). */
+static long sh_run_linux_fg(const char *line, const char *prog)
+{
+    if (!prog[0]) return -1;
+    /* "" means "prog is already a path"; the rest are the PATH directories. */
+    static const char *dirs[] = { "", "/usr/bin/", "/bin/", "/usr/local/bin/", 0 };
+    char path[192], probe[208];
+    struct statx meta;
+    int found = 0;
+
+    for (int d = 0; dirs[d] && !found; d++) {
+        if (d == 0 && prog[0] != '/') continue;     /* a bare name is not a path */
+        int i = 0;
+        for (const char *q = dirs[d]; *q && i < 190; q++) path[i++] = *q;
+        for (const char *q = prog;    *q && i < 190; q++) path[i++] = *q;
+        path[i] = 0;
+        /* The name is in the LINUX process's world (/usr/bin/claude); on this
+         * system that volume is mounted at /disk2, so that is where we look. */
+        int k = 0;
+        for (const char *q = "/disk2"; *q; q++) probe[k++] = *q;
+        for (int j = 0; path[j] && k < 206; j++) probe[k++] = path[j];
+        probe[k] = 0;
+        if (sys_statx(probe, &meta) == 0 && (meta.stx_mode & 0170000u) != 0040000u) found = 1;
+    }
+    if (!found) return -1;
+
+    /* Everything after the program name is its argv, verbatim -- quoting was
+     * already handled by the shell's own pass. */
+    const char *rest = line;
+    while (*rest && *rest != ' ') rest++;
+    while (*rest == ' ') rest++;
+
+    long pid = sys_linux_run(path, rest);
+    if (pid < 0) { print("could not start "); print(path); print("\n"); return 1; }
+    int status = 0;
+    sys_waitpid((int)pid, &status);              /* the foreground part: wait for it */
+    return status;
 }
 
 /*

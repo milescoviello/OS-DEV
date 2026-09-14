@@ -14,6 +14,7 @@ int  pipe_new_fifo(void);                                     /* -> a pinned, un
 long pipe_read(int idx, void *buf, unsigned long max);        /* bytes; 0 at EOF (no writers, drained); -1 bad idx */
 long pipe_write(int idx, const void *buf, unsigned long len); /* bytes; -1 if no readers (EPIPE) or bad idx */
 int  pipe_readable(int idx);                                  /* poll: 1 if a read won't block (data or EOF) (M1210) */
+void pipe_state(int idx, int *r_open, int *w_open, int *queued, int *had_writer);  /* reference counts + queued bytes, for a stalled poll (M2004) */
 int  pipe_writable(int idx);                                  /* poll: 1 if a write won't block (space or no reader) (M1210) */
 long pipe_splice(int in, int out, unsigned long max);         /* move bytes in->out (consumes in); bytes/-1 (M1211) */
 long pipe_tee(int in, int out, unsigned long max);            /* copy bytes in->out (in preserved); bytes/-1 (M1211) */

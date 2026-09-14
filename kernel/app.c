@@ -211,6 +211,8 @@ struct app {
      * this file. */
     volatile int vma_lk;
     struct app *out_to;                  /* a Linux child writes its stdout into THIS app's window (M1988) */
+    unsigned long lxcalls;               /* Linux syscalls this process has made, for the stall watchdog (M2004) */
+    unsigned long lxcalls_seen; int stall_ticks, stall_told;
     int      out_announced;              /* the routing has been logged once */
     void    *vma_owner;                  /* the task holding it; re-entry by the SAME task is allowed */
     int      vma_depth;
@@ -516,6 +518,14 @@ static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
 static void app_stop_siblings(struct app *a);   /* end every OTHER thread of a dying process (M1999) */
 static int  g_pend_lxargc;
 static const char *g_pend_env_extra;   /* one extra env var for the next Linux spawn (M1999) */
+/* WHERE THE NEXT SPAWNED LINUX PROCESS'S OUTPUT GOES, and whose child it is.
+ *
+ * Both used to be set AFTER app_spawn returned, which is a race the child wins
+ * whenever it prints early -- and worse, it meant nothing could wait for it,
+ * because a spawned app has no parent and waitpid only finds children. Handing
+ * them to the spawn itself closes both. (M2004) */
+static struct app *g_pend_out_to;
+static int         g_pend_parent;
 static int  g_last_spawn_pid;            /* pid of the last successful app_spawn (M1955) */
 /* One-shot: when set, app_spawn MAPS the executable's PT_LOADs from this path
  * instead of copying them out of a buffer the caller had to slurp whole.
@@ -1854,6 +1864,9 @@ void app_key(app_t *a, char c) {
     task_wake(a->task);          /* unblock the app if it's waiting in read() */
     irq_restore(f);
 }
+static int iq_has(struct app *a) {
+    return a && (a->paste_pos < a->paste_len || a->ih != a->it);
+}
 static int iq_get(struct app *a) {
     if (a->paste_pos < a->paste_len)            /* drain a pending paste first (not capped by IQ_SIZE) */
         return (unsigned char)a->pastebuf[a->paste_pos++];
@@ -1867,6 +1880,32 @@ int app_sys_pollkey(void) { app_kill_check(); return iq_get(cur()); }
 /* ---- syscall-facing ---- */
 /* ANSI/VT100: map an SGR colour code (30-37 normal / 90-97 bright) onto our
  * 16-entry app_palette (which isn't in ANSI order). */
+static uint8_t ansi_color(int code, int bold);   /* fwd: the 256-colour mappers use it */
+/* The xterm 256-colour cube, folded onto our 16-entry palette (M2004): 0-15
+ * are the ANSI colours, 16-231 a 6x6x6 RGB cube, 232-255 a grey ramp. */
+static uint8_t ansi_rgb(int r, int g, int b);
+static uint8_t ansi_256(int idx) {
+    if (idx < 0) idx = 0;
+    if (idx < 8)   return ansi_color(30 + idx, 0);
+    if (idx < 16)  return ansi_color(90 + (idx - 8), 0);
+    if (idx < 232) { int c = idx - 16;
+                     int r = (c / 36) * 51, g = ((c / 6) % 6) * 51, b = (c % 6) * 51;
+                     return ansi_rgb(r, g, b); }
+    { int v = 8 + (idx - 232) * 10; return ansi_rgb(v, v, v); }
+}
+/* Nearest of our sixteen by brightness + dominant channel -- exact matching is
+ * not the point, legibility is. */
+static uint8_t ansi_rgb(int r, int g, int b) {
+    int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    int bright = mx > 160;
+    if (mx - mn < 40) return mx < 64 ? 8 : (mx < 170 ? 0 : 1);    /* grey ramp: dark, normal, white */
+    if (r == mx && g > b + 40) return bright ? 12 : 3;            /* yellow */
+    if (r == mx) return (b > g + 40) ? (bright ? 11 : 5) : (bright ? 13 : 2);   /* magenta / red */
+    if (g == mx) return (b > r + 40) ? (bright ? 10 : 4) : (bright ? 9 : 0);    /* cyan / green */
+    return bright ? 14 : 6;                                       /* blue */
+}
+
 static uint8_t ansi_color(int code, int bold) {
     static const uint8_t base[8]   = { 8, 2, 0, 3, 6, 5, 4, 1 };   /* blk red grn yel blu mag cyn wht */
     static const uint8_t bright[8] = { 8, 13, 9, 12, 14, 11, 10, 1 };
@@ -1895,9 +1934,29 @@ static void ansi_csi(struct app *a, char final) {
             else if (v == 1) bold = 1;
             else if (v == 39) a->curcol = 0;
             else if ((v >= 30 && v <= 37) || (v >= 90 && v <= 97)) a->curcol = ansi_color(v, bold);
+            /* 256-COLOUR (M2004): "38;5;N" is a foreground index, and it is
+             * what every modern TUI actually emits -- Claude Code uses almost
+             * nothing else. Skipping it left the colour at whatever came
+             * before AND left the two following parameters to be misread as
+             * colours in their own right. Fold the cube onto our 16. */
+            else if (v == 38 && i + 2 < np && p[i + 1] == 5) { a->curcol = ansi_256(p[i + 2]); i += 2; }
+            else if (v == 48 && i + 2 < np && p[i + 1] == 5) { i += 2; }   /* background: no per-cell bg yet */
+            else if (v == 38 && i + 4 < np && p[i + 1] == 2) { a->curcol = ansi_rgb(p[i+2], p[i+3], p[i+4]); i += 4; }
+            else if (v == 48 && i + 4 < np && p[i + 1] == 2) { i += 4; }
         }
         break;
     }
+    case 'G':                            /* CHA: cursor to an absolute COLUMN (M2004) */
+        /* A TUI that draws boxes positions by column constantly -- "ESC[4G" is
+         * the single most common sequence Claude Code emits. Without it every
+         * one of them printed as text and nothing lined up. */
+        a->cx = (p[0] ? p[0] : 1) - 1;
+        if (a->cx < 0) a->cx = 0; if (a->cx >= a->cols) a->cx = a->cols - 1;
+        break;
+    case 'd':                            /* VPA: cursor to an absolute ROW */
+        a->cy = (p[0] ? p[0] : 1) - 1;
+        if (a->cy < 0) a->cy = 0; if (a->cy >= a->rows) a->cy = a->rows - 1;
+        break;
     case 'A': a->cy -= n; if (a->cy < 0) a->cy = 0; break;
     case 'B': a->cy += n; if (a->cy >= a->rows) a->cy = a->rows - 1; break;
     case 'C': a->cx += n; if (a->cx >= a->cols) a->cx = a->cols - 1; break;
@@ -1955,8 +2014,81 @@ void app_write_to(app_t *dest, const char *buf, unsigned len) {
         a->out_announced = 1;
         kprintf("[app] a Linux child's stdout is going to the window of pid %d\n", a->pid);
     }
-    for (unsigned i = 0; i < len; i++) grid_putc(a, buf[i]);
+    grid_write(a, buf, len);      /* the SAME terminal a native app writes to (M2004) */
 }
+
+/* Arm the NEXT Linux spawn: its output goes to `dest`'s window and it becomes
+ * a child of `ppid`, both from the moment it exists. One-shot. (M2004) */
+void app_arm_next_spawn(app_t *dest, int ppid) {
+    g_pend_out_to = (struct app *)dest;
+    g_pend_parent = ppid;
+}
+
+/* Is this app's output routed into ANOTHER app's window? Then it is a
+ * foreground job of that window and must not get one of its own. (M2004) */
+/* A fresh descriptor for this process's controlling terminal: the same console
+ * alias fd 0/1/2 are. This is what open("/dev/tty") returns. (M2004) */
+int app_open_console_alias(void) {
+    struct app *a = cur();
+    if (!a) return -1;
+    for (int fd = 0; fd < APP_NFD; fd++) {
+        if (a->fd[fd].used) continue;
+        a->fd[fd].used = 1; a->fd[fd].type = 14; a->fd[fd].obj = 0;
+        a->fd[fd].off = 0; a->fd[fd].cloexec = 0; a->fd[fd].nonblock = 0;
+        return fd;
+    }
+    return -1;
+}
+
+/* THE STALL WATCHDOG (M2004).
+ *
+ * A Linux program that stops making syscalls has stopped doing anything, and
+ * from outside that is indistinguishable from one that is merely slow -- which
+ * is the single most common thing to be wrong here and the most expensive to
+ * diagnose. Every process gets a syscall counter; this notices when one stops
+ * moving and prints, once, what each of its threads is parked on.
+ *
+ * Called from the window manager's loop, which runs anyway.
+ */
+void app_count_lx_syscall(void) { struct app *a = cur(); if (a) a->lxcalls++; }
+
+void app_stall_watchdog(void) {
+    static uint64_t next_check;
+    uint64_t now = timer_ms();
+    if (now < next_check) return;
+    next_check = now + 15000;
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app *a = &apps[i];
+        if (!a->used || a->exited || !a->lxcalls) continue;
+        /* A RATE, NOT A CHANGE. "Did the counter move at all" is too generous:
+         * a program parked on a long timer ticks over one syscall every
+         * fifteen seconds, which resets an equality test forever while the
+         * program does precisely nothing. Claude Code idles at exactly that
+         * rate. Fewer than a handful of calls in a whole interval is not
+         * progress. (M2004) */
+        unsigned long made = a->lxcalls - a->lxcalls_seen;
+        a->lxcalls_seen = a->lxcalls;
+        if (made >= 8) { a->stall_ticks = 0; a->stall_told = 0; continue; }
+        if (++a->stall_ticks < 3 || a->stall_told) continue;   /* ~45s of nothing */
+        a->stall_told = 1;
+        kprintf("[stall] pid %d '%s' has made no syscall in 45s (%lu total) -- threads:\n",
+                a->pid, a->title ? a->title : "?", a->lxcalls);
+        kprintf("[stall]   main state=%d wchan=%lx\n",
+                a->task ? (int)a->task->state : -1,
+                a->task ? (unsigned long)a->task->wchan : 0UL);
+        for (int k = 0; k < APP_MAXTHREAD; k++)
+            if (a->thr[k])
+                kprintf("[stall]   thread %d state=%d wchan=%lx wake_pending=%d\n",
+                        a->thr[k]->id, (int)a->thr[k]->state,
+                        (unsigned long)a->thr[k]->wchan, a->thr[k]->wake_pending);
+        app_futex_dump();
+        lx_trace_dump_last("the stall", 40);
+    }
+}
+
+app_t *app_out_to_of(app_t *a) { return a ? (app_t *)((struct app *)a)->out_to : 0; }
+
+int app_pid_of(app_t *a) { return a ? ((struct app *)a)->pid : 0; }   /* an app's pid, for callers holding the handle (M2004) */
 
 void app_set_out_to(int pid, app_t *dest) {
     for (int i = 0; i < MAX_APPS; i++)
@@ -2032,8 +2164,35 @@ app_t *app_out_to(void) {
     return a ? (app_t *)a->out_to : 0;
 }
 
-void app_sys_write(const char *buf, unsigned len) {
+/* The character grid a process's output actually lands on, and therefore the
+ * size a terminal program must be told (M2004).
+ *
+ * A Linux binary started with `linux` from a shell has no window of its own --
+ * its stdout is routed to the LAUNCHING shell's window -- so its terminal size
+ * is that window's grid, not its own. Returns 0 if there is no window at all,
+ * in which case the caller should say "not a terminal" rather than invent a
+ * size: a program told it has an 80x24 terminal when it has none will try to
+ * draw one. */
+int app_console_size(int *cols, int *rows) {
     struct app *a = cur();
+    if (!a) return 0;
+    struct app *t = (struct app *)a->out_to;
+    if (!t) t = a;                       /* no routing: our own window, if we have one */
+    if (!t || t->cols <= 0 || t->rows <= 0) return 0;
+    if (cols) *cols = t->cols;
+    if (rows) *rows = t->rows;
+    return 1;
+}
+
+/* Write bytes into an app's terminal grid, interpreting escape sequences.
+ *
+ * BOTH writers go through here now (M2004). app_write_to -- the path a Linux
+ * child's output takes -- called grid_putc directly, so every escape sequence
+ * was printed as literal text: Claude Code's interface arrived as thousands of
+ * visible "ESC[38;5;246m" instead of coloured, positioned characters. The
+ * terminal existed; one of its two entry points simply did not use it. */
+void grid_write(struct app *a, const char *buf, unsigned len) {
+    if (!a) return;
     for (unsigned i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)buf[i];
         if (a->esc == 0) {
@@ -2049,6 +2208,8 @@ void app_sys_write(const char *buf, unsigned len) {
         }
     }
 }
+
+void app_sys_write(const char *buf, unsigned len) { grid_write(cur(), buf, len); }
 
 /* Replace the on-screen line with history entry `idx` (or empty); returns len. */
 static unsigned hist_recall(struct app *a, char *buf, unsigned max, unsigned cur_n,
@@ -3807,11 +3968,46 @@ void app_futex_forget(void *t) {
 /* Who is parked on a futex right now, and on what key. Printed when a
  * synchronous run times out -- a threaded hang is a lost wakeup until proven
  * otherwise, and this is the evidence. (M1959) */
+/* THE LAST FUTEX OPERATIONS, kept in a ring rather than streamed (M2004).
+ *
+ * -append futextrace printed each one as it happened and stopped after 240
+ * lines, which is a few hundred milliseconds of a sixteen-thread browser --
+ * long before the stall it was meant to explain. The interesting window is the
+ * one right BEFORE everything went quiet, so keep the last few and print them
+ * when something asks why nothing is moving. The question a lost wakeup poses
+ * is precise: was a WAKE issued for the key a thread is still parked on? */
+#define FUTEX_RING_N 96
+struct futex_note { int tid, wake, woke; uint64_t uaddr, key; };
+static struct futex_note g_futex_ring[FUTEX_RING_N];
+static unsigned long g_futex_ring_i;
+static void futex_note(int wake, uint64_t uaddr, uint64_t key, int woke) {
+    unsigned long i = __atomic_fetch_add(&g_futex_ring_i, 1, __ATOMIC_RELAXED);
+    struct futex_note *e = &g_futex_ring[i % FUTEX_RING_N];
+    e->tid = task_current_id(); e->wake = wake; e->uaddr = uaddr; e->key = key; e->woke = woke;
+}
+
 void app_futex_dump(void) {
     for (int i = 0; i < FUTEX_NWAIT; i++)
         if (g_futex[i].used)
             kprintf("[futex] slot %d key=%lx task=%d\n", i, g_futex[i].key,
                     g_futex[i].task ? ((task_t *)g_futex[i].task)->id : -1);
+    /* ...and the last operations, with a verdict per line: a WAKE for a key
+     * nobody is parked on is ordinary (an uncontended unlock does it every
+     * time); a key that is STILL PARKED and was never woken is the hang. */
+    unsigned long n = g_futex_ring_i < FUTEX_RING_N ? g_futex_ring_i : FUTEX_RING_N;
+    if (!n) return;
+    kprintf("[futex] the last %lu operations (oldest first):\n", n);
+    for (unsigned long k = 0; k < n; k++) {
+        unsigned long idx = (g_futex_ring_i - n + k) % FUTEX_RING_N;
+        int parked = 0;
+        for (int i = 0; i < FUTEX_NWAIT; i++)
+            if (g_futex[i].used && g_futex[i].key == g_futex_ring[idx].key) { parked = 1; break; }
+        kprintf("[futex]   t%d %s uaddr=%lx key=%lx%s%s\n",
+                g_futex_ring[idx].tid, g_futex_ring[idx].wake ? "WAKE" : "WAIT",
+                g_futex_ring[idx].uaddr, g_futex_ring[idx].key,
+                g_futex_ring[idx].wake ? (g_futex_ring[idx].woke ? " -> woke one" : " -> woke NOBODY") : "",
+                parked ? "  [a thread is STILL parked on this key]" : "");
+    }
 }
 
 long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
@@ -3827,6 +4023,7 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         for (int i = 0; i < FUTEX_NWAIT; i++) if (!g_futex[i].used) { slot = i; break; }
         if (slot < 0) { irq_restore(f); return -1; }        /* too many waiters */
         g_futex[slot].key = key; g_futex[slot].task = task_self(); g_futex[slot].used = 1;
+        futex_note(0, uaddr, key, 0);
         if (g_futex_trace && g_futex_traced < 240) {
             g_futex_traced++;
             kprintf("[futex] WAIT tid %d uaddr %lx key %lx\n", task_current_id(), uaddr, key);
@@ -3860,6 +4057,7 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
          * does not match ours -- which is a lost wakeup and a hang. Printing
          * the address lets the two be told apart against the WAIT lines.
          * (M1997) */
+        futex_note(1, uaddr, key, woke);
         if (g_futex_trace && g_futex_traced < 240) {
             g_futex_traced++;
             kprintf("[futex] WAKE tid %d uaddr %lx key %lx -> %d\n",
@@ -5258,6 +5456,24 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     a->used = 1;
     a->pid = next_pid++;
     a->pgid = a->sid = a->pid;           /* a spawned app leads its own group + session (M1176) */
+    /* Consume the one-shot arming from app_arm_next_spawn, BEFORE the process
+     * can run a single instruction: a child that prints immediately used to
+     * print to the console because out_to was still being set. (M2004) */
+    if (g_pend_out_to || g_pend_parent) {
+        a->out_to = g_pend_out_to;
+        if (g_pend_parent) a->parent = g_pend_parent;
+        /* REAL DESCRIPTORS FOR 0/1/2 (M2004). They used to be "the console"
+         * only by virtue of NOT being in the fd table, which works right up
+         * until a program dups one -- and then the copy is an fd-table entry
+         * pointing at nothing. Claude Code writes its output to a dup, so
+         * every word of it went missing. Give them entries from the start and
+         * dup, dup2 and fork all do the right thing for free. */
+        if (g_pend_out_to) for (int q = 0; q < 3; q++) {
+            a->fd[q].used = 1; a->fd[q].type = 14; a->fd[q].obj = 0;
+            a->fd[q].off = 0; a->fd[q].cloexec = 0; a->fd[q].nonblock = 0;
+        }
+        g_pend_out_to = 0; g_pend_parent = 0;
+    }
     /* copy the title into our own buffer (the caller's string — e.g. a filename
      * from another address space — may not outlive this call). Done here, before
      * the CR3 switch below, while the caller's pointer is still valid. */
@@ -5370,7 +5586,20 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         if (an == 1 && a->launch_arg[0]) argv0[an++] = a->launch_arg;
         argv0[an] = 0;
         g_pend_lxargc = 0;                   /* one-shot: never leak into a later spawn */
-        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/root"; envp0[2] = "TERM=osdev";
+        /* TERM NAMES A TERMINAL THE PROGRAM HAS TO RECOGNISE (M2004).
+         *
+         * "osdev" is in no terminfo database anywhere, so a TUI looks it up,
+         * finds nothing, concludes it is driving something with no cursor
+         * addressing and no colour, and renders NOTHING rather than garbage.
+         * That is the correct thing for it to do and it left Claude Code
+         * sitting on a blank window having written not one byte.
+         *
+         * xterm-256color is the honest name for what the grid actually is: it
+         * takes CSI cursor positioning, SGR colour and the usual erases, which
+         * is what this terminal implements. Claiming a capability we lack would
+         * be worse than claiming none -- but we are not; we are naming one we
+         * have. */
+        envp0[0] = "PATH=/bin:/usr/bin"; envp0[1] = "HOME=/root"; envp0[2] = "TERM=xterm-256color";
         /* We have no /etc/ld.so.cache, so anything outside ld.so's default
          * directories is invisible to it. Naming the non-default library
          * directories explicitly is the portable substitute, and it
@@ -5429,10 +5658,18 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         envp0[20] = "MOZ_X11_EGL=0";
         envp0[21] = "MOZ_DISABLE_GPU_PROCESS=1";
         envp0[22] = "MOZ_WEBRENDER_SOFTWARE=1";
+        /* Claude Code runs a connectivity preflight against platform.claude.com
+         * and exits if it does not like the answer. Our stack completes that
+         * exchange -- the capture shows the TLS handshake finishing in 0.3s and
+         * the full response being read -- so what it dislikes is the answer,
+         * not the transport. This is the switch it documents for networks that
+         * restrict non-essential traffic, and the preflight is exactly that.
+         * (M2004) */
+        envp0[23] = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1";
         /* One extra entry, one-shot, for a caller that needs to hand a specific
          * program something the whole system should NOT have -- see
          * app_set_next_env. (M1999) */
-        int en = 23;
+        int en = 24;
         if (g_pend_env_extra) { envp0[en++] = g_pend_env_extra; g_pend_env_extra = 0; }
         envp0[en] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
@@ -5848,11 +6085,32 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 8) {   /* inotify: drain queued events (M1266) */
         return inotify_read(a->fd[fd].obj, buf, max);
     }
-    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M1972) */
-        /* EOF, not an error: a Linux binary here has no interactive input
-         * source wired up, and a program that reads its stdin should see a
-         * closed one rather than a failure it has to interpret. */
-        (void)max; return 0;
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M2004) */
+        /* THE KEYBOARD OF THE WINDOW WE WRITE TO.
+         *
+         * A foreground program's input is whatever is typed at the window it
+         * is printing into -- the shell that launched it is blocked in
+         * waitpid, so it is not competing for those keys. Reading from our own
+         * queue instead would read an empty one forever: the window belongs to
+         * the shell, so that is where the keystrokes land.
+         *
+         * Byte at a time, as a terminal in raw mode delivers them; a TUI wants
+         * each key as it is pressed, not a line at a time. EOF only when there
+         * is no window at all -- otherwise a program that reads stdin would
+         * see a closed one and give up. */
+        struct app *src = a->out_to ? a->out_to : a;
+        if (!max) return 0;
+        if (!a->out_to && !src->cols) return 0;        /* genuinely no terminal */
+        for (;;) {
+            int c = iq_get(src);
+            if (c >= 0) { ((char *)buf)[0] = (char)c; return 1; }
+            /* O_NONBLOCK means DO NOT WAIT. An event loop sets it on stdin and
+             * reads until EAGAIN; blocking there instead is the same deadlock
+             * the poll predicate above describes. */
+            if (app_fd_nonblock(fd)) return APP_FD_EAGAIN;
+            if (a->kill) return 0;                     /* asked to die: stop waiting */
+            task_sleep_ms(10);
+        }
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 9) {   /* connected UDP socket: recv (M1967) */
         if (!a->fd[fd].peer_port) return -1;                                  /* ENOTCONN */
@@ -5960,6 +6218,15 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
         return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M1972) */
+        /* TO THE WINDOW THAT LAUNCHED US, not the kernel console (M2004).
+         *
+         * This is what makes stdout survive a dup. Claude Code writes its
+         * startup error to fd SEVEN -- a dup of stdout -- so a hook that only
+         * looked at fd 1 and 2 never saw a word of it, and the program looked
+         * like it produced no output at all. Once fd 0/1/2 are real fd-table
+         * entries, dup copies the entry and every copy lands in the same
+         * place, which is the property a shell actually needs. */
+        if (a->out_to) { app_write_to((app_t *)a->out_to, (const char *)buf, (unsigned)len); return (long)len; }
         console_write_n((const char *)buf, len);
         return (long)len;
     }
@@ -6025,6 +6292,14 @@ int app_fd_set_cloexec(int fd, int on) {
 }
 int app_current_pid(void) { struct app *a = cur(); return a ? a->pid : -1; }
 
+/* The object index behind an fd (pipe number, memfd index, ...), or -1. Needed
+ * by a diagnostic that has to ask the object itself a question. (M2004) */
+int app_fd_obj(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    return a->fd[fd].obj;
+}
+
 int app_fd_type(int fd) {
     struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
     return a->fd[fd].type;
@@ -6036,7 +6311,12 @@ int app_fd_close(int fd) {
     else if (a->fd[fd].type == 3) memfd_unref(a->fd[fd].obj);   /* drop a memfd reference (M1212) */
     else if (a->fd[fd].type == 6) epoll_unref(a->fd[fd].obj);   /* drop an epoll reference (M1220) */
     else if (a->fd[fd].type == 8) inotify_free(a->fd[fd].obj);  /* free the inotify instance (M1266) */
-    else if (a->fd[fd].type == 10) net_tcp_sock_close(a->fd[fd].obj);  /* close the TCP connection (M1268) */
+    else if (a->fd[fd].type == 10) {
+        /* How long the connection lasted and how much crossed it: a TLS
+         * handshake that is merely SLOW and one that is not happening look
+         * identical from outside, and the byte counts tell them apart. (M2004) */
+        net_tcp_sock_close(a->fd[fd].obj);  /* close the TCP connection (M1268) */
+    }
     else if (a->fd[fd].type == 11) pty_close(a->fd[fd].obj);    /* close this pty end, waking the peer (M1274) */
     else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
     else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
@@ -6801,8 +7081,19 @@ int app_fd_ready(app_t *ap, int fd, int events) {
         /* POLLIN on a listening socket means "accept() would not block", which
          * is exactly what a server's event loop waits for. */
         if ((events & POLLIN) && unix_pending(a->fd[fd].obj)) re |= POLLIN;
-    } else if (a->fd[fd].type == 14) {                     /* console alias: always writable, reads give EOF (M1972) */
-        if (events & POLLIN)  re |= POLLIN;                /* an EOF read is "ready", not blocked */
+    } else if (a->fd[fd].type == 14) {                     /* console alias (M2004) */
+        /* READABLE ONLY WHEN A KEY IS ACTUALLY WAITING.
+         *
+         * This used to answer "always readable", which was harmless while the
+         * only read was an immediate EOF. Once the console became a real
+         * terminal it became a deadlock: an event loop polls stdin, is told it
+         * is ready, calls read -- and the read blocks until somebody types.
+         * The loop is now stuck inside a read it was promised would not block,
+         * so nothing else it was supposed to do can happen, including drawing
+         * the interface that would tell you to type. Claude Code sat on a
+         * blank window having written not one byte. */
+        struct app *src = a->out_to ? a->out_to : a;
+        if ((events & POLLIN) && iq_has(src)) re |= POLLIN;
         if (events & POLLOUT) re |= POLLOUT;
     } else if (a->fd[fd].type == 9) {                      /* AF_INET datagram socket (M1967) */
         /* An unbound socket has no port to receive on, so it is never readable;
@@ -7060,6 +7351,11 @@ long app_fork_at(struct registers *r, uint64_t child_rsp) {
      * it for free -- and cannot be handed indices into an empty one. (M1962) */
     for (int i = 0; i < APP_NSIG; i++) a->sig_handler[i] = p->sig_handler[i];
     a->sig_restorer = p->sig_restorer; a->curcol = p->curcol;
+    /* A CHILD'S OUTPUT BELONGS WHERE ITS PARENT'S WENT (M2004). Firefox and
+     * Claude Code both fork helpers that print; without this, a helper's
+     * diagnostics went to the kernel console while the program it belongs to
+     * wrote into a window, and the two could not be read together. */
+    a->out_to = p->out_to;
     a->rlim_nproc = p->rlim_nproc;                      /* RLIMIT_NPROC is inherited across fork (M1163) */
     a->rlim_as = p->rlim_as; a->rlim_data = p->rlim_data;   /* RLIMIT_AS/DATA inherited too (M1164) */
     a->rlim_nofile = p->rlim_nofile;                    /* RLIMIT_NOFILE inherited too (M1547) */
@@ -7826,6 +8122,8 @@ int app_spawn_linux_from_file_argv(const char *path, const char *const *args, in
  * lines interleave. Returns the exit status, or -1 if it never started, or
  * -2 on timeout. */
 int app_run_linux_sync(const char *path, const char *const *args, int n, int timeout_ms) {
+    unsigned long prev_maj = (unsigned long)-1, prev_min = (unsigned long)-1;   /* the previous heartbeat's fault counts (M2004) */
+    int stall_told = 0;
     g_last_spawn_pid = 0;
     if (app_spawn_linux_from_file_argv(path, args, n) < 0 || !g_last_spawn_pid) return -1;
     int pid = g_last_spawn_pid;
@@ -7864,6 +8162,35 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
                 if (apps[i].used) { live++; maj += apps[i].majflt; min += apps[i].minflt; }
             kprintf("[runsync] t=%ds free=%luK apps=%d majflt=%lu minflt=%lu\n", waited / 1000,
                     (unsigned long)(pmm_free_bytes() >> 10), live, maj, min);
+            /* FROZEN COUNTERS MEAN STUCK, AND STUCK SHOULD SAY SO NOW (M2004).
+             *
+             * The full thread dump below only ran when the whole budget expired
+             * -- twenty-five minutes for a browser -- so a run that stalled in
+             * its first minute reported nothing but an unchanging pair of
+             * numbers for the rest of its life. If not one page fault has
+             * happened in a whole minute then nothing is executing, and the
+             * question the heartbeat just answered with "stuck" deserves the
+             * answer it already has: every thread's state and what it is
+             * parked on. Once, so a long stall does not fill the log. */
+            if (maj == prev_maj && min == prev_min && !stall_told) {
+                stall_told = 1;
+                kprintf("[runsync] NOTHING has faulted in 60s -- every thread, and what it waits on:\n");
+                for (int i = 0; i < MAX_APPS; i++) {
+                    if (!apps[i].used) continue;
+                    kprintf("[runsync]   pid %d '%s' state=%d wchan=%lx exited=%d\n",
+                            apps[i].pid, apps[i].title ? apps[i].title : "?",
+                            apps[i].task ? (int)apps[i].task->state : -1,
+                            apps[i].task ? (unsigned long)apps[i].task->wchan : 0UL, apps[i].exited);
+                    for (int k = 0; k < APP_MAXTHREAD; k++)
+                        if (apps[i].thr[k])
+                            kprintf("[runsync]     thread %d state=%d wchan=%lx wake_pending=%d\n",
+                                    apps[i].thr[k]->id, (int)apps[i].thr[k]->state,
+                                    (unsigned long)apps[i].thr[k]->wchan, apps[i].thr[k]->wake_pending);
+                }
+                app_futex_dump();
+                lx_trace_dump_last("the stall", 220);
+            }
+            prev_maj = maj; prev_min = min;
             /* ...and WHERE a still-running one is. Frozen counters plus a
              * RUNNING task means a userspace loop, and the only thing that
              * identifies it is the ring-3 RIP together with the mapping that

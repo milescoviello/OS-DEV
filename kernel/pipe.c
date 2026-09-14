@@ -61,6 +61,21 @@ int pipe_readable(int idx) {
 }
 /* A write won't block iff the ring has room, or no reader remains (a write to a
  * reader-less pipe raises EPIPE and returns at once rather than blocking). */
+/* How many descriptors hold each end, and how many bytes are queued (M2004).
+ *
+ * "A reader is polling a pipe and never sees EOF" has exactly one cause -- a
+ * write end is still open somewhere -- and exactly one way to tell whether that
+ * is the application's doing or ours: count the references. A parent that forks
+ * a helper and forgets to close its own copy of the write end hangs on Linux
+ * too; a kernel that loses a close does not. */
+void pipe_state(int idx, int *r_open, int *w_open, int *queued, int *had_writer) {
+    struct kpipe *p = pp(idx);
+    if (r_open) *r_open = p ? p->r_open : -1;
+    if (w_open) *w_open = p ? p->w_open : -1;
+    if (queued) *queued = p ? p_cnt(p) : -1;
+    if (had_writer) *had_writer = p ? p->had_writer : -1;
+}
+
 int pipe_writable(int idx) {
     struct kpipe *p = pp(idx); if (!p) return 0;
     return p->r_open == 0 || p_spc(p) > 0;

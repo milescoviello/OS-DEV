@@ -6,7 +6,7 @@
 engine, and a sandboxed web browser — written in C and a little assembly.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2003-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2004-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
@@ -1430,3 +1430,69 @@ compute job pool has no steady-state caller — a narrow cosmetic gap.)
   Firefox no longer crashes. It now sits idle instead — zero page faults for
   thirteen minutes — so it is blocked on something rather than dying of
   something. That is a better problem.
+
+- **M2004** — **you type `claude` and Claude Code takes over the terminal.** Its
+  interface renders in the OS-DEV shell window — the theme picker, the
+  `console.log("Hello, World!")` preview, colours, box layout — and
+  `claude --version` prints `2.1.270 (Claude Code)` at the prompt like any other
+  command. Eight things had to be true at once, and none of them were.
+
+  **`claude` was not a command.** You had to type `linux /usr/bin/claude`, which
+  is not a compatibility layer, it is a confession. An unrecognised command now
+  gets looked up on a PATH and, if it is a Linux binary, run — **in the
+  foreground**, with the shell waiting for it. The old spawn returned instantly,
+  so the prompt came back while the program was still starting and an
+  interactive program had a shell competing with it for the keyboard.
+
+  **Its output went nowhere.** fd 0/1/2 were "the console" only by virtue of
+  *not* being in the fd table, which works right up until a program dups one —
+  and Claude Code writes to a dup. They are real descriptors now (a console
+  alias bound to the window), so dup, dup2 and fork all do the right thing, and
+  the child's output lands in the window that launched it. `out_to` is also
+  armed *before* the spawn rather than after, because the old order was a race
+  the child won whenever it printed early, and it left the child parentless so
+  nothing could wait for it.
+
+  **It got its own window.** A foreground job of a shell must not open a second,
+  empty window somewhere the person who typed the command is not looking.
+
+  **It could not tell it was on a terminal.** `ioctl` answered ENOTTY to
+  everything. Two traps: modern glibc's `tcgetattr` uses **TCGETS2**
+  (`_IOR('T',0x2A,44)`), not TCGETS — implementing only the old one answers a
+  question nobody asks; and a descriptor is a terminal because of **what it
+  refers to**, not its number, so a dup of stdio must answer yes too. Plus
+  `TIOCGWINSZ` from the real grid (80x24), and `/dev/tty`, which did not exist.
+
+  **`readv` did not exist** — unnoticed because glibc's stdio uses `read(2)`.
+  Bun reads stdin with **`preadv2`**, so an interactive program could never
+  receive a keystroke.
+
+  **Our console was always "readable".** An event loop polled stdin, was told it
+  was ready, called read — and the read blocked until somebody typed. The loop
+  was then stuck inside a read it had been promised would not block, so nothing
+  else could happen, *including drawing the interface that would tell you to
+  type*. Claude Code sat on a blank window having written not one byte.
+
+  **Escape sequences printed as literal text**, because `app_write_to` — the
+  path a Linux child's output takes — called `grid_putc` directly and bypassed
+  the terminal's own state machine. The terminal existed; one of its two entry
+  points did not use it. Added `CSI G`/`d` (absolute column/row, the single most
+  common thing a TUI emits) and 256-colour SGR, folded onto our palette.
+
+  **And `TERM=osdev` is in no terminfo database**, so a TUI concludes it is
+  driving something with no cursor addressing and renders nothing at all — which
+  is the correct thing for it to do.
+
+  Also here: a **stall watchdog** that reports any Linux process which stops
+  making syscalls, and which had to be rate-based rather than
+  change-based — a program parked on a long timer ticks over one syscall every
+  fifteen seconds, which resets an equality test forever while it does precisely
+  nothing.
+
+  **What still does not work, and why:** the interactive login. Claude Code runs
+  a connectivity preflight against `platform.claude.com` and exits if it does
+  not like the answer. A packet capture shows our stack is not the problem — the
+  TLS handshake completes in **0.3 s**, the server sends its response, and the
+  application reads every byte of it (3870 then 807). It then abandons the
+  connection and retries three times. What it dislikes is the answer, not the
+  transport.

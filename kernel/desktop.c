@@ -1679,6 +1679,13 @@ static int ctx_desktop_action(int row) {
  * spawn queue, so apps launched from anywhere get a window here). */
 static void make_app_window(app_t *a) {
     if (win_count >= MAX_WINDOWS) return;
+    /* A PROGRAM RUNNING INSIDE SOMEONE ELSE'S WINDOW DOES NOT GET ITS OWN
+     * (M2004). `claude` typed at the shell is a foreground job of that shell:
+     * its output goes into the shell's window and its input comes from there.
+     * Giving it a second, empty window of its own put the program's UI
+     * somewhere the person who typed the command was not looking, and left the
+     * terminal they WERE looking at frozen behind it. */
+    if (app_out_to_of(a)) return;
     spawn_n++;
     /* Open to the RIGHT of the boot column and cascade there, instead of at a
      * fixed 150,60 that lands on top of it. Clamped so a window can never open
@@ -2002,6 +2009,7 @@ void desktop_run(void) {
     render_scene();
     present_frame();
     for (;;) {
+        app_stall_watchdog();   /* say when a Linux process has stopped doing anything (M2004) */
         int dirty = 0;
         usb_tablet_poll();
         usb_kbd_poll();          /* feed any USB-keyboard keystrokes into the input queue */

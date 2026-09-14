@@ -40,7 +40,8 @@
 #include "app.h"
 #include "rtc.h"
 #include "random.h"
-#include "vfs.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
+#include "vfs.h"
+#include "pipe.h"      /* app_sbrk/app_mmap/app_mprotect/app_munmap -- the native primitives these translate onto */
 #include "timer.h"
 #include "pmm.h"    /* sysinfo reports real memory totals (M1958) */
 #include "kheap.h"  /* execve copies argv/envp into heap buffers, not onto the kernel stack (M1962) */
@@ -169,6 +170,11 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_rt_sigaction  13
 #define LXS_rt_sigprocmask 14
 #define LXS_ioctl         16
+#define LXS_readv         19
+#define LXS_preadv       295
+#define LXS_pwritev      296
+#define LXS_preadv2      327
+#define LXS_pwritev2     328
 #define LXS_writev        20
 #define LXS_getpid        39
 #define LXS_exit          60
@@ -479,6 +485,7 @@ static int64_t lx_realtime_sec(void) {
  * five others are busy. Firefox crashes with two threads in the same
  * instruction and ~470 mappings; without a tid the sixteen calls before it come
  * from six different places and mean nothing. */
+#define LX_INFLIGHT 0xB10CEDB10CEDB10Cull   /* `ret` of a call that has not come back yet (M2004) */
 struct lxring_ent { uint32_t nr; int tid; uint64_t a1, a2, a3, ret; char path[56]; };
 static struct lxring_ent g_lxring[LXRING_N];
 static unsigned long g_lxring_i;
@@ -568,7 +575,10 @@ void lx_trace_dump_last(const char *why, unsigned long want) {
         /* The RETURN VALUE is the point. Arguments alone show what a program
          * asked for; only the result shows which answer it could not live
          * with, and a negative return here is a Linux errno. */
-        if (e->path[0]) kprintf("   t%d %u(%lx, %lx, %lx) = %lx  \"%s\"\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret, e->path);
+        if (e->ret == LX_INFLIGHT) {
+            if (e->path[0]) kprintf("   t%d %u(%lx, %lx, %lx) = <still blocked in this call>  \"%s\"\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->path);
+            else            kprintf("   t%d %u(%lx, %lx, %lx) = <still blocked in this call>\n", e->tid, e->nr, e->a1, e->a2, e->a3);
+        } else if (e->path[0]) kprintf("   t%d %u(%lx, %lx, %lx) = %lx  \"%s\"\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret, e->path);
         else            kprintf("   t%d %u(%lx, %lx, %lx) = %lx\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret);
     }
 }
@@ -648,6 +658,39 @@ static const char *lx_proc_self_tail(const char *p) {
 int g_poll_trace;
 static int g_poll_reports;
 
+/* Output from a Linux process goes to the window that launched it, or to the
+ * kernel console when there is none. Which of the two it took is the whole
+ * question when a program "produces no output" -- so say, once per process,
+ * when it takes the console. (M2004) */
+static void lx_emit(const char *b, unsigned long n) {
+    app_t *dst = app_out_to();
+    if (dst) { app_write_to(dst, b, (unsigned)n); return; }
+    static int told_pid = -1;
+    int me = app_current_pid();
+    if (me != told_pid) {
+        told_pid = me;
+        kprintf("[app] pid %d has NO window for its output -- going to the console\n", me);
+    }
+    console_write_n(b, n);
+}
+
+/* HOW LONG TO WAIT BEFORE LOOKING AGAIN (M2004).
+ *
+ * Every poll and epoll_wait here is a sleep-spin, and it slept 10 ms between
+ * checks. That is a hard ceiling of a hundred wake-ups a second on every
+ * socket in the system, and a TLS handshake is a dozen round trips of a few
+ * kilobytes each -- so a connection that takes a fraction of a second on Linux
+ * took many seconds here, and Claude Code's ten-second connectivity check
+ * simply expired:
+ *
+ *     Connection to platform.claude.com timed out after 10 seconds
+ *
+ * Busy work is cheap for the first moment and expensive forever, so back off:
+ * 1 ms while something is plainly in flight, widening to 10 ms once the wait
+ * is clearly idle. An event loop servicing I/O gets a hundredfold more
+ * chances to see it; a loop parked on nothing costs what it did before. */
+static int lx_poll_nap(int spins) { return spins < 200 ? 1 : 10; }
+
 void linux_syscall_dispatch(struct registers *r) {
     /* WHICH RING SLOT THIS CALL OWNS -- a LOCAL, not a shared cursor (M2003).
      *
@@ -665,6 +708,7 @@ void linux_syscall_dispatch(struct registers *r) {
      * worth grepping the whole file for. */
     unsigned long ring_slot;
     lx_syscall_count++;
+    app_count_lx_syscall();          /* per-process, for the stall watchdog (M2004) */
     /* Always record; print only on demand. The rate-limited trace below is for
      * finding a SPIN (the same call repeating), and deliberately samples one in
      * 4096 so a compiler does not drown the log -- but that makes it useless for
@@ -680,6 +724,14 @@ void linux_syscall_dispatch(struct registers *r) {
         ring_slot = __atomic_fetch_add(&g_lxring_i, 1, __ATOMIC_RELAXED);
         struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
         re->nr = (uint32_t)r->rax; re->tid = task_current_id(); re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
+        /* MARK IT IN FLIGHT (M2004). `ret` is only written when the dispatch
+         * RETURNS, so an entry for a call that is still blocked -- which is
+         * exactly the entry you most want to read when a program has stalled --
+         * displayed whatever the previous occupant of the slot returned. That
+         * is how a futex wait appeared to return ENOENT, which it cannot, and
+         * it cost me a search for a bug that was not there. A blocked call has
+         * no return value yet; say so. */
+        re->ret = LX_INFLIGHT;
         re->path[0] = 0;
         int pa = lx_path_arg(re->nr);
         if (pa) {
@@ -743,13 +795,52 @@ void linux_syscall_dispatch(struct registers *r) {
              * the answer it could not live with. Once per boot. (M1992) */
             /* Launched from a shell? Then its window is where the output
              * belongs -- see app_write_to. Otherwise the console, as before. */
-            app_t *dst = app_out_to();
-            if (dst) app_write_to(dst, p2, (unsigned)a3);
-            else console_write_n(p2, (unsigned long)a3);   /* lock once: no splicing (M1952) */
+            lx_emit(p2, (unsigned long)a3);
         }
         r->rax = (uint64_t)a3;
         break;
     }
+    case LXS_readv:                         /* (fd, iov, iovcnt) */
+    case LXS_preadv:                        /* (fd, iov, iovcnt, off) */
+    case LXS_preadv2: {                     /* (fd, iov, iovcnt, off_lo, off_hi, flags) */
+        /* READV DID NOT EXIST (M2004), which went unnoticed because glibc's
+         * stdio reads with read(2). Bun does not use glibc's stdio: it reads
+         * stdin with preadv2, and an ENOSYS there means an interactive program
+         * can never see a keystroke. It sat waiting for input it had no way to
+         * receive, which looks exactly like a program that has hung.
+         *
+         * An offset of -1 means "use the file position", i.e. plain readv --
+         * which is what a terminal always is, since a tty has no position. */
+        long noff = (r->rax == LXS_readv) ? -1 : (long)r->r10;
+        const struct lx_iovec *v = (const struct lx_iovec *)r->rsi;
+        if (a3 < 0 || a3 > 1024) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (!vmm_user_ok(r->rsi, (uint64_t)a3 * sizeof *v)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!app_fd_is_open((int)a1) && a1 != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        long total = 0;
+        for (long i = 0; i < a3; i++) {
+            char *b = (char *)v[i].iov_base;
+            unsigned long n = v[i].iov_len;
+            if (!n) continue;
+            if (!vmm_user_ok((uint64_t)v[i].iov_base, n)) { if (!total) total = -(long)LX_EFAULT; break; }
+            long got;
+            if (noff >= 0) {
+                /* Positional: read the file directly so the fd's cursor is not
+                 * disturbed, exactly as pread64 does for ld.so. */
+                const char *fp = app_fd_path((int)a1);
+                got = fp ? vfs_pread(fp, b, n, (uint64_t)noff + (uint64_t)total) : -1;
+            } else {
+                got = app_fd_read((int)a1, b, n);
+            }
+            if (got == APP_FD_EAGAIN) { if (!total) total = -(long)LX_EAGAIN; break; }
+            if (got < 0) { if (!total) total = (long)lx_fd_err(got); break; }
+            total += got;
+            if ((unsigned long)got < n) break;   /* short read: stop, as readv does */
+        }
+        r->rax = (uint64_t)total;
+        break;
+    }
+    case LXS_pwritev:
+    case LXS_pwritev2:
     case LXS_writev: {                      /* (fd, iov, iovcnt) -- glibc's stdio flush path */
         /* Same rule as write(): fd 1/2 are the console ONLY while untouched.
          * This handler previously hard-coded them to the console and returned
@@ -791,9 +882,7 @@ void linux_syscall_dispatch(struct registers *r) {
                 /* glibc's buffered stdio flushes through writev, not write, so
                  * the shell-window routing has to be here too -- fixing only
                  * write() would leave every printf-heavy program invisible. */
-                app_t *dst = app_out_to();
-                if (dst) app_write_to(dst, b, (unsigned)n);
-                else console_write_n(b, n);           /* lock once: no splicing (M1952) */
+                lx_emit(b, (unsigned long)n);
                 total += (long)n;
             }
         }
@@ -1112,6 +1201,14 @@ void linux_syscall_dispatch(struct registers *r) {
                 r->rax = 0; break;
             }
             int crc = app_connect((int)a1, ip, port);
+            /* ALWAYS, not only under a trace flag (M2004). An outbound
+             * connection is a rare, structural event, and "which address did it
+             * actually try, and did it get there" is the first question when a
+             * program reports it cannot reach a service. Claude Code says
+             * "Connection to platform.claude.com timed out" without telling you
+             * whether that name resolved at all. */
+            kprintf("[net] t=%lums connect -> %d.%d.%d.%d:%d = %d\n",
+                    (unsigned long)timer_ms(), ip[0], ip[1], ip[2], ip[3], port, crc);
             if (g_lx_systrace || crc != 0)
                 kprintf("[sock] connect(fd %ld, %u.%u.%u.%u:%u) -> %d\n",
                         a1, ip[0], ip[1], ip[2], ip[3], port, crc);
@@ -1679,11 +1776,12 @@ void linux_syscall_dispatch(struct registers *r) {
         uint64_t start = timer_ms();
         long k = 0;
         __asm__ volatile("sti");            /* this loop sleeps on the timer */
-        int etold = 0;
+        int etold = 0, espins = 0;
         for (;;) {
             k = app_epoll_check((int)a1, tmp, (int)maxev);
             if (k != 0) break;
             if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
+            espins++;
             if (g_poll_trace && !etold && (long)(timer_ms() - start) > 3000 &&
                 g_poll_reports < 24) {
                 etold = 1; g_poll_reports++;
@@ -1691,7 +1789,7 @@ void linux_syscall_dispatch(struct registers *r) {
                         app_current_pid(), task_current_id(), (int)a1, timeout);
                 app_epoll_dump((int)a1);
             }
-            task_sleep_ms(10);
+            task_sleep_ms(lx_poll_nap(espins));
         }
         __asm__ volatile("cli");
         if (k < 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
@@ -1721,7 +1819,7 @@ void linux_syscall_dispatch(struct registers *r) {
         uint8_t *fds = (uint8_t *)r->rdi;
         uint64_t start = timer_ms();
         long ready = 0;
-        int told = 0;
+        int told = 0, spins = 0;
         __asm__ volatile("sti");
         for (;;) {
             ready = 0;
@@ -1734,6 +1832,7 @@ void linux_syscall_dispatch(struct registers *r) {
             }
             if (ready) break;
             if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
+            spins++;
             if (g_poll_trace && !told && (long)(timer_ms() - start) > 3000 &&
                 g_poll_reports < 24) {
                 told = 1; g_poll_reports++;
@@ -1742,12 +1841,23 @@ void linux_syscall_dispatch(struct registers *r) {
                 for (long i = 0; i < nfds; i++) {
                     int fd = *(const int32_t *)(fds + i * 8);
                     short want = *(const int16_t *)(fds + i * 8 + 4);
-                    kprintf("[poll]   fd %d type %d want %x -> %x\n", fd,
-                            fd < 0 ? -1 : app_fd_type(fd), (unsigned)(want & 0xffff),
+                    int fty = fd < 0 ? -1 : app_fd_type(fd);
+                    kprintf("[poll]   fd %d type %d want %x -> %x\n", fd, fty,
+                            (unsigned)(want & 0xffff),
                             fd < 0 ? 0 : app_fd_ready(app_current(), fd, want));
+                    /* A PIPE that never reports EOF still has a writer. Say how
+                     * many descriptors hold each end: that distinguishes a
+                     * program that forgot to close its own copy (which hangs on
+                     * Linux too) from a kernel that lost a close. (M2004) */
+                    if (fty == 1) {
+                        int ro = 0, wo = 0, q = 0, hw = 0;
+                        pipe_state(app_fd_obj(fd), &ro, &wo, &q, &hw);
+                        kprintf("[poll]     pipe #%d: %d reader(s), %d writer(s), %d byte(s) queued, had_writer=%d\n",
+                                app_fd_obj(fd), ro, wo, q, hw);
+                    }
                 }
             }
-            task_sleep_ms(10);
+            task_sleep_ms(lx_poll_nap(spins));
         }
         __asm__ volatile("cli");
         r->rax = (uint64_t)ready;
@@ -1817,12 +1927,115 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_rt_sigprocmask:
         r->rax = 0;                         /* accepted-and-ignored for now */
         break;
-    case LXS_ioctl:
-        /* musl asks TCGETS on stdout to decide whether it is a tty and thus
-         * whether to line-buffer. ENOTTY is a legitimate answer and makes it
-         * pick full buffering, which is correct for a non-tty. */
+    case LXS_ioctl: {                       /* (fd, request, arg) */
+        /* A TERMINAL PROGRAM HAS TO BE ABLE TO FIND OUT IT IS ON A TERMINAL
+         * (M2004).
+         *
+         * This answered ENOTTY to everything, which was the right answer while
+         * the only caller was musl deciding how to buffer stdio. It is the
+         * wrong answer for an interactive program: Claude Code, like anything
+         * built on a TUI, asks TCGETS to learn whether it may take over the
+         * screen and TIOCGWINSZ to learn how big the screen is. Told "not a
+         * terminal" it falls back to non-interactive mode, which is exactly the
+         * mode in which you cannot log in.
+         *
+         * Only fd 0/1/2, and only when there is really a window behind them --
+         * a process with no console must still be told the truth, or it will
+         * draw a UI nobody can see. */
+        long req = (long)r->rsi;
+        int cols = 0, rows = 0;
+        {   /* Which ioctls does this program actually ask, and on which fd?
+             * Each distinct pair once -- guessing which one decides "am I a
+             * terminal" is how two rebuilds got spent on the wrong fd. */
+            static struct { long fd, rq; } seen[24]; static int nseen;
+            int known = 0;
+            for (int i = 0; i < nseen; i++) if (seen[i].fd == a1 && seen[i].rq == req) { known = 1; break; }
+            if (!known && nseen < 24) {
+                seen[nseen].fd = a1; seen[nseen].rq = req; nseen++;
+                if (g_lx_systrace)
+                    kprintf("[linuxabi] ioctl(fd %ld, 0x%lx) type=%d\n", a1, req, app_fd_type((int)a1));
+            }
+        }
+        /* A DESCRIPTOR IS A TERMINAL BECAUSE OF WHAT IT REFERS TO, not because
+         * of its number (M2004). Checking `fd <= 2` looks right and is wrong
+         * the moment a program dups its stdio -- which Claude Code does, and
+         * then asks the DUP whether it is a tty. Type 14 is the console alias,
+         * so any copy of it answers yes, exactly as a dup of a tty does on
+         * Linux. */
+        int is_console = (app_fd_type((int)a1) == 14 ||
+                          ((a1 >= 0 && a1 <= 2) && !app_fd_is_open((int)a1)))
+                         && app_console_size(&cols, &rows);
+        if (!is_console) { r->rax = (uint64_t)-(long)LX_ENOTTY; break; }
+        /* TCGETS2, NOT TCGETS (M2004). glibc's tcgetattr has used the '2'
+         * variants since it grew arbitrary baud rates, so a modern program
+         * asks _IOR('T', 0x2A, struct termios2) -- 0x802c542a -- and never
+         * touches 0x5401 at all. Implementing only the old one looks correct
+         * and answers a question nobody asks; the trace is what settled it:
+         *
+         *     [linuxabi] ioctl(fd 0, 0x802c542a) type=14
+         *
+         * termios2 is termios plus c_ispeed/c_ospeed, so 44 bytes not 36. */
+        if (req == 0x802c542a /*TCGETS2*/) {
+            if (!vmm_user_ok(r->rdx, 44)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            uint8_t *t = (uint8_t *)r->rdx;
+            for (int i = 0; i < 44; i++) t[i] = 0;
+            *(uint32_t *)(t + 0)  = 0x0500;      /* c_iflag: ICRNL | IXON */
+            *(uint32_t *)(t + 4)  = 0x0005;      /* c_oflag: OPOST | ONLCR */
+            *(uint32_t *)(t + 8)  = 0x00BF;      /* c_cflag: B38400 | CS8 | CREAD */
+            *(uint32_t *)(t + 12) = 0x8A3B;      /* c_lflag: ISIG ICANON ECHO ECHOE ECHOK ECHOCTL IEXTEN */
+            t[17 + 0] = 3; t[17 + 1] = 28; t[17 + 2] = 127; t[17 + 3] = 21;
+            t[17 + 4] = 4; t[17 + 6] = 1; t[17 + 8] = 17; t[17 + 9] = 19; t[17 + 10] = 26;
+            *(uint32_t *)(t + 36) = 38400;       /* c_ispeed */
+            *(uint32_t *)(t + 40) = 38400;       /* c_ospeed */
+            r->rax = 0; break;
+        }
+        if (req == 0x402c542b || req == 0x402c542c || req == 0x402c542d) {   /* TCSETS2/W2/F2 */
+            r->rax = 0; break;                   /* see TCSETS below: accepted */
+        }
+        if (req == 0x5401 /*TCGETS*/) {
+            /* struct termios: 4 x u32 flags, c_line, then 19 c_cc bytes. */
+            if (!vmm_user_ok(r->rdx, 36)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            uint8_t *t = (uint8_t *)r->rdx;
+            for (int i = 0; i < 36; i++) t[i] = 0;
+            *(uint32_t *)(t + 0)  = 0x0500;      /* c_iflag: ICRNL | IXON */
+            *(uint32_t *)(t + 4)  = 0x0005;      /* c_oflag: OPOST | ONLCR */
+            *(uint32_t *)(t + 8)  = 0x00BF;      /* c_cflag: B38400 | CS8 | CREAD */
+            *(uint32_t *)(t + 12) = 0x8A3B;      /* c_lflag: ISIG ICANON ECHO ECHOE ECHOK ECHOCTL IEXTEN */
+            t[17 + 0] = 3;    /* VINTR  ^C */
+            t[17 + 1] = 28;   /* VQUIT  ^\ */
+            t[17 + 2] = 127;  /* VERASE DEL */
+            t[17 + 3] = 21;   /* VKILL  ^U */
+            t[17 + 4] = 4;    /* VEOF   ^D */
+            t[17 + 6] = 1;    /* VMIN   1 */
+            t[17 + 8] = 17;   /* VSTART ^Q */
+            t[17 + 9] = 19;   /* VSTOP  ^S */
+            t[17 + 10] = 26;  /* VSUSP  ^Z */
+            r->rax = 0; break;
+        }
+        if (req == 0x5402 || req == 0x5403 || req == 0x5404) {   /* TCSETS/W/F */
+            /* Accepted and ignored. A TUI turns echo and canonical mode OFF to
+             * read keys one at a time; our console already delivers them that
+             * way, so there is nothing to change -- but REFUSING makes the
+             * program conclude it cannot control the terminal and give up. */
+            r->rax = 0; break;
+        }
+        if (req == 0x5413 /*TIOCGWINSZ*/) {
+            if (!vmm_user_ok(r->rdx, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            uint16_t *w = (uint16_t *)r->rdx;
+            { static int told; if (!told) { told = 1;
+                kprintf("[tty] reporting a %dx%d terminal (cols x rows)\n", cols, rows); } }
+            w[0] = (uint16_t)rows; w[1] = (uint16_t)cols;
+            w[2] = (uint16_t)(cols * 8); w[3] = (uint16_t)(rows * 16);   /* pixels, at our font cell */
+            r->rax = 0; break;
+        }
+        if (req == 0x540F /*TIOCGPGRP*/) {
+            if (r->rdx && vmm_user_ok(r->rdx, 4)) *(int32_t *)r->rdx = app_current_pid();
+            r->rax = 0; break;
+        }
+        if (req == 0x5410 /*TIOCSPGRP*/) { r->rax = 0; break; }
         r->rax = (uint64_t)-(long)LX_ENOTTY;
         break;
+    }
     case LXS_brk: {
         /* Linux brk(0) returns the CURRENT break; brk(addr) sets it and returns
          * the resulting break -- crucially it does NOT return an errno on
@@ -2349,6 +2562,22 @@ void linux_syscall_dispatch(struct registers *r) {
         const char *upath = (const char *)r->rsi;
         if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        /* /dev/tty IS THE CONTROLLING TERMINAL (M2004), and we had no such
+         * file at all. A TUI does not settle for stdin: Ink -- which is what
+         * Claude Code draws with -- opens /dev/tty so it can read keys even
+         * when stdin has been redirected, and a program that cannot open it
+         * waits for input on a descriptor it never got. Hand back the same
+         * console alias fd 0/1/2 are, which is exactly what /dev/tty means:
+         * whatever terminal this process is attached to. */
+        {
+            const char *t = "/dev/tty";
+            int k = 0; while (t[k] && upath[k] == t[k]) k++;
+            if (!t[k] && !upath[k]) {
+                int tfd = app_open_console_alias();
+                r->rax = (tfd < 0) ? (uint64_t)-(long)LX_ENODEV : (uint64_t)tfd;
+                break;
+            }
+        }
         long lf = (long)r->rdx, nf = 0;
         if (lf & (LXO_WRONLY | LXO_RDWR)) nf |= O_WRONLY;   /* we have no separate RDWR */
         if (lf & LXO_CREAT)  nf |= O_CREAT;

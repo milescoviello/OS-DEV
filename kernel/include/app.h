@@ -23,6 +23,13 @@ void        app_futex_forget(void *t);                                 /* drop a
 int         app_last_spawn_pid(void);
 int         app_state_of(int pid);
 void        app_dump_threads(int pid);                                /* where every thread of a pid is parked (M1996) */                                     /* task state of a live pid, -1 if gone (M1996) */                                  /* pid of the last successful spawn (M1988) */
+void        app_count_lx_syscall(void);                                /* one more Linux syscall by the caller (M2004) */
+void        app_stall_watchdog(void);                                  /* WM: report any Linux process that has stopped making syscalls (M2004) */
+int         app_open_console_alias(void);                              /* a new fd for the controlling terminal: open("/dev/tty") (M2004) */
+app_t      *app_out_to_of(app_t *a);                                   /* the window this app's output goes to, or NULL (M2004) */
+int         app_pid_of(app_t *a);                                      /* an app handle's pid (M2004) */
+void        app_arm_next_spawn(app_t *dest, int ppid);                 /* the next Linux spawn: output -> dest's window, parent = ppid (M2004) */
+int         app_console_size(int *cols, int *rows);                    /* the grid this process's output lands on; 0 = no terminal (M2004) */
 app_t      *app_out_to(void);                                          /* the current app's stdout target, or NULL (M1988) */
 int         app_spawn_linux_from_file_arg(const char *path, const char *arg);  /* + a one-shot arg that becomes argv[1] (M1948) */
 int         app_spawn_linux_from_file_argv(const char *path, const char *const *args, int n);  /* + a FULL argv: args[] become argv[1..n] (M1955) */
@@ -68,6 +75,7 @@ void   app_kill_check(void);                     /* honor a pending kill from a 
 int    app_dirty_clear(app_t *a);                /* 1 if the grid changed (WM poll) */
 int    app_sys_pollkey(void);                    /* non-blocking key for the caller */
 void   app_render(app_t *a, int px, int py, int focused); /* draw text grid (+caret if focused) */
+void   grid_write(struct app *a, const char *buf, unsigned len);   /* terminal-interpreting write into an app grid (M2004) */
 void   app_key(app_t *a, char c);              /* deliver one keystroke        */
 
 /* Mouse-driven text selection + clipboard (WM calls these; row/col are visible cells). */
@@ -227,6 +235,7 @@ long app_fd_read(int fd, void *buf, unsigned long max);        /* read a pipe fd
 long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe fd; bytes/-1 EPIPE (M1187) */
 int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
 int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
+int  app_fd_obj(int fd);                                       /* the object index behind an fd (pipe no., memfd idx), or -1 (M2004) */
 int  app_fd_type(int fd);
 long app_memfd_size(int fd);                                   /* a memfd's size, or -1 if fd is not one (M2000) */
 uint64_t app_mmap_hint(uint64_t addr, uint64_t len);           /* mmap's addr WITHOUT MAP_FIXED: place there only if free, else 0 (M2000) */

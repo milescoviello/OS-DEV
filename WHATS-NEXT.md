@@ -1,5 +1,41 @@
 # What's next
 
+> **(M2004) YOU TYPE `claude` AND CLAUDE CODE TAKES OVER THE TERMINAL.**
+>
+> Its interface renders in the OS-DEV shell window -- theme picker, syntax
+> preview, colours, layout -- and `claude --version` prints
+> `2.1.270 (Claude Code)` at the prompt like any other command. Eight things had
+> to be true at once and none of them were:
+>
+> 1. **`claude` was not a command** -- you had to type `linux /usr/bin/claude`.
+>    Unrecognised commands are now looked up on a PATH and run in the
+>    FOREGROUND, with the shell waiting.
+> 2. **Its output went nowhere.** fd 0/1/2 were "the console" only by NOT being
+>    in the fd table -- which breaks the moment a program dups one, and Claude
+>    Code writes to a dup. They are real descriptors now.
+> 3. **It opened its own window.** A foreground job of a shell must not.
+> 4. **It could not tell it was on a terminal.** Modern glibc `tcgetattr` uses
+>    **TCGETS2**, not TCGETS; and a descriptor is a tty because of what it
+>    REFERS TO, not its number, so a dup must answer yes too. Plus TIOCGWINSZ
+>    and `/dev/tty`, which did not exist.
+> 5. **`readv` did not exist** -- glibc's stdio uses read(2) so nothing noticed.
+>    Bun reads stdin with `preadv2`.
+> 6. **Our console was always "readable"**, so an event loop polled stdin, was
+>    told it was ready, and blocked in the read -- freezing the loop before it
+>    could draw the interface that would tell you to type.
+> 7. **Escape sequences printed as literal text**: `app_write_to` bypassed the
+>    terminal state machine `app_sys_write` used. Added CSI `G`/`d` and
+>    256-colour SGR.
+> 8. **`TERM=osdev`** is in no terminfo database, so a TUI correctly renders
+>    nothing.
+>
+> **Still blocked: the interactive login.** Claude Code preflights
+> `platform.claude.com` and exits if it dislikes the answer. A packet capture
+> shows the transport is fine -- TLS completes in **0.3 s** and the app reads
+> every byte of the response (3870 then 807) -- then it abandons the connection
+> and retries three times. What it rejects is the answer, not the network.
+> That is the next thing to understand.
+
 > **(M2003) `getpid()` RETURNED THE CALLING THREAD'S ID.**
 >
 > On Linux every thread of a process reports the same `getpid()` -- that is the

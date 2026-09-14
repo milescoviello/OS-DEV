@@ -799,12 +799,15 @@ void syscall_dispatch(struct registers *r) {
         for (int q = 0; lp[q] && fk < VFS_PATH_MAX - 1; q++) full[fk++] = lp[q];
         full[fk] = 0;
         {
+            /* ARM BEFORE THE SPAWN, not after (M2004). Setting out_to on the
+             * way back is a race the child wins whenever it prints early, and
+             * it left the child parentless -- so the shell could not wait for
+             * it either, and `claude` returned to a prompt instantly while the
+             * real program ran on invisibly. Both are properties the process
+             * must be born with. */
+            app_arm_next_spawn((app_t *)self, app_pid_of((app_t *)self));
             int rc_l = app_spawn_linux_from_file_argv(full, (const char *const *)av, nav);
-            /* Point the child's stdout at the window that asked for it. The
-             * spawn returns 0/-1, not a pid -- reading it as one armed nothing
-             * and the output went to the invisible console exactly as before. */
             int npid = (rc_l < 0) ? -1 : app_last_spawn_pid();
-            if (npid > 0) app_set_out_to(npid, (app_t *)self);
             r->rax = (uint64_t)(long)npid;
         }
         break;

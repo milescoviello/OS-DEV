@@ -254,6 +254,7 @@ static volatile int g_wlraw;                  /* -append wlraw: also run the raw
 static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
+static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
 static volatile int g_ffshot;                 /* -append ffshot: Firefox headless, --screenshot to a real PNG (M2003) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
@@ -510,6 +511,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
+        if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
         if (cmdline_has(cl, "ffshot"))     { g_lxabi_test = 1; g_ffshot = 1; }   /* Firefox HEADLESS, rendering a page to a PNG (M2003) */
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
@@ -842,6 +844,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             } else {
                 kprintf("[lxabi] no DNS server in the lease; getaddrinfo will report EAI_AGAIN\n");
             }
+        }
+        /* -append lxdesktop: THE LINUX ENVIRONMENT, AND NOTHING ELSE (M2004).
+         *
+         * Everything above this line is setup a Linux program needs before it
+         * can do anything -- $HOME and the XDG directories, /etc/machine-id,
+         * the font cache directories, and /etc/resolv.conf written from the
+         * DHCP lease. Everything below it is a TEST. They were welded together,
+         * so the only way to get a usable Linux environment was to sit through
+         * a suite first, and a plain desktop boot had no /etc/resolv.conf at
+         * all -- which means no DNS, which means nothing that talks to the
+         * internet can work. That is the boot a person actually wants when they
+         * mean to sit down and use the machine. */
+        if (g_lxdesktop) {
+            kprintf("[lxabi] Linux environment ready; skipping the test suite (lxdesktop)\n");
+            goto lx_env_ready;
         }
         kprintf("[lxabi] launching a host-built static-PIE Linux binary from /disk2...\n");
         if (app_spawn_linux_from_file("/disk2/hellofree") < 0)
@@ -1456,6 +1473,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             if (ksz > 0) kprintf("[lxbuild] kernel32.elf built in-guest: %d bytes\n", ksz);
             else         kprintf("[lxbuild] kernel32.elf MISSING -- the build produced no kernel\n");
         }
+        lx_env_ready: ;   /* -append lxdesktop lands here: setup done, no tests (M2004) */
     }
 
     if (!g_nodisk && fat32_mount() == 0) {
