@@ -404,6 +404,11 @@ struct app {
     int      seccomp_n;                  /* program length (0 = no filter) */
 };
 
+/* -append lxnettrace: log every socket read/write a Linux process makes, with
+ * byte counts (M2016). Off by default; one line per call is far too much for a
+ * normal boot and exactly right when a handshake is not completing. */
+int g_net_trace;
+static unsigned long g_net_calls;   /* socket reads+writes, to notice a connection going quiet (M2016) */
 static struct app apps[MAX_APPS];
 
 /* SELF-AUDIT (-append vmaaudit, M1988). Two VMAs must never describe the same
@@ -2173,6 +2178,41 @@ int app_open_console_alias(void) {
  * Called from the window manager's loop, which runs anyway.
  */
 void app_count_lx_syscall(void) { struct app *a = cur(); if (a) a->lxcalls++; }
+
+/* A CONNECTION THAT HAS GONE QUIET (M2016).
+ *
+ * app_stall_watchdog asks "has this process stopped making syscalls", which a
+ * process waiting on a socket has not -- it is busy with timers and its event
+ * loop. The question that matters for a stalled HTTPS request is narrower:
+ * nothing has been read from or written to ANY socket for seconds, while a
+ * socket is still open. The ten seconds before "connection timed out" are
+ * silent on the wire and are exactly the interval worth seeing, and the
+ * program will not tell us what it did in them. */
+void app_net_stall_watch(void) {
+    static unsigned long seen; static uint64_t next; static int told;
+    if (!g_net_trace) return;
+    uint64_t now = timer_ms();
+    if (now < next) return;
+    next = now + 5000;
+    if (g_net_calls != seen) { seen = g_net_calls; told = 0; return; }
+    if (told) return;
+    for (int i = 0; i < MAX_APPS; i++) {
+        if (!apps[i].used || apps[i].exited || !apps[i].lxcalls) continue;
+        int nsock = 0;
+        for (int fd = 0; fd < APP_NFD; fd++)
+            if (apps[i].fd[fd].used && apps[i].fd[fd].type == 10) nsock++;
+        if (!nsock) continue;
+        told = 1;
+        kprintf("[nettrace] pid %d has %d open socket(s) and has not touched one in 5s "
+                "-- what it is doing instead:\n", apps[i].pid, nsock);
+        lx_trace_dump_last("the quiet socket", 0);   /* the WHOLE ring: the loop is longer than 48 calls */
+        for (int fd = 0; fd < APP_NFD; fd++)
+            if (apps[i].fd[fd].used && apps[i].fd[fd].type == 6)
+                app_epoll_dump_of((app_t *)&apps[i], fd);
+        app_dump_threads(apps[i].pid);
+        return;
+    }
+}
 
 void app_stall_watchdog(void) {
     static uint64_t next_check;
@@ -6392,7 +6432,32 @@ int app_pipe2(int *out, int flags) {
  * none of those copy paths need to know it exists. */
 #define EVFD_NWAIT 16
 static struct { struct app *a; int fd; void *task; int used; } g_evfd_wait[EVFD_NWAIT];
+/* A READ THAT KEEPS RETURNING EOF IS A SPIN (M2016). Zero means "there will
+ * never be more", so a caller that asks again has been told something it did
+ * not believe -- and a thread doing that in a loop burns a core forever. Say
+ * which fd and what it is, once, rather than leaving it to a syscall histogram
+ * to notice. */
+static void eof_spin_watch(struct app *a, int fd, long n) {
+    static int lastfd = -1; static unsigned long run; static int told;
+    if (n != 0) { if (fd == lastfd) run = 0; return; }
+    if (fd != lastfd) { lastfd = fd; run = 0; }
+    if (++run == 200 && !told) {
+        told = 1;
+        kprintf("[nettrace] pid %d fd %d (type %d) has read EOF 200 times in a row -- "
+                "this thread is spinning on a descriptor that will never have data\n",
+                a->pid, fd, a->fd[fd].used ? a->fd[fd].type : -1);
+        if (a->fd[fd].used && a->fd[fd].type == 2)
+            kprintf("[nettrace]   it is the file '%s' at offset %ld\n",
+                    a->fd[fd].path, (long)a->fd[fd].off);
+    }
+}
+static long app_fd_read_inner(int fd, void *buf, unsigned long max);
 long app_fd_read(int fd, void *buf, unsigned long max) {
+    long n = app_fd_read_inner(fd, buf, max);
+    if (g_net_trace) { struct app *a = cur(); if (a) eof_spin_watch(a, fd, n); }
+    return n;
+}
+static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     struct app *a = cur(); if (!a) return -1;
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned read (M1193/M1196) */
         long off = a->fd[fd].off;
@@ -6450,7 +6515,19 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
         return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 8) {   /* inotify: drain queued events (M1266) */
-        return inotify_read(a->fd[fd].obj, buf, max);
+        /* AN EMPTY INOTIFY IS NOT EOF (M2016). Zero from read() means "there
+         * will never be more", and a watcher told that about a descriptor it
+         * knows is live simply asks again -- forever. Linux blocks here, or
+         * answers EAGAIN on a non-blocking fd, and never returns 0. Claude
+         * Code's file watcher burned a core on exactly this. */
+        for (;;) {
+            long n = inotify_read(a->fd[fd].obj, buf, max);
+            if (n != 0) return n;
+            if (app_fd_nonblock(fd)) return APP_FD_EAGAIN;
+            if (a->kill || a->exited) return 0;
+            task_sleep_ms(10);
+            if (!a->fd[fd].used || a->fd[fd].type != 8) return -1;   /* closed under us */
+        }
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M2004) */
         /* THE KEYBOARD OF THE WINDOW WE WRITE TO.
@@ -6501,6 +6578,17 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 10) {  /* TCP socket: recv (M1268) */
         net_tcp_sock_set_nonblock(a->fd[fd].obj, a->fd[fd].nonblock);   /* O_NONBLOCK is a per-FD property (M1967) */
         long n = net_tcp_sock_recv(a->fd[fd].obj, buf, max);
+        /* WHERE A TLS HANDSHAKE ACTUALLY STOPS (M2016). "Connection timed out
+         * after 10 seconds" is the only thing the application can tell us, and
+         * it is true of a socket that never connected, one that connected and
+         * sent nothing, and one that sent a ClientHello and got no reply --
+         * three different bugs. Byte counts in both directions separate them,
+         * and nothing else here can. */
+        g_net_calls++;
+        if (g_net_trace)
+            kprintf("[nettrace] t=%lums pid %d fd %d recv(%lu) -> %ld%s\n",
+                    (unsigned long)timer_ms(), a->pid, fd, max, n,
+                    (n == NET_SOCK_EAGAIN) ? " (EAGAIN)" : "");
         return (n == NET_SOCK_EAGAIN) ? APP_FD_EAGAIN : n;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: read through the line discipline (M1274) */
@@ -6632,7 +6720,12 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
         return app_sendto(fd, a->fd[fd].peer_ip, a->fd[fd].peer_port, buf, (int)len);
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 10) {  /* TCP socket: send (M1268) */
-        return net_tcp_sock_send(a->fd[fd].obj, buf, (int)len);
+        long w = net_tcp_sock_send(a->fd[fd].obj, buf, (int)len);
+        g_net_calls++;
+        if (g_net_trace)
+            kprintf("[nettrace] t=%lums pid %d fd %d send(%u) -> %ld\n",
+                    (unsigned long)timer_ms(), a->pid, fd, len, w);
+        return w;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: master write feeds the ldisc, slave write -> master output (M1274) */
         return pty_write(a->fd[fd].obj, buf, len);
@@ -7399,7 +7492,7 @@ long app_sendfile(int out_fd, int in_fd, long *off, unsigned long count) {
  * it owns in ONE instance, so 32 is an arbitrary ceiling on how much a program
  * may do at once -- and hitting it looked like a random socket failure. */
 #define EP_MAX 256
-static struct epollobj { int used, refs, n; struct { int fd, events, last_ready; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
+static struct epollobj { int used, refs, n; struct { int fd, events, last_ready, disarmed; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
 static void epoll_ref(int idx)   { if (idx >= 0 && idx < NEPOLL && epolls[idx].used) epolls[idx].refs++; }
 static void epoll_unref(int idx) { if (idx >= 0 && idx < NEPOLL && epolls[idx].used && --epolls[idx].refs <= 0) epolls[idx].used = 0; }
 
@@ -7432,6 +7525,7 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
         if (e->n >= EP_MAX) return -28;                                        /* ENOSPC: instance full */
         e->items[e->n].fd = fd; e->items[e->n].events = (int)events; e->items[e->n].data = data;
         e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
+        e->items[e->n].disarmed = 0;     /* EPOLLONESHOT has not fired yet (M2016) */
         e->n++;
         return 0;
     }
@@ -7439,6 +7533,7 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
         for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) {
             e->items[i].events = (int)events; e->items[i].data = data;
             e->items[i].last_ready = 0;   /* M1545: a changed interest set re-arms the edge, same spirit as a fresh ADD */
+            e->items[i].disarmed = 0;     /* ...and re-arms EPOLLONESHOT, which is what MOD is FOR (M2016) */
             return 0;
         }
         return -2;                                                             /* ENOENT: not registered */
@@ -7464,6 +7559,23 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
 /* The registered set of an epoll instance, for the poll-stall diagnostic: a
  * program blocked in epoll_wait is waiting on fds it registered at some earlier
  * point, and nothing else in the log says which ones. (M1998) */
+/* The same report for a process that is NOT the caller (M2016): the quiet-
+ * socket watchdog runs in the window manager's context, and "which fds is that
+ * program waiting on" is exactly the question it needs to answer. */
+void app_epoll_dump_of(app_t *ap, int epfd) {
+    struct app *a = (struct app *)ap;
+    if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return;
+    struct epollobj *e = &epolls[a->fd[epfd].obj];
+    for (int i = 0; i < e->n; i++)
+        kprintf("[poll]   epfd %d: fd %d type %d want %x -> %x%s%s%s\n", epfd, e->items[i].fd,
+                a->fd[e->items[i].fd].used ? a->fd[e->items[i].fd].type : -1,
+                (unsigned)e->items[i].events,
+                app_fd_ready(ap, e->items[i].fd,
+                             e->items[i].events & ~(int)(EPOLLET | EPOLLONESHOT)),
+                e->items[i].last_ready ? " (edge reported)" : "",
+                (e->items[i].events & EPOLLONESHOT) ? " oneshot" : "",
+                e->items[i].disarmed ? " DISARMED" : "");
+}
 void app_epoll_dump(int epfd) {
     struct app *a = cur();
     if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) {
@@ -7472,10 +7584,13 @@ void app_epoll_dump(int epfd) {
     }
     struct epollobj *e = &epolls[a->fd[epfd].obj];
     for (int i = 0; i < e->n; i++)
-        kprintf("[poll]   fd %d type %d want %x -> %x%s\n", e->items[i].fd,
+        kprintf("[poll]   fd %d type %d want %x -> %x%s%s%s\n", e->items[i].fd,
                 app_fd_type(e->items[i].fd), (unsigned)e->items[i].events,
-                app_fd_ready((app_t *)a, e->items[i].fd, e->items[i].events & ~(int)EPOLLET),
-                e->items[i].last_ready ? " (edge already reported)" : "");
+                app_fd_ready((app_t *)a, e->items[i].fd,
+                             e->items[i].events & ~(int)(EPOLLET | EPOLLONESHOT)),
+                e->items[i].last_ready ? " (edge already reported)" : "",
+                (e->items[i].events & EPOLLONESHOT) ? " oneshot" : "",
+                e->items[i].disarmed ? " DISARMED" : "");
 }
 
 int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
@@ -7484,10 +7599,18 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
     struct epollobj *e = &epolls[a->fd[epfd].obj];
     int k = 0;
     for (int i = 0; i < e->n && k < maxevents; i++) {
-        int re = app_fd_ready((app_t *)a, e->items[i].fd, e->items[i].events & ~(int)EPOLLET);
+        /* EPOLLONESHOT: already delivered, and not re-armed. Linux keeps the
+         * registration but stops reporting until EPOLL_CTL_MOD sets a new
+         * event mask; `disarmed` is exactly that state. (M2016) */
+        if (e->items[i].disarmed) continue;
+        int want = e->items[i].events & ~(int)(EPOLLET | EPOLLONESHOT);
+        int re = app_fd_ready((app_t *)a, e->items[i].fd, want);
         int fire = (re > 0) && (!(e->items[i].events & EPOLLET) || !e->items[i].last_ready);
         e->items[i].last_ready = (re > 0);
-        if (fire) { out[k].events = (unsigned)re; out[k].data = e->items[i].data; k++; }
+        if (fire) {
+            out[k].events = (unsigned)re; out[k].data = e->items[i].data; k++;
+            if (e->items[i].events & EPOLLONESHOT) e->items[i].disarmed = 1;
+        }
     }
     return k;
 }

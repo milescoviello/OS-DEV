@@ -515,6 +515,13 @@ struct pollfd { int fd; short events; short revents; };
 #define EPOLLIN  POLLIN
 #define EPOLLOUT POLLOUT
 #define EPOLLET  (1u << 31)
+/* EPOLLONESHOT (M2016): report this fd ONCE and then stop, until the caller
+ * re-arms it with EPOLL_CTL_MOD. Ignoring it is not a missing optimisation --
+ * it is an infinite loop. Claude Code registers its console descriptors with
+ * EPOLLONESHOT|EPOLLOUT, which is always ready, so an epoll that keeps saying
+ * yes spins the event loop at full speed and the socket it was actually
+ * waiting on is never serviced. */
+#define EPOLLONESHOT (1u << 30)
 
 /* memfd_create flags + F_SEAL_* file seals (M1212). Seals are one-way (add-only);
  * F_SEAL_SEAL forbids adding any further seal. */

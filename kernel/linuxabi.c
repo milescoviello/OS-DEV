@@ -393,6 +393,7 @@ static long lx_fd_err(long rc) {
     if (rc == APP_FD_EPIPE)  return -(long)LX_EPIPE;
     return -(long)LX_EBADF;
 }
+static long g_epoll_lastk = -1;   /* what the last epoll_wait answered, for the spin detector (M2016) */
 int g_lx_mmap_trace;                      /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
 #define LX_ROOT     "/disk2"
 #define LX_ROOT_LEN 6
@@ -489,7 +490,14 @@ static int64_t lx_realtime_sec(void) {
  * instruction and ~470 mappings; without a tid the sixteen calls before it come
  * from six different places and mean nothing. */
 #define LX_INFLIGHT 0xB10CEDB10CEDB10Cull   /* `ret` of a call that has not come back yet (M2004) */
-struct lxring_ent { uint32_t nr; int tid; uint64_t a1, a2, a3, ret; char path[56]; };
+/* `seq` is the global ticket this entry was claimed with (M2013). The ring is
+ * 256 entries and a hundred threads share it, so a call that BLOCKS has its
+ * slot recycled out from under it long before it returns -- and the return
+ * patch below then lands on whatever call owns the slot now. That is how
+ * FUTEX_WAKE appeared to return -110 (ETIMEDOUT), which it cannot: a slow
+ * futex WAIT elsewhere finished and wrote its timeout into a stranger's entry.
+ * Checking the ticket makes a late return drop its patch instead of lying. */
+struct lxring_ent { uint32_t nr; int tid; unsigned long seq; uint64_t a1, a2, a3, ret; char path[56]; };
 static struct lxring_ent g_lxring[LXRING_N];
 static unsigned long g_lxring_i;
 
@@ -726,7 +734,8 @@ void linux_syscall_dispatch(struct registers *r) {
          * other's call. (M2003) */
         ring_slot = __atomic_fetch_add(&g_lxring_i, 1, __ATOMIC_RELAXED);
         struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
-        re->nr = (uint32_t)r->rax; re->tid = task_current_id(); re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
+        re->nr = (uint32_t)r->rax; re->tid = task_current_id(); re->seq = ring_slot;
+        re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
         /* MARK IT IN FLIGHT (M2004). `ret` is only written when the dispatch
          * RETURNS, so an entry for a call that is still blocked -- which is
          * exactly the entry you most want to read when a program has stalled --
@@ -1833,6 +1842,23 @@ void linux_syscall_dispatch(struct registers *r) {
         if (!vmm_user_ok(r->rsi, (uint64_t)maxev * 12)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         struct epoll_event tmp[64];
         uint64_t start = timer_ms();
+        /* AN EPOLL THAT KEEPS SAYING YES IS A BUSY LOOP (M2016). A level-
+         * triggered fd whose readiness is never consumed makes an event loop
+         * spin at full speed doing nothing -- Claude Code's main thread did
+         * exactly that, returning 2 every time, while the socket it was
+         * waiting on sat untouched. The report is worth one line: which fds,
+         * what they asked for, what we answered. */
+        if (g_net_trace) {
+            static unsigned long same; static long lastk = -1; static int told;
+            if (lastk > 0 && lastk == g_epoll_lastk) same++; else same = 0;   /* 0 is a legitimate timeout, not a spin */
+            lastk = g_epoll_lastk;
+            if (same == 400 && !told) {
+                told = 1;
+                kprintf("[nettrace] epoll fd %ld has answered %ld the same way 400 times "
+                        "-- this loop is spinning. Its fds:\n", a1, lastk);
+                app_epoll_dump((int)a1);
+            }
+        }
         long k = 0;
         __asm__ volatile("sti");            /* this loop sleeps on the timer */
         int etold = 0, espins = 0;
@@ -1857,6 +1883,7 @@ void linux_syscall_dispatch(struct registers *r) {
             *(uint32_t *)(out + i * 12 + 0) = tmp[i].events;
             *(uint64_t *)(out + i * 12 + 4) = tmp[i].data;
         }
+        g_epoll_lastk = k;
         r->rax = (uint64_t)k;
         break;
     }
@@ -2712,6 +2739,16 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_close_:
+        /* CLOSING A SOCKET IS THE END OF A STORY (M2016). When an HTTPS client
+         * gives up, the close is the only event it produces -- the ten seconds
+         * before it are silent, which is exactly the interval you need to see.
+         * Dump the ring here, under lxnettrace, so "timed out" comes with the
+         * syscalls the program made while waiting instead of nothing at all. */
+        if (g_net_trace && app_fd_type((int)a1) == 10) {
+            kprintf("[nettrace] t=%lums pid %d CLOSES socket fd %ld -- what it did while waiting:\n",
+                    (unsigned long)timer_ms(), app_current_pid(), a1);
+            lx_trace_dump_last("that socket's last seconds", 48);
+        }
         if (app_fd_close((int)a1) == 0) { r->rax = 0; break; }
         /* fd 0/1/2 are the console when they are not fd-table entries -- they
          * ARE open, so closing them succeeds; there is simply nothing to free.
@@ -3263,7 +3300,8 @@ void linux_syscall_dispatch(struct registers *r) {
     }
     /* Patch the ring entry with what we actually answered. Recorded here rather
      * than at entry because the whole value of the record is the RESULT. */
-    g_lxring[ring_slot & (LXRING_N - 1)].ret = r->rax;
+    { struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
+      if (re->seq == ring_slot) re->ret = r->rax;   /* still ours: see `seq` */ }
 }
 
 /* ---- the System V initial process stack (M1939) --------------------------

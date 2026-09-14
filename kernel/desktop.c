@@ -2014,6 +2014,7 @@ void desktop_run(void) {
     present_frame();
     for (;;) {
         app_stall_watchdog();   /* say when a Linux process has stopped doing anything (M2004) */
+        app_net_stall_watch();  /* ...and when a socket has gone quiet with a request outstanding (M2016) */
         int dirty = 0;
         usb_tablet_poll();
         usb_kbd_poll();          /* feed any USB-keyboard keystrokes into the input queue */

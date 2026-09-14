@@ -504,6 +504,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
+        if (cmdline_has(cl, "lxnettrace")) g_net_trace = 1;              /* socket byte counts, both directions (M2016) */
         if (cmdline_has(cl, "polltrace")) { extern int g_poll_trace; g_poll_trace = 1; }     /* name the fds a stalled poll waits on (M1998) */
         if (cmdline_has(cl, "vmaaudit"))   { extern int g_vma_audit; g_vma_audit = 1; }   /* check the no-overlap invariant on every mmap/munmap (M1988) */
         if (cmdline_has(cl, "lxstress"))   { g_lxabi_test = 1; g_lxstress = 1; }   /* mmap/thread/futex churn, on its own boot (M1987) */
