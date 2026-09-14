@@ -286,6 +286,7 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_memfd_create_ 319
 #define LXS_ftruncate_    77
 #define LXS_readahead_   187
+#define LXS_nanosleep_    35
 #define LXS_clock_nanosleep_ 230
 #define LXS_statx_       332
 #define LXS_sched_getaffinity_ 204
@@ -1622,12 +1623,33 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = is_mm ? (uint64_t)done : (uint64_t)first;
         msgdone: break;
     }
+    case LXS_nanosleep_:                    /* (req, rem) -- clock_nanosleep's arguments shifted two LEFT */
+        /* Plain nanosleep(2) was ENOSYS. glibc's sleep()/usleep() prefer
+         * clock_nanosleep, but plenty of code calls the syscall directly and
+         * an ENOSYS sleep does not sleep at all -- it returns instantly and
+         * whatever loop was pacing itself with it becomes a spin. Normalise
+         * into the handler below: CLOCK_REALTIME, relative. (M2010) */
+        r->rdx = r->rdi; r->r10 = r->rsi; a1 = 0; r->rsi = 0;
+        /* fall through */
     case LXS_clock_nanosleep_: {            /* (clockid, flags, req, rem) */
         /* Node polls with this. ENOSYS made it a busy-wait. */
         if (!r->rdx || !vmm_user_ok(r->rdx, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         const uint64_t *ts = (const uint64_t *)r->rdx;
-        uint64_t ms = ts[0] * 1000ull + ts[1] / 1000000ull;
-        if (r->rsi & 1) ms = 1;             /* TIMER_ABSTIME: we have no absolute clock to compare against */
+        uint64_t ms = ts[0] * 1000ull + (ts[1] + 999999ull) / 1000000ull;
+        /* TIMER_ABSTIME (M2010). This used to collapse to a 1 ms sleep on the
+         * claim that there was no absolute clock to compare against -- but
+         * clock_gettime above serves both CLOCK_REALTIME and CLOCK_MONOTONIC,
+         * so there is, and it is the very clock the caller derived this
+         * deadline from. Sleeping 1 ms instead turns "wake me at T" into a
+         * thousand-hertz busy loop: Firefox burned 1.2 million syscalls in
+         * fifteen seconds doing exactly that. */
+        if (r->rsi & 1) {                   /* TIMER_ABSTIME: `ms` is a DEADLINE */
+            int64_t now = (a1 == 0 /*CLOCK_REALTIME*/)
+                ? (int64_t)lx_realtime_sec() * 1000 + (int64_t)(timer_ms() % 1000)
+                : (int64_t)timer_ms();
+            int64_t rel = (int64_t)ms - now;
+            ms = (rel > 0) ? (uint64_t)rel : 0;
+        }
         if (ms > 60000) ms = 60000;
         __asm__ volatile("sti");
         task_sleep_ms((int)ms);
@@ -1901,9 +1923,21 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)app_gettid();        /* a thread's id, NOT the process's */
         break;
     case LXS_futex_: {                          /* (uaddr, op, val, timeout, uaddr2, val3) */
-        /* FUTEX_PRIVATE_FLAG(128) and FUTEX_CLOCK_REALTIME(256) are hints about
-         * scope and clock source; neither changes what we do, so mask them off
-         * rather than failing an op we do support. */
+        /* FUTEX_PRIVATE_FLAG(128) is genuinely a scope hint and is masked off.
+         *
+         * FUTEX_CLOCK_REALTIME(256) IS NOT (M2010). It was masked off too, with
+         * a comment claiming it did not change what we do, and it changes
+         * everything: it names the clock an ABSOLUTE deadline is measured
+         * against. FUTEX_WAIT_BITSET's timeout is absolute -- that is the
+         * difference between it and FUTEX_WAIT -- so reading its timespec as a
+         * relative duration turned a 50 ms pthread_cond_timedwait into a wait
+         * of 1.79e12 milliseconds: fifty-six years.
+         *
+         * That is what Firefox looked like: sixty-six threads parked in futex
+         * waits they believed were milliseconds long, the process making zero
+         * syscalls, and nothing in the trace saying "timeout" because from the
+         * kernel's side the wait was proceeding exactly as asked. Every
+         * condition variable with a deadline in glibc goes through this path. */
         int op = (int)r->rsi & 0x7F;
         int val = (int)r->rdx;
         if (!vmm_user_ok(r->rdi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
@@ -1918,8 +1952,20 @@ void linux_syscall_dispatch(struct registers *r) {
             if (r->r10) {                       /* struct timespec { sec; nsec; } */
                 if (!vmm_user_ok(r->r10, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
                 const int64_t *ts = (const int64_t *)r->r10;
-                ms = (long)(ts[0] * 1000 + ts[1] / 1000000);
-                if (ms < 0) ms = 0;
+                /* Round the nanoseconds UP: a 500 us wait must not become a
+                 * zero-millisecond one that returns ETIMEDOUT without ever
+                 * yielding, which turns a timed wait into a spin. */
+                int64_t want = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
+                if (op == 9) {                  /* FUTEX_WAIT_BITSET: `want` is a DEADLINE */
+                    /* Measured against the same clock clock_gettime reports,
+                     * because that is the clock the caller computed it from. */
+                    int64_t now = ((int)r->rsi & 256)        /* FUTEX_CLOCK_REALTIME */
+                        ? (int64_t)lx_realtime_sec() * 1000 + (int64_t)(timer_ms() % 1000)
+                        : (int64_t)timer_ms();
+                    want -= now;
+                }
+                ms = (long)want;
+                if (ms < 0) ms = 0;             /* already expired */
             }
             long fr = app_futex(r->rdi, FUTEX_WAIT, val, ms);
             /* We got past the value check, so a -1 now is the timeout (or the

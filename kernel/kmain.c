@@ -255,6 +255,7 @@ static volatile int g_lxstress;              /* -append lxstress: hammer mmap/th
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
+static volatile int g_ffmozlog;               /* -append ffmozlog: ask Firefox itself where it is, via MOZ_LOG (M2010) */
 static volatile int g_ffshot;                 /* -append ffshot: Firefox headless, --screenshot to a real PNG (M2003) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
@@ -512,6 +513,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
+        if (cmdline_has(cl, "ffmozlog"))   g_ffmozlog = 1;                /* + Firefox's OWN widget/Wayland logging, to stderr (M2010) */
         if (cmdline_has(cl, "ffshot"))     { g_lxabi_test = 1; g_ffshot = 1; }   /* Firefox HEADLESS, rendering a page to a PNG (M2003) */
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
@@ -932,6 +934,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the non-blocking-pipe probe...\n");
         int nbrc = app_run_linux_sync("/disk2/lxnbpipe", 0, 0, 60000);
         kprintf("[lxabi] LXNB exit -> %d\n", nbrc);
+        /* ...and ABSOLUTE deadlines. FUTEX_WAIT_BITSET and
+         * clock_nanosleep(TIMER_ABSTIME) both take a timestamp, and reading
+         * one as a duration is a fifty-six-year wait while substituting a
+         * constant is a thousand-hertz spin. Neither is visible from in here:
+         * the wait proceeds exactly as asked. (M2010) */
+        kprintf("[lxabi] launching the absolute-deadline probe...\n");
+        int trc = app_run_linux_sync("/disk2/lxtime", 0, 0, 90000);
+        kprintf("[lxabi] LXTIME exit -> %d\n", trc);
         if (g_lxfault_test) {
             kprintf("[lxabi] launching a binary expected to FAULT (M1941 regression)...\n");
             app_spawn_linux_from_file("/disk2/hellolibc");
@@ -1054,6 +1064,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * the window manager both keep running while it does. */
                     static const char *av_fw[] = { "--no-remote", "--new-instance",
                                                    "--window-size", "800,600", "about:blank" };
+                    /* When Firefox parks, the syscall trace shows a futex
+                     * address and nothing else -- it cannot name the Gecko
+                     * code that is waiting. Firefox can: MOZ_LOG prints the
+                     * widget and Wayland layers' own view of what they are
+                     * doing, to stderr, which is our console. (M2010) */
+                    if (g_ffmozlog) app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,WidgetWayland:5,nsWindow:5,WaylandBackend:5,Event:4");
                     kprintf("[ff] spawning FIREFOX against our compositor...\n");
                     int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_fw, 5);
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());

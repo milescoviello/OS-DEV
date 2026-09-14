@@ -440,6 +440,21 @@ LXTHREAD: 4 threads
     else
         echo "  FAIL: O_NONBLOCK on a pipe:"; grep -a "LXNB" "$SLOG3" | head -8; f3=1
     fi
+    # ABSOLUTE DEADLINES (M2010). FUTEX_WAIT_BITSET's timeout is a timestamp,
+    # not a duration -- that is the entire difference between it and
+    # FUTEX_WAIT -- and reading it as a duration made every glibc
+    # pthread_cond_timedwait a wait of 1.79e12 milliseconds. Firefox parked 66
+    # threads in those and made zero syscalls for minutes. The same class,
+    # opposite direction: clock_nanosleep(TIMER_ABSTIME) was collapsed to a
+    # 1 ms sleep, turning "wake me at T" into a 1 kHz busy loop (1.2 million
+    # syscalls in 15 seconds). So each check asserts the wait was NEITHER too
+    # long NOR too short -- too long is a hang, too short is a spin.
+    if grep -aq "LXTIME: pthread_cond_timedwait waited" "$SLOG3" && \
+       grep -aq "LXTIME: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: absolute deadlines ($(grep -ao 'pthread_cond_timedwait waited [0-9]*ms for a [0-9]*ms ABSOLUTE deadline' "$SLOG3" | head -1)), and TIMER_ABSTIME does not spin"
+    else
+        echo "  FAIL: absolute deadlines:"; grep -a "LXTIME" "$SLOG3" | head -8; f3=1
+    fi
     if grep -aq "LXCAGE: 4GiB/4GiB wrote and read back" "$SLOG3" && \
        grep -aq "LXCAGE: 0 failure(s)" "$SLOG3"; then
         echo "  ok: reserve 8 GiB, align to 4 GiB, trim head and tail -- and the kept region is still writable end to end"
