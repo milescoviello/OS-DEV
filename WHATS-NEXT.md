@@ -1,5 +1,43 @@
 # What's next
 
+> **(M2007-M2013) SEVEN BUGS BETWEEN FIREFOX AND A WINDOW, and the desktop
+> stopped jumping around.**
+>
+> Firefox went from dying 30 seconds into startup to **971 mappings, ~110
+> threads, GTK constructing widgets, bound to our own compositor with a
+> keyboard and pointer** -- and surviving, where it used to crash in one run out
+> of two. It still does not paint. Each of these was found the same way: run the
+> real thing, read what it actually says, and fix the thing it named.
+>
+> | | What it was | How it presented |
+> |---|---|---|
+> | **M2007** | libxul has **702 unconditional GFNI sites** and QEMU's TCG has no GFNI | `#UD` on instruction one; now **emulated in the `#UD` handler**, byte-identical to hardware |
+> | **M2008** | **`/dev/shm` did not exist** | `openat("/dev/shm/org.mozilla.ipc.106.1") = -ENOENT`, then a deliberate null write |
+> | **M2009** | the **pipe was the last fd type ignoring `O_NONBLOCK`**, and `pipe2` discarded its flags | the main thread blocked in the final read of its self-pipe drain loop, taking 33 futex-waiting threads with it |
+> | **M2010** | **`FUTEX_WAIT_BITSET`'s timeout is absolute**, read as relative | every `pthread_cond_timedwait` became a **fifty-six-year** wait; `clock_nanosleep(TIMER_ABSTIME)` became a 1 kHz spin |
+> | **M2011** | the framebuffer console and the desktop are the same pixels | **"the desktop jumped around a lot, like the whole thing moving"** -- 43 log lines = 688 px of scroll |
+> | **M2012** | **`socketpair` masked off `SOCK_NONBLOCK`/`SOCK_CLOEXEC`** | `###!!! ABORT: ipc_channel_posix.cc:128` |
+> | **M2013** | **`FS_BASE` was restored only when we thought it needed restoring** | a thread died reading its stack canary at `%fs:0x28` while its saved thread pointer was perfectly good |
+>
+> **The recurring shape: a request granted in name only.** `pipe2`, `socketpair`
+> and `FS_BASE` are all the same defect -- the caller asked for a property, was
+> told yes, and did not get it. Refusing would have been safe; agreeing without
+> delivering is what produces a hang a hundred frames away. Every fix in this
+> arc now has a test that **fails when the fix is reverted**, and the FS_BASE
+> one reproduces the defect itself in three lines rather than a proxy for it.
+>
+> **The other lesson: ask the program.** Firefox named its own crash site
+> (`ipc_channel_posix.cc:128`), its own missing machine-id, and -- once the
+> thread dump learned to print **library + offset for the caller** rather than a
+> kernel `wchan` that says `app_futex` for every blocked thread -- its own
+> parked subsystem. `make check` is at **492 checkpoints**, up from 482.
+>
+> Still open: Firefox's main thread parks in a glib condition variable inside
+> libgio with everything else idle behind it, and Claude Code renders its
+> interface but cannot complete its login preflight.
+
+---
+
 > **(M2006) OS-DEV BUILDS ITS OWN KERNEL INSIDE ITSELF, AND THAT KERNEL BOOTS.**
 >
 > ```
