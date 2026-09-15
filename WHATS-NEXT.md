@@ -1,5 +1,32 @@
 # What's next
 
+> **(M2052-M2055) A STALE TASK POINTER, AND A LOCK REPLACED BY A CAS.**
+>
+> | | |
+> |---|---|
+> | **M2052** | fork's write-protect is now a **compare-and-swap**, not a bare store of a value computed from a stale snapshot. It either wins against the exact PTE it read or retries with the fresh one, so it can never clobber a sibling's `mmap`/`mprotect`/`munmap` -- and unlike the global lock M2050 had to revert, it costs no contention at all. A better fix than the lock, not a weaker one |
+> | **M2053** | **five subsystems parked a `task_t*` and were never told the task died** -- mbox, mqueue, POSIX and SysV semaphores, AF_UNIX accept, plus the uffd monitor. Only futexes had a forget hook. A stale pointer meant `task_wake()` on reclaimed memory, putting a **freed task back on the run queue to be scheduled**. The kernel said so itself: *"thread 66 reached its trampoline with no start frame"*. That message is gone after the fix |
+> | **M2054** | `bash` and `git` were listed in `LXTOOLS` and **never staged** -- `.tools-staged` is a stamp file, so changing a variable did not re-run it. Three rounds of hand-injecting git and watching `make` wipe it |
+> | **M2055** | `connect()` to **port 0 reported success**, handing back a socket that can never deliver a byte |
+>
+> M2053 is the one worth remembering: the same shape as M2043's memfd
+> double-free -- a pointer to shared state outliving the thing it points at,
+> with the damage surfacing somewhere entirely unrelated.
+>
+> **Where Phase 7 actually stands, honestly.** Claude Code reaches its trust
+> prompt reliably with **zero faults**, workspace correctly on OS-DEV's own
+> source, `git` present, four cores. Its full interface has painted -- logged in
+> as `Opus 5 (1M context)` -- on three separate runs. It connects to the API.
+> But it has **never completed an answer**: after the trust prompt it clears the
+> screen, goes idle with every core halted, and waits. So Phase 7 is *not* done.
+>
+> The nine "granted in name only" defects found in this campaign are the
+> pattern worth carrying forward: `pipe2`, `socketpair`, `eventfd2`, `bind`,
+> `wait4`'s options, a timeout wearing EOF's return value, `openat`'s dirfd,
+> `dup2`'s CLOEXEC guarantee, and `connect()` to port 0. Every one was a request
+> accepted and then not honoured, and every one presented as something else
+> entirely. **Refusing would have been safer than agreeing, every time.**
+
 > **(M2040-M2050) A MEMORY-OWNERSHIP AUDIT, AND ONE FIX REVERTED ON ITS OWN EVIDENCE.**
 >
 > The `-smp 1` vs `-smp 4` split said the remaining corruption was a multi-core
