@@ -14,6 +14,7 @@
  * Under QEMU's user-mode networking, the virtual gateway 10.0.2.2 answers both.
  */
 #include "net.h"
+#include "cookiejar.h"   /* HTTP cookies (M2029) */
 #include "url.h"        /* url_host_port() — honor an explicit :port in the fetch host (M1773) */
 #include "nic.h"
 #include "timer.h"
@@ -2335,6 +2336,25 @@ void tcp_close(tcp_conn *c) {
 
 /* HTTP/1.0 GET http://host/path -> writes the raw response (headers+body) into
  * out (up to max bytes). Returns bytes received, or -1 on error. */
+/* THE ONE COOKIE JAR (M2029). Both HTTP paths -- plaintext here and TLS in
+ * tls.c -- share it, because a site that redirects http->https and sets its
+ * clearance cookie on the way must have that cookie survive the scheme change.
+ * Two jars would silently lose it exactly where it matters. */
+static cj_jar g_jar;
+int cookie_header_for(const char *host, const char *path, int secure, char *out, int max) {
+    return cj_header(&g_jar, host, path, secure, 1, timer_ms(), out, max);
+}
+int cookie_script_view(const char *host, const char *path, int secure, char *out, int max) {
+    return cj_header(&g_jar, host, path, secure, 0, timer_ms(), out, max);   /* document.cookie: no HttpOnly */
+}
+int cookie_harvest_from(const char *host, const char *path, const char *resp, int len) {
+    return cj_harvest(&g_jar, host, path, resp, len, timer_ms());
+}
+int cookie_set_one(const char *host, const char *path, const char *hdr) {
+    return cj_set(&g_jar, host, path, hdr, timer_ms());
+}
+void cookie_reset(void) { cj_clear(&g_jar); }
+
 int http_get(const char *host, const char *path, char *out, int max) {
     if (max <= 0) return 0;
     char bare[256]; uint16_t port = (uint16_t)url_host_port(host, bare, sizeof(bare), 80);   /* honor host:port (M1773); DNS gets the bare host, Host: keeps the port */
@@ -2344,8 +2364,13 @@ int http_get(const char *host, const char *path, char *out, int max) {
     if (tcp_connect(&c, ip, port) != 0) return -1;
 
     char rpath[1024]; url_request_path(path, rpath, sizeof(rpath));   /* drop any #fragment from the wire request-target (M1774) */
-    char req[512]; int rl = 0;
+    char req[1600]; int rl = 0;
+    /* Cookies (M2029): empty unless the jar holds something for this host+path,
+     * so a cookieless request is byte-identical to the pre-M2029 one. */
+    static char ckbuf[1024]; ckbuf[0] = 0;
+    int ckn = cookie_header_for(bare, rpath, 0, ckbuf, (int)sizeof ckbuf);
     const char *parts[] = { "GET ", rpath, " HTTP/1.0\r\nHost: ", host,
+                            ckn ? "\r\nCookie: " : "", ckn ? ckbuf : "",
                             "\r\nConnection: close\r\nUser-Agent: OS-DEV/0.1\r\n\r\n" };
     for (unsigned k = 0; k < sizeof(parts)/sizeof(parts[0]); k++)
         for (const char *s = parts[k]; *s && rl < (int)sizeof(req); s++) req[rl++] = *s;
@@ -2358,6 +2383,7 @@ int http_get(const char *host, const char *path, char *out, int max) {
         if (n < 0) break;
         total += n;
     }
+    if (total > 0) cookie_harvest_from(bare, rpath, out, total);   /* before the redirect is followed (M2029) */
     tcp_close(&c);
     return total;
 }
@@ -2713,6 +2739,7 @@ int http_post(const char *host, const char *path, const char *ctype,
  * reply is filed where its owner will find it. No timing luck is needed: the
  * UDP drain is given 300 ms and the reply takes about 5, so it is CERTAIN to be
  * the consumer that sees it. */
+static void net_selftest_cookies(void);   /* M2029 */
 static void net_selftest_rx_demux(const uint8_t *gw_mac) {
     uint8_t buf[1600], dummy[64], sip[4];
     uint16_t sport;
@@ -2731,6 +2758,26 @@ static void net_selftest_rx_demux(const uint8_t *gw_mac) {
     }
     kprintf("[%s] net: an ICMP reply SURVIVES another consumer draining the NIC\n",
             got ? " ok " : "FAIL");
+}
+
+/* Cookies survive a request/response round trip (M2029). Asserted at boot
+ * against the jar the real HTTP paths use, so it fails here rather than as a
+ * login that silently never sticks. */
+static void net_selftest_cookies(void) {
+    cookie_reset();
+    const char *resp =
+        "HTTP/1.1 302 Found\r\n"
+        "Set-Cookie: clearance=abc123; Path=/\r\n"
+        "Set-Cookie: hidden=zz; Path=/; HttpOnly\r\n"
+        "Location: /\r\n\r\n";
+    int n = 0; while (resp[n]) n++;
+    int got = cookie_harvest_from("example.com", "/", resp, n);
+    char buf[256];
+    int hl = cookie_header_for("example.com", "/", 0, buf, sizeof buf);
+    int sl = cookie_script_view("example.com", "/", 0, buf, sizeof buf);
+    kprintf("[%s] net: cookies survive a response and come back on the next request (%d set, hdr=%d, script=%d)\n",
+            (got == 2 && hl > 0 && sl > 0 && sl < hl) ? " ok " : "FAIL", got, hl, sl);
+    cookie_reset();
 }
 
 void net_demo(void) {
@@ -2754,6 +2801,7 @@ void net_demo(void) {
 
     net_selftest_rx_demux(gw_mac);
 
+    net_selftest_cookies();
     int got = 0;
     for (uint16_t seq = 1; seq <= 3; seq++) {
         if (ping(GW_IP, gw_mac, seq)) {

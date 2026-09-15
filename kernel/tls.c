@@ -30,6 +30,16 @@
 #include "ecdsa.h"
 #include "rsa.h"
 #include "rtc.h"
+
+#ifdef TLS_RING3
+/* The ring-3 TLS builds (webview.elf, httpget.elf) compile tls.c on its own and
+ * do NOT link net.c, so the shared cookie jar is not there to call. Stub it to
+ * "no cookies" rather than dragging the jar across the ring boundary: those two
+ * are single-shot fetchers, not a session-carrying browser. The in-kernel
+ * browser -- the one with the window -- gets the real jar. (M2029) */
+#define cookie_header_for(h, p, sec, o, m)  ((void)(h), (void)(p), (void)(sec), ((m) > 0 ? ((o)[0] = 0) : 0), 0)
+#define cookie_harvest_from(h, p, r, n)     ((void)(h), (void)(p), (void)(r), (void)(n), 0)
+#endif
 #include "sha512.h"
 #include "rootca.h"
 #include "string.h"
@@ -689,14 +699,22 @@ static int tls_get_inner(const char *host, const char *path, uint8_t *out, int m
     if (is_post) {
         if (bodylen < 0) bodylen = 0;
         char clen[12]; { unsigned b=(unsigned)bodylen; int t=0; char tmp[12]; do{ tmp[t++]=(char)('0'+b%10); b/=10; }while(b && t<11); int ci=0; while(t) clen[ci++]=tmp[--t]; clen[ci]=0; }
+        /* Cookies (M2029): "" when the jar has nothing for this host+path, so a
+         * request that carries none is byte-identical to the pre-M2029 one. */
+        static char ckbuf[1024]; ckbuf[0] = 0;
+        int ckn = cookie_header_for(bare, rpath, 1, ckbuf, (int)sizeof ckbuf);
         const char *parts[] = { "POST ", rpath, " HTTP/1.0\r\nHost: ", host,
                                 "\r\nContent-Type: ", ctype ? ctype : "text/plain",
                                 "\r\nContent-Length: ", clen,
+                                ckn ? "\r\nCookie: " : "", ckn ? ckbuf : "",
                                 "\r\nConnection: close\r\nUser-Agent: OS-DEV/0.1\r\n\r\n" };
         for (unsigned k = 0; k < sizeof(parts)/sizeof(parts[0]); k++)
             for (const char *s = parts[k]; *s && rl < (int)sizeof(req); s++) req[rl++] = (char)*s;
     } else {                       /* GET: byte-identical to the original request (no regression) */
+        static char ckbuf[1024]; ckbuf[0] = 0;
+        int ckn = cookie_header_for(bare, rpath, 1, ckbuf, (int)sizeof ckbuf);
         const char *parts[] = { "GET ", rpath, " HTTP/1.0\r\nHost: ", host,
+                                ckn ? "\r\nCookie: " : "", ckn ? ckbuf : "",
                                 "\r\nConnection: close\r\nUser-Agent: OS-DEV/0.1\r\n\r\n" };
         for (unsigned k = 0; k < sizeof(parts)/sizeof(parts[0]); k++)
             for (const char *s = parts[k]; *s && rl < (int)sizeof(req); s++) req[rl++] = (char)*s;
@@ -721,6 +739,10 @@ static int tls_get_inner(const char *host, const char *path, uint8_t *out, int m
      * (level=warning(1), description=close_notify(0)) so the peer sees a clean EOF */
     if (tcp.up) { uint8_t cn[2] = { 1, 0 }; write_enc(&T, REC_ALERT, cn, 2); }
     tcp_close(&tcp);
+    /* Take any Set-Cookie BEFORE returning: a bot-check or a login answers with
+     * a redirect whose only payload is the cookie, and the caller follows that
+     * redirect immediately. Harvesting later would be too late. (M2029) */
+    if (total > 0) cookie_harvest_from(bare, rpath, (const char *)out, total);
     return total;
 }
 

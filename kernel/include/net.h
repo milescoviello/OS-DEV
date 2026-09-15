@@ -109,3 +109,10 @@ int  net_tcp_sock_getpeer(int idx, uint8_t out[6]);   /* the connected peer's {i
  * "clone", "<n>/ctl", or "<n>/data". Routed from vfs.c. */
 long netfs_read(const char *sub, void *buf, unsigned long max);
 long netfs_write(const char *sub, const void *buf, unsigned long len);
+
+/* HTTP cookies (M2029) -- one jar, shared by the plaintext and TLS paths. */
+int  cookie_header_for(const char *host, const char *path, int secure, char *out, int max);
+int  cookie_script_view(const char *host, const char *path, int secure, char *out, int max);
+int  cookie_harvest_from(const char *host, const char *path, const char *resp, int len);
+int  cookie_set_one(const char *host, const char *path, const char *hdr);
+void cookie_reset(void);
