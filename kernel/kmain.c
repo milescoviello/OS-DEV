@@ -252,6 +252,7 @@ static volatile int g_fftest;                 /* -append fftest: run Firefox aga
 static volatile int g_wlraw;                  /* -append wlraw: also run the raw handshake client (M1978) */
 
 static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
+static volatile int g_lxcage;                /* -append lxcagetest: the huge-reservation probes, on demand (M2041) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
@@ -509,6 +510,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "polltrace")) { extern int g_poll_trace; g_poll_trace = 1; }     /* name the fds a stalled poll waits on (M1998) */
         if (cmdline_has(cl, "vmaaudit"))   { extern int g_vma_audit; g_vma_audit = 1; }   /* check the no-overlap invariant on every mmap/munmap (M1988) */
         if (cmdline_has(cl, "lxstress"))   { g_lxabi_test = 1; g_lxstress = 1; }   /* mmap/thread/futex churn, on its own boot (M1987) */
+        if (cmdline_has(cl, "lxcagetest")) { g_lxabi_test = 1; g_lxcage = 1; }    /* the 8 GiB reservation probes (M2041) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
@@ -972,12 +974,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * wait4 discarded its options, so WNOHANG blocked for ever. (M2025) */
         /* ...and the RESERVE-TRIM-COMMIT pattern JavaScriptCore's pointer
          * cage is built from, which is where Claude Code died. (M2035) */
-        kprintf("[lxabi] launching the EXACT-ARGUMENTS cage probe...\n");
-        int c3 = app_run_linux_sync("/disk2/lxcage3", 0, 0, 120000);
-        kprintf("[lxabi] LXCAGE3 exit -> %d\n", c3);
-        kprintf("[lxabi] launching the pointer-cage probe...\n");
-        int gcrc = app_run_linux_sync("/disk2/lxgcage", 0, 0, 120000);
-        kprintf("[lxabi] LXGCAGE exit -> %d\n", gcrc);
+        /* ON DEMAND ONLY (M2041). These reserve 8 GiB, trim it, and commit
+         * dozens of slabs -- minutes of TCG each. Adding them to the default
+         * boot pushed the whole lxfulltest sequence past the harness's wait, so
+         * the assertions that come AFTER them never ran and reported themselves
+         * as failures ("real threads did not work") in a boot that was merely
+         * unfinished. They have already served their purpose -- proving the
+         * mmap subsystem innocent -- so they are a diagnostic to reach for, not
+         * a tax on every run. */
+        if (g_lxcage) {
+            kprintf("[lxabi] launching the EXACT-ARGUMENTS cage probe...\n");
+            int c3 = app_run_linux_sync("/disk2/lxcage3", 0, 0, 120000);
+            kprintf("[lxabi] LXCAGE3 exit -> %d\n", c3);
+        }
+        if (g_lxcage) {
+            kprintf("[lxabi] launching the pointer-cage probe...\n");
+            int gcrc = app_run_linux_sync("/disk2/lxgcage", 0, 0, 120000);
+            kprintf("[lxabi] LXGCAGE exit -> %d\n", gcrc);
+        }
         kprintf("[lxabi] launching the subprocess-lifecycle probe...\n");
         int wrc = app_run_linux_sync("/disk2/lxwait", 0, 0, 120000);
         kprintf("[lxabi] LXWAIT exit -> %d\n", wrc);

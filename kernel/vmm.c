@@ -616,8 +616,18 @@ static void tlb_discharge(void) {
 
 void vmm_tlb_shootdown_ack(void) { tlb_discharge(); }
 
-void vmm_tlb_shootdown(void) {
-    if (smp_cpu_count <= 1) return;             /* uniprocessor: invlpg was enough */
+/* Returns 1 if EVERY other core acknowledged, 0 if we gave up waiting.
+ *
+ * It used to return void, and that was the dangerous part (M2043). Callers
+ * proceed straight from here to something irreversible -- the COW fault path
+ * does `app_tlb_sync(a); pmm_free_frame(old);` -- so a shootdown that timed out
+ * silently handed a frame back to the allocator while another core still had a
+ * cached translation for it. The comment below is right that the target flushes
+ * on its next entry to the address space, and that is no comfort at all if the
+ * frame has been reallocated to somebody else in the meantime. A caller that is
+ * about to free has to be able to ASK. */
+int vmm_tlb_shootdown(void) {
+    if (smp_cpu_count <= 1) return 1;           /* uniprocessor: invlpg was enough */
     int others = smp_cpu_count - 1;
     /* One shootdown at a time: the pending counter is global. A second caller
      * simply waits its turn, which is fine -- these are rare. */
@@ -651,9 +661,11 @@ void vmm_tlb_shootdown(void) {
         kprintf("[vmm] TLB shootdown timed out waiting for %d core(s) -- they will flush on next entry\n",
                 __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE));
     }
+    int acked = (__atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) == 0);
     for (int c = 0; c < 32; c++) g_tlb_owed[c] = 0;   /* give up cleanly: owe nothing */
     __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+    return acked;
 }
 
 int vmm_protect(uint64_t virt, uint64_t flags) {

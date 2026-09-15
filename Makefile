@@ -340,7 +340,10 @@ LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hello
 #
 # Order-only against ext2.img via a stamp, because the tools are not built
 # here and their mtimes are the host package manager's.
-LXTOOLS := as ld objcopy nasm
+# bash, git and the text tools Claude Code shells out to. It runs `rg`, `git`,
+# and `/bin/bash -c ...` at startup and treats a missing one as a hard error
+# rather than a degraded mode, so they are part of the image, not an extra.
+LXTOOLS := as ld objcopy nasm bash git grep sed awk find ps wc head tail cut sort uniq xargs tr env
 
 # The source the in-guest toolchain assembles. Staged as a plain file, at the
 # path a Linux process inside OS-DEV sees as /hello.s.
@@ -393,6 +396,16 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl
 	@tools/stage-linux-tool.sh $(LXROOT) cc1  "$$(gcc -print-prog-name=cc1 2>/dev/null)"
 	@tools/stage-linux-tool.sh $(LXROOT) collect2 "$$(gcc -print-prog-name=collect2 2>/dev/null)"
 	@tools/stage-linux-tool.sh $(LXROOT) gcc
+	@# ...and the /bin ALIASES. A Linux program execs "/bin/bash" and
+	@# "/bin/git" by absolute path -- Claude Code does both -- so staging them
+	@# only into /usr/bin leaves execve() returning ENOENT and the child
+	@# exiting 127, which is the shell's code for "command not found" and so
+	@# reads like a missing program rather than a missing symlink. (M2041)
+	@mkdir -p $(LXROOT)/bin
+	@for t in bash git grep sed awk; do \
+	    if [ -f $(LXROOT)/usr/bin/$$t ]; then cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t; fi; \
+	 done
+	@echo "  STAGE   /bin aliases (bash git grep sed awk) -- execve uses the /bin path"
 	@# GCC's own FREESTANDING headers (stdint.h, stddef.h, stdarg.h, the
 	@# intrinsics). -ffreestanding still needs these -- they are part of the
 	@# compiler, not of libc -- and cc1 finds them via a path relative to the

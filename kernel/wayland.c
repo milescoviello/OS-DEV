@@ -191,6 +191,7 @@ struct wl_object {
      * stops -- which from outside is indistinguishable from a hang. (M1998) */
     uint32_t version;
     uint32_t link;                 /* xdg_surface -> its wl_surface; xdg_toplevel -> its xdg_surface */
+    uint32_t frame_cb;             /* wl_surface: a pending wl_surface.frame callback id (M2042) */
 };
 
 struct wl_client {
@@ -683,6 +684,23 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         o->attached = rd32(args + 0);                /* the wl_buffer id */
         return;
     }
+    /* wl_surface.frame HAD NO DISPATCH AT ALL (M2042).
+     *
+     * The opcode was #defined and then fell through to wl_unhandled, so the
+     * callback the client allocated was never answered. A toolkit asks "tell me
+     * when it is a good time to draw again" before nearly every frame and will
+     * not produce the next one until it hears back -- so this is a client that
+     * connects, binds every global, builds its widgets, commits once at most,
+     * and then waits for ever. No error, no protocol violation, nothing in any
+     * log but a single "UNHANDLED request" line.
+     *
+     * The id is the client's to allocate; we only have to send done on it. The
+     * timestamp is milliseconds, and clients use it only for animation timing,
+     * so the tick clock is precise enough. */
+    if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_FRAME && alen >= 4) {
+        o->frame_cb = rd32(args + 0);
+        return;
+    }
     if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_COMMIT) {
         /* THE POINT OF ALL OF IT: the client's pixels are now ours to read,
          * in the memory it wrote them to. Nothing was copied to get here. */
@@ -704,6 +722,16 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             /* Tell the client it may reuse the buffer. Without this a client
              * that double-buffers waits forever for its first frame back. */
             wl_send(c, b->id, WL_BUFFER_EV_RELEASE, 0, 0);
+        }
+        /* ...and answer the frame callback, AFTER the commit that presented it
+         * (M2042). Fired here rather than on request so the ordering a client
+         * expects -- frame, commit, done -- actually holds. */
+        if (o->frame_cb) {
+            uint8_t ts[4]; uint32_t ms = (uint32_t)(timer_ticks() * 10u);
+            ts[0] = (uint8_t)ms; ts[1] = (uint8_t)(ms >> 8);
+            ts[2] = (uint8_t)(ms >> 16); ts[3] = (uint8_t)(ms >> 24);
+            wl_send(c, o->frame_cb, WL_CALLBACK_EV_DONE, ts, 4);
+            o->frame_cb = 0;                       /* one done per request */
         }
         return;
     }

@@ -3484,10 +3484,11 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
  *
  * Called AFTER the mapping change and OUTSIDE the vmm lock: a core spinning
  * for that lock with interrupts off could never ack. */
-static void app_tlb_sync(struct app *a) {
-    if (!a) return;
+static int app_tlb_sync(struct app *a) {
+    if (!a) return 1;
     for (int i = 0; i < APP_MAXTHREAD; i++)
-        if (a->thr[i] && a->thr[i]->state != TASK_DEAD) { vmm_tlb_shootdown(); return; }
+        if (a->thr[i] && a->thr[i]->state != TASK_DEAD) return vmm_tlb_shootdown();
+    return 1;                      /* single-threaded: this core's invlpg was enough */
 }
 
 /* Remove [addr, addr+len) from this process's VMA list, splitting any VMA it
@@ -4670,8 +4671,21 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
              *
              * mprotect and munmap were given this in M1963; the COW path was
              * the one that kept a local invlpg. */
-            app_tlb_sync(a);
-            pmm_free_frame(old);                    /* decrements the shared frame's refcount */
+            /* ONLY RELEASE IT IF EVERY OTHER CORE ACTUALLY ACKED (M2043). A
+             * shootdown that timed out leaves a sibling holding a cached
+             * translation, and pmm_free_frame has no quarantine -- a frame
+             * whose count reaches zero is handed to the very next allocation on
+             * any core. Freeing anyway turns a missed IPI into a
+             * use-after-free. Leaking one 4 KiB frame is the strictly better
+             * failure: bounded, harmless, and reported. */
+            if (app_tlb_sync(a)) {
+                pmm_free_frame(old);                /* decrements the shared frame's refcount */
+            } else {
+                static int told;
+                if (!told) { told = 1;
+                    kprintf("[vmm] a COW frame was LEAKED rather than freed: the shootdown "
+                            "did not complete, so another core may still be using it\n"); }
+            }
         }
         a->minflt++;                                /* COW resolve: no disk I/O => minor fault (M1150) */
         return 1;
@@ -6481,7 +6495,39 @@ static int memfd_alloc(const char *name) {
     }
     return -1;
 }
-static void memfd_ref(int idx) { if (idx >= 0 && idx < NMEMFD && memfds[idx].used) memfds[idx].refs++; }
+/* THE memfd REFCOUNT IS SHARED ACROSS PROCESSES, so it needs a lock (M2043).
+ *
+ * `refs++` and `--refs` were plain non-atomic read-modify-writes on an object
+ * designed to be shared -- inherited across fork, passed over a socket with
+ * SCM_RIGHTS, opened by name under /dev/shm. Two cores dropping the last two
+ * references at once can both read 2, both compute 1, and both store 1: the
+ * object leaks a slot out of NMEMFD for the rest of the boot.
+ *
+ * The worse case is both reading 1. Then both compute 0 and both run
+ * `kfree(raw)` -- a DOUBLE FREE of kernel-heap memory, which corrupts the
+ * allocator's own free list. After that any unrelated kmalloc anywhere in the
+ * kernel can return an overlapping block, which is a fully generic mechanism
+ * for "memory that has nothing to do with this reads back wrong". That is the
+ * shape of the corruption being hunted, and this is one way to produce it.
+ *
+ * One lock around the count and the teardown it guards. Same irq_save + spin
+ * idiom the rest of this file uses. */
+static volatile int g_memfd_lock;
+static inline uint64_t memfd_lock_take(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_memfd_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static inline void memfd_lock_give(uint64_t f) {
+    __atomic_store_n(&g_memfd_lock, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+static void memfd_ref(int idx) {
+    if (idx < 0 || idx >= NMEMFD) return;
+    uint64_t f = memfd_lock_take();
+    if (memfds[idx].used) memfds[idx].refs++;
+    memfd_lock_give(f);
+}
 
 /* A memfd's current size, or -1 if this fd is not one (M2000).
  *
@@ -6503,11 +6549,18 @@ long app_memfd_size(int fd) {
     return (long)memfds[idx].size;
 }
 static void memfd_unref(int idx) {
-    if (idx < 0 || idx >= NMEMFD || !memfds[idx].used) return;
-    if (--memfds[idx].refs > 0) return;
-    if (memfds[idx].raw) kfree(memfds[idx].raw);
-    memfds[idx].used = 0; memfds[idx].buf = 0; memfds[idx].raw = 0;
-    memfds[idx].mapped = 0; memfds[idx].size = memfds[idx].cap = 0;
+    if (idx < 0 || idx >= NMEMFD) return;
+    /* Decide who frees UNDER the lock, and take the buffer pointer with us, so
+     * exactly one caller can ever reach the kfree for a given object. (M2043) */
+    void *doomed = 0;
+    uint64_t f = memfd_lock_take();
+    if (memfds[idx].used && --memfds[idx].refs <= 0) {
+        doomed = memfds[idx].raw;
+        memfds[idx].used = 0; memfds[idx].buf = 0; memfds[idx].raw = 0;
+        memfds[idx].mapped = 0; memfds[idx].size = memfds[idx].cap = 0;
+    }
+    memfd_lock_give(f);
+    if (doomed) kfree(doomed);            /* outside the lock: kfree can be slow */
 }
 /* Ensure cap >= need (doubling), preserving the first `size` bytes. 0/-1. */
 static int memfd_grow(struct memfd *m, unsigned long need) {
