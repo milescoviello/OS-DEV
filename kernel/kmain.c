@@ -1009,6 +1009,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the subprocess-lifecycle probe...\n");
         int wrc = app_run_linux_sync("/disk2/lxwait", 0, 0, 120000);
         kprintf("[lxabi] LXWAIT exit -> %d\n", wrc);
+        /* An edge-triggered epoll losing one edge is a whole-process hang, and
+         * nothing here had ever tested the case that loses it: a drain with no
+         * wait in between. (M2059) */
+        kprintf("[lxabi] launching the edge-triggered epoll probe...\n");
+        int erc = app_run_linux_sync("/disk2/lxepoll", 0, 0, 90000);
+        kprintf("[lxabi] LXEPOLL exit -> %d\n", erc);
         kprintf("[lxabi] launching the absolute-deadline probe...\n");
         int trc = app_run_linux_sync("/disk2/lxtime", 0, 0, 90000);
         kprintf("[lxabi] LXTIME exit -> %d\n", trc);

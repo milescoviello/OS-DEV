@@ -461,7 +461,7 @@ struct app {
      * send()/recv()s on it, so a connect that only understood TCP made every
      * getaddrinfo fail with EAI_AGAIN, an error meaning "try later" about a
      * lookup that was never going to happen. */
-    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; uint8_t peer_ip[4]; uint16_t peer_port; } fd[APP_NFD];   /* cloexec/nonblock/peer at END to keep the positional initializers valid (M1218/M1965/M1967) */
+    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; uint8_t peer_ip[4]; uint16_t peer_port; uint8_t epwatch; } fd[APP_NFD];   /* cloexec/nonblock/peer at END to keep the positional initializers valid (M1218/M1965/M1967) */
     /* seccomp-BPF self-filter (M1190): a process installs a bpf.c program that
      * vets its own syscalls. Zero on spawn/fork; inherited across fork; once set
      * it's permanent (privilege drop is one-way). Empty => no filtering overhead. */
@@ -7507,9 +7507,12 @@ static void eof_spin_watch(struct app *a, int fd, long n) {
     }
 }
 static long app_fd_read_inner(int fd, void *buf, unsigned long max);
+/* AN EDGE THAT HAPPENS BETWEEN TWO POLLS (M2059). See epoll_note_drain. */
+static void epoll_note_drain(struct app *a, int fd);
 long app_fd_read(int fd, void *buf, unsigned long max) {
     long n = app_fd_read_inner(fd, buf, max);
     if (g_net_trace) { struct app *a = cur(); if (a) eof_spin_watch(a, fd, n); }
+    if (n > 0) { struct app *a = cur(); if (a) epoll_note_drain(a, fd); }
     return n;
 }
 static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
@@ -7761,7 +7764,17 @@ static long app_file_write_at(struct app *a, int fd, const void *buf, unsigned l
     return (long)len;
 }
 #define SIGPIPE 13   /* real Linux's own number; free here (M1581) */
+static long app_fd_write_inner(int fd, const void *buf, unsigned long len);
 long app_fd_write(int fd, const void *buf, unsigned long len) {
+    long n = app_fd_write_inner(fd, buf, len);
+    /* A write can consume WRITABILITY the same way a read consumes readability
+     * -- fill a pipe or a socket's send ring and the fd goes not-writable. An
+     * edge-triggered EPOLLOUT waiter needs that transition recorded, or it
+     * never hears about the space that opens up later. (M2059) */
+    if (n > 0) { struct app *a = cur(); if (a) epoll_note_drain(a, fd); }
+    return n;
+}
+static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
     struct app *a = cur(); if (!a) return -1;
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned write (M1195) */
         long off = a->fd[fd].off;
@@ -8758,6 +8771,7 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
         e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
         e->items[e->n].disarmed = 0;     /* EPOLLONESHOT has not fired yet (M2016) */
         e->n++;
+        a->fd[fd].epwatch = 1;           /* this descriptor is worth a drain check (M2059) */
         return 0;
     }
     if (op == EPOLL_CTL_MOD) {
@@ -8765,6 +8779,7 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
             e->items[i].events = (int)events; e->items[i].data = data;
             e->items[i].last_ready = 0;   /* M1545: a changed interest set re-arms the edge, same spirit as a fresh ADD */
             e->items[i].disarmed = 0;     /* ...and re-arms EPOLLONESHOT, which is what MOD is FOR (M2016) */
+            a->fd[fd].epwatch = 1;
             return 0;
         }
         return -2;                                                             /* ENOENT: not registered */
@@ -8844,6 +8859,82 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
         }
     }
     return k;
+}
+
+/* AN EDGE THAT HAPPENS BETWEEN TWO POLLS (M2059).
+ *
+ * THE BUG. Our epoll is a POLLING loop: app_epoll_check asks app_fd_ready for
+ * each item and, for an EPOLLET item, reports it only when `last_ready` was 0.
+ * `last_ready` was updated nowhere else -- so the only way an item could ever
+ * become eligible again was for a check to personally OBSERVE it not-ready.
+ *
+ * A wake-up eventfd is never observed in that state. The sequence is:
+ *
+ *   1. epoll_wait   -> eventfd counter is 1, report it, last_ready = 1
+ *   2. the woken thread read()s the eventfd    -> counter 0   (NOT OBSERVED)
+ *   3. another thread write()s the eventfd     -> counter 1
+ *   4. epoll_wait   -> ready == last_ready == 1, SUPPRESSED
+ *
+ * and step 4 repeats forever. Linux cannot lose this: readiness there is
+ * PUSHED -- the eventfd's own wake path puts the file on the instance's ready
+ * list, so the 0 -> 1 transition in step 3 is an event whether or not anybody
+ * was looking. Sampling can only ever see the state, never the transition.
+ *
+ * WHAT IT COST. This is the Claude Code hang. Its dump reads:
+ *
+ *   [poll] epfd 3: fd 4 type 5 want 80000001 -> 1 (edge reported)
+ *   t25 441(3, 548129800e0, 400) = <still blocked in this call>
+ *
+ * thread 25 parked in epoll_pwait2 on epfd 3, while fd 4 -- the eventfd
+ * registered EPOLLIN|EPOLLET on that very instance -- sits READY and
+ * suppressed. Every core idle, no fault in minutes, nothing wrong with the
+ * network: an HTTP/2 POST to api.anthropic.com returns 401 from Node in nine
+ * seconds on this same kernel. The loop simply never woke again.
+ *
+ * THE FIX. Close the sampling gap at the only other moment readiness changes
+ * for a reason we know about: when the process itself consumes it. After a
+ * read or a write, re-ask app_fd_ready; if the fd has gone not-ready, record
+ * that as the transition the poll loop missed. The next arrival is then a
+ * fresh edge.
+ *
+ * Deliberately NOT level-triggered-by-accident: last_ready is cleared only
+ * when the fd really is not ready, so an item that stays ready keeps its
+ * reported edge and an EPOLLET loop cannot spin (which is the M2016 defect).
+ *
+ * The remaining gap is a readiness change caused by something OUTSIDE this
+ * process -- a peer writing into a pipe, a segment arriving -- between two
+ * checks. That one is benign for EPOLLET: the fd is still ready at the next
+ * check, so the level is seen even though the edge was not. The pathological
+ * case is exactly the one above, where the process's own drain hid the dip. */
+static void epoll_note_drain(struct app *a, int fd) {
+    if (!a || fd < 0 || fd >= APP_NFD) return;
+    /* EVERY read and write reaches here, so the uninteresting case has to be
+     * free: APP_NFD is 1024, and scanning the whole table per transfer would
+     * be a real slowdown for a process (a compiler, a build) that never
+     * epolls anything.
+     *
+     * `epwatch` is set when epoll_ctl registers this descriptor and is never
+     * cleared. It lives on the FD ENTRY on purpose: fork and dup2 copy fdents
+     * wholesale, so the flag is inherited automatically -- a counter on
+     * `struct app` would have needed a matching update in app_fd_fork,
+     * app_dup2, app_fcntl's F_DUPFD and exec, and forgetting one would make
+     * this hook silently stop working in a child. Monotonic also means the
+     * only possible error is scanning when we need not, which costs time and
+     * cannot lose an edge. */
+    if (!a->fd[fd].epwatch) return;
+    for (int j = 0; j < APP_NFD; j++) {
+        /* Only epoll instances THIS process owns: items hold fd NUMBERS, and
+         * fd 4 means something different in another address space. */
+        if (!a->fd[j].used || a->fd[j].type != 6) continue;
+        struct epollobj *e = &epolls[a->fd[j].obj];
+        for (int i = 0; i < e->n; i++) {
+            if (e->items[i].fd != fd) continue;
+            if (!e->items[i].last_ready) continue;              /* no edge outstanding */
+            if (!(e->items[i].events & EPOLLET)) continue;      /* level-triggered: last_ready is not a gate */
+            int want = e->items[i].events & ~(int)(EPOLLET | EPOLLONESHOT);
+            if (!app_fd_ready((app_t *)a, fd, want)) e->items[i].last_ready = 0;
+        }
+    }
 }
 
 /* ---- seccomp-BPF self-filter (M1190) ------------------------------------------

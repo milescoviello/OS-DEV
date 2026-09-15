@@ -192,6 +192,8 @@ LXNOPIEDYN: ET_EXEC + PT_INTERP ran
 LXDYN: a dynamically-linked binary ran
 guest exited with status 11
 LXTHREAD: 4 threads
+LXEPOLL: ALL PASSED
+LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
     while [ $i -lt 560 ]; do
@@ -297,6 +299,35 @@ LXTHREAD: 4 threads
         echo "  ok: fork+execve+dup2+pipe: reader counted all 4 lines, status returned via wait4"
     else
         echo "  FAIL: the pipeline did not deliver 4 lines:"; grep -a "LXBOX" "$SLOG3" | head -2; f3=1
+    fi
+    # M2059 -- AN EDGE-TRIGGERED EPOLL MUST NOT LOSE AN EDGE. Our epoll is a
+    # polling loop, and it only ever cleared an item's "edge already reported"
+    # memory when a wait happened to OBSERVE the fd not-ready. A wake-up
+    # eventfd is never observed in that state: write, wait, drain, write again
+    # -- the dip to zero fell between two waits, so the second write was
+    # suppressed and the waiter slept forever with the fd ready in front of it.
+    # That is the shape of Claude Code's hang (every core idle, no fault in
+    # minutes, the network provably fine). lxepoll drives exactly that
+    # sequence, 100 times, and also checks the OPPOSITE failure -- an fd that
+    # stays ready must not fire twice, or the fix has turned edge-triggered
+    # into level-triggered and an event loop spins at full speed.
+    if grep -aq "LXEPOLL: ALL PASSED" "$SLOG3"; then
+        echo "  ok: an edge-triggered epoll edge survives an unobserved drain, 100x, on an eventfd and a pipe"
+    else
+        echo "  FAIL: edge-triggered epoll lost an edge:"; grep -a "LXEPOLL" "$SLOG3" | tail -3; f3=1
+    fi
+    # M2025 -- the subprocess lifecycle Claude Code depends on: 40 children
+    # reaped, a threaded child whose exit_group comes from a helper thread, a
+    # WNOHANG poll that does not block, and ECHILD when there is nothing left.
+    if grep -aq "LXWAIT: reaped 40/40 children" "$SLOG3"; then
+        echo "  ok: fork/wait4 reaped 40 of 40 children"
+    else
+        echo "  FAIL: wait4 did not reap every child:"; grep -a "LXWAIT" "$SLOG3" | tail -3; f3=1
+    fi
+    if grep -aq "WNOHANG polled without blocking" "$SLOG3"; then
+        echo "  ok: wait4 honoured WNOHANG instead of blocking on it"
+    else
+        echo "  FAIL: WNOHANG blocked:"; grep -a "LXWAIT" "$SLOG3" | tail -3; f3=1
     fi
     # mmap: the two shapes a dynamic linker needs. MAP_FIXED (an address the
     # caller chose) and file-backed AT AN OFFSET. The offset test asserts the
