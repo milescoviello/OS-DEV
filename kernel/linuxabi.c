@@ -187,6 +187,7 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_rt_sigaction  13
 #define LXS_rt_sigprocmask 14
 #define LXS_rt_sigreturn_  15
+#define LXS_pause_         34
 #define LXS_rt_sigpending_ 127
 #define LXS_rt_sigsuspend_ 130
 #define LXS_ioctl         16
@@ -2309,6 +2310,31 @@ void linux_syscall_dispatch(struct registers *r) {
         *(uint64_t *)r->rdi = lx_sigset_out(app_sigpending());
         r->rax = 0;
         break;
+    case LXS_pause_:
+        /* WAIT FOR A SIGNAL (M2063). ENOSYS until now, which was harmless only
+         * while nothing could deliver a signal anyway -- and Firefox called it
+         * forty times in one startup. A thread told "that syscall does not
+         * exist" where it expected to sleep until a signal arrives either
+         * spins or gives up; neither is what it asked for.
+         *
+         * app_pause blocks on the CURRENT mask and always returns -1/EINTR,
+         * which is pause()'s only defined success. */
+        __asm__ volatile("sti");            /* it sleeps: the timer has to run */
+        app_pause(r);
+        __asm__ volatile("cli");
+        r->rax = (uint64_t)-(long)LX_EINTR;
+        break;
+    case LXS_rt_sigsuspend_: {              /* (mask, sigsetsize) */
+        /* Same shape, with a temporary mask -- glibc's sigwait and
+         * pthread_cond_wait cancellation path both land here. */
+        if (!r->rdi || !vmm_user_ok(r->rdi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        uint64_t m = lx_sigset_in(*(const uint64_t *)r->rdi);
+        __asm__ volatile("sti");
+        app_sigsuspend(r, m);
+        __asm__ volatile("cli");
+        r->rax = (uint64_t)-(long)LX_EINTR;
+        break;
+    }
     case LXS_rt_sigreturn_:
         /* THE HANDLER'S WAY BACK. glibc's __restore_rt is `syscall(15)`, so
          * without this a Linux signal handler could be entered and never
