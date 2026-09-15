@@ -283,18 +283,42 @@ void vmm_destroy_address_space(uint64_t cr3) {
  * copied instead, so they're never double-freed. The parent's TLB is flushed
  * (CR3 reload) because we write-protected its live pages. Returns 0, or -1.
  */
+/* FORK COPIED ONLY THE FIRST 512 GiB (M2031).
+ *
+ * This walked pml4[0] and nothing else, so a fork() duplicated only the bottom
+ * 512 GiB of the address space. MMAP_TOP is 32 TiB -- PML4 entries 0 through 63
+ * -- and mmap hands out addresses across that whole range, so any mapping above
+ * half a terabyte was simply absent from the child.
+ *
+ * It is not absent in a way that faults, which is what made it so hard to see:
+ * the child still has the VMA (app_fork_common copies the table), so the
+ * address is valid and readable -- it just faults in a FRESH ZERO PAGE. The
+ * child reads zeros where the parent wrote data, and every check passes.
+ *
+ * Claude Code died of this on every subprocess it spawned. Bun's heap sits
+ * around 5 TiB, so the child's argv and path pointers were readable, correctly
+ * aligned, in a real VMA, and pointed at zeros -- which is an empty string. It
+ * called execve("") , got ENOENT, and exited 127, nine times in a row, with no
+ * error anywhere naming a pointer or a page.
+ *
+ * Walk every user PML4 slot (the low half; the kernel's own entries are shared
+ * and identified by matching the master table), and carry the slot index into
+ * the virtual address. */
 int vmm_fork_cow(uint64_t child_cr3) {
     uint64_t cr3 = read_cr3() & ADDR_MASK;
     uint64_t *pml4  = phys_to_table(cr3);
     uint64_t *bpml4 = phys_to_table(kernel_pml4);
-    uint64_t pml4e = pml4[0];
-    if (!(pml4e & PTE_PRESENT) || (pml4e & ADDR_MASK) == (bpml4[0] & ADDR_MASK)) return 0;
-    uint64_t *pdpt  = phys_to_table(pml4e & ADDR_MASK);
-    uint64_t *bpdpt = phys_to_table(bpml4[0] & ADDR_MASK);
     int rc = 0;
+    for (int top = 0; top < 256 && rc == 0; top++) {          /* user half only */
+    uint64_t pml4e = pml4[top];
+    if (!(pml4e & PTE_PRESENT)) continue;
+    if ((bpml4[top] & PTE_PRESENT) && (pml4e & ADDR_MASK) == (bpml4[top] & ADDR_MASK)) continue;  /* shared with the kernel */
+    uint64_t *pdpt  = phys_to_table(pml4e & ADDR_MASK);
+    uint64_t *bpdpt = (bpml4[top] & PTE_PRESENT) ? phys_to_table(bpml4[top] & ADDR_MASK) : 0;
     for (int i = 0; i < 512 && rc == 0; i++) {
         if (!(pdpt[i] & PTE_PRESENT)) continue;
-        if ((pdpt[i] & ADDR_MASK) == (bpdpt[i] & ADDR_MASK)) continue;   /* shared boot PD */
+        if (bpdpt && (bpdpt[i] & PTE_PRESENT) &&
+            (pdpt[i] & ADDR_MASK) == (bpdpt[i] & ADDR_MASK)) continue;   /* shared boot PD */
         if (pdpt[i] & PTE_HUGE) continue;
         uint64_t *pd = phys_to_table(pdpt[i] & ADDR_MASK);
         for (int j = 0; j < 512 && rc == 0; j++) {
@@ -304,7 +328,8 @@ int vmm_fork_cow(uint64_t child_cr3) {
                 uint64_t e = pt[k];
                 if (!(e & PTE_PRESENT) || !(e & PTE_USER)) continue;
                 uint64_t phys = e & ADDR_MASK;
-                uint64_t va = ((uint64_t)i << 30) | ((uint64_t)j << 21) | ((uint64_t)k << 12);  /* PML4 idx 0 */
+                uint64_t va = ((uint64_t)top << 39) | ((uint64_t)i << 30) |
+                              ((uint64_t)j << 21) | ((uint64_t)k << 12);   /* incl. the PML4 slot (M2031) */
                 if (!pmm_refcountable(phys)) {            /* can't refcount -> eager private copy */
                     uint64_t nf = pmm_alloc_frame();
                     if (!nf) { rc = -1; break; }
@@ -333,6 +358,7 @@ int vmm_fork_cow(uint64_t child_cr3) {
             }
         }
     }
+    }   /* end of the PML4 loop (M2031) */
     __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");   /* flush parent TLB (we write-protected it) */
     return rc;
 }
