@@ -43,6 +43,27 @@ struct psem {
 };
 static struct psem tab[SEM_N];
 
+/* FORGET A DYING TASK (M2053).
+ *
+ * This table parks a task_t* so it can be woken later. Nothing told it when
+ * that task was freed, so a stale pointer survived here and a later wake
+ * called task_wake() on reclaimed memory -- which sets a state field and puts
+ * it back on the run queue. A freed task_t then gets SCHEDULED, and its
+ * trampoline runs with whatever the allocator has since put in those bytes.
+ * That is exactly the symptom the kernel reported during a Claude Code run:
+ *
+ *   [task] thread 66 reached its trampoline with no start frame
+ *          -- it was made runnable before its context was complete
+ *
+ * Only the futex table had a forget hook (app_futex_forget). Every other
+ * subsystem that stores a waiter needed the same one. */
+void psem_forget_task(void *t) {
+    for (int i = 0; i < SEM_N; i++)
+        for (int w = 0; w < SEM_WAITERS; w++)
+            if ((void *)tab[i].waiters[w] == t) tab[i].waiters[w] = 0;
+}
+
+
 static int seq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
 
 /* Open (find-or-create) a named semaphore. O_CREAT|O_EXCL fails (EEXIST) if

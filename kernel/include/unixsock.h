@@ -29,3 +29,4 @@ int  unix_accept_nb(int lid);    /* accept without blocking; -1 if nothing pendi
 int  unix_unlisten(int lid);     /* release a listener's name on close(); 0/-1 (M1965) */
 int  unix_shutdown(int ep, int how);  /* half-close: SHUT_WR gives the peer EOF; 0/-1 (M1965) */
 int  unix_format(char *b, int max);                            /* /proc/unix table */
+void unix_forget_task(void *t);      /* a freed task must not stay a stored waiter (M2053) */

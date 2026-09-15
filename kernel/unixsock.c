@@ -101,6 +101,25 @@ struct ulisten {
 };
 static struct ulisten lis[U_LISTEN];
 
+/* FORGET A DYING TASK (M2053).
+ *
+ * This table parks a task_t* so it can be woken later. Nothing told it when
+ * that task was freed, so a stale pointer survived here and a later wake
+ * called task_wake() on reclaimed memory -- which sets a state field and puts
+ * it back on the run queue. A freed task_t then gets SCHEDULED, and its
+ * trampoline runs with whatever the allocator has since put in those bytes.
+ * That is exactly the symptom the kernel reported during a Claude Code run:
+ *
+ *   [task] thread 66 reached its trampoline with no start frame
+ *          -- it was made runnable before its context was complete
+ *
+ * Only the futex table had a forget hook (app_futex_forget). Every other
+ * subsystem that stores a waiter needed the same one. */
+void unix_forget_task(void *t) {
+    for (int i = 0; i < U_LISTEN; i++) if ((void *)lis[i].waiter == t) lis[i].waiter = 0;
+}
+
+
 static int peq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
 
 int unix_listen(const char *path) {

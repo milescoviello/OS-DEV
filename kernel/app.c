@@ -23,6 +23,10 @@
 #include "interrupts.h"   /* struct registers, for ring-3 signal delivery */
 #include "vmm.h"
 #include "unixsock.h"   /* AF_UNIX sockets live in the fd table now (M1965) */
+#include "mbox.h"      /* mbox_forget_task: a freed task must not stay a stored waiter (M2053) */
+#include "mqueue.h"    /* mqueue_forget_task (M2053) */
+#include "sem.h"       /* psem_forget_task (M2053) */
+#include "sysvipc.h"   /* sysvsem_forget_task (M2053) */
 #include "pmm.h"
 #include "vdso.h"
 #include "elf.h"
@@ -1821,6 +1825,7 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
  * its task isn't off-CPU yet (retry next pass). Frees the task_t + kernel stack,
  * the app's address space (a->cr3 — page tables + user frames, via
  * vmm_destroy_address_space), and the apps[] slot. */
+void app_task_forget_everywhere(void *t);   /* every stored waiter drops this task (M2053) */
 static void app_fd_release(struct app *a);   /* close the process's fds/pipes (M1187; defined below) */
 /* A task a reaper may now free: dead (and off its stack), or stopped for good
  * by app_stop_siblings (and off its stack). Anything else is still finishing
@@ -1889,7 +1894,7 @@ int app_reap(app_t *a) {
          * there returns the kernel stack to the allocator while it is in use. */
         if (a->task) {
             task_t *mt = a->task;
-            app_futex_forget(mt);
+            app_task_forget_everywhere(mt);
             if (app_task_reapable(mt))
                 app_task_release(mt);           /* dead, or stopped for good -- either way off its stack */
             else
@@ -1904,7 +1909,7 @@ int app_reap(app_t *a) {
             if (!t) continue;
             /* Same off_cpu rule as the main task above: a DEAD thread may still
              * be finishing its final context_switch. (M1961) */
-            app_futex_forget(t);                 /* and not from the reaper's side either (M1990) */
+            app_task_forget_everywhere(t);       /* and not from the reaper's side either (M1990) */
             /* Same rule as the main task: a STOPPED thread is never scheduled
              * again either, so once it is off its stack its 256 KB kernel stack
              * can go back. Leaving them STOPPED-but-allocated leaked a stack
@@ -8635,13 +8640,43 @@ long app_fork(struct registers *r) { return app_fork_at(r, 0); }
  * finishing its final context_switch on another core, and freeing its stack
  * underneath that is the bug M1961 fixed elsewhere. Returns a slot index, or
  * -1 when every slot really is a live thread. */
+/* Tell EVERY subsystem that parks a task_t* that this one is going away (M2053).
+ *
+ * app_futex_forget existed and was called faithfully; nothing else had a hook
+ * at all. mbox, mqueue, POSIX semaphores, SysV semaphores and AF_UNIX accept
+ * each store a waiter to wake later, and each kept a stale pointer after the
+ * task was freed. A later wake then calls task_wake() on reclaimed memory,
+ * which writes a state field and puts it back on the run queue -- so a FREED
+ * task_t gets scheduled and its trampoline runs on whatever the allocator has
+ * since put in those bytes. The kernel said so out loud during a Claude Code
+ * run, and the guard that printed it is the only reason it was not silent:
+ *
+ *   [task] thread 66 reached its trampoline with no start frame
+ *          -- it was made runnable before its context was complete
+ *
+ * One call site so a sixth subsystem cannot be forgotten by accident. */
+void app_task_forget_everywhere(void *t) {
+    if (!t) return;
+    app_futex_forget(t);
+    mbox_forget_task(t);
+    mqueue_forget_task(t);
+    psem_forget_task(t);
+    sysvsem_forget_task(t);
+    unix_forget_task(t);
+    {   /* the userfaultfd monitor, which lives here rather than in its own file */
+        uint64_t uf = irq_save();
+        if (g_uffd.monitor == (task_t *)t) { g_uffd.monitor = 0; g_uffd.monitor_waiting = 0; }
+        irq_restore(uf);
+    }
+}
+
 static int app_thr_slot(struct app *a) {
     for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) return i;
     for (int i = 0; i < APP_MAXTHREAD; i++) {
         task_t *t = a->thr[i];
         if (!t || t->state != TASK_DEAD) continue;
         if (!__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) continue;
-        app_futex_forget(t);
+        app_task_forget_everywhere(t);
         a->thr[i] = 0;
         task_free(t);
         return i;

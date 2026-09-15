@@ -14,3 +14,4 @@ long mbox_write(const char *name, const void *data, unsigned long len);  /* enqu
 long mbox_read(const char *name, void *buf, unsigned long max);          /* dequeue one (blocks if empty); bytes, or 0 if woken empty */
 int  mbox_format(char *buf, int max);                                    /* list queues + pending depth (backs /proc/ipc) */
 int  mbox_ready(const char *name);                                       /* fswait peek: a message queued? (M1125) */
+void mbox_forget_task(void *t);      /* a freed task must not stay a stored waiter (M2053) */

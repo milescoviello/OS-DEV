@@ -25,3 +25,4 @@ int      sysv_shmget(int key, uint64_t size, int flags);   /* open/create a segm
 uint64_t sysv_shmat(int id);                               /* attach: map into the caller, base VA or 0 */
 int      sysv_shmctl(int id, int cmd);                      /* IPC_RMID only; 0/-1 (M1576) */
 int      sysv_shm_format(char *out, int max);               /* /proc/sysvipc text (M1619) */
+void sysvsem_forget_task(void *t);   /* a freed task must not stay a stored waiter (M2053) */

@@ -11,3 +11,4 @@ int sem_named_wait(int idx);                                            /* block
 int sem_named_trywait(int idx);                                        /* non-blocking sem_wait; 0/-1 (EAGAIN) */
 int sem_named_post(int idx);                                            /* increment + wake waiters; 0/-1 */
 int sem_named_getvalue(int idx, int *out);                             /* read the current value; 0/-1 */
+void psem_forget_task(void *t);      /* a freed task must not stay a stored waiter (M2053) */
