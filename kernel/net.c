@@ -2316,8 +2316,27 @@ void tcp_close(tcp_conn *c) {
             /* Flush unacked data before closing so a graceful close doesn't drop
              * buffered/in-flight bytes: pump ACKs + retransmit briefly. Normally a
              * no-op (a preceding tcp_read already reaped the ACKs). (M1886) */
+            /* A DEADLINE IN TICKS IS NOT A BOUND IF THE CLOCK CAN STOP (M2060).
+             *
+             * A syscall enters through a 0xEE interrupt gate, so it runs with
+             * IF=0 -- and then timer_ticks() never advances, `timer_ticks() <
+             * giveup` is true forever, and this loop becomes infinite. That is
+             * not hypothetical: Claude Code's HTTP client did
+             * setsockopt(SO_LINGER) then close() on a live socket and the
+             * close never returned:
+             *
+             *     t24 54(c, 1, d) = 0
+             *     t24 3(c, 0, 0) = <still blocked in this call>
+             *
+             * The caller should enable interrupts, and the Linux close path now
+             * does. But net.c is also compiled into the host test harness and
+             * cannot reach for `sti` itself, and a teardown that can hang a
+             * process forever if ONE caller forgets is the wrong shape. So bound
+             * the work as well as the time: whichever limit is reached first
+             * wins, and neither depends on a clock that may be frozen. */
             uint64_t giveup = timer_ticks() + 200;   /* ~2 s cap */
-            while (o->snd_una != o->snd_nxt && timer_ticks() < giveup) {
+            int spins = 0;
+            while (o->snd_una != o->snd_nxt && timer_ticks() < giveup && ++spins < 4000) {
                 tcp_rto_check(c, o); tcp_output(c, o);
                 uint8_t buf[1600]; uint8_t *tcp; int dlen;
                 if (tcp_recv_seg(buf, sizeof buf, c->ip, c->sport, c->dport, 20, &tcp, &dlen)) {

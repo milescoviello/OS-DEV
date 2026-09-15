@@ -4332,9 +4332,42 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
     if (new_len == old_len) return old_addr;
 
     if (new_len < old_len) {                              /* SHRINK: free [old_addr+new_len, old_addr+old_len) */
+        /* THE SHOOTDOWN THIS PATH NEVER HAD (M2060). Every other place that
+         * takes a mapping away -- munmap, mprotect, madvise, the COW privatise
+         * -- calls app_tlb_sync, because pmm_free_frame has no quarantine: the
+         * instant a frame's count reaches zero it is handed to the next
+         * allocation on any core, while a sibling thread still holds a cached
+         * translation for it. That is silent cross-process corruption, and it
+         * does not fault anywhere near where it was caused. mremap's shrink
+         * was doing exactly what M2000 fixed in madvise, in a function nobody
+         * revisited. mimalloc shrinks with mremap, so a threaded allocator is
+         * the thing that reaches it.
+         *
+         * Unmap everything first, then flush ONCE, then free -- and only free
+         * if every other core acked, for the same reason the COW path leaks
+         * rather than frees on a timed-out IPI. */
+        uint64_t freed[64]; int nfreed = 0; int leaked = 0;
         for (uint64_t p = old_addr + new_len; p < old_addr + old_len; p += PAGE_SIZE) {
             uint64_t ph = vmm_translate(p);
-            if (ph) { vmm_unmap(p); pmm_free_frame(ph); }
+            if (!ph) continue;
+            vmm_unmap(p);
+            if (nfreed < 64) freed[nfreed++] = ph;
+            else {                                        /* batch full: flush and drain */
+                if (app_tlb_sync(a)) { for (int k = 0; k < nfreed; k++) pmm_free_frame(freed[k]); }
+                else leaked += nfreed;
+                nfreed = 0;
+                freed[nfreed++] = ph;
+            }
+        }
+        if (nfreed) {
+            if (app_tlb_sync(a)) { for (int k = 0; k < nfreed; k++) pmm_free_frame(freed[k]); }
+            else leaked += nfreed;
+        }
+        if (leaked) {
+            static int told;
+            if (!told) { told = 1;
+                kprintf("[vmm] mremap LEAKED %d frame(s) rather than freeing them: the shootdown "
+                        "did not complete, so another core may still be using them\n", leaked); }
         }
         a->vma[vi].len = new_len;
         return old_addr;
@@ -5412,6 +5445,44 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
         if (have_vma) {
             uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
             uint64_t cpte = vmm_pte_raw(page);
+            /* PROT_NONE READ AS ZEROS (M2060).
+             *
+             * Nothing in this handler ever consulted VMA_PROT_READ. Only WRITE
+             * and EXEC were checked, so a READ of a PROT_NONE page inside a
+             * recorded VMA took the demand-zero path below, got a fresh zeroed
+             * frame, and SUCCEEDED. A reservation the program made precisely so
+             * that touching it would fail instead answered every question with
+             * zero.
+             *
+             * This is the same class as M2031's fork bug, and just as
+             * invisible: a missing mapping that returns zeros instead of
+             * faulting passes every assertion. What made it matter is what a
+             * 64-bit runtime uses PROT_NONE for. JavaScriptCore reserves its
+             * 4 GiB structure heap PROT_NONE and deliberately leaves BLOCK
+             * ZERO uncommitted so that `StructureID 0` is an invalid id --
+             * `decode(0)` is meant to be a segfault. Here it read zeros, so a
+             * zeroed JSCell decoded to a Structure of all zeros, whose
+             * m_classInfo was null, and the GC's
+             *
+             *     call *0xd0(%rax)      with rax = 0
+             *
+             * faulted at CR2=0xd0 inside SlotVisitor::visitChildren -- pages
+             * away from the thing that was actually wrong, and with the one
+             * check that would have named it (JSC's own decoded-Structure
+             * validation) reading a zero it should never have been able to
+             * read.
+             *
+             * A write or an instruction fetch is rejected further down by the
+             * WRITE/EXEC checks; this is the read case, which had no check at
+             * all. mprotect(PROT_NONE) sets prot = 0 and VMA_NEW defaults to
+             * READ|WRITE, so a prot of exactly 0 is always deliberate. */
+            if (!(v.prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC))) {
+                static int told;
+                if (++told <= 8)
+                    kprintf("[fault] access to a PROT_NONE mapping at %lx (vma %lx+%lx) -- "
+                            "refusing, not zero-filling\n", cr2, v.start, v.len);
+                return 0;
+            }
             if (cpte & PTE_PRESENT) {
                 /* The page IS mapped, so this is a PERMISSION fault, not a
                  * missing one -- and "return 1" (retry) on a permission fault

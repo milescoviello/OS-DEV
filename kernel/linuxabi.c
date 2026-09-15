@@ -2955,7 +2955,19 @@ void linux_syscall_dispatch(struct registers *r) {
                     (unsigned long)timer_ms(), app_current_pid(), a1);
             lx_trace_dump_last("that socket's last seconds", 48);
         }
-        if (app_fd_close((int)a1) == 0) { r->rax = 0; break; }
+        /* CLOSE CAN BLOCK, SO IT NEEDS THE TIMER (M2060). Closing a live TCP
+         * socket flushes unacked data with a deadline measured in timer ticks,
+         * and this dispatch runs with IF=0 -- so the deadline was unreachable
+         * and close() never returned. The poll/epoll/nanosleep handlers above
+         * already do exactly this for the same reason. */
+        {
+            int cl_sock = (app_fd_type((int)a1) == 10 || app_fd_type((int)a1) == 16 ||
+                           app_fd_type((int)a1) == 12 || app_fd_type((int)a1) == 15);
+            int cl_rc;
+            if (cl_sock) { __asm__ volatile("sti"); cl_rc = app_fd_close((int)a1); __asm__ volatile("cli"); }
+            else cl_rc = app_fd_close((int)a1);
+            if (cl_rc == 0) { r->rax = 0; break; }
+        }
         /* fd 0/1/2 are the console when they are not fd-table entries -- they
          * ARE open, so closing them succeeds; there is simply nothing to free.
          * Returning EBADF made coreutils' close_stdout report

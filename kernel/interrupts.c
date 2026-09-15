@@ -277,8 +277,16 @@ void isr_dispatch(struct registers *r) {
              * identical. One number separates them. */
             kprintf("[fault] FS_BASE=%p (a CR2 of 0x28 with FS_BASE=0 is the stack canary, not a null deref)\n",
                     (void *)(unsigned long)task_fs_base_live_value());
-            kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) -- terminating it\n",
-                    exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2);
+            /* WHICH THREAD (M2060). This line named neither the tid nor the
+             * thread's own name, so attributing a fault in a program with
+             * fifteen named threads meant matching `rsp` against a stack
+             * address that happened to appear in the syscall ring -- and
+             * getting it wrong sends you to the wrong subsystem entirely. A
+             * runtime names its threads for exactly this purpose; print it. */
+            kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) "
+                    "[tid %d '%s'] -- terminating it\n",
+                    exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2,
+                    task_current_id(), task_name_of(task_self()));
             app_describe_addr(r->rip);   /* which library, and where inside it (M2003) */
             if (r->int_no == 14) app_describe_fault_addr();   /* ...and what the FAULTING page is (M2005) */
             /* Dump the registers for a ring-3 fault too (M1945). The panic path
