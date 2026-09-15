@@ -105,6 +105,52 @@ int main(void) {
         ooo_store(&fuzz_o, theirseq, seq, fuzz, dl);
     }
 
+    /* 3. A TIMEOUT IS NOT END-OF-STREAM (M2026).
+     *
+     * net_tcp_sock_recv answers three different questions with one long, and
+     * it used to collapse two of them: "nothing arrived before the deadline"
+     * and "the peer closed" both returned 0. app_fd_read passes that straight
+     * to the application, where POSIX read() defines 0 as EOF -- so a socket
+     * that was merely quiet was reported as a closed connection.
+     *
+     * Claude Code froze mid-answer on this, with the capture showing its
+     * reply (len=1367) arriving and being ACKed, and no FIN anywhere.
+     *
+     * The three answers must stay distinct: EAGAIN for not-yet, 0 for a real
+     * EOF, -1 for a bad descriptor. */
+    {
+        int idx = 0;
+        for (int i = 0; i < TCPSOCK_N; i++) if (!g_tcpsock[i].used) { idx = i; break; }
+        g_tcpsock[idx].used = 1; g_tcpsock[idx].refs = 1;
+        g_tcpsock[idx].eof = 0; g_tcpsock[idx].c.up = 1;
+        g_tcpsock[idx].nonblock = 0;            /* the BLOCKING path: it is the one that timed out */
+        g_tcpsock[idx].opt_rcvtimeo = 10;       /* ms -- timer_ticks() advances on every call */
+        g_tcpsock[idx].rxhead = g_tcpsock[idx].rxtail = 0;
+        g_consumed = 1;                         /* the stubbed NIC has nothing to give */
+
+        long quiet = net_tcp_sock_recv(idx, buf, (int)sizeof buf);
+        if (quiet != NET_SOCK_EAGAIN) {
+            printf("nettest: FAIL a quiet socket answered %ld, not EAGAIN (%d)"
+                   " -- a timeout is being reported as END OF STREAM\n", quiet, NET_SOCK_EAGAIN);
+            return 1;
+        }
+        printf("nettest: ok  a socket with no data YET answers EAGAIN, not EOF\n");
+
+        g_tcpsock[idx].eof = 1;                 /* now a REAL end of stream */
+        long ended = net_tcp_sock_recv(idx, buf, (int)sizeof buf);
+        if (ended != 0) {
+            printf("nettest: FAIL a closed socket answered %ld, not 0 (EOF)\n", ended);
+            return 1;
+        }
+        g_tcpsock[idx].eof = 0; g_tcpsock[idx].c.up = 0;   /* connection down is EOF too */
+        if (net_tcp_sock_recv(idx, buf, (int)sizeof buf) != 0) {
+            printf("nettest: FAIL a down connection did not answer 0 (EOF)\n");
+            return 1;
+        }
+        printf("nettest: ok  ...and a genuinely closed one still answers 0\n");
+        g_tcpsock[idx].used = 0;
+    }
+
     printf("nettest: %d tcp_recv_seg + %d ooo_store fuzz iters — ASan/UBSan clean\n", ITERS, ITERS);
     return 0;
 }

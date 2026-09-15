@@ -98,7 +98,7 @@ int  net_tcp_sock_set_nonblock(int idx, int on);            /* O_NONBLOCK -> EAG
 int  net_udp_readable(uint16_t sport);                      /* poll: is a datagram queued for this port? (M1967) */
 int  net_tcp_sock_connect(int idx, const uint8_t ip[4], uint16_t port);  /* 0/-1 */
 long net_tcp_sock_send(int idx, const void *buf, int len);  /* bytes/-1 */
-long net_tcp_sock_recv(int idx, void *buf, int max);        /* bytes/0 timeout/-1 closed */
+long net_tcp_sock_recv(int idx, void *buf, int max);        /* bytes / NET_SOCK_EAGAIN not-yet / 0 EOF / -1 bad fd (M2026) */
 void net_tcp_sock_ref(int idx);                             /* a dup()/fork() alias of an existing fd (M1603) */
 void net_tcp_sock_close(int idx);                           /* drop a reference; closes the TCB at 0 (M1603) */
 int  net_tcp_sock_setopt(int idx, int level, int optname, int val);   /* 0/-1 (M1554) */

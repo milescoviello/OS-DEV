@@ -1067,7 +1067,24 @@ long net_tcp_sock_recv(int idx, void *buf, int max) {
     for (;;) {
         if (tcpsock_pump(idx) > 0 || rxcount(idx) > 0) break;
         if (g_tcpsock[idx].eof || !g_tcpsock[idx].c.up) return 0;
-        if (timer_ticks() >= deadline) return 0;                  /* timed out: no data */
+        /* A TIMEOUT IS NOT END-OF-STREAM (M2026).
+         *
+         * This returned 0, and app_fd_read hands that straight to the
+         * application, where POSIX read() defines 0 as END OF FILE. So a
+         * socket that simply had nothing to give YET was reported as a
+         * connection the peer had closed.
+         *
+         * Claude Code froze mid-answer on exactly this. The capture shows the
+         * whole exchange succeeding -- request out, `len=1367` of response
+         * back, our own ACK for it -- and no FIN and no RST anywhere. The
+         * reply was sitting in this stack while the reader was told the
+         * stream had ended, so it waited for a continuation that, as far as
+         * it was concerned, could never come.
+         *
+         * EOF is one specific thing and it is already tested one line above:
+         * `eof` or the connection down. Everything else is "not yet", which
+         * is what EAGAIN means. */
+        if (timer_ticks() >= deadline) return NET_SOCK_EAGAIN;    /* no data YET -- not EOF */
         task_sleep_ms(2);
     }
     {
