@@ -1,5 +1,40 @@
 # What's next
 
+> **(M2063) SIGNALS WERE ACCEPTED AND NEVER DELIVERED.**
+>
+> `rt_sigaction` and `rt_sigprocmask` were, verbatim, `r->rax = 0; /*
+> accepted-and-ignored for now */`, and kill/tkill/tgkill said *"other
+> signals: accepted, undelivered"*. Those are the **twelfth and thirteenth**
+> "granted in name only" defects in this campaign, and together they made
+> every other piece of signal support pointless: nothing could raise anything,
+> so none of it could ever run.
+>
+> The worst-behaved part is the QUERY. `rt_sigaction(sig, NULL, &old)` asks
+> what is installed; answering 0 without writing `old` leaves the caller
+> reading its own uninitialised stack **as a function pointer**.
+>
+> Four independent fixes, each verified by reverting it alone:
+>
+> | revert | checks that fail |
+> |---|---|
+> | rt_sigaction/rt_sigprocmask/rt_sigpending/rt_sigreturn | 6 of 9 |
+> | kill/tkill/tgkill routed to real delivery | 3 |
+> | `app_deliver_pending` on the **Linux** syscall return (the native and interrupt returns both had it; the Linux entry never did, so a process could raise a signal and return straight past its own handler) | 2 |
+> | the sigset **bit numbering** -- Linux's `sigmask(sig)` is `1 << (sig - 1)`, ours is indexed by the signal number, so SIGWINCH is bit 27 on one side and bit 28 on the other | 2 |
+>
+> That last one is the M1967 class again: *only an exact-value assertion finds
+> it*. Block SIGWINCH, record SIGPROF as blocked, and the signal the program
+> asked you to hold back is delivered immediately -- with a success return
+> every step of the way.
+>
+> The numbers now match Linux too (SIGWINCH 24 → 28, SIGRTMIN 28 → 34,
+> SIGXCPU/SIGXFSZ/SIGVTALRM/SIGPROF at Linux's numbers, `APP_NSIG` 32 → 65 and
+> every mask 64-bit). **That renumbering found a fifth bug by itself**: app.c
+> carried local `#define SIGXCPU 25` / `SIGXFSZ 26` overrides from when 24 was
+> SIGWINCH, which silently shadowed the header -- so the RLIMIT_CPU timer
+> raised the wrong signal, and with delivery working for the first time it hung
+> the whole ABI suite. A redefinition warning nobody was reading.
+
 > **(M2061-M2062) THE DIAGNOSTIC THAT PANICKED, AND A FILENAME CUT AT 31 CHARACTERS.**
 >
 > Both were found by finally being able to READ things: M2056 made a Linux
