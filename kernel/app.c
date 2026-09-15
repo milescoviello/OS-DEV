@@ -407,6 +407,7 @@ struct app {
 /* -append lxnettrace: log every socket read/write a Linux process makes, with
  * byte counts (M2016). Off by default; one line per call is far too much for a
  * normal boot and exactly right when a handshake is not completing. */
+unsigned long g_readahead_pages;   /* pages filled by readahead rather than by a fault (M2019) */
 int g_net_trace;
 static unsigned long g_net_calls;   /* socket reads+writes, to notice a connection going quiet (M2016) */
 static struct app apps[MAX_APPS];
@@ -4400,6 +4401,77 @@ static uint64_t vma_pte_flags(uint8_t prot) {
  * machine down with an unnamed one. */
 static volatile uint64_t g_fault_chain[16][6];
 unsigned long g_spurious_faults;   /* stale-TLB faults invalidated and retried (M2005) */
+/* Fill the pages AFTER `page` from the same file in one read (M2019).
+ *
+ * Deliberately best-effort: every failure path simply stops, because the
+ * demand-fault handler above will do the work again correctly if this does
+ * nothing at all. It must never make a page DIFFERENT from what a fault would
+ * have produced -- only earlier.
+ *
+ * `vcopy` is the caller's private snapshot of the VMA, taken under the lock;
+ * re-reading the table here would race a concurrent munmap. */
+#define FAULT_READAHEAD_PAGES 16          /* 64 KiB: one disk request instead of sixteen */
+static void app_fault_readahead(struct app *a, const void *vcopy, uint64_t page) {
+    const struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared;
+                   uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid; } *v = vcopy;
+    uint64_t first = page + PAGE_SIZE;
+    uint64_t vend  = v->start + v->len;
+    if (first >= vend) return;
+    uint64_t n = (vend - first) / PAGE_SIZE;
+    if (n > FAULT_READAHEAD_PAGES) n = FAULT_READAHEAD_PAGES;
+    if (!n) return;
+    /* Never past the file-backed length: beyond it the correct content is
+     * zero, and a demand fault already produces that without any I/O. */
+    if (v->fvalid) {
+        uint64_t voff = first - v->start;
+        if (voff >= v->fvalid) return;
+        uint64_t avail = (v->fvalid - voff + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (n > avail) n = avail;
+        if (!n) return;
+    }
+    /* Stop at the first page that is already present -- past it we would be
+     * guessing about a region someone else is managing. */
+    uint64_t todo = 0;
+    for (todo = 0; todo < n; todo++)
+        if (vmm_pte_raw(first + todo * PAGE_SIZE) & PTE_PRESENT) break;
+    if (!todo) return;
+
+    uint8_t *buf = kmalloc(todo * PAGE_SIZE);
+    if (!buf) return;
+    uint64_t voff = first - v->start;
+    unsigned long want = todo * PAGE_SIZE;
+    if (v->fvalid && voff + want > v->fvalid) want = v->fvalid - voff;
+    const char *fp = g_vma_paths[v->fidx];
+    __asm__ volatile("sti");
+    long got = vfs_pread(fp, buf, want, v->foff + voff);
+    __asm__ volatile("cli");
+    if (got <= 0) { kfree(buf); return; }
+
+    for (uint64_t k = 0; k < todo; k++) {
+        uint64_t off = k * PAGE_SIZE;
+        if ((long)off >= got) break;                  /* short read: stop, let faults finish it */
+        uint64_t va = first + off;
+        uint64_t frame = pmm_alloc_frame();
+        if (!frame) break;
+        uint8_t *z = (uint8_t *)hhdm(frame);
+        long have = got - (long)off; if (have > PAGE_SIZE) have = PAGE_SIZE;
+        for (long b = 0; b < have; b++) z[b] = buf[off + b];
+        for (long b = have; b < PAGE_SIZE; b++) z[b] = 0;
+        uint64_t mfl = vma_alloc_lock(a);
+        if (vmm_pte_raw(va) & PTE_PRESENT) {          /* someone got there first */
+            vma_alloc_unlock(a, mfl); pmm_free_frame(frame); break;
+        }
+        if (vmm_map(va, frame, vma_pte_flags(v->prot)) != 0) {
+            vma_alloc_unlock(a, mfl); pmm_free_frame(frame); break;
+        }
+        vma_alloc_unlock(a, mfl);
+        __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+        a->majflt++;                                   /* it came from disk, like any other filled page */
+        g_readahead_pages++;
+    }
+    kfree(buf);
+}
+
 static int app_fault_handle_inner(uint64_t cr2, uint64_t err);
 int app_fault_handle(uint64_t cr2, uint64_t err) {
     /* PER-TASK depth (M1992). This counted per CORE, which is wrong for the
@@ -4700,6 +4772,22 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                 vma_alloc_unlock(a, mfl);
             }
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+            /* READAHEAD (M2019). One 4 KiB disk read per page fault is why a
+             * 214 MB demand-paged executable takes minutes to start: Claude
+             * Code touches well over a hundred megabytes before it draws
+             * anything, and every single page of it was a separate trip
+             * through the filesystem and the ATA driver. The bytes are
+             * contiguous in the file and the driver's per-request overhead
+             * dwarfs the transfer, so reading a cluster costs barely more than
+             * reading one page and saves fifteen faults.
+             *
+             * PRIVATE file mappings only -- a MAP_SHARED page has writeback
+             * semantics that a speculative fill has no business guessing at --
+             * and strictly inside the VMA and its fvalid bound, so readahead
+             * can never invent bytes a demand fault would not have produced.
+             * Pages another thread already mapped are skipped, not replaced. */
+            if (v.file_backed && !v.shared && v.fidx >= 0 && v.fidx < g_vma_npath)
+                app_fault_readahead(a, &v, page);
             return 1;
         }
     }
@@ -8884,8 +8972,8 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
             int live = 0; unsigned long maj = 0, min = 0;
             for (int i = 0; i < MAX_APPS; i++)
                 if (apps[i].used) { live++; maj += apps[i].majflt; min += apps[i].minflt; }
-            kprintf("[runsync] t=%ds free=%luK apps=%d majflt=%lu minflt=%lu\n", waited / 1000,
-                    (unsigned long)(pmm_free_bytes() >> 10), live, maj, min);
+            kprintf("[runsync] t=%ds free=%luK apps=%d majflt=%lu minflt=%lu readahead=%lu\n", waited / 1000,
+                    (unsigned long)(pmm_free_bytes() >> 10), live, maj, min, g_readahead_pages);
             /* FROZEN COUNTERS MEAN STUCK, AND STUCK SHOULD SAY SO NOW (M2004).
              *
              * The full thread dump below only ran when the whole budget expired
