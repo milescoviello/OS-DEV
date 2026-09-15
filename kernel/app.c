@@ -287,6 +287,11 @@ struct app {
      * and the code point built so far. One code point becomes one cell. */
     uint8_t  u8need;
     unsigned long u8cp;
+    /* Bytes owed to a Linux reader from a key that expands to an ESCAPE
+     * SEQUENCE -- arrows, Home, End, Delete (M2024). Our keyboard hands the
+     * kernel one sentinel byte per key; a terminal sends three or four. */
+    char     keyseq[8];
+    uint8_t  keyseq_n, keyseq_i;
     int      cx, cy;
     char     sb[SB_ROWS][APP_COLS_MAX];  /* scrollback: lines that scrolled off */
     int      sb_count;                   /* how many scrollback lines are stored */
@@ -1456,6 +1461,18 @@ void app_render(app_t *a, int px, int py, int focused) {
 
 int app_alive(app_t *a) { return a && a->used && !a->exited; }
 
+/* Process-slot enumeration for the reaper (M2025). Returns slot `i` only if it
+ * holds a process that has EXITED and is still waiting to be reaped -- the WM
+ * uses it to sweep up processes that own no window, which its windows[] loop
+ * cannot see. Nothing else should walk apps[] from outside. */
+int app_slot_max(void) { return MAX_APPS; }
+app_t *app_exited_slot(int i) {
+    if (i < 0 || i >= MAX_APPS) return 0;
+    struct app *a = &apps[i];
+    if (!a->used || !a->exited || a->zombie) return 0;
+    return (app_t *)a;
+}
+
 /* Does this app's window currently show the blinking text caret (app_render,
  * M1527)? Lets the desktop's main loop know it must force a full redraw on
  * the once-a-second clock tick even when otherwise idle, so the blink is
@@ -1680,18 +1697,60 @@ static void app_notify_pdeathsig(int ppid) {
  * mbox.c's own version of this, fixed as M1608 earlier this session. Only the
  * check+flag-set is locked; the block itself must NOT happen while holding it
  * (would deadlock the WM's own wake attempt against this now-parked core). */
-long app_waitpid(int pid, int *status) {
+/* Turn any of MY exited children into collectable zombies, in the WAITER's own
+ * context (M2025).
+ *
+ * app_reap is the only thing that zombifies an exited child, and until now the
+ * only thing that called it was the window manager's loop over windows[]. So a
+ * child was reapable only if it owned a window -- and the WM stops handing out
+ * windows at the MAX_WINDOWS cap, deliberately leaving the app PENDING rather
+ * than dropping it. A child parked in that queue never zombified, so its
+ * parent's wait4() blocked forever.
+ *
+ * That is a true deadlock, not a delay: the pending child can only get a window
+ * once one CLOSES, closing goes through this same reap loop, and the window
+ * that would have to close belongs to the parent -- which is the process stuck
+ * in wait4(). Claude Code spawning its 17th helper wedged the machine, with
+ * every core halted and no syscall for 45 seconds.
+ *
+ * Reaping from the waiter removes the dependency on the WM entirely: the parent
+ * is by definition a different context from the dying child, which is all
+ * app_reap's off_cpu rule requires. */
+static int app_reap_children_of(struct app *me) {
+    int did = 0;
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app *c = &apps[i];
+        /* Read the flags once, unlocked, exactly as the WM's own reap loop
+         * does: app_reap re-checks every one of them under its own rules. */
+        if (!c->used || !c->exited || c->zombie || c->parent != me->pid) continue;
+        if (app_reap((app_t *)c)) did = 1;
+    }
+    return did;
+}
+
+/* wait4's blocking and WNOHANG forms. `nohang` returns 0 (not -1) when children
+ * exist but none is ready, which is what Linux does and what an event loop
+ * polling its subprocesses depends on -- see the LXS_wait4_ case, which until
+ * M2025 discarded the options argument and so blocked forever on WNOHANG. */
+long app_wait4(int pid, int *status, int nohang) {
     struct app *me = cur();
     if (!me) return -1;
     for (;;) {
+        app_reap_children_of(me);                  /* collect before looking (M2025) */
         uint64_t f = irq_save();
-        struct app *z = 0; int have = 0;
+        struct app *z = 0; int have = 0, finishing = 0;
         for (int i = 0; i < MAX_APPS; i++) {
             struct app *c = &apps[i];
             if (!c->used || c->parent != me->pid) continue;
             if (pid > 0 && c->pid != pid) continue;
             have = 1;
             if (c->zombie) { z = c; break; }
+            /* Exited, but app_reap above declined it: the task has set
+             * TASK_DEAD and not yet finished its final context switch. It will
+             * zombify within a tick, so poll rather than block -- nothing will
+             * wake us, because the wake happens inside the reap we just
+             * refused to complete. */
+            if (c->exited) finishing = 1;
         }
         if (z) {
             int code = z->exit_code, cpid = z->pid;
@@ -1701,12 +1760,15 @@ long app_waitpid(int pid, int *status) {
             return cpid;
         }
         if (!have) { irq_restore(f); return -1; }  /* no matching children to wait for */
+        if (nohang) { irq_restore(f); return 0; }  /* children exist, none ready */
+        if (finishing) { irq_restore(f); task_sleep_ms(1); continue; }
         me->waiting = 1;
         irq_restore(f);
         task_block();                              /* woken by app_reap when a child zombifies */
         me->waiting = 0;
     }
 }
+long app_waitpid(int pid, int *status) { return app_wait4(pid, status, 0); }
 /* waitid (M1227): the superset of waitpid — supports WNOHANG (non-blocking reap,
  * so an event loop can supervise children) and fills a siginfo. idtype P_PID (a
  * specific child), P_ALL (any), or P_PIDFD (a pidfd carrying the pid). Returns 0
@@ -1720,6 +1782,7 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
         want = me->fd[id].obj; idtype = P_PID;
     }
     for (;;) {
+        app_reap_children_of(me);                  /* same self-reaping as wait4 (M2025) */
         uint64_t f = irq_save();
         struct app *z = 0; int have = 0;
         for (int i = 0; i < MAX_APPS; i++) {
@@ -1755,14 +1818,39 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
  * the app's address space (a->cr3 — page tables + user frames, via
  * vmm_destroy_address_space), and the apps[] slot. */
 static void app_fd_release(struct app *a);   /* close the process's fds/pipes (M1187; defined below) */
+/* A task a reaper may now free: dead (and off its stack), or stopped for good
+ * by app_stop_siblings (and off its stack). Anything else is still finishing
+ * and must be left for the next pass. (M2025) */
+static int app_task_reapable(task_t *t) {
+    if (!t) return 1;
+    if (t->state == TASK_DEAD)
+        return __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE) != 0;
+    if (t->state == TASK_STOPPED) return task_off_stack(t);
+    return 0;
+}
+/* Free a task the gate above accepted. A STOPPED one is still linked into the
+ * scheduler's ring and must be unlinked first -- task_free only releases
+ * memory. If the unlink is refused (it went back on a CPU under us) leave the
+ * task alone and let the next reap pass try again. (M2025) */
+static void app_task_release(task_t *t) {
+    if (!t) return;
+    if (t->state == TASK_STOPPED && !task_retire_stopped(t)) return;
+    task_free(t);
+}
 int app_reap(app_t *a) {
     if (!a) return 1;
     if (a->zombie) return 1;                  /* already reaped to a zombie: resources freed, slot kept for waitpid */
     /* off_cpu, not just TASK_DEAD: the state is set BEFORE the dying task's
      * final context_switch, which still writes to its own task_t. Freeing it
      * on state alone is a use-after-free of a live kernel stack. (M1961) */
-    if (a->used && a->exited && (!a->task || (a->task->state == TASK_DEAD &&
-                                              __atomic_load_n(&a->task->off_cpu, __ATOMIC_ACQUIRE)))) {
+    /* A STOPPED MAIN TASK COUNTS AS GONE TOO (M2025). This gate used to demand
+     * TASK_DEAD, and app_stop_siblings leaves the main task STOPPED whenever a
+     * non-main thread is the one that called exit_group -- the normal shape for
+     * every Linux runtime. A STOPPED task never reaches TASK_DEAD (it is never
+     * scheduled again to run task_exit), so the gate was unsatisfiable: the
+     * process stayed un-reaped and un-zombified for ever and its parent hung in
+     * wait4(). See task_off_stack for why STOPPED needs its own proof. */
+    if (a->used && a->exited && (!a->task || app_task_reapable(a->task))) {
         {
             uint64_t uf = irq_save();      /* pairs with app_uffd_read/app_fault_handle's own lock (M1612) */
             if (g_uffd.active && g_uffd.owner == a) {     /* uffd owner gone: tear down, free any blocked monitor (M1134) */
@@ -1784,8 +1872,8 @@ int app_reap(app_t *a) {
         if (a->task) {
             task_t *mt = a->task;
             app_futex_forget(mt);
-            if (mt->state == TASK_DEAD && __atomic_load_n(&mt->off_cpu, __ATOMIC_ACQUIRE))
-                task_free(mt);
+            if (app_task_reapable(mt))
+                app_task_release(mt);           /* dead, or stopped for good -- either way off its stack */
             else
                 task_stop(mt);                  /* still finishing: never scheduled again, never freed here */
         }
@@ -1799,7 +1887,11 @@ int app_reap(app_t *a) {
             /* Same off_cpu rule as the main task above: a DEAD thread may still
              * be finishing its final context_switch. (M1961) */
             app_futex_forget(t);                 /* and not from the reaper's side either (M1990) */
-            if (t->state == TASK_DEAD && __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) task_free(t);
+            /* Same rule as the main task: a STOPPED thread is never scheduled
+             * again either, so once it is off its stack its 256 KB kernel stack
+             * can go back. Leaving them STOPPED-but-allocated leaked a stack
+             * per thread per exited process. (M2025) */
+            if (app_task_reapable(t)) app_task_release(t);
             else task_stop(t);
             a->thr[i] = 0;
         }
@@ -6654,9 +6746,47 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
         struct app *src = a->out_to ? a->out_to : a;
         if (!max) return 0;
         if (!a->out_to && !src->cols) return 0;        /* genuinely no terminal */
+        /* Finish handing over a sequence started by a previous read, before
+         * looking for another key (M2024). */
+        if (a->keyseq_i < a->keyseq_n) {
+            unsigned long k = 0;
+            while (k < max && a->keyseq_i < a->keyseq_n) ((char *)buf)[k++] = a->keyseq[a->keyseq_i++];
+            if (a->keyseq_i >= a->keyseq_n) a->keyseq_i = a->keyseq_n = 0;
+            return (long)k;
+        }
         for (;;) {
             int c = iq_get(src);
             if (c >= 0) {
+                /* ARROW KEYS ARE ESCAPE SEQUENCES (M2024).
+                 *
+                 * Our keyboard delivers one sentinel byte per extended key --
+                 * 0x11..0x14 for the arrows -- which is what every OS-DEV app
+                 * reads. A terminal sends `ESC [ A`, and a Linux TUI matches on
+                 * exactly that. So Claude Code's menus could be SEEN but not
+                 * NAVIGATED: every arrow press arrived as a control character
+                 * it had no meaning for, and the selection never moved. Same
+                 * class as the Return key in M2014 -- the key was delivered,
+                 * in an encoding the program does not speak. */
+                const char *seq = 0;
+                switch (c) {
+                case 0x11: seq = "\x1b[A"; break;   /* up    */
+                case 0x12: seq = "\x1b[B"; break;   /* down  */
+                case 0x13: seq = "\x1b[D"; break;   /* left  */
+                case 0x14: seq = "\x1b[C"; break;   /* right */
+                case 0x15: seq = "\x1b[5~"; break;  /* page up   */
+                case 0x16: seq = "\x1b[6~"; break;  /* page down */
+                default: break;
+                }
+                if (seq) {
+                    a->keyseq_n = 0;
+                    for (int q = 0; seq[q] && q < (int)sizeof a->keyseq; q++)
+                        a->keyseq[a->keyseq_n++] = seq[q];
+                    a->keyseq_i = 0;
+                    unsigned long k = 0;
+                    while (k < max && a->keyseq_i < a->keyseq_n) ((char *)buf)[k++] = a->keyseq[a->keyseq_i++];
+                    if (a->keyseq_i >= a->keyseq_n) a->keyseq_i = a->keyseq_n = 0;
+                    return (long)k;
+                }
                 /* RETURN IS CR IN RAW MODE (M2014). See tio_wants_cr: our
                  * keyboard produces NL because every native app expects it,
                  * and a program that cleared ICRNL is asking for the CR a
@@ -9302,46 +9432,3 @@ int app_take_browse(char *out, int max) {          /* WM drains; 1 if returned *
     bq_t = (bq_t + 1) % MAX_BROWSE;
     return 1;
 }
-    /* Bytes owed to a Linux reader from a key that expands to an ESCAPE
-     * SEQUENCE -- arrows, Home, End, Delete (M2024). Our keyboard hands the
-     * kernel one sentinel byte per key; a terminal sends three or four. */
-    char     keyseq[8];
-    uint8_t  keyseq_n, keyseq_i;
-        /* Finish handing over a sequence started by a previous read, before
-         * looking for another key (M2024). */
-        if (a->keyseq_i < a->keyseq_n) {
-            unsigned long k = 0;
-            while (k < max && a->keyseq_i < a->keyseq_n) ((char *)buf)[k++] = a->keyseq[a->keyseq_i++];
-            if (a->keyseq_i >= a->keyseq_n) a->keyseq_i = a->keyseq_n = 0;
-            return (long)k;
-        }
-                /* ARROW KEYS ARE ESCAPE SEQUENCES (M2024).
-                 *
-                 * Our keyboard delivers one sentinel byte per extended key --
-                 * 0x11..0x14 for the arrows -- which is what every OS-DEV app
-                 * reads. A terminal sends `ESC [ A`, and a Linux TUI matches on
-                 * exactly that. So Claude Code's menus could be SEEN but not
-                 * NAVIGATED: every arrow press arrived as a control character
-                 * it had no meaning for, and the selection never moved. Same
-                 * class as the Return key in M2014 -- the key was delivered,
-                 * in an encoding the program does not speak. */
-                const char *seq = 0;
-                switch (c) {
-                case 0x11: seq = "\x1b[A"; break;   /* up    */
-                case 0x12: seq = "\x1b[B"; break;   /* down  */
-                case 0x13: seq = "\x1b[D"; break;   /* left  */
-                case 0x14: seq = "\x1b[C"; break;   /* right */
-                case 0x15: seq = "\x1b[5~"; break;  /* page up   */
-                case 0x16: seq = "\x1b[6~"; break;  /* page down */
-                default: break;
-                }
-                if (seq) {
-                    a->keyseq_n = 0;
-                    for (int q = 0; seq[q] && q < (int)sizeof a->keyseq; q++)
-                        a->keyseq[a->keyseq_n++] = seq[q];
-                    a->keyseq_i = 0;
-                    unsigned long k = 0;
-                    while (k < max && a->keyseq_i < a->keyseq_n) ((char *)buf)[k++] = a->keyseq[a->keyseq_i++];
-                    if (a->keyseq_i >= a->keyseq_n) a->keyseq_i = a->keyseq_n = 0;
-                    return (long)k;
-                }

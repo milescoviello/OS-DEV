@@ -243,6 +243,7 @@ void linux_abi_init_this_cpu(void) {
 #define LX_CLONE_VFORK  0x00004000
 #define LXS_vfork_        58
 #define LXS_execve_       59
+#define LX_WNOHANG        1      /* wait4/waitid: do not block (M2025) */
 #define LXS_wait4_        61
 #define LXS_pipe_         22
 #define LXS_pipe2_       293
@@ -674,8 +675,23 @@ static int g_poll_reports;
  * kernel console when there is none. Which of the two it took is the whole
  * question when a program "produces no output" -- so say, once per process,
  * when it takes the console. (M2004) */
+/* -append lxout: mirror a Linux process's output to the kernel log as well as
+ * to its window (M2023).
+ *
+ * Everything a guest program prints has only ever existed as PIXELS -- it goes
+ * to a window text grid, and nothing else. That means the only way to read what
+ * a program said is to screenshot it and transcribe, which I did to get Claude
+ * Code's OAuth URL out and promptly misread one character of a scope string.
+ * The program was not wrong and the terminal was not wrong; the output simply
+ * was not text anywhere.
+ *
+ * It costs nothing on screen: since M2011 the console writes to the serial port
+ * and /proc/kmsg only once the window manager owns the framebuffer. So this is
+ * the same bytes, in a form you can grep. */
+int g_lx_out_log;
 static void lx_emit(const char *b, unsigned long n) {
     app_t *dst = app_out_to();
+    if (g_lx_out_log) console_write_n(b, n);
     if (dst) { app_write_to(dst, b, (unsigned)n); return; }
     static int told_pid = -1;
     int me = app_current_pid();
@@ -3175,8 +3191,14 @@ void linux_syscall_dispatch(struct registers *r) {
     }
     case LXS_wait4_: {                      /* (pid, status*, options, rusage*) */
         int st = 0;
-        long got = app_waitpid((int)a1, &st);
+        /* The OPTIONS argument was being discarded (M2025) -- the same
+         * granted-in-name-only shape as pipe2's flags (M2009), socketpair's
+         * (M2012) and eventfd2's (M2017). WNOHANG means "look, do not block",
+         * and an event loop that polls its children with it was instead parked
+         * forever on the first call. */
+        long got = app_wait4((int)a1, &st, ((int)a3 & LX_WNOHANG) != 0);
         if (got < 0) { r->rax = (uint64_t)-(long)LX_ECHILD; break; }
+        if (got == 0) { r->rax = 0; break; }   /* WNOHANG: children exist, none ready */
         if (r->rsi) {
             if (!vmm_user_ok(r->rsi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             /* Linux packs the exit code into bits 8-15 and leaves the low byte
@@ -3567,18 +3589,3 @@ uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
                         const char *const *argv, const char *const *envp) {
     return lx_spawn_stack_dyn(image, base, entry, 0, stack_top, stack_bottom, argv, envp);
 }
-/* -append lxout: mirror a Linux process's output to the kernel log as well as
- * to its window (M2023).
- *
- * Everything a guest program prints has only ever existed as PIXELS -- it goes
- * to a window text grid, and nothing else. That means the only way to read what
- * a program said is to screenshot it and transcribe, which I did to get Claude
- * Code's OAuth URL out and promptly misread one character of a scope string.
- * The program was not wrong and the terminal was not wrong; the output simply
- * was not text anywhere.
- *
- * It costs nothing on screen: since M2011 the console writes to the serial port
- * and /proc/kmsg only once the window manager owns the framebuffer. So this is
- * the same bytes, in a form you can grep. */
-int g_lx_out_log;
-    if (g_lx_out_log) console_write_n(b, n);

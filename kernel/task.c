@@ -1110,6 +1110,73 @@ void task_stop(task_t *t) {
     irq_restore(f);
 }
 
+/* Has this task definitely left its kernel stack, so a reaper may free it?
+ *
+ * `off_cpu` answers this for a task that DIED -- it is published by whoever
+ * runs next on the dying task's core. A task that was merely STOPPED never
+ * travels that path, so its off_cpu stays 0 forever, and app_reap's gate
+ * (which tested TASK_DEAD && off_cpu) could never free it.
+ *
+ * That is not a leak, it is a hang: app_stop_siblings STOPS a process's main
+ * task when a non-main thread calls exit_group -- which is what every Linux
+ * runtime does -- so app_reap declined the process for ever, it never became a
+ * waitpid()-collectable zombie, and its parent blocked in wait4() until the
+ * machine was rebooted. Claude Code hit this on the first helper it spawned.
+ *
+ * For a STOPPED task the proof is direct rather than published: it will never
+ * be scheduled again (task_stop removed it from the rotation and cancelled its
+ * deadline), so if no core has it as `cur` and no core is mid-switch away from
+ * it, it is not on its stack. Checked under the run-queue lock so the answer
+ * cannot change beneath us. (M2025) */
+int task_off_stack(task_t *t) {
+    if (!t) return 1;
+    if (__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) return 1;
+    uint64_t f = irq_save();
+    rq_lock_take();
+    int on = 0;
+    for (int c = 0; c < MAX_SCHED_CPUS; c++)
+        if (cur[c] == t || core_leaving[c] == t || core_prev[c] == t || core_dying[c] == t) { on = 1; break; }
+    rq_lock_give();
+    irq_restore(f);
+    return !on;
+}
+
+/* Take a STOPPED task out of the scheduler's ring so its memory can be freed.
+ *
+ * task_free does NOT do this -- it frees the stack and the task_t and nothing
+ * else -- because every task it was written for had already been unlinked by
+ * task_exit on its way out. A task that was merely STOPPED never ran task_exit,
+ * so it is still a link in the circular ring, and freeing it leaves the ring
+ * pointing into reclaimed heap. task_wake_sleepers walks that ring on every
+ * timer tick, which is where the machine died:
+ *
+ *   call trace: [0] task_wake_sleepers+0x6e ... system halted.
+ *
+ * Returns 1 if the task was unlinked and may now be freed. Refuses a task that
+ * is still on a CPU, and refuses to leave the ring empty. (M2025) */
+int task_retire_stopped(task_t *t) {
+    if (!t) return 0;
+    uint64_t f = irq_save();
+    rq_lock_take();
+    int ok = 0;
+    int on = 0;
+    for (int c = 0; c < MAX_SCHED_CPUS; c++)
+        if (cur[c] == t || core_leaving[c] == t || core_prev[c] == t || core_dying[c] == t) { on = 1; break; }
+    if (!on && t->state == TASK_STOPPED && t->next && t->next != t) {
+        task_t *prev = t->next;
+        while (prev->next != t && prev->next) prev = prev->next;
+        if (prev->next == t) {
+            prev->next = t->next;
+            t->next = 0;                 /* no longer a link in anything */
+            t->state = TASK_DEAD;        /* nothing may resurrect it now */
+            ok = 1;
+        }
+    }
+    rq_lock_give();
+    irq_restore(f);
+    return ok;
+}
+
 /* Resume a STOPPED task. */
 void task_cont(task_t *t) {
     uint64_t f = irq_save();

@@ -2696,6 +2696,24 @@ void desktop_run(void) {
                 if (sw_open && sw_sel >= win_count) sw_sel = win_count - 1;   /* ...and the switcher's index (M1926) */
             }
 
+        /* ...and reap exited processes that own NO window (M2025). The loop
+         * above can only see processes that got one, and the pending queue
+         * deliberately STOPS handing them out at MAX_WINDOWS. A fork()ed child
+         * parked in that queue was therefore never reaped, never became a
+         * waitpid()-collectable zombie, and hung its parent in wait4() forever
+         * -- a deadlock, because the slot it was waiting for could only be
+         * freed by reaping, and the window that would have to close belonged to
+         * the parent that was stuck. Nothing else here needs a window either:
+         * app_reap frees the task, the address space and the slot. */
+        for (int i = 0; i < app_slot_max(); i++) {
+            app_t *a = app_exited_slot(i);
+            if (!a) continue;
+            int owned = 0;
+            for (int w = 0; w < win_count && !owned; w++)
+                if (windows[w].kind == KIND_APP && (app_t *)windows[w].app == a) owned = 1;
+            if (!owned && app_reap(a)) dirty = 1;
+        }
+
         uint64_t sec = timer_ticks() / 100;
         int clock_tick = (sec != last_sec);
         if (clock_tick) last_sec = sec;

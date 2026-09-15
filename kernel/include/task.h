@@ -126,6 +126,8 @@ void    task_fs_base_live(uint64_t *live, uint64_t *cached, int *core);  /* the 
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */
 struct registers *task_uframe(task_t *t);  /* the task's most recent ring-3 trap frame, or 0 (M1119) */
 void    task_stop(task_t *t);              /* suspend another task (READY/RUNNING -> STOPPED); not self */
+int     task_off_stack(task_t *t);         /* has it left its kernel stack, so a reaper may free it? (M2025) */
+int     task_retire_stopped(task_t *t);    /* unlink a STOPPED task from the ring so it can be freed (M2025) */
 void    task_cont(task_t *t);              /* resume a STOPPED task */
 int     task_count(void);
 uint64_t task_vruntime_self(void);   /* current task's CFS vruntime (M1912 self-test) */

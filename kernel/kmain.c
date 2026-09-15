@@ -504,6 +504,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
+        if (cmdline_has(cl, "lxout")) { extern int g_lx_out_log; g_lx_out_log = 1; }   /* guest output -> the log, as TEXT (M2023) */
         if (cmdline_has(cl, "lxnettrace")) g_net_trace = 1;              /* socket byte counts, both directions (M2016) */
         if (cmdline_has(cl, "polltrace")) { extern int g_poll_trace; g_poll_trace = 1; }     /* name the fds a stalled poll waits on (M1998) */
         if (cmdline_has(cl, "vmaaudit"))   { extern int g_vma_audit; g_vma_audit = 1; }   /* check the no-overlap invariant on every mmap/munmap (M1988) */
@@ -955,6 +956,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * one as a duration is a fifty-six-year wait while substituting a
          * constant is a thousand-hertz spin. Neither is visible from in here:
          * the wait proceeds exactly as asked. (M2010) */
+        /* ...and the SUBPROCESS LIFECYCLE: fork, exit, wait4, WNOHANG. Claude
+         * Code hung here with every core halted and no syscall for 45 seconds,
+         * its main thread parked in wait4() for children that had already
+         * exited. A process whose exit_group came from a non-main thread was
+         * left with its main task merely STOPPED, which the reaper's gate could
+         * never satisfy, so the child never became a collectable zombie; and
+         * wait4 discarded its options, so WNOHANG blocked for ever. (M2025) */
+        kprintf("[lxabi] launching the subprocess-lifecycle probe...\n");
+        int wrc = app_run_linux_sync("/disk2/lxwait", 0, 0, 120000);
+        kprintf("[lxabi] LXWAIT exit -> %d\n", wrc);
         kprintf("[lxabi] launching the absolute-deadline probe...\n");
         int trc = app_run_linux_sync("/disk2/lxtime", 0, 0, 90000);
         kprintf("[lxabi] LXTIME exit -> %d\n", trc);
@@ -1730,4 +1741,3 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     speaker_chime();              /* a little startup arpeggio */
     desktop_run();
 }
-        if (cmdline_has(cl, "lxout")) { extern int g_lx_out_log; g_lx_out_log = 1; }   /* guest output -> the log, as TEXT (M2023) */

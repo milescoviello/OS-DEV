@@ -70,6 +70,8 @@ int         app_format_fds(app_t *a, char *buf, int max);    /* /proc/<pid>/fd: 
 int    app_alive(app_t *a);
 int    app_shows_caret(app_t *a);                /* does this app's window blink a text caret right now? (M1527) */
 int    app_reap(app_t *a);                       /* free a self-exited app's task+stack+slot (WM) */
+int    app_slot_max(void);                       /* process-slot count, for the WM's reap sweep (M2025) */
+app_t *app_exited_slot(int i);                   /* slot i if it holds an exited, un-reaped process (M2025) */
 void   app_request_kill(app_t *a);               /* ask a running app to close (it self-exits) */
 void   app_kill_check(void);                     /* honor a pending kill from a polling/gfx/sleep syscall (exits) */
 int    app_dirty_clear(app_t *a);                /* 1 if the grid changed (WM poll) */
@@ -332,7 +334,8 @@ long   app_get_mouse_rel(void);        /* SYS_mouse_rel: packed dx|dy, read+clea
 void   app_sys_clear(void);             /* clear the calling app's screen */
 void   app_setcolor(int idx);           /* set the calling app's text colour (palette 0-15) */
 void   app_sys_exit(int code);          /* records the exit status; does not return */
-long   app_waitpid(int pid, int *status); /* block until a child (pid, or -1=any) exits; returns its pid + *status (M1117) */
+long   app_waitpid(int pid, int *status);   /* block until a child (pid, or -1=any) exits; returns its pid + *status (M1117) */
+long   app_wait4(int pid, int *status, int nohang);   /* wait4, honouring WNOHANG (M2025) */
 void   app_fault_current(struct registers *r);  /* a ring-3 task faulted: dump a core, kill it, keep the kernel alive; no return */
 void   app_core_dump(struct registers *r);      /* write an ET_CORE ELF of the faulting app to /tmp/core (M1104) */
 
