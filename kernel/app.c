@@ -4656,39 +4656,28 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
      * on the shared frame (the other process keeps it). vmm_set_raw invlpg's. */
     if ((pte & PTE_PRESENT) && (pte & PTE_COW) && (err & 2)) {
         uint64_t old = pte & PTE_ADDR_MASK;
-        /* DECIDE UNDER THE PAGE-TABLE LOCK (M2046).
+        /* ALWAYS COPY (M2044, and re-affirmed in M2050).
          *
-         * M2044 deleted the "refcount is 0, so I am the sole owner, so just
-         * make it writable in place" fast path because it was a race: the
-         * refcount was read unlocked, and vmm_fork_cow on another core could
-         * take its reference and map the frame into a child between the read
-         * and the commit -- leaving this process with a writable non-COW
-         * mapping of a page the child shares, so every later write leaked
-         * across, silently.
+         * The "refcount is 0, so I am the sole owner, so just make it writable
+         * in place" fast path is a race: the count is an unlocked read, and
+         * vmm_fork_cow on another core can take its reference and map the frame
+         * into a child between the read and the commit -- leaving this process
+         * writable and non-COW on a page the child shares, so every later write
+         * leaks across silently.
          *
-         * Deleting it was correct and it cost a page copy on every COW fault,
-         * which more than doubled an in-guest GCC compile. M2045 changed the
-         * picture: fork_cow now performs its addref-and-write-protect under
-         * vmm_lock. Taking the same lock here makes the decision and its commit
-         * atomic with respect to fork, so the fast path is sound again --
-         * re-reading the PTE inside the lock as well, because the value that
-         * brought us into this handler is itself only a snapshot. */
-        int sole = 0;
-        {
-            uint64_t lf = vmm_lock_acquire();
-            uint64_t cur = vmm_pte_raw(fpage);
-            if ((cur & PTE_PRESENT) && (cur & PTE_COW) &&
-                (cur & PTE_ADDR_MASK) == old && pmm_refcount(old) == 0) {
-                vmm_set_raw(fpage, (cur & ~PTE_COW) | PTE_WRITABLE);   /* lock-free by design */
-                sole = 1;
-            }
-            vmm_lock_release(lf);
-        }
-        if (sole) {
-            app_tlb_sync(a);      /* siblings must not keep the read-only entry */
-            a->minflt++;
-            return 1;
-        }
+         * M2046 made the decision atomic by taking vmm_lock here, since M2045
+         * had fork take the same lock. Both are reverted: the locked fork
+         * stalled the machine (a baseline kernel ran the in-guest compile at
+         * 46% CPU, the locked one at 4-6%), and without fork holding the lock
+         * there is nothing here to be atomic against.
+         *
+         * So: copy unconditionally, which is correct in every interleaving. No
+         * concurrent fork -> we copy and free the old frame, which really is
+         * free. A fork in the middle -> it has already taken its own
+         * reference, so our free drops only ours and the child becomes sole
+         * owner. The cost is a 4 KiB copy on a fault that could sometimes have
+         * been a flag flip, and it is the honest price of not holding a global
+         * lock in the fault path. */
         {
             uint64_t nf = pmm_alloc_frame();
             if (!nf) return 0;                      /* OOM -> let it fault/die */

@@ -116,12 +116,8 @@ static uint64_t *next_table(uint64_t *table, uint64_t idx, uint64_t flags) {
     return phys_to_table(table[idx] & ADDR_MASK);
 }
 
-/* Lock-free core of do_map: the caller ALREADY holds vmm_lock. Split out so a
- * caller that must hold the lock across MANY mappings -- vmm_fork_cow's chunked
- * walk -- can map without self-deadlocking. vmm_lock is a plain, NON-RECURSIVE
- * test-and-set spinlock, so a second acquisition on the same core spins against
- * itself for ever. (M2045) */
-static int do_map_nl(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags) {
+static int do_map(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags) {
+    uint64_t f = vmm_lock_take();
     uint64_t *pml4 = phys_to_table(pml4_phys);
     uint64_t *pdpt = next_table(pml4, PML4_IDX(virt), flags);
     uint64_t *pd   = pdpt ? next_table(pdpt, PDPT_IDX(virt), flags) : 0;
@@ -135,7 +131,7 @@ static int do_map_nl(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t 
         uint64_t base = e & ~0x1FFFFFull;
         uint64_t lf   = e & (PTE_WRITABLE | PTE_USER | PTE_NX | PTE_PCD | PTE_PWT);   /* carry leaf perms + cache attrs, drop HUGE (M1884) */
         uint64_t ptphys = pmm_alloc_frame();
-        if (!ptphys) return -1;
+        if (!ptphys) { vmm_lock_give(f); return -1; }
         uint64_t *npt = phys_to_table(ptphys);
         for (int i = 0; i < 512; i++)
             npt[i] = (base + (uint64_t)i * PAGE_SIZE) | PTE_PRESENT | lf;
@@ -144,7 +140,7 @@ static int do_map_nl(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t 
         for (uint64_t off = 0; off < 0x200000; off += PAGE_SIZE) invlpg(hbase + off);
     }
     uint64_t *pt   = pd   ? next_table(pd,   PD_IDX(virt),   flags) : 0;
-    if (!pt) return -1;
+    if (!pt) { vmm_lock_give(f); return -1; }
 
     /* x86 TLBs never cache a not-present translation, so populating a fresh
      * (previously not-present) PTE can never leave a stale entry behind — only
@@ -158,22 +154,8 @@ static int do_map_nl(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t 
     int was_present = (pt[PT_IDX(virt)] & PTE_PRESENT) != 0;
     pt[PT_IDX(virt)] = (phys & ADDR_MASK) | PTE_PRESENT | flags;
     if (was_present) invlpg(virt);
-    return 0;
-}
-
-static int do_map(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags) {
-    uint64_t f = vmm_lock_take();
-    int rc = do_map_nl(pml4_phys, virt, phys, flags);
     vmm_lock_give(f);
-    return rc;
-}
-
-/* vmm_map_to for a caller that already holds vmm_lock. Never call it without:
- * do_map_nl assumes the exclusive access every other caller gets from do_map's
- * wrapper. Static -- vmm_fork_cow is the only walker of more than one mapping
- * at a time. (M2045) */
-static int vmm_map_to_nl(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags) {
-    return do_map_nl(pml4_phys & ADDR_MASK, virt, phys, flags);
+    return 0;
 }
 
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
@@ -323,16 +305,6 @@ void vmm_destroy_address_space(uint64_t cr3) {
  * and identified by matching the master table), and carry the slot index into
  * the virtual address. */
 int vmm_fork_cow(uint64_t child_cr3) {
-    /* REMEMBER THE CALLER'S INTERRUPT STATE (M2045). The chunked walk below
-     * re-enables interrupts between page tables -- that is the whole point, so
-     * this core can ACK a TLB shootdown during an RSS-proportional fork -- but
-     * fork is entered from the syscall gate with IF=0 and everything after this
-     * call in app_fork_common (publishing the child, handing it its task) is
-     * written for IF=0. Returning with interrupts on would silently hand the
-     * rest of fork a different set of rules. Saved here, restored before every
-     * return. */
-    uint64_t entry_fl;
-    __asm__ volatile("pushfq; pop %0" : "=r"(entry_fl));
     uint64_t cr3 = read_cr3() & ADDR_MASK;
     uint64_t *pml4  = phys_to_table(cr3);
     uint64_t *bpml4 = phys_to_table(kernel_pml4);
@@ -350,41 +322,8 @@ int vmm_fork_cow(uint64_t child_cr3) {
         if (pdpt[i] & PTE_HUGE) continue;
         uint64_t *pd = phys_to_table(pdpt[i] & ADDR_MASK);
         for (int j = 0; j < 512 && rc == 0; j++) {
-                /* Cheap UNLOCKED peek. An intermediate table, once created, is
-                 * never torn down while its address space is ACTIVE: munmap and
-                 * vmm_unmap free only leaf DATA frames, and only
-                 * vmm_destroy_address_space frees a PD/PT, for a space nobody
-                 * is running. So `pd` cannot dangle under this walk. What CAN
-                 * change is the CONTENT of pd[j] -- a huge-page split -- which
-                 * is why the real work below re-reads it under the lock. (M2045) */
-                if (!(pd[j] & PTE_PRESENT) || (pd[j] & PTE_HUGE)) continue;
-
-                /* HOLD vmm_lock FOR ONE PAGE TABLE AT A TIME (M2045).
-                 *
-                 * This walk read and rewrote pt[k] with NO LOCK, while every
-                 * other mutator of the same hierarchy -- vmm_map_to,
-                 * vmm_protect, vmm_unmap, vmm_set_raw -- takes vmm_lock, which
-                 * exists (per its own comment) precisely to stop two cores
-                 * walking-and-writing it at once. A sibling thread calling
-                 * mmap/mprotect/munmap raced this, and fork's write, built from
-                 * the stale snapshot `e`, could silently clobber it.
-                 *
-                 * CHUNKED rather than held for the whole walk, because vmm_lock
-                 * is GLOBAL: holding it across an RSS-proportional fork would
-                 * freeze memory management for every process on every core.
-                 * One PT bounds any waiter to <=512 leaves.
-                 *
-                 * The sti is not incidental either. Nothing upstream of fork
-                 * re-enables interrupts, so this walk ran with IF=0 for its
-                 * whole length -- during which this core cannot ACK another
-                 * core's TLB shootdown. That is what made the bounded ack wait
-                 * time out in practice, observed once per run, leaking a frame
-                 * rather than freeing it. Safe only because it happens strictly
-                 * AFTER vmm_lock_give: nothing is held across the window. */
-                uint64_t lf = vmm_lock_take();
-                uint64_t pde = pd[j];                      /* re-validate under the lock */
-                if (!(pde & PTE_PRESENT) || (pde & PTE_HUGE)) { vmm_lock_give(lf); continue; }
-                uint64_t *pt = phys_to_table(pde & ADDR_MASK);
+            if (!(pd[j] & PTE_PRESENT) || (pd[j] & PTE_HUGE)) continue;
+            uint64_t *pt = phys_to_table(pd[j] & ADDR_MASK);
             for (int k = 0; k < 512; k++) {
                 uint64_t e = pt[k];
                 if (!(e & PTE_PRESENT) || !(e & PTE_USER)) continue;
@@ -396,7 +335,7 @@ int vmm_fork_cow(uint64_t child_cr3) {
                     if (!nf) { rc = -1; break; }
                     uint8_t *s = hhdm(phys), *d = hhdm(nf);
                     for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
-                    if (vmm_map_to_nl(child_cr3, va, nf, e & (PTE_WRITABLE | PTE_USER | PTE_NX)) != 0) { pmm_free_frame(nf); rc = -1; break; }
+                    if (vmm_map_to(child_cr3, va, nf, e & (PTE_WRITABLE | PTE_USER | PTE_NX)) != 0) { pmm_free_frame(nf); rc = -1; break; }
                     continue;
                 }
                 uint64_t flags = e & (PTE_USER | PTE_NX);
@@ -438,26 +377,10 @@ int vmm_fork_cow(uint64_t child_cr3) {
                  * nothing before this had a 3rd-generation-or-later child
                  * write to a page any earlier sibling had already touched. */
                 if (e & (PTE_WRITABLE | PTE_COW)) flags |= PTE_COW;
-                if (vmm_map_to_nl(child_cr3, va, phys, flags) != 0) {
+                if (vmm_map_to(child_cr3, va, phys, flags) != 0) {
                     pmm_free_frame(phys);                 /* undo the reference taken above */
                     rc = -1; break;
                 }
-                vmm_lock_give(lf);
-                /* Interrupts ON from here to the end of the walk (M2045).
-                 *
-                 * I tried throttling this -- a window every 32 tables with a
-                 * cli in between -- to cut the number of preemption points.
-                 * The guest HUNG: 716 seconds of wall clock for 16 seconds of
-                 * CPU, every core halted. I could not explain it, and shipping
-                 * an unexplained hang to save some throughput is not a trade
-                 * worth making, so it is reverted to the form that
-                 * demonstrably makes progress: once the lock is released the
-                 * first time, this walk stays preemptible.
-                 *
-                 * Safe because it happens strictly AFTER vmm_lock_give --
-                 * nothing is held across it -- and because the caller's
-                 * interrupt state is restored before this function returns. */
-                __asm__ volatile("sti");
             }
         }
     }
@@ -481,14 +404,12 @@ int vmm_fork_cow(uint64_t child_cr3) {
      * 512 GiB to the whole user half -- a threaded runtime keeps its heap far
      * above 512 GiB, so before that there was almost nothing here to race on. */
     __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");   /* flush parent TLB (we write-protected it) */
-    /* The CALLER does the shootdown now (M2047), because only it knows whether
-     * this address space is live on another core at all. An unconditional IPI
-     * plus its bounded ack wait on EVERY fork is very expensive for the common
-     * case -- a single-threaded parent has no sibling using its address space,
-     * so there is nothing to shoot down -- and gcc forks once per compilation
+    /* The CALLER does the shootdown (M2047): only it knows whether this address
+     * space is live on another core at all, and an unconditional IPI plus its
+     * bounded ack wait on EVERY fork is heavy for the common single-threaded
+     * case -- a shell, make, the gcc driver, which forks once per compilation
      * stage. app_fork_common calls app_tlb_sync(parent), which fires only when
      * a live thread exists. */
-    __asm__ volatile("push %0; popfq" : : "r"(entry_fl) : "memory", "cc");   /* as we found it (M2045) */
     return rc;
 }
 
@@ -569,21 +490,6 @@ uint64_t vmm_pte_raw(uint64_t virt) {
 }
 /* Set the raw leaf PTE for `virt` (the page table must already exist — true for
  * a page being evicted, which was present). Used to write the swapped encoding. */
-/* Take/release the page-table lock from ANOTHER file (M2046).
- *
- * The copy-on-write fault handler in app.c has to decide "am I the sole owner
- * of this frame?" and act on the answer atomically with respect to
- * vmm_fork_cow, which takes its child's reference and write-protects the parent
- * under this same lock (M2045). Without sharing the lock the decision is made
- * on a value that can change before it is committed -- which is the race M2044
- * removed the fast path entirely to avoid. With it, the fast path is safe
- * again, and a fork-heavy workload does not pay a page copy per fault.
- *
- * Order is unchanged and unchanged everywhere: vma_alloc_lock (per-process) ->
- * vmm_lock (page tables) -> pmm_lock (frame allocator). */
-uint64_t vmm_lock_acquire(void) { return vmm_lock_take(); }
-void     vmm_lock_release(uint64_t fl) { vmm_lock_give(fl); }
-
 void vmm_set_raw(uint64_t virt, uint64_t pte) {
     uint64_t *pml4 = phys_to_table(read_cr3() & ADDR_MASK);
     if (!(pml4[PML4_IDX(virt)] & PTE_PRESENT)) return;

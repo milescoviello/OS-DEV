@@ -110,8 +110,6 @@ static inline void *dma_alloc_page(void) {
 /* TLB shootdown (M1963): make every OTHER core drop its cached translations
  * after this one removed or tightened a mapping. Call AFTER releasing the vmm
  * lock -- a core spinning for that lock with interrupts off cannot ack. */
-uint64_t vmm_lock_acquire(void);         /* the page-table lock, for app.c's COW decision (M2046) */
-void     vmm_lock_release(uint64_t fl);
 int      vmm_tlb_shootdown(void);       /* 1 = every other core acked; 0 = gave up (M2043) */
 void     vmm_tlb_shootdown_ack(void);   /* the IPI handler's side */
 unsigned long vmm_tlb_shootdown_count(void);   /* how many have actually fired -- lets a test prove the mechanism runs */
