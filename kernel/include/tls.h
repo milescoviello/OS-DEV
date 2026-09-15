@@ -23,6 +23,7 @@ void tls_ws_close(void);
 /* CertificateVerify result of the most recent tls_get: -2 = none/absent,
  * 0 = signature verified (server proved leaf-key possession), -1 = failed.
  * (Chain-to-root path validation is done separately -- see tls_chain_anchored.) */
+const char *tls_fail_reason(void);   /* which stage the last failed fetch reached (M2026) */
 int tls_cert_status(void);
 
 /* 1 if the most recent tls_get's certificate chain anchored to a trusted root CA

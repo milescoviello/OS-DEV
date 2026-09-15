@@ -4279,11 +4279,20 @@ int browser_poll(browser_t *b) {
         b->ntok = 0; b->redirects = 0;
         if (b->raw) {
             int p = 0; char *o = b->raw;
+            /* NAME THE STAGE (M2026). This used to list four possible causes
+             * in one sentence -- host may not exist, connection failed, TLS
+             * failed, or refused -- which is not a diagnosis, it is everything
+             * it could have been. tls_fail_reason() reports the stage the
+             * fetch actually got to, which the code knew all along and threw
+             * away. */
             const char *e1 = "<h2>Could not load page</h2><p>Could not reach <b>";
-            const char *e2 = "</b>.</p><p>The host may not exist, the connection or TLS handshake failed, or the site refused our request. Check the address and your connection, then try again.</p>";
+            const char *e2 = "</b>.</p><p>Failed at: <b>";
+            const char *e3 = "</b></p><p>Check the address and your connection, then try again.</p>";
             for (const char *q = e1;     *q && p < RAW_MAX - 1; q++) o[p++] = *q;
             for (const char *q = b->url; *q && p < RAW_MAX - 1; q++) o[p++] = *q;
             for (const char *q = e2;     *q && p < RAW_MAX - 1; q++) o[p++] = *q;
+            for (const char *q = tls_fail_reason(); *q && p < RAW_MAX - 1; q++) o[p++] = *q;
+            for (const char *q = e3;     *q && p < RAW_MAX - 1; q++) o[p++] = *q;
             o[p] = 0;
             b->bodyoff = 0; b->bodylen = p;
             parse_html(b, o, p);                /* header-less HTML, like the local home page */

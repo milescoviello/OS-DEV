@@ -287,6 +287,8 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_memfd_create_ 319
 #define LXS_ftruncate_    77
 #define LXS_readahead_   187
+#define LXS_sendfile_     40
+#define LXS_fadvise64_   221
 #define LXS_nanosleep_    35
 #define LXS_clock_nanosleep_ 230
 #define LXS_statx_       332
@@ -1469,6 +1471,48 @@ void linux_syscall_dispatch(struct registers *r) {
      *                    void *control; u64 controllen; int flags; }   56 bytes
      *   struct mmsghdr { struct msghdr hdr; u32 len; }                 64 bytes
      */
+    case LXS_fadvise64_:
+        /* (fd, offset, len, advice). A HINT, exactly like readahead_ below:
+         * "I will read this sequentially / at random / not again." A kernel
+         * with no page-cache policy to steer has nothing to do with it, and
+         * the caller's correctness never depends on the answer. Claude Code
+         * issues one every time it checks for an IDE, so ENOSYS made a
+         * successful no-op look like a repeated failure. (M2026) */
+        r->rax = 0;
+        break;
+    case LXS_sendfile_: {                   /* (out_fd, in_fd, off_t *off, count) */
+        /* Copy between two descriptors without a round trip through user
+         * memory. We have no page-cache splice, so do the obvious thing: read
+         * a chunk from in_fd and write it to out_fd, honouring the optional
+         * *off (which, when given, is updated and the file cursor is NOT
+         * moved -- pread semantics, the same distinction app_pread exists to
+         * make). Returning ENOSYS instead made every caller believe the copy
+         * had FAILED, rather than that it had to do the loop itself. (M2026) */
+        int ofd = (int)a1, ifd = (int)r->rsi;
+        uint64_t upoff = r->rdx;
+        unsigned long count = (unsigned long)r->r10;
+        long off = -1;
+        if (upoff) {
+            if (!vmm_user_ok(upoff, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            off = *(long *)upoff;
+        }
+        static char sfbuf[4096];            /* the syscall path is serialized; see lx_emit */
+        long total = 0;
+        while ((unsigned long)total < count) {
+            unsigned long want = count - (unsigned long)total;
+            if (want > sizeof sfbuf) want = sizeof sfbuf;
+            long got = (off >= 0) ? app_pread(ifd, sfbuf, want, off + total)
+                                  : app_fd_read(ifd, sfbuf, want);
+            if (got <= 0) { if (total == 0 && got < 0) total = got; break; }
+            long put = app_fd_write(ofd, sfbuf, (unsigned long)got);
+            if (put <= 0) { if (total == 0) total = put < 0 ? put : 0; break; }
+            total += put;
+            if (put < got) break;           /* short write: stop, report what landed */
+        }
+        if (total >= 0 && off >= 0) *(long *)upoff = off + total;
+        r->rax = (uint64_t)total;
+        break;
+    }
     case LXS_readahead_:
         /* (fd, offset, count). A HINT: "I will read this soon." Linux may
          * start the I/O early or ignore it entirely, and the caller's

@@ -452,16 +452,31 @@ static tls       g_wss_T;
 static tcp_conn  g_wss_tcp;
 static int       g_wss_open;
 
+/* WHICH STAGE FAILED (M2026).
+ *
+ * tls_get answers every failure with -1, and the browser turned that into one
+ * sentence naming four different causes at once: "the host may not exist, the
+ * connection or TLS handshake failed, or the site refused our request." That
+ * is not a diagnosis, it is a list of everything it could have been -- and the
+ * one thing the code DOES know, which stage it got to, was the thing it threw
+ * away. Same shape as the socket errors in M1965: the error named the wrong
+ * thing, so every failure looked alike.
+ *
+ * One string, set at the point of failure, read by whoever reports it. */
+static const char *g_tls_fail = "";
+const char *tls_fail_reason(void) { return (g_tls_fail && g_tls_fail[0]) ? g_tls_fail : "unknown"; }
+
 static int tls_get_inner(const char *host, const char *path, uint8_t *out, int max, uint32_t seed,
                          const char *method, const char *ctype, const char *body, int bodylen, int sse, int ws_mode) {   /* method NULL/"GET" => GET (byte-identical to before); "POST" => send body (M702); sse=1 => stop after the first SSE event (M-eventsource); ws_mode=1 => stop after the handshake, leave the session open for tls_ws_* (M1847) */
     rng_seed(seed);
     g_cert_status = -2; g_chain_anchored = 0; g_host_match = -2;   /* clear stale results */
+    g_tls_fail = "";                                               /* ...including the last failure stage (M2026) */
     g_leaf_cn[0] = 0; g_leaf_expiry[0] = 0;
     char bare[256]; uint16_t cport = (uint16_t)url_host_port(host, bare, sizeof(bare), 443);   /* honor host:port (M1773); DNS/SNI/cert-match use the bare host, Host: keeps the :port */
     uint8_t ip[4];
-    if (parse_ipv4(bare, ip) != 0 && dns_resolve(bare, ip) != 0) return -1;   /* IP literal (M1847), else DNS */
+    if (parse_ipv4(bare, ip) != 0 && dns_resolve(bare, ip) != 0) { g_tls_fail = "DNS lookup failed"; return -1; }   /* IP literal (M1847), else DNS */
     tcp_conn tcp;
-    if (tcp_connect(&tcp, ip, cport) != 0) return -1;
+    if (tcp_connect(&tcp, ip, cport) != 0) { g_tls_fail = "TCP connect refused or timed out"; return -1; }
 
     /* These large buffers live in BSS, not on the small (16 KB) task stack. They're
      * shared, so tls_get() serializes all callers (the browser worker AND the shell's
@@ -513,12 +528,12 @@ static int tls_get_inner(const char *host, const char *path, uint8_t *out, int m
     hs[hp++] = HS_CLIENT_HELLO; hs[hp++]=(uint8_t)(p>>16); hs[hp++]=(uint8_t)(p>>8); hs[hp++]=(uint8_t)p;
     memcpy(hs + hp, ch, p); hp += p;
     trans_add(&T, hs, hp);
-    if (write_record(&T, REC_HS, hs, hp) != 0) { tcp_close(&tcp); return -1; }
+    if (write_record(&T, REC_HS, hs, hp) != 0) { g_tls_fail = "could not send the TLS ClientHello"; tcp_close(&tcp); return -1; }
 
     /* --- read ServerHello (plaintext handshake record) --- */
     static uint8_t sh[4096]; int shlen, stype;
-    if (read_record(&T, &stype, sh, sizeof(sh), &shlen) != 0 || stype != REC_HS) { tcp_close(&tcp); return -1; }
-    if (shlen < 4 || sh[0] != HS_SERVER_HELLO) { tcp_close(&tcp); return -1; }
+    if (read_record(&T, &stype, sh, sizeof(sh), &shlen) != 0 || stype != REC_HS) { g_tls_fail = "no TLS ServerHello (server rejected our handshake)"; tcp_close(&tcp); return -1; }
+    if (shlen < 4 || sh[0] != HS_SERVER_HELLO) { g_tls_fail = "malformed TLS ServerHello"; tcp_close(&tcp); return -1; }
     trans_add(&T, sh, shlen);
     /* parse ServerHello: skip version(2)+random(32), session_id, cipher_suite, comp, exts.
      * Every field length is attacker-controlled, so bound each step against shlen
