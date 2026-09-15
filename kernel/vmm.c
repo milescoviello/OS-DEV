@@ -623,7 +623,6 @@ uint64_t vmm_pt_phys_in(uint64_t cr3, uint64_t virt) {
  *    ack, and this kernel takes locks with IF=0 in many places. Giving up is
  *    survivable -- the target flushes anyway the next time it enters this
  *    address space -- and it is reported, once, rather than hidden. */
-static volatile int g_tlb_pending;
 static volatile int g_tlb_gaveup;
 static volatile unsigned long g_tlb_shootdowns;   /* how many we have actually performed */
 
@@ -648,13 +647,33 @@ static inline int tlb_me(void) { return (int)(smp_current_cpu() & 31); }
 
 /* Flush and clear this core's obligation, if it has one. Safe to call from
  * anywhere: it is a no-op when nothing is owed. */
+/* THE FLAGS ARE THE ONLY SOURCE OF TRUTH (M2067).
+ *
+ * A `g_tlb_pending` counter used to sit alongside them, and once M2065 made
+ * the flags SURVIVE a timeout the two could no longer agree. Two ways:
+ *
+ *  - a core discharging a debt left over from a timed-out shootdown decrements
+ *    a counter that is no longer counting it, driving it NEGATIVE -- after
+ *    which the next shootdown's `pending > 0` wait falls through instantly and
+ *    reports that every core acked when none had;
+ *  - set-the-flags-then-store-the-count is not atomic, so a core that
+ *    discharges between the two has its flag consumed and the count written
+ *    back over the top, and THAT shootdown can never reach zero.
+ *
+ * One bit per core answers "does this core owe a flush" completely. Scanning
+ * 32 bytes is not worth a second representation that can contradict it. */
 static void tlb_discharge(void) {
     int me = tlb_me();
     if (!g_tlb_owed[me]) return;
     g_tlb_owed[me] = 0;
     uint64_t c = read_cr3();
     __asm__ volatile("mov %0, %%cr3" : : "r"(c) : "memory");   /* full local flush */
-    __atomic_sub_fetch(&g_tlb_pending, 1, __ATOMIC_RELEASE);
+}
+/* How many OTHER cores still owe a flush. */
+static int tlb_others_owing(void) {
+    int me = tlb_me(), n = smp_cpu_count > 32 ? 32 : smp_cpu_count, k = 0;
+    for (int c = 0; c < n; c++) if (c != me && g_tlb_owed[c]) k++;
+    return k;
 }
 
 void vmm_tlb_shootdown_ack(void) { tlb_discharge(); }
@@ -698,7 +717,7 @@ static int tlb_shootdown_inner(int send_ipi, int spin_budget) {
         if (n > 32) n = 32;
         for (int c = 0; c < n; c++) if (c != me) g_tlb_owed[c] = 1;
     }
-    __atomic_store_n(&g_tlb_pending, others, __ATOMIC_RELEASE);
+    (void)others;
     __atomic_add_fetch(&g_tlb_shootdowns, 1, __ATOMIC_RELAXED);
     if (send_ipi) smp_send_tlb_shootdown_ipi();  /* the self-test deliberately does not, to exercise the timeout */
     /* A few milliseconds, not seconds. The first version spun 20 million times
@@ -707,9 +726,9 @@ static int tlb_shootdown_inner(int send_ipi, int spin_budget) {
      * long the first time a core was slow to ack. An ack is an interrupt on an
      * already-running core: if it has not arrived in this many spins it is not
      * coming, and waiting longer buys nothing. (M1963) */
-    for (int spin = 0; spin < spin_budget && __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) > 0; spin++)
+    for (int spin = 0; spin < spin_budget && tlb_others_owing() > 0; spin++)
         __asm__ volatile("pause");
-    int left = __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE);
+    int left = tlb_others_owing();
     /* `send_ipi == 0` is the self-test, which times out ON PURPOSE -- reporting
      * it as news would make the suite's own real-timeout detector fire on a
      * passing run, and would burn the one-shot so a genuine timeout later in
@@ -739,14 +758,13 @@ static int tlb_shootdown_inner(int send_ipi, int spin_budget) {
      *
      * So leave the flags set. `tlb_discharge` is now called on every kernel
      * entry and every timer tick, so the debt is paid before the core can use
-     * the stale entry from ring 3 or read a user buffer from ring 0 -- and
-     * `g_tlb_pending` is reset only for the cores that DID ack, so the next
-     * shootdown starts from a clean count without cancelling anyone's debt.
+     * the stale entry from ring 3 or read a user buffer from ring 0. The flags
+     * are the whole state (M2067), so a new shootdown simply re-asserts them
+     * and cancels nobody's outstanding debt.
      *
      * The caller still learns the truth from the return value, which is what
      * makes the COW path leak a page rather than free one another core may
      * still be writing (M2043). */
-    __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
     return acked;
 }
@@ -778,11 +796,9 @@ int vmm_tlb_selftest(void) {
 
     /* 2. A core with a debt pays it when asked. */
     g_tlb_owed[tlb_me()] = 1;
-    __atomic_add_fetch(&g_tlb_pending, 1, __ATOMIC_RELEASE);
     vmm_tlb_discharge();
     if (g_tlb_owed[tlb_me()]) { kprintf("[tlbtest] FAIL vmm_tlb_discharge did not clear this core's debt\n"); fails++; }
     else kprintf("[tlbtest] ok   vmm_tlb_discharge pays this core's own debt\n");
-    __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
 
     /* 3. THE REGRESSION. A shootdown nobody answers must GIVE UP and KEEP the
      *    obligation -- the old code zeroed every flag one line after printing
