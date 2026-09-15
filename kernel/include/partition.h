@@ -81,12 +81,30 @@ typedef int (*blk_write_fn)(void *ctx, uint64_t lba, uint32_t count, const void 
 /* One directory entry returned by fatvol_list() / ext2_list_path(). FAT fills
  * only an 8.3 "NAME.EXT" (<=12), but ext2 supports long names, so `name` is 32
  * (31 usable + NUL) -- widened from 13 (M1746) to stop ext2 listings truncating
- * to 12. Bounded well below ext2's 255 limit on purpose: this struct is used in
- * fatvol_dirent[64] arrays on the 16 KB kernel task stack (see vfs.c over_list /
- * vfs_list), and ext2_list_path already carries a 4 KB block buffer down the
- * same call chain, so a full-255 name here would risk a stack overflow. */
+ * to 12. It now carries ext2's full 255-byte limit; see the field comment for
+ * why the old stack-size argument for keeping it short was the wrong trade. */
 typedef struct {
-    char     name[32];   /* file name + NUL (ext2: up to 31; FAT 8.3: <=12) */
+    /* 32 -> 256 (M2062). Every directory listing in the kernel came through
+     * this struct, so every listing TRUNCATED AT 31 CHARACTERS -- and a
+     * truncated name is not a cosmetic problem, it is a name that does not
+     * exist. `find /root/.claude` inside OS-DEV said it plainly:
+     *
+     *   find: '/root/.claude/backups/.claude.json.backup.17894368240':
+     *         No such file or directory
+     *   find: '/root/.claude/sessions/101.e6a4c69b6e4f03ca50222125240':
+     *         No such file or directory
+     *
+     * -- both exactly 31 characters, both real files with longer names. A
+     * program that writes a file, lists the directory and then acts on what it
+     * read gets ENOENT for its own data. Claude Code names its session keys
+     * with a 64-hex-character hash and its config backups with a millisecond
+     * timestamp, so nearly everything it owns was invisible to it.
+     *
+     * The old comment reasoned this was safe because the struct is used in
+     * [64] arrays on a 16 KB kernel stack. That reasoning was sound and the
+     * conclusion was wrong: the answer is to move the arrays to the heap, not
+     * to hand back the wrong filename. Every such array is now allocated. */
+    char     name[256];  /* file name + NUL (ext2's own limit is 255; FAT 8.3 <= 12) */
     uint32_t size;       /* file size in bytes (0 for directories) */
     int      is_dir;     /* 1 if a subdirectory, else 0 */
 } fatvol_dirent;

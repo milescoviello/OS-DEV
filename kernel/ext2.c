@@ -336,7 +336,7 @@ int ext2_list_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *
                 /* skip "." and ".." */
                 int dot = (nl == 1 && blk[bo + 8] == '.') || (nl == 2 && blk[bo + 8] == '.' && blk[bo + 9] == '.');
                 if (!dot) {
-                    int k = 0; for (; k < nl && k < 31; k++) out[n].name[k] = (char)blk[bo + 8 + k];   /* was 12 -> truncated long ext2 names (M1746); 31 = fatvol_dirent.name[32]-1 */
+                    int k = 0; for (; k < nl && k < (int)sizeof out[n].name - 1; k++) out[n].name[k] = (char)blk[bo + 8 + k];   /* 12 -> 31 (M1746) -> 255, ext2's own limit (M2062) */
                     out[n].name[k] = 0;
                     out[n].is_dir = (blk[bo + 7] == 2);
                     uint8_t cino[256];                         /* child inode -> size */

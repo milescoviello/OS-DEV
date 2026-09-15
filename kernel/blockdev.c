@@ -849,7 +849,7 @@ void blockdev_enumerate(void) {
 
         for (int v = 0; v < nstart; v++) {
             uint64_t start = starts[v];
-            fatvol_dirent ents[32];
+            static fatvol_dirent ents[32];   /* static, not stack: 8 KB of 256-byte names on a 16 KB kernel stack (M2062). Boot probe, one core, one caller. */
             int n = fatvol_list(bd_blk_read, (void *)(intptr_t)i, start, ents, 32);
             if (n <= 0) {
                 /* The candidate wasn't actually a readable FAT32 volume — skip
@@ -877,7 +877,7 @@ void blockdev_enumerate(void) {
         if (g_mount[mi].fstype == FS_FAT) continue;                 /* already shown above */
         const char *fs = g_mount[mi].fstype == FS_ISO9660 ? "ISO 9660" : "ext2";
         const char *ro = g_mount[mi].fstype == FS_ISO9660 ? "read-only" : "read-write";
-        fatvol_dirent ents[32];
+        static fatvol_dirent ents[32];   /* see above (M2062) */
         int n = blockdev_mount_list(mi, "", ents, 32);
         if (n < 0) n = 0;
         total_volumes++;
@@ -931,7 +931,7 @@ int blockdev_format(char *out, int max) {
         uint64_t starts[16];
         int nstart = collect_fat_starts(i, starts, 16);
         for (int v = 0; v < nstart; v++) {
-            fatvol_dirent ents[32];
+            static fatvol_dirent ents[32];   /* static, not stack: 8 KB of 256-byte names on a 16 KB kernel stack (M2062). Boot probe, one core, one caller. */
             int n = fatvol_list(bd_blk_read, (void *)(intptr_t)i, starts[v], ents, 32);
             if (n <= 0) continue;
             p = sapp(out, p, max, "    FAT32 @ LBA ");

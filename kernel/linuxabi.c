@@ -430,8 +430,33 @@ static const char *lx_xlate(const char *p, char *out, int max) {
          * runtime sends output it means to discard. (M1965) */
         if (lx_is_synth(p)) return p;
         for (const char *r = LX_ROOT; *r && n < max - 1; r++) out[n++] = *r;
-        for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
+        int pi = 0;
+        for (; p[pi] && n < max - 1; pi++) out[n++] = p[pi];
         out[n] = 0;
+        /* A TRUNCATED PATH IS A DIFFERENT FILE (M2062).
+         *
+         * This loop stopped at max-1 and said nothing, so a path longer than
+         * VFS_PATH_MAX quietly named something else -- create it and you get a
+         * file under the wrong name; open it and you get ENOENT for a file you
+         * just wrote. It is the eleventh instance in this campaign of a request
+         * accepted and then not honoured, and the only one that had no
+         * diagnostic at all.
+         *
+         * The real repair is a longer path budget: VFS_PATH_MAX is 256 against
+         * Linux's 4096, and the /disk2 prefix eats six more, so the usable
+         * limit is 249. Raising it is not a constant change -- seventy stack
+         * buffers are declared [VFS_PATH_MAX] and several nest in one call
+         * chain against a 16 KB kernel stack -- so it is its own milestone.
+         * Until then, say so: a wrong answer that announces itself can be
+         * found, and this one could not. */
+        if (p[pi]) {
+            int want = 0; while (p[want]) want++;
+            static int told;
+            if (++told <= 4)
+                kprintf("[linuxabi] path TRUNCATED: %d chars requested, %d is the limit "
+                        "(+%d for the mount prefix) -- this names a DIFFERENT file: \"%s\"\n",
+                        want, max - 1, LX_ROOT_LEN, out);
+        }
         /* A TRAILING SLASH IS NOT A CHARACTER THE PATH WALKER FORGIVES, and
          * "/" is the path a program is most likely to hand us: the root itself
          * became "/disk2/", which resolved to nothing. Claude Code checks its

@@ -11,6 +11,7 @@
 #include "fb.h"
 #include "font.h"
 #include "vfs.h"
+#include "kheap.h"   /* listings are heap-allocated: a dirent name is 256 bytes (M2062) */
 #include "timer.h"
 #include "string.h"
 
@@ -76,10 +77,11 @@ static void run(const char *cmd) {
         { clear(); return; }
     else if (starts(cmd, "echo ")) { print(cmd + 5); put('\n'); }
     else if (eq(cmd, "ls")) {
-        vfs_dirent e[32];
-        int n = vfs_list(e, 32);
+        vfs_dirent *e = kmalloc(32 * sizeof *e);    /* heap: 256-byte names (M2062) */
+        int n = e ? vfs_list(e, 32) : -1;
         for (int i = 0; i < n; i++) { print(e[i].name); put(' '); }
         put('\n');
+        if (e) kfree(e);
     } else if (starts(cmd, "cat ")) {
         char buf[512];
         long r = vfs_read(cmd + 4, buf, sizeof(buf) - 1);

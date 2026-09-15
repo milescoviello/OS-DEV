@@ -1015,6 +1015,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the edge-triggered epoll probe...\n");
         int erc = app_run_linux_sync("/disk2/lxepoll", 0, 0, 90000);
         kprintf("[lxabi] LXEPOLL exit -> %d\n", erc);
+        /* A listing that truncates a filename hands a program a name that does
+         * not exist, and nothing here had ever asserted the bytes come back
+         * unchanged. (M2062) */
+        kprintf("[lxabi] launching the long-filename round-trip probe...\n");
+        int lnrc = app_run_linux_sync("/disk2/lxlongname", 0, 0, 90000);
+        kprintf("[lxabi] LXLONGNAME exit -> %d\n", lnrc);
         kprintf("[lxabi] launching the absolute-deadline probe...\n");
         int trc = app_run_linux_sync("/disk2/lxtime", 0, 0, 90000);
         kprintf("[lxabi] LXTIME exit -> %d\n", trc);
@@ -1617,14 +1623,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 kprintf("[lxbuild] make pass %d -> %d\n", pass, rc);
             }
             kprintf("[lxbuild] make -> %d\n", rc);
-            vfs_dirent kents[64];
-            int kn = vfs_list_path("/disk2/src", kents, 64), ksz = -1;
+            vfs_dirent *kents = kmalloc(64 * sizeof *kents);   /* heap: 256-byte names (M2062) */
+            int kn = kents ? vfs_list_path("/disk2/src", kents, 64) : 0, ksz = -1;
             for (int i = 0; i < kn; i++) {
                 const char *nm = kents[i].name;
                 if (nm[0]=='k'&&nm[1]=='e'&&nm[2]=='r'&&nm[3]=='n'&&nm[4]=='e'&&nm[5]=='l'&&
                     nm[6]=='3'&&nm[7]=='2'&&nm[8]=='.'&&nm[9]=='e'&&nm[10]=='l'&&nm[11]=='f'&&!nm[12])
                     ksz = (int)kents[i].size;
             }
+            if (kents) kfree(kents);
             if (ksz > 0) kprintf("[lxbuild] kernel32.elf built in-guest: %d bytes\n", ksz);
             else         kprintf("[lxbuild] kernel32.elf MISSING -- the build produced no kernel\n");
         }
@@ -1635,11 +1642,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[ ok ] mounted FAT32 volume (ATA primary master).\n\n");
         if (g_fatjournal_test)             /* -append fatjournaltest: live FAT32 create crash-atomicity (M1866) */
             fat32_journal_selftest();
-        vfs_dirent ents[32];
-        int n = vfs_list(ents, 32);
+        vfs_dirent *ents = kmalloc(32 * sizeof *ents);   /* heap: 256-byte names (M2062) */
+        int n = ents ? vfs_list(ents, 32) : 0;
         kprintf("  / contains %d file(s):\n", n);
         for (int i = 0; i < n; i++)
             kprintf("    %s  (%u bytes)\n", ents[i].name, ents[i].size);
+        if (ents) kfree(ents);
         char fbuf[256];
         long r = vfs_read("README.TXT", fbuf, sizeof(fbuf) - 1);
         if (r > 0) {

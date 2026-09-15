@@ -11,7 +11,10 @@
 #include "partition.h"   /* ext2_extent_t, for vfs_fiemap (M1152) */
 
 typedef struct {
-    char     name[64];
+    /* 64 -> 256 (M2062): the second of the two caps that truncated a long
+     * filename. See fatvol_dirent in partition.h for what that cost. Callers
+     * that held these in a stack array now allocate instead. */
+    char     name[256];
     uint32_t size;
     uint16_t date, time;     /* FAT-packed last-write date/time (0 = unset) */
 } vfs_dirent;

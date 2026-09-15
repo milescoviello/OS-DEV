@@ -3472,7 +3472,10 @@ int app_sys_read(char *buf, unsigned max) {
                  * name starts with the typed word (case-insensitive). A unique
                  * match fills in the whole name; several matches advance to the
                  * point where they first disagree — bash's default Tab. */
-                vfs_dirent e[32]; int ne = vfs_list(e, 32);
+                /* HEAP (M2062): 32 x 256-byte names is 8 KB, half the kernel
+                 * stack, and this runs inside the keystroke path. */
+                vfs_dirent *e = kmalloc(32 * sizeof *e);
+                int ne = e ? vfs_list(e, 32) : 0;
                 const char *names[32];
                 for (int i = 0; i < ne; i++) names[i] = e[i].name;
                 int nm, fmi, cpl = complete_scan(names, ne, buf + ws, plen, &nm, &fmi);
@@ -3503,6 +3506,7 @@ int app_sys_read(char *buf, unsigned max) {
                     cx0 = a->cx; cy0 = a->cy;       /* input restarts after the redrawn prompt */
                     emit_range(a, buf, 0, n);
                 }
+                if (e) kfree(e);
             }
             cur_i = n;
             continue;
@@ -7578,8 +7582,10 @@ static void eof_spin_watch(struct app *a, int fd, long n) {
     }
 }
 static long app_fd_read_inner(int fd, void *buf, unsigned long max);
-/* AN EDGE THAT HAPPENS BETWEEN TWO POLLS (M2059). See epoll_note_drain. */
+/* AN EDGE THAT HAPPENS BETWEEN TWO POLLS (M2059/M2062). See epoll_note_drain
+ * for the consumer side and epoll_note_post for the producer side. */
 static void epoll_note_drain(struct app *a, int fd);
+static void epoll_note_post(struct app *a, int fd);
 long app_fd_read(int fd, void *buf, unsigned long max) {
     long n = app_fd_read_inner(fd, buf, max);
     if (g_net_trace) { struct app *a = cur(); if (a) eof_spin_watch(a, fd, n); }
@@ -7883,6 +7889,11 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
                 task_wake((task_t *)g_evfd_wait[i].task);
             }
         irq_restore(f);
+        /* EVERY WRITE IS AN EDGE ON AN EVENTFD (M2062). See epoll_note_post:
+         * this is the wake-up primitive a thread pool posts work on, and the
+         * counter staying non-zero across two posts must not swallow the
+         * second one. */
+        epoll_note_post(a, fd);
         return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 16) {  /* accepted AF_INET connection (M2020) */
@@ -8977,6 +8988,55 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
  * checks. That one is benign for EPOLLET: the fd is still ready at the next
  * check, so the level is seen even though the edge was not. The pathological
  * case is exactly the one above, where the process's own drain hid the dip. */
+/* THE OTHER HALF OF THE EDGE (M2062).
+ *
+ * M2059 closed the CONSUMER side: a drain that no poll observed. This is the
+ * PRODUCER side, and it is a different fact about Linux rather than the same
+ * one restated.
+ *
+ * On Linux an epoll item becomes ready because the file's own wake path says
+ * so. `eventfd_write` calls `wake_up_locked_poll`, which runs
+ * `ep_poll_callback`, which puts the item on the instance's ready list -- and
+ * it does that on EVERY write, whether or not the counter was already
+ * non-zero. So for an eventfd, edge-triggered does not mean "0 -> non-zero",
+ * it means "each write". Sampling readiness cannot express that: the state is
+ * "non-zero" before and after, and an implementation that compares states sees
+ * nothing happen.
+ *
+ * It matters because this is the wake-up primitive every thread pool and event
+ * loop is built on. A producer posts work with a write and a consumer drains
+ * with a read; if a consumer is told once and then handles the batch without
+ * reading the counter to zero, the NEXT post has to wake it, and here it did
+ * not. Claude Code's dump is exactly that picture -- a thread parked in
+ * epoll_pwait2 on an instance whose waker eventfd is ready and latched.
+ *
+ * So treat a post as an edge, which is what Linux does. This cannot spin: it
+ * requires an actual write each time, and a write is work the producer chose
+ * to do. */
+static void epoll_note_post(struct app *a, int fd) {
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].epwatch) return;
+    for (int j = 0; j < APP_NFD; j++) {
+        if (!a->fd[j].used || a->fd[j].type != 6) continue;
+        struct epollobj *e = &epolls[a->fd[j].obj];
+        for (int i = 0; i < e->n; i++) {
+            if (e->items[i].fd != fd || !e->items[i].last_ready) continue;
+            if (!(e->items[i].events & EPOLLET)) continue;   /* level-triggered already re-reports */
+            int want = e->items[i].events & ~(int)(EPOLLET | EPOLLONESHOT);
+            if (!app_fd_ready((app_t *)a, fd, want)) continue;
+            /* This is the instant a wake-up WOULD have been lost. Say so once:
+             * it names the posting thread and the epoll instance, at the moment
+             * the hang used to be created rather than minutes later. */
+            static int told;
+            if (!told) {
+                told = 1;
+                kprintf("[poll] a post to fd %d found epfd %d's edge for it ALREADY REPORTED "
+                        "(tid %d) -- re-arming; before M2062 this wake-up was dropped\n",
+                        fd, j, task_current_id());
+            }
+            e->items[i].last_ready = 0;                      /* a fresh post is a fresh edge */
+        }
+    }
+}
 static void epoll_note_drain(struct app *a, int fd) {
     if (!a || fd < 0 || fd >= APP_NFD) return;
     /* EVERY read and write reaches here, so the uninteresting case has to be
@@ -9154,9 +9214,13 @@ int app_pidfd_getfd(int pidfd, int targetfd) {
  * convention the real filesystems use). Returns bytes written (0 = no more from
  * `start`), or -1; the caller resumes from the last record's d_off. */
 long app_getdents64(void *buf, unsigned long max, int start) {
-    vfs_dirent ents[128];
+    /* HEAP (M2062): a dirent name is 256 bytes now, so 128 of them is 33 KB
+     * against a 16 KB kernel stack. Widening the name is what stopped every
+     * listing truncating a filename at 31 characters. */
+    vfs_dirent *ents = kmalloc(128 * sizeof *ents);
+    if (!ents) return -1;
     int n = vfs_list(ents, 128);
-    if (n < 0) return -1;
+    if (n < 0) { kfree(ents); return -1; }
     unsigned long off = 0;
     for (int i = (start < 0 ? 0 : start); i < n; i++) {
         const char *nm = ents[i].name;
@@ -9174,6 +9238,7 @@ long app_getdents64(void *buf, unsigned long max, int start) {
         rec[19 + dlen] = 0;
         off += reclen;
     }
+    kfree(ents);
     return (long)off;
 }
 /* prctl (M1225): PR_SET_NAME / PR_GET_NAME — a process renames itself at runtime

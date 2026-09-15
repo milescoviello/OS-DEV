@@ -397,8 +397,15 @@ static void ov_join(const char *base, const char *rel, char *out, int max) {
 /* Merged listing of the overlay (M1143): upper entries (minus whiteout markers),
  * then lower entries that the upper doesn't shadow and that aren't whiteouted.
  * v1 lists a tmpfs upper + a /diskN lower (the usual config). */
+/* HEAP, NOT STACK (M2062). A dirent name is 256 bytes now, so 64 of them is
+ * 17 KB and the kernel task stack is 16 KB. Every listing buffer in the kernel
+ * moved for this reason; the alternative was to keep truncating filenames,
+ * which is what made a program unable to open its own files. */
 static int over_list(vfs_dirent *out, int max) {
-    vfs_dirent up[64]; int nup = 0;
+    vfs_dirent *up = kmalloc(64 * sizeof *up);
+    fatvol_dirent *lo = kmalloc(64 * sizeof *lo);
+    if (!up || !lo) { if (up) kfree(up); if (lo) kfree(lo); return -1; }
+    int nup = 0;
     if (veq(ov_upper, "/tmp")) nup = tmpfs_list(up, 64);
     int n = 0;
     for (int i = 0; i < nup && n < max; i++) {
@@ -406,19 +413,20 @@ static int over_list(vfs_dirent *out, int max) {
         out[n++] = up[i];
     }
     if (ov_lower_midx >= 0) {
-        fatvol_dirent lo[64];
         int nlo = blockdev_mount_list(ov_lower_midx, "", lo, 64);
         for (int i = 0; i < nlo && n < max; i++) {
             int hidden = ov_whiteouted(lo[i].name);
             for (int j = 0; !hidden && j < nup; j++) if (veq(lo[i].name, up[j].name)) hidden = 1;  /* shadowed */
             if (hidden) continue;
-            int k = 0; while (lo[i].name[k] && k < 60) { out[n].name[k] = lo[i].name[k]; k++; }
+            int k = 0;
+            while (lo[i].name[k] && k < (int)sizeof out[n].name - 2) { out[n].name[k] = lo[i].name[k]; k++; }
             if (lo[i].is_dir) out[n].name[k++] = '/';
             out[n].name[k] = 0;
             out[n].size = lo[i].size; out[n].date = 0; out[n].time = 0;
             n++;
         }
     }
+    kfree(up); kfree(lo);
     return n;
 }
 
@@ -428,15 +436,18 @@ int vfs_list(vfs_dirent *out, int max) {
         return procfs_list(synth_cwd == 1 ? "/proc" : "/dev", out, max);
     if (synth_cwd == 3) return tmpfs_list(out, max);       /* the RAM /tmp */
     if (synth_cwd >= 4) {                                  /* a mounted disk volume's root */
-        fatvol_dirent fe[64];
         int cap = max < 64 ? max : 64;
+        fatvol_dirent *fe = kmalloc((unsigned long)cap * sizeof *fe);   /* heap: see over_list (M2062) */
+        if (!fe) return -1;
         int n = blockdev_mount_list(synth_cwd - 4, mount_sub, fe, cap);
         for (int i = 0; i < n; i++) {
-            int k = 0; while (fe[i].name[k] && k < 60) { out[i].name[k] = fe[i].name[k]; k++; }
+            int k = 0;
+            while (fe[i].name[k] && k < (int)sizeof out[i].name - 2) { out[i].name[k] = fe[i].name[k]; k++; }
             if (fe[i].is_dir) out[i].name[k++] = '/';     /* match fat32_list's dir marker */
             out[i].name[k] = 0;
             out[i].size = fe[i].size; out[i].date = 0; out[i].time = 0;
         }
+        kfree(fe);
         return n;
     }
     return fs ? fs->list(out, max) : -1;
@@ -741,13 +752,17 @@ static int vfs_stat_inner(const char *path, struct statx *st) {
     }
     const char *base = path; for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
     if (!*base) { st->stx_mode = S_IFDIR | 0755u; st->stx_ino = path_ino(path); return 0; }   /* trailing slash -> a directory */
-    vfs_dirent ents[64]; int n = vfs_list(ents, 64);
+    vfs_dirent *ents = kmalloc(64 * sizeof *ents);     /* heap: see over_list (M2062) */
+    if (!ents) return -1;
+    int n = vfs_list(ents, 64);
     for (int i = 0; i < n; i++) if (veq(ents[i].name, base)) {
         st->stx_mode = S_IFREG | 0644u;                /* the dirent carries no type bit -> assume regular */
         st->stx_size = ents[i].size; st->stx_blocks = (ents[i].size + 511) / 512;
         st->stx_ino = path_ino(path);
+        kfree(ents);
         return 0;
     }
+    kfree(ents);
     return -1;
 }
 

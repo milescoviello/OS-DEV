@@ -193,6 +193,7 @@ LXDYN: a dynamically-linked binary ran
 guest exited with status 11
 LXTHREAD: 4 threads
 LXEPOLL: ALL PASSED
+LXLONG: ALL PASSED
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -315,6 +316,21 @@ LXWAIT: reaped 40/40 children
         echo "  ok: an edge-triggered epoll edge survives an unobserved drain, 100x, on an eventfd and a pipe"
     else
         echo "  FAIL: edge-triggered epoll lost an edge:"; grep -a "LXEPOLL" "$SLOG3" | tail -3; f3=1
+    fi
+    # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
+    # Every listing in the kernel came through one struct whose name field was
+    # 32 bytes, so every filename was truncated at 31 characters -- and a
+    # truncated name is not cosmetic, it is a name that does not exist. `find`
+    # inside OS-DEV said it: two files under /root/.claude reported "No such
+    # file or directory" at exactly 31 characters each. Claude Code names its
+    # session keys with a 64-hex hash, so nearly everything it owns was
+    # invisible to it. lxlongname writes 31..240-character names, lists the
+    # directory, demands the bytes back exactly, and then OPENS each one by the
+    # name the listing gave -- which is the operation that actually failed.
+    if grep -aq "LXLONG: ALL PASSED" "$SLOG3"; then
+        echo "  ok: filenames up to 240 chars round-trip through a directory listing and are openable"
+    else
+        echo "  FAIL: a directory listing truncated a filename:"; grep -a "LXLONG" "$SLOG3" | head -3; f3=1
     fi
     # M2025 -- the subprocess lifecycle Claude Code depends on: 40 children
     # reaped, a threaded child whose exit_group comes from a helper thread, a
