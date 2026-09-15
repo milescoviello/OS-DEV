@@ -126,7 +126,9 @@ static int arp_maybe_reply(const uint8_t *buf, int len) {
  * (M2017) */
 static void park_put(const uint8_t *f, int len);   /* the TCP park ring, defined with the TCP demux below */
 static void udpq_put(const uint8_t *f, int len);   /* the UDP datagram queue */
-#define ORING_N   16
+/* 16 -> 48 (M2022): same reasoning as PARK_N. This ring holds the protocols
+ * that have nowhere else to go, and it is written by every drain site. */
+#define ORING_N   48
 #define ORING_MAX 1600
 static struct { uint8_t buf[ORING_MAX]; int len; uint64_t at; } g_oring[ORING_N];
 #define ORING_TTL 200            /* ticks (~2s): a frame nobody claimed is stale */
@@ -280,6 +282,43 @@ static int arp_resolve(const uint8_t *ip, uint8_t *out_mac) {
 }
 
 /* Send one ICMP echo request to `ip` (via `dst_mac`) and await the reply. */
+/* Send one echo request and DO NOT wait. Split out so a test can put another
+ * NIC consumer between the request and the reply (M2018). */
+static void ping_send(const uint8_t *ip, const uint8_t *dst_mac, uint16_t seq) {
+    const uint8_t *mac = nic_mac();
+    uint8_t pkt[42];                         /* 14 eth + 20 IP + 8 ICMP */
+
+    /* ethernet */
+    memcpy(pkt + 0, dst_mac, 6);
+    memcpy(pkt + 6, mac, 6);
+    put16(pkt + 12, 0x0800);                 /* IPv4 */
+
+    /* IP header (20 bytes, at offset 14) */
+    uint8_t *ip_h = pkt + 14;
+    ip_h[0] = 0x45;                          /* version 4, IHL 5 */
+    ip_h[1] = 0;                             /* DSCP/ECN */
+    put16(ip_h + 2, 28);                     /* total length = 20 + 8 */
+    put16(ip_h + 4, seq);                    /* identification */
+    put16(ip_h + 6, 0);                      /* flags/fragment */
+    ip_h[8] = 64;                            /* TTL */
+    ip_h[9] = 1;                             /* protocol = ICMP */
+    put16(ip_h + 10, 0);                     /* checksum (fill below) */
+    memcpy(ip_h + 12, OUR_IP, 4);
+    memcpy(ip_h + 16, ip, 4);
+    put16(ip_h + 10, inet_checksum(ip_h, 20));
+
+    /* ICMP header (8 bytes, at offset 34) */
+    uint8_t *icmp = pkt + 34;
+    icmp[0] = 8;                             /* type = echo request */
+    icmp[1] = 0;                             /* code */
+    put16(icmp + 2, 0);                      /* checksum (fill below) */
+    put16(icmp + 4, 0x1234);                 /* identifier */
+    put16(icmp + 6, seq);                    /* sequence */
+    put16(icmp + 2, inet_checksum(icmp, 8));
+
+    nic_send(pkt, sizeof(pkt));
+}
+
 static int ping(const uint8_t *ip, const uint8_t *dst_mac, uint16_t seq) {
     const uint8_t *mac = nic_mac();
     uint8_t pkt[42];                         /* 14 eth + 20 IP + 8 ICMP */
@@ -660,7 +699,9 @@ int net_udp_send(const uint8_t dstip[4], uint16_t dport, uint16_t sport,
  *
  * Now a pump parks TCP frames (the M1908 ring) and queues UDP datagrams by
  * destination port, and both recv and poll read the queue. */
-#define UDPQ_N    16
+/* 16 -> 48 (M2022): a DNS lookup in flight while another consumer floods the
+ * NIC used to lose its reply to eviction. */
+#define UDPQ_N    48
 #define UDPQ_MAX  1500
 #define UDPQ_TTL  500                  /* ticks (~5s): a datagram nobody claims must not hold a slot */
 static struct {
@@ -1247,7 +1288,12 @@ static void tcp_send_seg(const uint8_t *dmac, const uint8_t *dip,
  * for it, and without expiry those slots would leak and eventually wedge the
  * ring. PARK_TTL is generous relative to a poll interval but short enough that a
  * dead connection's frames cannot hold a slot for long. */
-#define PARK_N    8
+/* 8 -> 64 (M2022). Eight parked frames total, evicting the oldest, is not a
+ * queue -- it is a one-connection assumption. Claude Code holds two or three
+ * TLS connections while the boot self-test holds another and the desktop is
+ * live, and a single burst on any one of them silently evicted every frame
+ * belonging to the others. 64 x 1600 B is 100 KiB and removes the assumption. */
+#define PARK_N    64
 #define PARK_MAX  1600
 #define PARK_TTL  200            /* ticks (~2s at 100Hz) */
 static struct {
@@ -1272,6 +1318,7 @@ static int park_matches(const uint8_t *f, int len, const uint8_t *dip,
 /* Stash a frame that belongs to someone else. Drops the OLDEST parked frame when
  * full: losing a segment is recoverable (TCP retransmits), whereas refusing to
  * park would put us back to discarding the newest. */
+uint64_t g_park_evicted;                  /* frames thrown away because the ring was full (M2022) */
 static void park_put(const uint8_t *f, int len) {
     if (len <= 0 || len > PARK_MAX) return;
     uint64_t now = timer_ticks();
@@ -1280,7 +1327,11 @@ static void park_put(const uint8_t *f, int len) {
         if (g_park[i].len && now - g_park[i].at > PARK_TTL) g_park[i].len = 0;  /* expire */
         if (!g_park[i].len && slot < 0) slot = i;
     }
-    if (slot < 0) {                       /* full: evict the oldest */
+    if (slot < 0) {                       /* full: evict the oldest -- and SAY SO.
+                                           * A silent eviction here is a silently
+                                           * lost TCP segment, which is the most
+                                           * expensive kind of quiet. (M2022) */
+        g_park_evicted++;
         uint64_t oldest = ~0ull; slot = 0;
         for (int i = 0; i < PARK_N; i++)
             if (g_park[i].at < oldest) { oldest = g_park[i].at; slot = i; }
@@ -1840,7 +1891,12 @@ int net_tcp_serve(uint16_t port, const uint8_t *resp, int resp_len,
  * `base` is the sequence number of buf[0]; `have` marks which bytes have
  * arrived; `hi` is the highest stored offset+1. */
 #define OOO_CAP (96 * 1024)
-#define OOO_N   8   /* TCPSOCK_N(2) + NETCONN_N(4) persistent, + spare for ephemeral local tcp_conns (http_get/tls) */
+/* 8 -> 24 (M2022). The comment below was written when TCPSOCK_N was 2; it is
+ * 64 now, so "TCPSOCK_N(2) + NETCONN_N(4) + spare" had quietly become a
+ * ceiling on how many connections could reassemble out-of-order data at once.
+ * Each slot is ~140 KiB, so this is a real memory trade rather than a free
+ * one -- 24 covers every concurrent user we actually have. */
+#define OOO_N   24  /* was: TCPSOCK_N(2) + NETCONN_N(4) persistent, + spare for ephemeral local tcp_conns (http_get/tls) */
 
 /* --- send-side reliability tunables (M1886) --- */
 #define TCP_MSS   1400            /* our segment payload cap (matches tcp_write's historical chunking) */
@@ -2620,6 +2676,46 @@ int http_post(const char *host, const char *path, const char *ctype,
     return total;
 }
 
+/* THE RX DEMUX, PROVEN (M2018).
+ *
+ * The defect this guards against was invisible for a long time because nothing
+ * ever looked: there is one NIC and several independent consumers, and each of
+ * them drained it directly and DESTROYED whatever it did not recognise. A DNS
+ * lookup ate ICMP replies; an ARP resolve ate another socket's TCP segments.
+ * It surfaced as `ping` reporting 1 reply out of 3 with all three on the wire.
+ *
+ * Reproduce it exactly rather than testing a proxy for it:
+ *
+ *   1. send an ICMP echo request
+ *   2. have a DIFFERENT consumer hold the NIC while the reply arrives --
+ *      net_udp_recv on a port nobody sends to does precisely that, and is what
+ *      a concurrent DNS lookup is doing
+ *   3. then wait for the echo reply
+ *
+ * Before the fix, step 2 discards the reply and step 3 times out. After it, the
+ * reply is filed where its owner will find it. No timing luck is needed: the
+ * UDP drain is given 300 ms and the reply takes about 5, so it is CERTAIN to be
+ * the consumer that sees it. */
+static void net_selftest_rx_demux(const uint8_t *gw_mac) {
+    uint8_t buf[1600], dummy[64], sip[4];
+    uint16_t sport;
+
+    while (recv_timeout(buf, sizeof buf, 0) > 0) { }      /* start from a clean queue */
+
+    ping_send(GW_IP, gw_mac, 0xBEEF);
+    (void)net_udp_recv(60999, dummy, sizeof dummy, sip, &sport, 300);   /* the other consumer */
+
+    int got = 0;
+    uint64_t deadline = timer_ticks() + 100;
+    while (timer_ticks() < deadline) {
+        int len = recv_timeout(buf, sizeof buf, 20);
+        if (len >= 42 && get16(buf + 12) == 0x0800 && buf[14 + 9] == 1 &&
+            buf[34] == 0 && memcmp(buf + 26, GW_IP, 4) == 0) { got = 1; break; }
+    }
+    kprintf("[%s] net: an ICMP reply SURVIVES another consumer draining the NIC\n",
+            got ? " ok " : "FAIL");
+}
+
 void net_demo(void) {
     if (nic_init() != 0) {
         kprintf("[net] no supported NIC found (tried e1000, rtl8139).\n\n");
@@ -2638,6 +2734,8 @@ void net_demo(void) {
     kprintf("[net] ARP: 10.0.2.2 is at ");
     print_mac(gw_mac);
     kprintf("\n");
+
+    net_selftest_rx_demux(gw_mac);
 
     int got = 0;
     for (uint16_t seq = 1; seq <= 3; seq++) {
