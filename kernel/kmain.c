@@ -970,6 +970,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * left with its main task merely STOPPED, which the reaper's gate could
          * never satisfy, so the child never became a collectable zombie; and
          * wait4 discarded its options, so WNOHANG blocked for ever. (M2025) */
+        /* ...and the RESERVE-TRIM-COMMIT pattern JavaScriptCore's pointer
+         * cage is built from, which is where Claude Code died. (M2035) */
+        kprintf("[lxabi] launching the EXACT-ARGUMENTS cage probe...\n");
+        int c3 = app_run_linux_sync("/disk2/lxcage3", 0, 0, 120000);
+        kprintf("[lxabi] LXCAGE3 exit -> %d\n", c3);
+        kprintf("[lxabi] launching the pointer-cage probe...\n");
+        int gcrc = app_run_linux_sync("/disk2/lxgcage", 0, 0, 120000);
+        kprintf("[lxabi] LXGCAGE exit -> %d\n", gcrc);
         kprintf("[lxabi] launching the subprocess-lifecycle probe...\n");
         int wrc = app_run_linux_sync("/disk2/lxwait", 0, 0, 120000);
         kprintf("[lxabi] LXWAIT exit -> %d\n", wrc);
