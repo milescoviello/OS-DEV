@@ -1021,6 +1021,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the long-filename round-trip probe...\n");
         int lnrc = app_run_linux_sync("/disk2/lxlongname", 0, 0, 90000);
         kprintf("[lxabi] LXLONGNAME exit -> %d\n", lnrc);
+        /* rt_sigaction and rt_sigprocmask returned 0 and did nothing until
+         * M2063, including for the QUERY form -- which hands a caller its own
+         * uninitialised stack as a signal handler. */
+        kprintf("[lxabi] launching the signal-disposition probe...\n");
+        int sgrc = app_run_linux_sync("/disk2/lxsig", 0, 0, 90000);
+        kprintf("[lxabi] LXSIG exit -> %d\n", sgrc);
         kprintf("[lxabi] launching the absolute-deadline probe...\n");
         int trc = app_run_linux_sync("/disk2/lxtime", 0, 0, 90000);
         kprintf("[lxabi] LXTIME exit -> %d\n", trc);

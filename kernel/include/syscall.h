@@ -416,7 +416,7 @@ struct timeval { long tv_sec; long tv_usec; };
 #define ECONNREFUSED  111
 #define SA_ONSTACK 0x08000000  /* sigaction flag: run this handler on the sigaltstack() stack (M1276) */
 #define SIGUSR1  10            /* user signal 1 */
-#define SIGRTMIN 28            /* first real-time signal; signos >= here are intended for queued sigqueue use (M1271) */
+#define SIGRTMIN 34            /* first real-time signal; signos >= here are intended for queued sigqueue use (M1271). 28 -> 34 to match Linux, which reserves 32/33 for glibc's own use (M2063) */
 #define SA_SIGINFO 4           /* sigaction flag: 3-arg handler h(signo, siginfo*, ucontext*) (M1270) */
 #define SI_QUEUE  (-1)         /* siginfo.si_code: signal sent by sigqueue (carries si_value) (M1271) */
 #define SI_USER   0            /* siginfo.si_code: signal sent by kill/raise (no payload) (M1271) */
@@ -433,7 +433,20 @@ struct timeval { long tv_sec; long tv_usec; };
 #define UTIME_NOW  (-1L)       /* set the timestamp to the current time (M1230) */
 #define UTIME_OMIT (-2L)       /* leave the timestamp unchanged (M1230) */
 #define SIGCHLD 17
-#define SIGWINCH 24            /* terminal window-size change (M1279); standard (coalescing), < SIGRTMIN */
+/* 24 -> 28, WHICH IS WHAT LINUX CALLS IT (M2063).
+ *
+ * Everything else here already matched Linux; SIGWINCH did not, and neither
+ * did SIGRTMIN, so the Linux ABI could not simply pass a signal number
+ * through. A Linux program asking for SIGXCPU (24) would have been handed
+ * SIGWINCH, and vice versa -- the quietest possible way to run the wrong
+ * handler. Both sides of the tree are rebuilt from this header, so the
+ * renumber is consistent; the in-guest build reuses prebuilt user ELFs, which
+ * is why this is done as one atomic change rather than incrementally. */
+#define SIGWINCH 28            /* terminal window-size change (M1279); standard (coalescing), < SIGRTMIN */
+#define SIGXCPU  24            /* CPU time limit exceeded -- Linux's number, now that 24 is free (M2063) */
+#define SIGXFSZ  25            /* file size limit exceeded */
+#define SIGVTALRM 26
+#define SIGPROF  27
 /* waitid (M1227): minimal siginfo + idtype/options/si_code constants. */
 struct siginfo { int si_signo, si_errno, si_code, si_pid, si_uid, si_status; };
 #define P_ALL   0

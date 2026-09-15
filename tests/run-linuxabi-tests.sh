@@ -194,6 +194,7 @@ guest exited with status 11
 LXTHREAD: 4 threads
 LXEPOLL: ALL PASSED
 LXLONG: ALL PASSED
+LXSIG: ALL PASSED
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -316,6 +317,22 @@ LXWAIT: reaped 40/40 children
         echo "  ok: an edge-triggered epoll edge survives an unobserved drain, 100x, on an eventfd and a pipe"
     else
         echo "  FAIL: edge-triggered epoll lost an edge:"; grep -a "LXEPOLL" "$SLOG3" | tail -3; f3=1
+    fi
+    # M2063 -- SIGNALS, HONOURED RATHER THAN ACKNOWLEDGED. rt_sigaction and
+    # rt_sigprocmask returned 0 and did nothing, and kill/tkill/tgkill said
+    # "other signals: accepted, undelivered" -- so nothing could raise
+    # anything, and rt_sigaction's QUERY form handed a caller its own
+    # uninitialised stack as a function pointer. lxsig checks all of it:
+    # a handler that runs, a query that reports what is installed, SIG_IGN
+    # discarding instead of queueing, a block that blocks and reports pending,
+    # a mask query, and SIGKILL refused. Four separate fixes, each verified by
+    # reverting it alone: putting rt_sigaction back fails 6 of the 9, the
+    # kill path fails 3, dropping app_deliver_pending from the Linux syscall
+    # return fails 2, and removing the sigset bit shift fails 2.
+    if grep -aq "LXSIG: ALL PASSED" "$SLOG3"; then
+        echo "  ok: rt_sigaction/rt_sigprocmask/kill are honoured -- a handler runs, a block blocks, SIG_IGN discards"
+    else
+        echo "  FAIL: signal dispositions are not honoured:"; grep -a "LXSIG" "$SLOG3" | grep -a FAIL | head -4; f3=1
     fi
     # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
     # Every listing in the kernel came through one struct whose name field was

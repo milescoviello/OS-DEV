@@ -167,8 +167,28 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_write          1
 #define LXS_close          3
 #define LXS_brk           12
+#define APP_NSIG_LX 65          /* signals 1..64, matching app.c's table (M2063) */
+/* LINUX NUMBERS ITS SIGSET BITS FROM ZERO, WE NUMBER OURS FROM ONE (M2063).
+ *
+ * Linux's `sigmask(sig)` is `1UL << (sig - 1)`, and glibc's `sigaddset` agrees,
+ * so SIGWINCH (28) is bit 27 in every sigset that crosses this boundary. Our
+ * own masks are indexed by the signal number itself, because that is what
+ * `pending_sigs`, `sig_blocked` and `sig_handler[]` have always used and those
+ * are shared with the native ABI.
+ *
+ * One shift either way. Getting it wrong is silent and total: a program blocks
+ * SIGWINCH, we record SIGPROF as blocked, and the signal it asked us to hold
+ * back is delivered immediately -- which is exactly what lxsig caught. Same
+ * class as M1967's struct statx offsets: only an exact-value assertion finds
+ * it, which is why lxsig checks the DELIVERY and the PENDING SET rather than
+ * the return code. */
+static inline uint64_t lx_sigset_in(uint64_t user)  { return user << 1; }
+static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_rt_sigaction  13
 #define LXS_rt_sigprocmask 14
+#define LXS_rt_sigreturn_  15
+#define LXS_rt_sigpending_ 127
+#define LXS_rt_sigsuspend_ 130
 #define LXS_ioctl         16
 #define LXS_readv         19
 #define LXS_preadv       295
@@ -1186,16 +1206,23 @@ void linux_syscall_dispatch(struct registers *r) {
          * confusing crash in place of a clean, reportable abort. Terminating
          * with 128+signal is the shell's convention and makes the abort
          * visible for what it is. (M1960) */
-        if (sig == 6 /*SIGABRT*/ || sig == 9 /*SIGKILL*/ || sig == 4 /*SIGILL*/ ||
-            sig == 8 /*SIGFPE*/ || sig == 11 /*SIGSEGV*/) {
-            kprintf("[linuxabi] process raised signal %d at itself -- terminating\n", sig);
+        if (sig < 0 || sig >= APP_NSIG_LX) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (sig == 0) { r->rax = 0; break; }         /* signal 0 is an existence probe */
+        /* WHICH PROCESS (M2063). tkill names a THREAD, tgkill a thread within
+         * a thread group; signals here are per-PROCESS, so both are treated as
+         * "this process" when the group is ours -- which is what raise() and
+         * pthread_kill(self) need, and is stated rather than pretended. */
+        long tpid = (r->rax == LXS_tkill_) ? 0 : a1;
+        int rc = app_raise_signal_to((int)tpid, sig);
+        if (rc == 1) {                               /* SIG_DFL and fatal, at ourselves */
+            kprintf("[linuxabi] process raised signal %d at itself with no handler -- terminating\n", sig);
             /* abort() prints nothing of its own and leaves no fault address, so
              * without this the only evidence is the exit status. (M1970) */
             if (sig == 6) { lx_trace_dump("abort()"); lx_user_backtrace(r); }
             app_sys_exit(128 + sig);
             break;
         }
-        r->rax = 0;                          /* other signals: accepted, undelivered */
+        r->rax = (rc < 0) ? (uint64_t)-(long)LX_ESRCH : 0;
         break;
     }
     case LXS_uname: {                       /* (struct utsname *) */
@@ -2237,10 +2264,73 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)-(long)LX_ENOSYS;
         break;
     }
-    case LXS_rt_sigaction:
-    case LXS_rt_sigprocmask:
-        r->rax = 0;                         /* accepted-and-ignored for now */
+    /* SIGNALS, HONOURED RATHER THAN ACKNOWLEDGED (M2063).
+     *
+     * Both of these returned 0 and did nothing. That is the twelfth "granted
+     * in name only" defect in this campaign, and the worst-behaved shape of
+     * it: `rt_sigaction(sig, NULL, &old)` is a QUERY, and answering 0 without
+     * writing `old` leaves the caller reading its own uninitialised stack as
+     * a function pointer. A runtime that saves the old handler and restores it
+     * later then installs garbage. Meanwhile SIG_IGN was not recorded at all,
+     * so a program that asked for a signal to be ignored kept getting it.
+     *
+     * Everything needed already existed -- app_sigaction, app_sigprocmask, a
+     * pending bitset, sigaltstack, an RT sigqueue. The numbers just did not
+     * line up: our SIGWINCH was 24 where Linux says 28, and SIGRTMIN was 28.
+     * M2063 renumbered both and widened every mask to 64 bits, so a Linux
+     * signal number now passes straight through. */
+    case LXS_rt_sigaction: {                /* (sig, act, oldact, sigsetsize) */
+        int sig = (int)a1;
+        if (sig <= 0 || sig >= APP_NSIG_LX) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (sig == 9 || sig == 19) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }   /* SIGKILL/SIGSTOP */
+        /* Linux's KERNEL sigaction, which is not glibc's:
+         *   { void *handler; unsigned long flags; void *restorer; u64 mask; } */
+        if (r->rdx) {                       /* oldact first: `act` may alias it */
+            if (!vmm_user_ok(r->rdx, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            uint64_t *o = (uint64_t *)r->rdx;
+            o[0] = app_sig_handler_of(sig);
+            o[1] = (uint64_t)app_sig_flags_of(sig);
+            o[2] = app_sig_restorer_of();
+            o[3] = lx_sigset_out(app_sig_mask_of(sig));
+        }
+        if (r->rsi) {
+            if (!vmm_user_ok(r->rsi, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            const uint64_t *na = (const uint64_t *)r->rsi;
+            app_sigaction_full(sig, na[0], na[2], (uint32_t)na[1], lx_sigset_in(na[3]));
+        }
+        r->rax = 0;
         break;
+    }
+    case LXS_rt_sigpending_:                /* (set, sigsetsize) */
+        /* ENOSYS until M2063, so a program could not tell a blocked signal
+         * from one that was never raised -- and sigwait/sigtimedwait loops are
+         * built on exactly that question. */
+        if (!r->rdi || !vmm_user_ok(r->rdi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        *(uint64_t *)r->rdi = lx_sigset_out(app_sigpending());
+        r->rax = 0;
+        break;
+    case LXS_rt_sigreturn_:
+        /* THE HANDLER'S WAY BACK. glibc's __restore_rt is `syscall(15)`, so
+         * without this a Linux signal handler could be entered and never
+         * return: the trampoline would fall through to an ENOSYS and then off
+         * the end of the world. Nothing had noticed because nothing could
+         * raise a signal in the first place (see kill, above). (M2063) */
+        app_sigreturn(r);
+        break;
+    case LXS_rt_sigprocmask: {              /* (how, set, oldset, sigsetsize) */
+        long how = a1;
+        if (r->rdx) {
+            if (!vmm_user_ok(r->rdx, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            *(uint64_t *)r->rdx = lx_sigset_out(app_sigprocmask(3 /* query only */, 0));
+        }
+        if (r->rsi) {
+            if (!vmm_user_ok(r->rsi, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            if (how != 0 && how != 1 && how != 2) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            app_sigprocmask((int)how, lx_sigset_in(*(const uint64_t *)r->rsi));
+        }
+        r->rax = 0;
+        break;
+    }
     case LXS_ioctl: {                       /* (fd, request, arg) */
         /* A TERMINAL PROGRAM HAS TO BE ABLE TO FIND OUT IT IS ON A TERMINAL
          * (M2004).
@@ -3597,6 +3687,20 @@ void linux_syscall_dispatch(struct registers *r) {
      * than at entry because the whole value of the record is the RESULT. */
     { struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
       if (re->seq == ring_slot) re->ret = r->rax;   /* still ours: see `seq` */ }
+    /* AND DELIVER ANY SIGNAL THAT CAME DUE (M2063).
+     *
+     * The native syscall return (syscall.c) and the interrupt return
+     * (interrupts.c) both do this; the LINUX entry never did. So a Linux
+     * process could install a handler, raise the signal, and return from the
+     * raising syscall straight past its own handler -- `raise(SIGUSR1)`
+     * reported success and the handler did not run until some later timer
+     * interrupt happened to catch the process in ring 3, which for a program
+     * that checks immediately is never.
+     *
+     * AFTER the ring patch and after r->rax is final, because
+     * app_deliver_pending snapshots the whole frame for sigreturn to restore --
+     * both existing call sites carry the same note, and for the same reason. */
+    app_deliver_pending(r);
 }
 
 /* ---- the System V initial process stack (M1939) --------------------------

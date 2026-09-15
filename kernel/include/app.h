@@ -217,13 +217,23 @@ long     app_sigfd_read(app_t *a, char *buf, int max);     /* read the next sigf
 int      app_sigfd_ready(app_t *a);                        /* fswait peek: a sigfd signal pending? */
 void app_signal_set(int signo, uint64_t handler, uint64_t restorer);  /* SYS_signal */
 void app_sigaction(int signo, uint64_t handler, uint64_t restorer, uint32_t flags);  /* SYS_sigaction: SA_SIGINFO etc. (M1270) */
+void app_sigaction_full(int signo, uint64_t handler, uint64_t restorer, uint32_t flags, uint64_t samask);  /* + sa_mask, for rt_sigaction (M2063) */
+uint64_t app_sig_handler_of(int signo);   /* what rt_sigaction's oldact must report (M2063) */
+uint32_t app_sig_flags_of(int signo);
+uint64_t app_sig_restorer_of(void);
+uint64_t app_sig_mask_of(int signo);
 int  app_signal_deliver(struct registers *r, int signo);  /* redirect r to the handler; 1 if delivered */
 void app_sigreturn(struct registers *r);            /* restore the pre-signal context */
 void app_request_signal(app_t *a, int signo);      /* async-raise a signal (Ctrl-C->SIGINT); opt-in (needs a handler) */
-uint32_t app_sigprocmask(int how, uint32_t set);   /* block/unblock signals; returns the old mask (M1208) */
-uint32_t app_sigpending(void);                      /* the raised-but-blocked (pending) signal set (M1209) */
+/* kill/tkill/tgkill for the Linux ABI: raise `signo` at `pid` (<=0 or our own
+ * pid = self), honouring SIG_IGN and the default action. 0 = raised/discarded,
+ * 1 = the CALLER must exit 128+signo, 2 = the target was killed, -1 = ESRCH.
+ * The decision needs struct app, so it lives in app.c. (M2063) */
+int  app_raise_signal_to(int pid, int signo);
+uint64_t app_sigprocmask(int how, uint64_t set);   /* block/unblock signals; returns the old mask (M1208; 64-bit since M2063) */
+uint64_t app_sigpending(void);                      /* the raised-but-blocked (pending) signal set (M1209) */
 int      app_signal_deliverable(void);              /* 1 if the current task has a real (handled, unblocked) signal pending (M1567) */
-long     app_sigsuspend(struct registers *r, uint32_t mask);  /* swap the blocked mask, block for a signal, deliver it, restore + always -1 (M1561) */
+long     app_sigsuspend(struct registers *r, uint64_t mask);  /* swap the blocked mask, block for a signal, deliver it, restore + always -1 (M1561) */
 long     app_pause(struct registers *r);                     /* block for a signal using the CURRENT mask, unchanged; always -1 (M1563) */
 int  app_sigqueue(int pid, int signo, uint64_t value);  /* SYS_sigqueue: RT signal carrying a queued sigval payload (M1271) */
 /* POSIX per-process interval timers: timer_create(2) firing a signal via the sigqueue FIFO (M1272) */

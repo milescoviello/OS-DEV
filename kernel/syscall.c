@@ -2247,7 +2247,7 @@ void syscall_dispatch(struct registers *r) {
         int nfds = (int)r->rsi; long timeout = (long)r->rdx;
         if (nfds < 1 || nfds > 64 || !ubuf(r->rdi, (uint64_t)(unsigned)nfds * sizeof(struct pollfd))) { r->rax = (uint64_t)-1; break; }
         app_t *self = app_current();
-        uint32_t old_mask = app_sigprocmask(2 /* SIG_SETMASK */, (uint32_t)r->r10);
+        uint64_t old_mask = app_sigprocmask(2 /* SIG_SETMASK */, (uint64_t)r->r10);
         app_kill_check();
         __asm__ volatile("sti");
         uint64_t start = timer_ms();
@@ -2665,7 +2665,7 @@ void syscall_dispatch(struct registers *r) {
         struct epoll_event *out = (struct epoll_event *)r->rsi;
         int maxev = (int)r->rdx; long timeout = (long)r->r10;
         if (maxev < 1 || maxev > 64 || !ubuf(r->rsi, (uint64_t)(unsigned)maxev * sizeof(struct epoll_event))) { r->rax = (uint64_t)-1; break; }
-        uint32_t old_mask = app_sigprocmask(2 /* SIG_SETMASK */, (uint32_t)r->r8);
+        uint64_t old_mask = app_sigprocmask(2 /* SIG_SETMASK */, (uint64_t)r->r8);
         app_kill_check();
         __asm__ volatile("sti");
         uint64_t start = timer_ms(); int k = 0; int interrupted = 0;
@@ -2692,7 +2692,7 @@ void syscall_dispatch(struct registers *r) {
         r->rax = (uint64_t)app_getdents64((void *)r->rdi, (unsigned long)r->rsi, (int)r->rdx);
         break;
     case SYS_sigprocmask:                  /* (how, set): block/unblock signals; returns the old mask (M1208) */
-        r->rax = (uint64_t)app_sigprocmask((int)r->rdi, (uint32_t)r->rsi);
+        r->rax = (uint64_t)app_sigprocmask((int)r->rdi, (uint64_t)r->rsi);
         break;
     case SYS_sigpending:                   /* (): the pending (raised-but-blocked) signal set (M1209) */
         r->rax = (uint64_t)app_sigpending();
