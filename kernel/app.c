@@ -2496,7 +2496,22 @@ void grid_write(struct app *a, const char *buf, unsigned len) {
             /* else: a stray continuation or 0xFE/0xFF -- not a character, drop it */
         } else if (a->esc == 1) {                /* after ESC */
             if (ch == '[') { a->esc = 2; a->csilen = 0; }
+            /* OSC: ESC ] Ps ; Pt (BEL | ESC \) -- an OPERATING SYSTEM COMMAND,
+             * and dropping only the two-byte introducer leaves its whole
+             * payload to be printed as text. Claude Code's login screen is
+             * built from OSC 8 hyperlinks, so the sign-in URL came out three
+             * times over, each copy prefixed with `8;id=fgcesq;` and trailing
+             * a stray `%`. The visible link text is the part between the two
+             * OSC 8 sequences, which is exactly what survives once the
+             * sequences themselves are consumed. (M2020) */
+            else if (ch == ']') { a->esc = 3; }
+            else if (ch == '\\') a->esc = 0;      /* a stray ST: nothing to end */
             else a->esc = 0;                     /* unsupported ESC x: consume + drop */
+        } else if (a->esc == 3) {                /* in OSC: swallow to BEL or ST */
+            if (ch == 0x07) a->esc = 0;          /* BEL terminates */
+            else if (ch == 0x1B) a->esc = 4;     /* maybe ESC \ */
+        } else if (a->esc == 4) {                /* saw ESC inside an OSC */
+            a->esc = (ch == '\\') ? 0 : 3;       /* ESC \ ends it; anything else stays in the string */
         } else {                                 /* in CSI: collect until the final byte */
             if (ch >= 0x40 && ch <= 0x7E) { ansi_csi(a, (char)ch); a->esc = 0; }
             else if (a->csilen < sizeof(a->csi)) a->csi[a->csilen++] = (char)ch;
@@ -6617,6 +6632,12 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
             if (!a->fd[fd].used || a->fd[fd].type != 8) return -1;   /* closed under us */
         }
     }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 16) {  /* accepted AF_INET connection (M2020) */
+        long n = net_tcp_accept_recv((uint8_t *)buf, (int)max, app_fd_nonblock(fd) ? 0 : 20);
+        if (n < 0) return 0;                       /* peer closed: EOF */
+        if (n == 0 && app_fd_nonblock(fd)) return APP_FD_EAGAIN;
+        return n;
+    }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M2004) */
         /* THE KEYBOARD OF THE WINDOW WE WRITE TO.
          *
@@ -6790,6 +6811,10 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
         irq_restore(f);
         return 8;
     }
+    if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 16) {  /* accepted AF_INET connection (M2020) */
+        int w = net_tcp_accept_send((const uint8_t *)buf, (int)len);
+        return (w < 0) ? APP_FD_EPIPE : (long)len;
+    }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M1972) */
         /* TO THE WINDOW THAT LAUNCHED US, not the kernel console (M2004).
          *
@@ -6906,6 +6931,7 @@ int app_fd_close(int fd) {
     else if (a->fd[fd].type == 11) pty_close(a->fd[fd].obj);    /* close this pty end, waking the peer (M1274) */
     else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
     else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
+    else if (a->fd[fd].type == 16) net_tcp_accept_close();                                  /* accepted AF_INET connection (M2020) */
     a->fd[fd].used = 0; a->fd[fd].type = 0;
     return 0;
 }
@@ -7246,6 +7272,95 @@ int app_inotify_rm(int fd, int wd) {
  * UDP path (M1258) + loopback (M1264). fd type 9; the bound local port lives in
  * fdent.off (0 = unbound -> an ephemeral port is assigned on first sendto). */
 static uint16_t g_ephemeral = 49152;
+/* ---- AF_INET SERVER SOCKETS: bind / listen / accept (M2020) ---------------
+ *
+ * bind() on an AF_INET socket used to be accepted and ignored, with the
+ * reasoning that we are single-homed and nothing depended on a specific local
+ * port. Something does: Claude Code's OAuth login starts a local HTTP server
+ * for the callback, asks the kernel which port it got, and puts that port in
+ * the URL it shows you. Accepting the bind and then failing the listen gave
+ *
+ *     OAuth error: Failed to start OAuth callback server.
+ *                  Failed to start server. Is port 0 in use?
+ *
+ * which is the third time in this arc that saying "yes" without meaning it has
+ * been worse than saying "no" (see pipe2 M2009, socketpair M2012, eventfd2
+ * M2017).
+ *
+ * net.c has had a passive open since M1327 -- SYN/SYN-ACK, recv, send, close --
+ * used by the in-guest httpd. What was missing was the SOCKET surface over it.
+ * One connection at a time, which is what that primitive supports and what an
+ * OAuth callback needs; a second accept simply waits.
+ *
+ * fd type 15 = a listening AF_INET socket (off = the bound port)
+ * fd type 16 = a connection returned by accept() on one
+ */
+static uint16_t g_inet_next_ephemeral = 45000;
+static int inet_port_taken(uint16_t port) {
+    for (int i = 0; i < MAX_APPS; i++) {
+        if (!apps[i].used) continue;
+        for (int f = 0; f < APP_NFD; f++)
+            if (apps[i].fd[f].used && (apps[i].fd[f].type == 15) &&
+                (uint16_t)apps[i].fd[f].off == port) return 1;
+    }
+    return 0;
+}
+/* Record the local port. Port 0 means "choose one", which is what a program
+ * that only needs *a* port asks for -- and it then has to be able to find out
+ * WHICH, so the chosen port is stored where getsockname can read it. */
+/* The local port recorded by bind(), for getsockname. */
+long app_fd_port(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return 0;
+    return a->fd[fd].off;
+}
+int app_inet_bind(int fd, uint16_t port) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    if (a->fd[fd].type != 10 && a->fd[fd].type != 9) return -1;
+    if (port == 0) {
+        for (int tries = 0; tries < 1000; tries++) {
+            uint16_t p = g_inet_next_ephemeral++;
+            if (g_inet_next_ephemeral > 60000) g_inet_next_ephemeral = 45000;
+            if (!inet_port_taken(p)) { port = p; break; }
+        }
+        if (!port) return -1;
+    } else if (inet_port_taken(port)) {
+        return -2;                                   /* EADDRINUSE */
+    }
+    a->fd[fd].off = (long)port;                      /* where getsockname reads it */
+    return (int)port;
+}
+/* Turn a bound socket into a listener. The TCP state machine itself lives in
+ * net.c; this only records that this descriptor is the one accept() waits on. */
+int app_inet_listen(int fd, int backlog) {
+    (void)backlog;
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    if (a->fd[fd].type != 10) return -1;
+    if (!a->fd[fd].off) {                            /* listen() without bind(): choose a port now */
+        int p = app_inet_bind(fd, 0);
+        if (p < 0) return -1;
+    }
+    if (a->fd[fd].obj >= 0) net_tcp_sock_close(a->fd[fd].obj);   /* it was a client TCB; it is a listener now */
+    a->fd[fd].obj = -1;
+    a->fd[fd].type = 15;
+    return 0;
+}
+/* One non-blocking attempt at a passive open. Returns a new fd for the
+ * connection, -11 (EAGAIN) if nobody is knocking, or -1 on a bad descriptor. */
+int app_inet_accept(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 15) return -1;
+    uint16_t port = (uint16_t)a->fd[fd].off;
+    if (net_tcp_accept_open(port, 1) != 0) return APP_FD_EAGAIN;   /* ~10ms look, then EAGAIN */
+    int nfd = -1;
+    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { nfd = i; break; }
+    if (nfd < 0) { net_tcp_accept_close(); return -1; }
+    a->fd[nfd] = (struct fdent){ 1, 16, 0, -1, {0}, (long)port, 0 };
+    return nfd;
+}
+
 int app_socket(int domain, int type) {
     struct app *a = cur(); if (!a) return -1;
     /* SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC (0x80000) ride in the type
@@ -7764,6 +7879,16 @@ int app_fd_ready(app_t *ap, int fd, int events) {
         /* POLLIN on a listening socket means "accept() would not block", which
          * is exactly what a server's event loop waits for. */
         if ((events & POLLIN) && unix_pending(a->fd[fd].obj)) re |= POLLIN;
+    } else if (a->fd[fd].type == 15) {                     /* AF_INET listener (M2020) */
+        /* "Would accept() block?" cannot be answered without looking at the
+         * wire, and looking means completing the handshake -- so a positive
+         * answer here has already done the passive open and accept() just
+         * hands the descriptor over. That is why accept() checks for an
+         * already-open connection before trying again. */
+        if ((events & POLLIN) && net_tcp_accept_ready((uint16_t)a->fd[fd].off)) re |= POLLIN;
+    } else if (a->fd[fd].type == 16) {                     /* accepted AF_INET connection (M2020) */
+        if ((events & POLLIN) && net_tcp_accept_readable()) re |= POLLIN;
+        if (events & POLLOUT) re |= POLLOUT;               /* send goes straight out */
     } else if (a->fd[fd].type == 14) {                     /* console alias (M2004) */
         /* READABLE ONLY WHEN A KEY IS ACTUALLY WAITING.
          *

@@ -239,6 +239,10 @@ long app_fd_read(int fd, void *buf, unsigned long max);        /* read a pipe fd
 long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe fd; bytes/-1 EPIPE (M1187) */
 int  app_termios_get(uint32_t *ifl, uint32_t *ofl, uint32_t *cfl, uint32_t *lfl, uint8_t *cc);  /* the terminal settings this app asked for (M2014) */
 int  app_termios_set(uint32_t ifl, uint32_t ofl, uint32_t cfl, uint32_t lfl, const uint8_t *cc); /* ...and TCSETS, stored for real */
+long app_fd_port(int fd);                     /* the local port bind() recorded (M2020) */
+int  app_inet_bind(int fd, uint16_t port);    /* AF_INET bind; returns the port actually bound (M2020) */
+int  app_inet_listen(int fd, int backlog);    /* ...and turn it into a listener */
+int  app_inet_accept(int fd);                 /* one non-blocking passive open; new fd or -EAGAIN */
 int  app_tio_echo(void);                                      /* is ECHO on? (M2014) */
 void app_epoll_dump_of(app_t *a, int epfd);   /* ...for a process that is not the caller (M2016) */
 void app_net_stall_watch(void);   /* report a socket that has gone quiet (M2016) */

@@ -1220,11 +1220,17 @@ void linux_syscall_dispatch(struct registers *r) {
             uint16_t port = (uint16_t)((sa[2] << 8) | sa[3]);
             uint8_t ip[4] = { sa[4], sa[5], sa[6], sa[7] };
             if (r->rax == LXS_bind_) {
-                /* bind() on a client socket names a local port. We are
-                 * single-homed with ephemeral source ports, and no caller here
-                 * depends on a specific one, so accept it rather than fail a
-                 * program that binds out of habit. */
-                r->rax = 0; break;
+                /* A REAL BIND (M2020). This used to be accepted and ignored on
+                 * the reasoning that nothing depended on a specific local port.
+                 * Something does: Claude Code's OAuth login binds port 0, asks
+                 * getsockname which port it got, and puts that port in the URL
+                 * it shows you. Ignoring the bind and then failing the listen
+                 * produced "Failed to start OAuth callback server. Is port 0 in
+                 * use?" -- a question the kernel had made unanswerable. */
+                int bp = app_inet_bind((int)a1, port);
+                if (bp == -2) { r->rax = (uint64_t)-(long)LX_EADDRINUSE; break; }
+                r->rax = (bp < 0) ? (uint64_t)-(long)LX_EINVAL : 0;
+                break;
             }
             int crc = app_connect((int)a1, ip, port);
             /* ALWAYS, not only under a trace flag (M2004). An outbound
@@ -1253,6 +1259,14 @@ void linux_syscall_dispatch(struct registers *r) {
         break;
     }
     case LXS_listen_: {
+        /* AF_INET listens here too now (M2020) -- it used to be AF_UNIX only,
+         * so an IP server socket got EADDRINUSE for a port nobody held. */
+        if (app_fd_type((int)a1) == 10) {
+            int lrc = app_inet_listen((int)a1, (int)r->rsi);
+            kprintf("[net] listen(fd %ld) on AF_INET -> %d\n", a1, lrc);
+            r->rax = (uint64_t)(lrc == 0 ? 0 : -(long)LX_EADDRINUSE);
+            break;
+        }
         int lrc = app_unix_listen((int)a1);
         if (g_lx_systrace) kprintf("[sock] listen(fd %ld) -> %d\n", a1, lrc);
         if (lrc != 0) kprintf("[linuxabi] listen(fd %ld) FAILED\n", a1);
@@ -1262,6 +1276,20 @@ void linux_syscall_dispatch(struct registers *r) {
     case LXS_accept_:
     case LXS_accept4_: {                    /* (fd, sockaddr *, addrlen *[, flags]) */
         int is4 = (r->rax == LXS_accept4_);          /* rax still holds the syscall number here */
+        if (app_fd_type((int)a1) == 15) {            /* AF_INET listener (M2020) */
+            int af = app_inet_accept((int)a1);
+            if (af < 0) { r->rax = (uint64_t)lx_fd_err(af); break; }
+            if (is4) app_fd_set_nonblock(af, (r->r10 & 0x800) ? 1 : 0);
+            if (r->rsi && vmm_user_ok(r->rsi, 16)) {   /* fill in a plausible peer address */
+                uint8_t *o = (uint8_t *)r->rsi;
+                for (int i = 0; i < 16; i++) o[i] = 0;
+                *(uint16_t *)o = 2;                    /* AF_INET */
+                o[4] = 127; o[7] = 1;                  /* the callback comes from loopback */
+            }
+            if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 16;
+            r->rax = (uint64_t)af;
+            break;
+        }
         int nf = app_unix_accept((int)a1);
         if (g_lx_systrace) kprintf("[sock] accept(fd %ld) -> %d\n", a1, nf);
         /* Non-blocking by construction: a server polls POLLIN first. Reporting
@@ -1311,6 +1339,20 @@ void linux_syscall_dispatch(struct registers *r) {
          *     a1->source_addr.sin6_family == PF_INET
          * after the DNS lookup had already succeeded. (M1967) */
         int ty = app_fd_type((int)a1);
+        if (ty == 15 || ty == 16) {                  /* a listening / accepted AF_INET socket (M2020) */
+            /* THE PORT IS THE WHOLE ANSWER. A program that binds port 0 asks
+             * this to find out what it actually got, and then tells the world
+             * -- Claude Code puts it straight into the OAuth callback URL. */
+            if (!r->rsi || !vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            uint8_t *o = (uint8_t *)r->rsi;
+            for (int i = 0; i < 16; i++) o[i] = 0;
+            long lp = app_fd_port((int)a1);
+            *(uint16_t *)o = 2;                                   /* AF_INET */
+            o[2] = (uint8_t)((lp >> 8) & 0xFF); o[3] = (uint8_t)(lp & 0xFF);
+            o[4] = 127; o[7] = 1;                                 /* 127.0.0.1 */
+            if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 16;
+            r->rax = 0; break;
+        }
         if (ty == 9 || ty == 10) {
             if (!r->rsi || !vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             uint8_t lip[4] = {0,0,0,0}; uint16_t lport = 0;

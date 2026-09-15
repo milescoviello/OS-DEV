@@ -69,6 +69,8 @@ int  net_tcp_accept_open(uint16_t port, uint64_t timeout_ticks);
 long net_tcp_accept_recv(uint8_t *out, int max, uint64_t timeout_ticks);
 int  net_tcp_accept_send(const uint8_t *data, int len);
 void net_tcp_accept_close(void);
+int  net_tcp_accept_ready(uint16_t port);   /* would accept() succeed? completes the handshake if so (M2020) */
+int  net_tcp_accept_readable(void);         /* has the accepted connection data (or EOF)? (M2020) */
 
 const uint8_t *net_ip(void);        /* our IPv4 address (4 bytes) */
 const uint8_t *net_gateway(void);   /* the gateway IPv4 address (4 bytes) */

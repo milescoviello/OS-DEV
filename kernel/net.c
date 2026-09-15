@@ -1545,6 +1545,31 @@ int net_tcp_respond(const uint8_t *resp, int resp_len) {
  * timeout. Then drive it with net_tcp_accept_recv/send/close. Deliberately a
  * separate function (not a refactor of net_tcp_accept) to leave the tested
  * httpd/ws_serve accept path byte-for-byte unchanged. */
+/* Is a connection waiting on `port`? (M2020)
+ *
+ * There is no way to answer this without touching the wire, and touching it
+ * means completing the handshake -- a SYN that is looked at and not answered
+ * is a SYN that gets retransmitted. So a "yes" here has already done the
+ * passive open, and accept() finds the connection ready rather than doing it
+ * again. An event loop can therefore poll a listening socket the same way it
+ * polls everything else. */
+int net_tcp_accept_ready(uint16_t port) {
+    if (g_srvconn.active && g_srvconn.lport == port) return 1;
+    return net_tcp_accept_open(port, 1) == 0;
+}
+/* Does the accepted connection have data, or has the peer finished? Both mean
+ * a read will not block, which is what POLLIN promises. (M2020) */
+int net_tcp_accept_readable(void) {
+    if (!g_srvconn.active) return 0;
+    if (g_srvconn.peer_fin) return 1;                 /* EOF is readable */
+    uint8_t buf[1600], *tcp; int dlen;
+    /* One non-blocking pass. srv_rx files anything that is not ours (M2017),
+     * so peeking here cannot cost another connection its packets. */
+    if (!srv_rx(buf, sizeof buf, g_srvconn.lport, g_srvconn.cport, g_srvconn.cip,
+                timer_ticks(), &tcp, &dlen)) return 0;
+    return dlen > 0 || (tcp[13] & (TCP_FIN | TCP_RST)) ? 1 : 0;
+}
+
 int net_tcp_accept_open(uint16_t port, uint64_t timeout_ticks) {
     uint8_t buf[1600], *tcp; int dlen;
     srv_announce(port);
