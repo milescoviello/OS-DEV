@@ -3230,7 +3230,18 @@ void linux_syscall_dispatch(struct registers *r) {
         /* Safe on both paths: lx_spawn_stack has already copied the strings
          * into the NEW user stack by the time app_exec returns. */
         kfree(abuf); kfree(ebuf); kfree(av); kfree(ev);
-        if (xrc < 0) r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
+        if (xrc < 0) {
+            /* SAY WHAT IT COULD NOT EXEC (M2030). A failed execve is reported
+             * to the parent as a child that exited 127, and 127 is the shell's
+             * "command not found" -- so the one fact that would explain it,
+             * the path, was the one thing never written down. Six children in a
+             * row died this way and the log named none of them. */
+            kprintf("[linuxabi] execve(\"%s\") -> ENOENT (raw=\"%s\" ptr=%lx readable=%d argv0=\"%s\" na=%d) (child exits 127)\n",
+                    pbuf, (path && vmm_user_ok(r->rdi, 1)) ? path : "<unreadable>",
+                    (unsigned long)r->rdi, (path && vmm_user_ok(r->rdi, 1)) ? 1 : 0,
+                    na > 0 ? av[0] : "<none>", na);
+            r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
+        }
         break;
     }
     case LXS_wait4_: {                      /* (pid, status*, options, rusage*) */
