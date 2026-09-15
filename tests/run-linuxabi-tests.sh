@@ -772,6 +772,8 @@ LXTHREAD: 4 threads
         echo "  ok: the real gcc driver compiled OS-DEV's own kernel/elf.c in-guest"
     else
         echo "  FAIL: gcc could not compile kernel/elf.c:"
+        cp "$SLOG5" /tmp/osdev-lxgcc-FAIL.log 2>/dev/null && \
+            echo "  (the failing boot's serial log is at /tmp/osdev-lxgcc-FAIL.log)"
         grep -aE "\[lxtool\] gcc\(kernel|error:|TRUNCATED" "$SLOG5" | head -4; f5=1
     fi
     # Prove the object is REAL by reading its symbol table -- an empty or
