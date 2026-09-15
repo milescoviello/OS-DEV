@@ -309,6 +309,7 @@ int vmm_fork_cow(uint64_t child_cr3) {
     uint64_t *pml4  = phys_to_table(cr3);
     uint64_t *bpml4 = phys_to_table(kernel_pml4);
     int rc = 0;
+    int cas_retries = 0;                   /* consecutive lost write-protect races (M2052) */
     for (int top = 0; top < 256 && rc == 0; top++) {          /* user half only */
     uint64_t pml4e = pml4[top];
     if (!(pml4e & PTE_PRESENT)) continue;
@@ -363,7 +364,44 @@ int vmm_fork_cow(uint64_t child_cr3) {
                  * for a moment, which is the safe direction: the worst a racing
                  * fault can then do is copy a page it did not strictly need to. */
                 pmm_addref(phys);                         /* one extra ref for the child's mapping */
-                if (e & PTE_WRITABLE) pt[k] = (e & ~PTE_WRITABLE) | PTE_COW;  /* first share: write-protect both sides, mark COW */
+                /* WRITE-PROTECT WITH A COMPARE-AND-SWAP, NOT A BARE STORE (M2052).
+                 *
+                 * `e` is a snapshot. A bare `pt[k] = (e & ~PTE_WRITABLE) |
+                 * PTE_COW` writes a value COMPUTED FROM THAT SNAPSHOT, so if a
+                 * sibling thread changed the entry in between -- an mmap
+                 * landing there, an mprotect widening it, a munmap clearing it
+                 * -- fork silently overwrites their update with a stale one.
+                 * Every other mutator of this hierarchy takes vmm_lock; this
+                 * walk does not, and M2045 showed that giving it that global
+                 * lock stalls the machine.
+                 *
+                 * A CAS needs no lock and cannot clobber: fork either wins
+                 * against the exact value it read, or loses and starts the page
+                 * over with the fresh one. No global serialisation, no
+                 * contention with other processes, and the failure mode is a
+                 * retry rather than someone else's mapping being destroyed.
+                 *
+                 * The reference taken just above has to be given back before
+                 * retrying, or a lost race leaks one. */
+                if (e & PTE_WRITABLE) {
+                    uint64_t expect = e;
+                    uint64_t want   = (e & ~PTE_WRITABLE) | PTE_COW;
+                    if (!__atomic_compare_exchange_n(&pt[k], &expect, want, 0,
+                                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                        pmm_free_frame(phys);             /* undo our ref, then redo this page */
+                        if (++cas_retries < 64) { k--; continue; }
+                        /* Persistently contended: leave the page to the sibling
+                         * that keeps winning. The child simply does not inherit
+                         * it, which its VMA resolves as a fresh page -- wrong
+                         * data is not possible, only a missing share, and 64
+                         * consecutive losses on one entry has never been
+                         * observed. Say so rather than loop for ever. */
+                        kprintf("[vmm] fork gave up write-protecting %lx after %d "
+                                "contended attempts\n", va, cas_retries);
+                        continue;
+                    }
+                    cas_retries = 0;
+                }
                 /* Either this page just became RO+COW above, OR it already was
                  * (a second-or-later fork of a page an EARLIER child already
                  * shares) -- both cases need the new child's own mapping to
