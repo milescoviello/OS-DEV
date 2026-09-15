@@ -2314,8 +2314,35 @@ void linux_syscall_dispatch(struct registers *r) {
         if ((uint64_t)a1 > cur) {
             uint64_t want = (uint64_t)a1 - cur;
             if (app_sbrk((long)want) == (uint64_t)-1) { r->rax = cur; break; }  /* failed: unchanged break */
+            r->rax = app_sbrk(0);
+            break;
         }
-        r->rax = app_sbrk(0);
+        /* A SHRINK MUST SUCCEED AND REPORT THE ADDRESS IT WAS GIVEN (M2049).
+         *
+         * This used to "accept and ignore" a shrink and then return the
+         * UNCHANGED, higher break. On Linux, brk(addr) below the current break
+         * succeeds and returns addr, and glibc compares the value it gets back
+         * against the one it asked for -- so returning a higher number is a
+         * FAILURE report. malloc's heap-trimming path then asks again, gets the
+         * same answer, and asks again:
+         *
+         *   t70 12(48572000, ...) = 48592000      (x thousands)
+         *
+         * -- a brk loop that hung the in-guest GCC compile with the guest at
+         * 12% CPU, which reads as a wedged machine rather than a disagreement
+         * about a return value.
+         *
+         * The bookkeeping moves down; the pages stay mapped. Linux does not
+         * guarantee the memory is returned either, only that the break is
+         * where you asked, and not unmapping keeps this a two-line change
+         * instead of a teardown path. Never below the heap base. */
+        {
+            uint64_t lo = (uint64_t)a1;
+            uint64_t base = app_heap_base();
+            if (lo < base) lo = base;
+            app_set_break(lo);
+            r->rax = lo;
+        }
         break;
     }
     case LXS_mmap: {

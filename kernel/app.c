@@ -2876,6 +2876,19 @@ int app_sys_read(char *buf, unsigned max) {
  * ulib's allocator reuses freed space itself (the kernel never has to shrink).
  * Frames mapped here are reclaimed wholesale by vmm_destroy_address_space when
  * the app exits, so even the OOM path below leaks nothing past the app's life. */
+/* The heap base, and a way to LOWER the recorded break (M2049). brk(addr) with
+ * addr below the current break must succeed and report addr -- see the
+ * LXS_brk case for what looping on that costs. The pages stay mapped; only the
+ * bookkeeping moves, which is all the caller can observe. */
+uint64_t app_heap_base(void) { return UHEAP_BASE; }
+void app_set_break(uint64_t addr) {
+    struct app *a = cur();
+    if (!a) return;
+    if (!a->heap_end) a->heap_end = UHEAP_BASE;
+    if (addr < UHEAP_BASE) addr = UHEAP_BASE;
+    if (addr <= a->heap_end) a->heap_end = addr;      /* only ever lowers, never grows */
+}
+
 uint64_t app_sbrk(long inc) {
     struct app *a = cur();
     if (!a) return (uint64_t)-1;

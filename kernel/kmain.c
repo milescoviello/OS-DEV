@@ -1536,7 +1536,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * so every COW fault now copies a page -- and a compile forks
              * constantly. Correctness is not negotiable and the budget was
              * tuned before it, so the budget moves. */
-            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 18, 600000);
+            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 18, 1200000);
             g_lx_systrace = 0;
             kprintf("[lxtool] gcc(kernel/elf.c) -> %d\n", rc);
             /* Prove the object is REAL by reading its symbol table with nm --

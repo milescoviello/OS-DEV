@@ -443,7 +443,21 @@ int vmm_fork_cow(uint64_t child_cr3) {
                     rc = -1; break;
                 }
                 vmm_lock_give(lf);
-                __asm__ volatile("sti");   /* a window for a pending tick or shootdown IPI; nothing held (M2045) */
+                /* Interrupts ON from here to the end of the walk (M2045).
+                 *
+                 * I tried throttling this -- a window every 32 tables with a
+                 * cli in between -- to cut the number of preemption points.
+                 * The guest HUNG: 716 seconds of wall clock for 16 seconds of
+                 * CPU, every core halted. I could not explain it, and shipping
+                 * an unexplained hang to save some throughput is not a trade
+                 * worth making, so it is reverted to the form that
+                 * demonstrably makes progress: once the lock is released the
+                 * first time, this walk stays preemptible.
+                 *
+                 * Safe because it happens strictly AFTER vmm_lock_give --
+                 * nothing is held across it -- and because the caller's
+                 * interrupt state is restored before this function returns. */
+                __asm__ volatile("sti");
             }
         }
     }
