@@ -734,7 +734,9 @@ static int g_poll_reports;
 int g_lx_out_log;
 static void lx_emit(const char *b, unsigned long n) {
     app_t *dst = app_out_to();
-    if (g_lx_out_log) console_write_n(b, n);
+    /* The lxout mirror moved into app_write_to (M2056) -- it has to cover the
+     * fd-table path too, and doing it in both places printed the no-window
+     * case twice. */
     if (dst) { app_write_to(dst, b, (unsigned)n); return; }
     static int told_pid = -1;
     int me = app_current_pid();

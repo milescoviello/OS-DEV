@@ -370,8 +370,28 @@ $(LXROOT)/.src-staged: $(wildcard kernel/*.c kernel/include/*.h boot/*.asm kerne
 	@# applications are reused as blobs, which is stated plainly in the docs.
 	@cp -f build/*.elf build/*.bin build/*.ko $(LXROOT)/src/build/ 2>/dev/null || true
 	@printf '#include "ksyms.h"\nconst struct ksym ksyms[]={{0,0}};\nconst int ksyms_count=0;\n' > $(LXROOT)/src/ksyms_stub.c
+	@# A REAL GIT REPOSITORY for the staged tree (M2056).
+	@#
+	@# /src had a .git with HEAD, index, config and packed-refs but an EMPTY
+	@# objects/ -- hand-injected metadata with no object database behind it.
+	@# git therefore found a repository, resolved HEAD to a commit it could not
+	@# read, and died with status 128 on every invocation. Claude Code runs git
+	@# several times at startup, so that was three failing child processes and
+	@# a 28-byte fatal on stderr before it drew anything.
+	@#
+	@# One commit, not 51 MB of history: the guest tree IS a snapshot, so a
+	@# snapshot repo is the honest shape for it. build/ is ignored -- those are
+	@# 356 MB of prebuilt ELFs the in-guest build reuses as blobs.
+	@rm -rf $(LXROOT)/src/.git
+	@printf 'build/\n' > $(LXROOT)/src/.gitignore
+	@cd $(LXROOT)/src && git init -q -b main >/dev/null 2>&1 && \
+	   git add -A kernel boot linker.ld Makefile ksyms_stub.c .gitignore >/dev/null 2>&1 && \
+	   git -c user.name='OS-DEV' -c user.email='osdev@localhost' \
+	       -c commit.gpgsign=false commit -q \
+	       -m 'OS-DEV kernel source as staged into the guest volume' >/dev/null 2>&1 && \
+	   git repack -adq >/dev/null 2>&1 || true
 	@touch $@
-	@echo "  STAGE   $(LXROOT)/src (OS-DEV's own kernel source + Makefile, for the in-guest build)"
+	@echo "  STAGE   $(LXROOT)/src (OS-DEV's own kernel source + Makefile + a real git repo, for the in-guest build)"
 
 # A LARGE real assembly file (OS-DEV's own biggest source, compiled to .s on
 # the host) for the in-guest assembler to chew on. Half a megabyte of real

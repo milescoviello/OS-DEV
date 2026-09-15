@@ -2257,6 +2257,21 @@ void app_write_to(app_t *dest, const char *buf, unsigned len) {
         a->out_announced = 1;
         kprintf("[app] a Linux child's stdout is going to the window of pid %d\n", a->pid);
     }
+    /* `-append lxout` MIRRORS IT HERE, not at the syscall (M2056).
+     *
+     * M2023 put the mirror in linuxabi.c's lx_emit, which only runs while fd
+     * 1 and 2 are UNTOUCHED. Claude Code's are not: app_open_console_alias
+     * gives every Linux process real type-14 fd-table entries for 0/1/2
+     * precisely so a dup of stdout keeps working, so its output takes
+     * app_fd_write -> here and never passes lx_emit at all.
+     *
+     * The consequence was not a missing line, it was a silent, total one: I
+     * ran the program the flag was built for, grepped the log for the TUI it
+     * had just painted on screen, found not one escape byte in 1067 lines,
+     * and concluded the program had printed nothing. It had printed
+     * everything. This is the one funnel every windowed write passes through
+     * -- fd 1, fd 2, and every dup of either -- so the mirror belongs here. */
+    { extern int g_lx_out_log; if (g_lx_out_log) console_write_n(buf, len); }
     grid_write(a, buf, len);      /* the SAME terminal a native app writes to (M2004) */
 }
 
@@ -9387,15 +9402,31 @@ static void lx_drop_interp(void) {
  * from the REQUESTER here, because by the time the window manager performs the
  * spawn, cur() is the WM and the shell's directory is long gone. */
 static char g_pend_lxcwd[VFS_PATH_MAX];
+/* An explicit cwd for the NEXT spawn, for callers that have no app context to
+ * inherit one from (M2056). A boot-task-driven run had cur() == 0 and so
+ * always started at the volume root, which is not where a program that cares
+ * about its working directory -- a repo tool, say -- should be run. One-shot. */
+static char g_pend_lxcwd_set[VFS_PATH_MAX];
+void app_set_next_cwd(const char *p) {
+    int k = 0;
+    if (p) while (p[k] && k < (int)sizeof g_pend_lxcwd_set - 1) { g_pend_lxcwd_set[k] = p[k]; k++; }
+    g_pend_lxcwd_set[k] = 0;
+}
 static int lx_spawn_file(const char *path) {
     int i = 0; while (path[i] && i < (int)sizeof g_pend_lxpath - 1) { g_pend_lxpath[i] = path[i]; i++; }
     g_pend_lxpath[i] = 0;
     g_pend_lxcwd[0] = 0;
-    { struct app *rq = cur();
-      if (rq && rq->cwd_path[0]) {
-          int k = 0; while (rq->cwd_path[k] && k < (int)sizeof g_pend_lxcwd - 1) { g_pend_lxcwd[k] = rq->cwd_path[k]; k++; }
-          g_pend_lxcwd[k] = 0;
-      } }
+    if (g_pend_lxcwd_set[0]) {
+        int k = 0; while (g_pend_lxcwd_set[k] && k < (int)sizeof g_pend_lxcwd - 1) { g_pend_lxcwd[k] = g_pend_lxcwd_set[k]; k++; }
+        g_pend_lxcwd[k] = 0;
+        g_pend_lxcwd_set[0] = 0;                /* one-shot: never leak it to a later spawn */
+    } else {
+        struct app *rq = cur();
+        if (rq && rq->cwd_path[0]) {
+            int k = 0; while (rq->cwd_path[k] && k < (int)sizeof g_pend_lxcwd - 1) { g_pend_lxcwd[k] = rq->cwd_path[k]; k++; }
+            g_pend_lxcwd[k] = 0;
+        }
+    }
 
     if (lx_stage_interp(path) < 0) return -1;
 

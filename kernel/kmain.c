@@ -259,6 +259,16 @@ static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Li
 static volatile int g_ffmozlog;               /* -append ffmozlog: ask Firefox itself where it is, via MOZ_LOG (M2010) */
 static volatile int g_ffshot;                 /* -append ffshot: Firefox headless, --screenshot to a real PNG (M2003) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
+/* -append lxask: THE PHASE 7 DEMO, and nothing else (M2056).
+ *
+ * lxclaudetest runs --version, --help and two -p attempts, which is four
+ * program starts of a 214 MB Bun binary under TCG before the one that
+ * matters. The north star is a single question answered, so make that a
+ * target on its own: one `claude -p` in the source tree, with whatever login
+ * the image happens to hold, and the whole guest side mirrored to the log.
+ * Implies lxout -- there is no point running this and not being able to read
+ * what it said. */
+static volatile int g_lxask;
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
@@ -522,6 +532,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
+        if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
+                                        extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
@@ -1293,6 +1305,27 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxclaude] running CLAUDE CODE -p WITH a (fake) key: DNS + TLS + HTTP for real...\n");
             int crc4 = app_run_linux_sync("/disk2/usr/bin/claude", av_cp, 2, 300000);
             kprintf("[lxclaude] claude -p (fake key) -> %d\n", crc4);
+        }
+        if (g_lxask) {
+            /* PHASE 7, asked as plainly as it can be asked: one question, in
+             * the OS-DEV source tree, answered by Claude Code running on this
+             * kernel. -p is print mode, so there is no TUI and no trust
+             * prompt to get past -- the answer is bytes on stdout, which
+             * lxout puts in this log as text.
+             *
+             * --dangerously-skip-permissions because print mode in a
+             * directory the config has never seen otherwise stops to ask, and
+             * a synchronous run has no one to answer. */
+            /* --debug because this flag exists to DIAGNOSE. Claude Code's own
+             * HTTP/retry/stream logging is the only thing that can say what it
+             * believes is happening on a connection we cannot decrypt, and
+             * with lxout it lands in this log as text. (M2056) */
+            static const char *av_ask[] = { "--dangerously-skip-permissions", "--debug", "-p",
+                                            "Reply with exactly: OS-DEV" };
+            app_set_next_cwd("/disk2/src");
+            kprintf("[lxask] PHASE 7 DEMO: claude -p, in /src, on this kernel...\n");
+            int arc = app_run_linux_sync("/disk2/usr/bin/claude", av_ask, 4, 900000);
+            kprintf("[lxask] claude -p -> %d\n", arc);
         }
         if (g_lxinet_test) {
             /* AF_INET through the ABI (M1967): a DNS lookup over UDP and an
