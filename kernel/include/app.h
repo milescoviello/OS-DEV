@@ -284,6 +284,7 @@ long app_close_range(unsigned lo, unsigned hi, int flags); /* close fds in [lo,h
 long app_sendfile(int out_fd, int in_fd, long *off, unsigned long count); /* zero-copy fd->fd; bytes/-1 (M1219) */
 int  app_fd_is_open(int fd);        /* is fd a live fd-table entry? distinguishes a dup2'd stdio fd from an untouched one (M1949) */
 const char *app_fd_path(int fd);                           /* path behind a FILE fd (type 2), or 0 (M1221) */
+const char *app_fd_path_of(int fd);                        /* path behind ANY fd that has one, incl. a directory (M2032) */
 int  app_pidfd_open(int pid);                              /* a pollable process-exit handle (>=3); -1 (M1222) */
 int  app_pidfd_send_signal(int pidfd, int sig);            /* signal the pidfd's process; 0/-1 (M1222) */
 int  app_pidfd_getfd(int pidfd, int targetfd);             /* duplicate the pidfd-process's fd into ours; new fd/-1 (M1281) */

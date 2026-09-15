@@ -466,6 +466,47 @@ static const char *lx_xlate(const char *p, char *out, int max) {
     return out;
 }
 
+/* THE dirfd WAS BEING DISCARDED (M2032).
+ *
+ * openat's own comment admitted it: "the leading dirfd, which we ignore anyway
+ * (everything resolves against the process cwd)". So openat(dirfd, "name")
+ * looked for "name" in the CWD instead of in the directory that fd refers to.
+ *
+ * That is not an edge case -- it is how every real directory walker reads a
+ * tree. ripgrep's walkdir, Go's filepath.WalkDir, glibc's fts, find(1): all of
+ * them open a directory once and then reference its children by a bare name
+ * against that descriptor, because it is both faster and immune to renames.
+ * Every one of those lookups landed in the wrong directory.
+ *
+ * The symptom was ripgrep reporting a hundred files as "No such file or
+ * directory" that a shell in the same boot could list and read perfectly --
+ * the file existed, the name was right, and the directory it was looked up in
+ * was not the one asked for.
+ *
+ * Seventh instance of the session's recurring shape: an argument accepted and
+ * then not honoured. (pipe2 M2009, socketpair M2012, eventfd2 M2017, bind
+ * M2020, wait4's options M2025, a timeout as EOF M2026.)
+ *
+ * An absolute path ignores dirfd, exactly as Linux does. AT_FDCWD keeps the
+ * old cwd-relative behaviour. The stored fd path is ALREADY kernel-side
+ * (/disk2/...), so it must not be translated a second time. */
+#define LX_AT_FDCWD (-100)
+static const char *lx_xlate_at(long dirfd, const char *up, char *out, int max) {
+    if (!up) return lx_xlate(up, out, max);
+    if (up[0] == '/' || dirfd == LX_AT_FDCWD) return lx_xlate(up, out, max);
+    const char *base = app_fd_path_of((int)dirfd);
+    if (!base) return lx_xlate(up, out, max);      /* not a path-bearing fd: old behaviour */
+    int p = 0;
+    while (base[p] && p < max - 2) { out[p] = base[p]; p++; }
+    if (p && out[p - 1] != '/') out[p++] = '/';
+    /* skip a leading "./" so "./x" does not become "dir/./x" */
+    const char *u = up;
+    while (u[0] == '.' && u[1] == '/') u += 2;
+    for (int k = 0; u[k] && p < max - 1; k++) out[p++] = u[k];
+    out[p] = 0;
+    return out;
+}
+
 /* struct iovec, exactly Linux's layout. */
 struct lx_iovec { void *iov_base; unsigned long iov_len; };
 
@@ -969,7 +1010,7 @@ void linux_syscall_dispatch(struct registers *r) {
         uint64_t up = (r->rax == LXS_unlink_) ? r->rdi : r->rsi;
         const char *upath = (const char *)up;
         if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         /* gcc writes its intermediate .s to a mkstemp'd name and unlinks it
          * when done; without this the driver reported
          * "gcc: error: ./ccXXXXXX.s: Function not implemented" and stopped
@@ -982,7 +1023,7 @@ void linux_syscall_dispatch(struct registers *r) {
         uint64_t up = (r->rax == LXS_mkdir_) ? r->rdi : r->rsi;   /* mkdirat shifts right */
         const char *upath = (const char *)up;
         if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         /* A TRAILING SLASH is legal in mkdir(2) -- `mkdir -p o/kernel/` passes
          * one straight through -- and our VFS path walker treats it as an
          * extra empty component and fails. Strip it here rather than in
@@ -1165,7 +1206,7 @@ void linux_syscall_dispatch(struct registers *r) {
         const char *up = (const char *)r->rsi;
         if (!up || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
         struct statx sx;
         if (vfs_stat(path, &sx) != 0) {
             /* Name BOTH spellings. A stat that fails on a path the program
@@ -2785,7 +2826,7 @@ void linux_syscall_dispatch(struct registers *r) {
         }
         const char *upath = (const char *)r->rsi;
         if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* honour dirfd (M2032) */
         /* /dev/tty IS THE CONTROLLING TERMINAL (M2004), and we had no such
          * file at all. A TUI does not settle for stdin: Ink -- which is what
          * Claude Code draws with -- opens /dev/tty so it can read keys even
@@ -2905,7 +2946,7 @@ void linux_syscall_dispatch(struct registers *r) {
         uint64_t ubuf_u  = by_path ? r->rsi : r->rdx;
         const char *upath = (const char *)upath_u;
         if (!upath || !vmm_user_ok(upath_u, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         if (!vmm_user_ok(ubuf_u, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         r->rdx = ubuf_u;                    /* the writes below all go through rdx */
         struct statx sx;

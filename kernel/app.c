@@ -1828,14 +1828,28 @@ static int app_task_reapable(task_t *t) {
     if (t->state == TASK_STOPPED) return task_off_stack(t);
     return 0;
 }
-/* Free a task the gate above accepted. A STOPPED one is still linked into the
- * scheduler's ring and must be unlinked first -- task_free only releases
- * memory. If the unlink is refused (it went back on a CPU under us) leave the
- * task alone and let the next reap pass try again. (M2025) */
+/* Free a task the gate above accepted -- but ONLY one that actually DIED.
+ *
+ * A STOPPED task must NOT have its memory freed, however certain we are that it
+ * will never run again. Its task_t is still pointed at by whatever it was
+ * blocked on when exit_group stopped it: mbox's `waiter`, mqueue's
+ * send_waiter/recv_waiter, the uffd monitor, and every other subsystem that
+ * parks a task_t* to wake later. Freeing it there hands those a poisoned
+ * pointer, which is a General Protection Fault with rbx=dededededededede --
+ * the heap's own free pattern -- in whatever touches it next.
+ *
+ * That is why this is not the place to reclaim them. The HANG fix is the gate
+ * above accepting TASK_STOPPED so the process can zombify and release its
+ * parent; the task_t is left allocated exactly as it was before M2025. It
+ * leaks, as it always has, and reclaiming it needs every one of those
+ * subsystems to drop its waiter first -- a separate piece of work, not a
+ * side-effect of this one. */
 static void app_task_release(task_t *t) {
     if (!t) return;
-    if (t->state == TASK_STOPPED && !task_retire_stopped(t)) return;
-    task_free(t);
+    if (t->state == TASK_DEAD && __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE))
+        task_free(t);
+    else
+        task_stop(t);                  /* never scheduled again, never freed here */
 }
 int app_reap(app_t *a) {
     if (!a) return 1;
@@ -7785,6 +7799,15 @@ int app_fd_is_open(int fd) {
     return (a && fd >= 0 && fd < APP_NFD && a->fd[fd].used) ? 1 : 0;
 }
 
+/* The path behind ANY fd that has one -- a FILE fd or a DIRECTORY fd. The
+ * *at() syscalls need this to resolve a relative path against the directory a
+ * dirfd names, which is how every real directory walker reads a tree. The
+ * type-2-only app_fd_path above cannot answer for a directory. (M2032) */
+const char *app_fd_path_of(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return 0;
+    return a->fd[fd].path[0] ? a->fd[fd].path : 0;
+}
 const char *app_fd_path(int fd) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 2) return 0;
