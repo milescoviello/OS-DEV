@@ -104,16 +104,105 @@ static int arp_maybe_reply(const uint8_t *buf, int len) {
     return 1;
 }
 
+/* ---- ONE RX DEMUX: nothing is discarded because of who happened to poll ----
+ *
+ * There is one NIC and several independent consumers -- a TCP connection's
+ * read loop, a UDP socket, an ARP resolve, a ping -- and each of them used to
+ * drain the NIC directly and DESTROY every frame it did not recognise.
+ * `udp_pump_once` said so outright: "everything else discarded".
+ *
+ * That makes the network non-deterministic in a way no single component looks
+ * guilty for. A connect() does an ARP resolve; the ARP wait eats a TCP segment
+ * belonging to a TLS handshake already in flight on another socket. A ping
+ * eats a DNS reply. The TCP path eats every ICMP echo reply, which is how this
+ * was finally caught: three echo requests, three replies on the wire, and the
+ * guest reporting 1/3.
+ *
+ * M1908 fixed one quadrant of this (TCP frames parked for other TCP
+ * connections) and M1967 another (a UDP queue). The general rule is the one
+ * that was missing: a consumer may take what is ITS OWN and must FILE
+ * everything else where its owner will find it.
+ *
+ * (M2017) */
+static void park_put(const uint8_t *f, int len);   /* the TCP park ring, defined with the TCP demux below */
+static void udpq_put(const uint8_t *f, int len);   /* the UDP datagram queue */
+#define ORING_N   16
+#define ORING_MAX 1600
+static struct { uint8_t buf[ORING_MAX]; int len; uint64_t at; } g_oring[ORING_N];
+#define ORING_TTL 200            /* ticks (~2s): a frame nobody claimed is stale */
+
+static void oring_put(const uint8_t *f, int len) {
+    if (len <= 0 || len > ORING_MAX) return;
+    uint64_t now = timer_ticks();
+    int slot = -1;
+    for (int i = 0; i < ORING_N; i++) {
+        if (g_oring[i].len && now - g_oring[i].at > ORING_TTL) g_oring[i].len = 0;
+        if (!g_oring[i].len && slot < 0) slot = i;
+    }
+    if (slot < 0) {                                  /* full: evict the oldest */
+        uint64_t oldest = ~0ull; slot = 0;
+        for (int i = 0; i < ORING_N; i++) if (g_oring[i].at < oldest) { oldest = g_oring[i].at; slot = i; }
+    }
+    memcpy(g_oring[slot].buf, f, (size_t)len);
+    g_oring[slot].len = len; g_oring[slot].at = now;
+}
+static int oring_take(uint8_t *out, int max) {
+    uint64_t now = timer_ticks();
+    for (int i = 0; i < ORING_N; i++) {
+        if (!g_oring[i].len) continue;
+        if (now - g_oring[i].at > ORING_TTL) { g_oring[i].len = 0; continue; }
+        int len = g_oring[i].len; if (len > max) len = max;
+        memcpy(out, g_oring[i].buf, (size_t)len);
+        g_oring[i].len = 0;
+        return len;
+    }
+    return 0;
+}
+
+/* File a frame that is not ours. Returns 1 if it was filed (so the caller
+ * should keep waiting), 0 if the caller may have it. TCP goes to the park ring
+ * for its connection, UDP to the datagram queue for its port, and everything
+ * else -- ICMP, ARP, whatever arrives next -- to the ring above. */
+static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
+    if (len < 14) return 1;                                   /* runt: nothing can use it */
+    if (get16(f + 12) != 0x0800) {                            /* not IPv4 (ARP, ...) */
+        if (want_tcp) { oring_put(f, len); return 1; }
+        return 0;                                             /* the caller handles ARP itself */
+    }
+    if (len < 34) return 1;
+    uint8_t proto = f[14 + 9];
+    if (proto == 6)  { park_put(f, len); return 1; }           /* TCP: its connection's */
+    if (proto == 17) { udpq_put(f, len); return 1; }           /* UDP: its port's */
+    if (want_tcp)    { oring_put(f, len); return 1; }          /* ICMP etc: park for ping */
+    return 0;                                                  /* ICMP, and the caller wants it */
+}
+
 /* Wait up to `ticks` for a frame; return its length (0 on timeout). Loopback
  * frames (M1264) are drained first so a NIC flood can't starve them. */
 static int recv_timeout(uint8_t *buf, int max, uint64_t ticks) {
     uint64_t deadline = timer_ticks() + ticks;
     while (timer_ticks() <= deadline) {
-        int l = lo_dequeue(buf, max);
+        int l = oring_take(buf, max);                  /* frames another consumer filed for us (M2018) */
+        if (l > 0) {
+            if (arp_maybe_reply(buf, l)) continue;
+            return l;
+        }
+        l = lo_dequeue(buf, max);
         if (l > 0) return l;
         int len = nic_receive(buf, max);
         if (len > 0) {
             if (arp_maybe_reply(buf, len)) continue;   /* answered an ARP query — keep waiting */
+            /* TCP belongs to a connection, never to these callers: an ARP
+             * resolve, a ping, a DNS query and a TFTP transfer all filter for
+             * their own protocol and drop the rest. So a connect()'s ARP
+             * resolve used to destroy segments of a TLS handshake already in
+             * flight on another socket. Park them instead. (M2017)
+             *
+             * UDP is deliberately NOT filed here: dns_resolve and net_tftp_get
+             * read their datagrams THROUGH this function, so filing them into
+             * the UDP queue would leave those callers waiting for something
+             * that had already been put away. Their own filters handle it. */
+            if (len >= 34 && get16(buf + 12) == 0x0800 && buf[14 + 9] == 6) { park_put(buf, len); continue; }
             return len;
         }
         /* Nothing yet: instead of tight-spinning the CPU, SLEEP until the next
@@ -651,6 +740,11 @@ static int udp_pump_once(uint16_t want) {
             }
         } else if (rb[14 + 9] == 6) {                           /* TCP: someone else's, park it */
             park_put(rb, len);
+        } else {
+            /* ICMP and anything else: file it, do not destroy it. This line is
+             * why `ping` reported 1 reply out of 3 while all three were on the
+             * wire -- a DNS lookup's pump had eaten the other two. (M2017) */
+            oring_put(rb, len);
         }
     }
     return got;
@@ -907,9 +1001,41 @@ long net_tcp_sock_recv(int idx, void *buf, int max) {
     }
     if (g_tcpsock[idx].eof || !g_tcpsock[idx].c.up) return 0;     /* EOF, only once drained */
     if (g_tcpsock[idx].nonblock) return NET_SOCK_EAGAIN;
+    /* THE BLOCKING PATH MUST GO THROUGH THE RING TOO (M2018).
+     *
+     * This used to call tcp_read straight into the caller's buffer, which
+     * makes TWO consumers of one TCP byte stream: this call, and tcpsock_pump
+     * running from any other thread's poll() or epoll() on the same socket.
+     * Each tcp_read takes whatever has arrived, so the stream gets SPLIT
+     * between the caller's buffer and the ring -- and then served out of
+     * order, because the ring's bytes are handed to a LATER recv even when
+     * they came FIRST.
+     *
+     * The byte COUNT still matches the wire, which is what makes it so hard to
+     * see: a capture shows every byte arriving and every byte being delivered.
+     * What is wrong is the ORDER, and downstream that looks like a truncated
+     * HTTP response or a TLS record whose length no longer makes sense.
+     *
+     * One consumer. Pump into the ring with a deadline, then serve from the
+     * ring exactly as the non-blocking path does. */
+    /* timer_TICKS, not timer_ms: net.c is compiled into the host test harness
+     * too, and only the tick clock is stubbed there. (Same coupling the
+     * memory notes call out -- a cross-module call breaks the host link.) */
     uint64_t ms = (uint64_t)g_tcpsock[idx].opt_rcvtimeo;
-    uint64_t ticks = ms ? (ms + 9) / 10 : ((uint64_t)-1 >> 1);
-    return tcp_read(&g_tcpsock[idx].c, (uint8_t *)buf, max, ticks);
+    uint64_t deadline = timer_ticks() + (ms ? (ms + 9) / 10 : 30000);
+    for (;;) {
+        if (tcpsock_pump(idx) > 0 || rxcount(idx) > 0) break;
+        if (g_tcpsock[idx].eof || !g_tcpsock[idx].c.up) return 0;
+        if (timer_ticks() >= deadline) return 0;                  /* timed out: no data */
+        task_sleep_ms(2);
+    }
+    {
+        int n = rxcount(idx); if (n > max) n = max;
+        for (int k = 0; k < n; k++) ((uint8_t *)buf)[k] = g_tcpsock[idx].rx[g_tcpsock[idx].rxtail + k];
+        g_tcpsock[idx].rxtail += n;
+        if (g_tcpsock[idx].rxtail == g_tcpsock[idx].rxhead) g_tcpsock[idx].rxtail = g_tcpsock[idx].rxhead = 0;
+        return n;
+    }
 }
 void net_tcp_sock_ref(int idx) { if (idx >= 0 && idx < TCPSOCK_N && g_tcpsock[idx].used) g_tcpsock[idx].refs++; }
 void net_tcp_sock_close(int idx) {
@@ -1204,7 +1330,13 @@ static int tcp_recv_seg(uint8_t *buf, int max, const uint8_t *dip,
                 len = nic_receive(buf, max);
             }
             if (len < 34) continue;
-            if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 6) continue;   /* IPv4/TCP */
+            /* NOT TCP IS NOT RUBBISH (M2017). This used to `continue` -- i.e.
+             * destroy -- every UDP datagram and ICMP reply that happened to
+             * arrive while a TCP read was polling. M1908 already established
+             * that another connection's TCP frame must be parked rather than
+             * dropped; the same is true of every other protocol, and a read
+             * loop on a busy socket is exactly where the others land. */
+            if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 6) { net_rx_file_foreign(buf, len, 1); continue; }
             /* Not ours, but a valid TCP frame: PARK it rather than destroy it —
              * it may be another live connection's data (M1908). */
             if (!park_matches(buf, len, dip, sport, dport)) { park_put(buf, len); continue; }
@@ -1297,7 +1429,10 @@ static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
             continue;
         }
         if (arp_maybe_reply(buf, len)) continue;                          /* answer "who has us?" so a LAN client can connect in (M1878) */
-        if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 6) continue;     /* IPv4 / TCP */
+        /* Same rule as every other drain site (M2018): a server's accept loop
+         * runs FOREVER (netcon), so anything it throws away is thrown away for
+         * the whole uptime of the machine. */
+        if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 6) { net_rx_file_foreign(buf, len, 1); continue; }
         int ihl = (buf[14] & 0x0F) * 4;
         if (ihl < 20 || 14 + ihl + 20 > len) continue;
         uint8_t *tcp = buf + 14 + ihl;
