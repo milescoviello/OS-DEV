@@ -4643,10 +4643,34 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
      * on the shared frame (the other process keeps it). vmm_set_raw invlpg's. */
     if ((pte & PTE_PRESENT) && (pte & PTE_COW) && (err & 2)) {
         uint64_t old = pte & PTE_ADDR_MASK;
-        if (pmm_refcount(old) == 0) {
-            vmm_set_raw(fpage, (pte & ~PTE_COW) | PTE_WRITABLE);
-            app_tlb_sync(a);   /* re-widened to writable: siblings must not keep the RO entry (M2034) */
-        } else {
+        /* ALWAYS COPY. The "refcount is 0, so I am the sole owner, so I can
+         * just make it writable in place" fast path is a RACE and cannot be
+         * made safe by reading more carefully (M2044).
+         *
+         * pmm_refcount() is an unlocked read, and vmm_fork_cow on another core
+         * takes its reference and write-protects in a sequence this handler is
+         * not synchronised against at all:
+         *
+         *   this core:  read pmm_refcount(old) == 0   -> decide "sole owner"
+         *   other core: fork: pmm_addref(old), map old into the CHILD as COW
+         *   this core:  commit the decision: PTE := WRITABLE, PTE_COW cleared
+         *
+         * The page is now writable and non-COW here while the child shares the
+         * same frame, so every later write silently appears in the child, with
+         * nothing faulting and no refcount left wrong to notice afterwards.
+         * M2036 fixed the ordering INSIDE fork_cow; this is the same bug
+         * re-entered from the reader's side, and no ordering in fork can close
+         * it while the decision here is made on an unlocked read.
+         *
+         * Copying unconditionally is correct in every interleaving. If nobody
+         * forks, we copy and free the old frame, which then really is free. If
+         * a fork lands in the middle, it has already taken its own reference,
+         * so our free just drops ours and the child becomes the sole owner --
+         * which is exactly right. The cost is one 4 KiB copy on a fault that
+         * could sometimes have been a flag flip; the alternative is silent
+         * cross-process corruption, and this is what was corrupting
+         * JavaScriptCore's hash tables into an infinite probe loop. */
+        {
             uint64_t nf = pmm_alloc_frame();
             if (!nf) return 0;                      /* OOM -> let it fault/die */
             uint8_t *s = (uint8_t *)hhdm(old), *d = (uint8_t *)hhdm(nf);
