@@ -595,6 +595,10 @@ static char     g_jail_path[64];
  * one-shot shape as g_pend_arg/g_pend_jail. (M1940) */
 static volatile int g_pend_linux;
 static char         g_pend_lxpath[256];
+/* The cwd a newly spawned Linux process should start in (M2033). Captured from
+ * the REQUESTER at request time, because by the time the window manager
+ * performs the spawn, cur() is the WM and the shell's directory is gone. */
+static char         g_pend_lxcwd[VFS_PATH_MAX];
 /* Pending INTERPRETER image for a dynamically-linked Linux binary (M1954).
  * Read before the spawn so no disk I/O happens inside app_spawn's cli/CR3
  * critical section. A pending global is acceptable HERE, unlike execve's --
@@ -4637,12 +4641,33 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
         uint64_t old = pte & PTE_ADDR_MASK;
         if (pmm_refcount(old) == 0) {
             vmm_set_raw(fpage, (pte & ~PTE_COW) | PTE_WRITABLE);
+            vmm_tlb_shootdown();   /* re-widened to writable: siblings must not keep the RO entry (M2034) */
         } else {
             uint64_t nf = pmm_alloc_frame();
             if (!nf) return 0;                      /* OOM -> let it fault/die */
             uint8_t *s = (uint8_t *)hhdm(old), *d = (uint8_t *)hhdm(nf);
             for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
             vmm_set_raw(fpage, nf | PTE_PRESENT | (pte & (PTE_USER | PTE_NX)) | PTE_WRITABLE);
+            /* SHOOT THE OTHER CORES DOWN BEFORE DROPPING THE FRAME (M2034).
+             *
+             * vmm_set_raw invlpg's THIS core only. A sibling thread -- same
+             * address space, another core -- still holds a cached translation
+             * for `old`. The moment pmm_free_frame takes the last reference the
+             * frame goes back to the allocator and is handed to somebody else,
+             * while that core is still reading and writing it through a stale
+             * entry. That is silent cross-process memory corruption, and it
+             * does not fault anywhere near where it was caused.
+             *
+             * Unreachable before M2031, because fork only ever COW-marked the
+             * bottom 512 GiB and every threaded runtime keeps its heap far
+             * above that. The first thing to exercise it was Claude Code, whose
+             * JavaScriptCore values came back as non-canonical pointers:
+             *
+             *   GPF at claude+4388900: mov 0x20(%rbx),%ecx  rbx=7c3b4b88a9eac000
+             *
+             * mprotect and munmap were given this in M1963; the COW path was
+             * the one that kept a local invlpg. */
+            vmm_tlb_shootdown();
             pmm_free_frame(old);                    /* decrements the shared frame's refcount */
         }
         a->minflt++;                                /* COW resolve: no disk I/O => minor fault (M1150) */
@@ -6127,8 +6152,20 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * and a relative path is the one thing the ABI cannot translate --
          * so without this, "./out.s" lands on the boot volume or nowhere at
          * all. gcc creates its intermediate .s exactly that way. (M1960) */
-        vfs_cwd_set_for(a, "/disk2");
-        { const char *r = "/disk2"; int k = 0; while (r[k]) { a->cwd_path[k] = r[k]; k++; } a->cwd_path[k] = 0; }
+        /* INHERIT THE SPAWNER'S DIRECTORY (M2033). This used to plant every
+         * Linux process at "/disk2" unconditionally -- the volume root -- so a
+         * shell that had cd'd somewhere handed its child a cwd of "/", and
+         * getcwd(2) said so. Claude Code launched from inside OS-DEV's own
+         * source tree therefore took the whole VOLUME as its workspace, git
+         * reported "not a git repository", and ripgrep walked 2 GB of
+         * libraries instead of the project. Fall back to the volume root only
+         * when the requester has no usable directory of its own. */
+        const char *startcwd = "/disk2";
+        { const char *pre = "/disk2"; int k = 0;
+          while (pre[k] && g_pend_lxcwd[k] == pre[k]) k++;
+          if (!pre[k] && (g_pend_lxcwd[k] == 0 || g_pend_lxcwd[k] == '/')) startcwd = g_pend_lxcwd; }
+        vfs_cwd_set_for(a, startcwd);
+        { int k = 0; while (startcwd[k] && k < (int)sizeof a->cwd_path - 1) { a->cwd_path[k] = startcwd[k]; k++; } a->cwd_path[k] = 0; }
         static const char *argv0[2 + LX_PEND_ARGS], *envp0[40];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
@@ -9160,9 +9197,19 @@ static void lx_drop_interp(void) {
     g_pend_mappath[0] = 0; g_pend_mapsize = 0;
 }
 
+/* The cwd a newly spawned Linux process should start in (M2033). Captured
+ * from the REQUESTER here, because by the time the window manager performs the
+ * spawn, cur() is the WM and the shell's directory is long gone. */
+static char g_pend_lxcwd[VFS_PATH_MAX];
 static int lx_spawn_file(const char *path) {
     int i = 0; while (path[i] && i < (int)sizeof g_pend_lxpath - 1) { g_pend_lxpath[i] = path[i]; i++; }
     g_pend_lxpath[i] = 0;
+    g_pend_lxcwd[0] = 0;
+    { struct app *rq = cur();
+      if (rq && rq->cwd_path[0]) {
+          int k = 0; while (rq->cwd_path[k] && k < (int)sizeof g_pend_lxcwd - 1) { g_pend_lxcwd[k] = rq->cwd_path[k]; k++; }
+          g_pend_lxcwd[k] = 0;
+      } }
 
     if (lx_stage_interp(path) < 0) return -1;
 

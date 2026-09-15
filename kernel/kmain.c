@@ -797,6 +797,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         vfs_mkdir("/disk2/root/.claude/todos");
         vfs_mkdir("/disk2/root/.claude/backups");
         vfs_mkdir("/disk2/root/.claude/skills");
+        /* ...and the ones it does NOT create itself (M2033). A missing
+         * plugins/cache surfaced as ripgrep reporting an "IO error" on the
+         * directory, which reads like a disk fault and is a missing mkdir. */
+        vfs_mkdir("/disk2/root/.claude/plugins/cache");
+        vfs_mkdir("/disk2/root/.claude/plans");
+        vfs_mkdir("/disk2/root/.claude/sessions");
+        vfs_mkdir("/disk2/root/.claude/shell-snapshots");
         vfs_mkdir("/disk2/tmp");
         vfs_mkdir("/disk2/root/.cache/fontconfig");
         vfs_mkdir("/disk2/var");
