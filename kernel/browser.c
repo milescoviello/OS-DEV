@@ -5406,6 +5406,39 @@ static void find_prompt(browser_t *b) {
 /* Does the address-bar text look like a web-search query rather than a URL?
  * A scheme (http/https/file), the home keyword, or a dotted host -> navigate;
  * a space or no dot at all (e.g. "operating systems", "weather") -> search. */
+/* Normalise what the user typed into the address bar (M2028).
+ *
+ * Two things went wrong with a bare hostname, and between them a real site was
+ * unreachable by the only address anyone actually types.
+ *
+ * A schemeless address fell through to `http_get` on port 80, because the fetch
+ * decides with `startsw(url, "https://")` and anything else is plain HTTP. Most
+ * of the web no longer answers there -- the page loads instantly over https and
+ * fails over http -- so typing a host and pressing Return could not work.
+ * Browsers stopped defaulting to http years ago; this does the same.
+ *
+ * And a LEADING SPACE made `looks_like_search` see a space and send the whole
+ * thing to a search engine instead, which is how a hostname turned into a
+ * search for itself.
+ *
+ * Trim first, then decide, then default the scheme. */
+static void trim_address(char *s) {
+    int a = 0; while (s[a] == ' ' || s[a] == '\t') a++;
+    int n = 0; while (s[a + n]) { s[n] = s[a + n]; n++; }
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) n--;
+    s[n] = 0;
+}
+static void default_scheme(char *url) {
+    if (startsw(url, "http://") || startsw(url, "https://") || startsw(url, "file:")) return;
+    if (!url[0] || streqs(url, "home")) return;
+    char t[URL_MAX]; int p = 0;
+    const char *sch = "https://";
+    while (*sch && p < URL_MAX - 1) t[p++] = *sch++;
+    for (int i = 0; url[i] && p < URL_MAX - 1; i++) t[p++] = url[i];
+    t[p] = 0;
+    copy_url(url, t);
+}
+
 static int looks_like_search(const char *s) {
     if (startsw(s, "http://") || startsw(s, "https://") || startsw(s, "file:")) return 0;
     if (!s[0] || streqs(s, "home")) return 0;
@@ -5627,7 +5660,9 @@ void browser_key(browser_t *b, int c) {
     if (b->editing) {
         int n = (int)strlen(b->url);
         if (b->url_cur > n) b->url_cur = n;
-        if (c == '\n' || c == '\r') { b->editing = 0; if (looks_like_search(b->url)) make_search_url(b->url); browser_navigate(b); }
+        if (c == '\n' || c == '\r') { b->editing = 0; trim_address(b->url);
+                                       if (looks_like_search(b->url)) make_search_url(b->url); else default_scheme(b->url);
+                                       browser_navigate(b); }
         else if (c == 27)            { b->editing = 0; }
         else if (c == 0x13) { b->edit_fresh = 0; if (b->url_cur > 0) b->url_cur--; }              /* left  */
         else if (c == 0x14) { b->edit_fresh = 0; if (b->url_cur < n) b->url_cur++; }              /* right */
