@@ -11,6 +11,7 @@
  * interrupt is what yanks the CPU away from a running task.
  */
 #include "timer.h"
+#include "vmm.h"   /* vmm_tlb_discharge: pay any deferred shootdown debt on the tick (M2065) */
 #include "watchdog.h"
 #include "interrupts.h"
 #include "io.h"
@@ -29,6 +30,12 @@ static uint32_t          tick_hz = 100;   /* IRQ0 frequency, set by timer_init *
 static uint32_t          tick_ms = 10;    /* ms per tick (1000/hz), for CPU-time accounting (M1150) */
 
 static void timer_handler(struct registers *r) {
+    /* PAY ANY TLB DEBT FIRST (M2065). A shootdown whose IPI this core missed
+     * leaves a per-core flag set rather than cancelling it, and this tick --
+     * 100 times a second, on every core -- is the backstop that guarantees the
+     * flush actually happens. Before anything else in the handler, because the
+     * handler itself can touch a task's memory. */
+    vmm_tlb_discharge();
     ticks++;
     watchdog_pet();        /* pet the HW watchdog (no-op unless armed) — a wedge that stops this IRQ lets it reset (M1881) */
     vdso_tick(ticks);      /* refresh the userspace vDSO time page (syscall-free clock_gettime, M1111) */

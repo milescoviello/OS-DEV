@@ -46,7 +46,13 @@ echo "booting kernel headless under QEMU (COM1 capture)..."
 # but a firewall that DROPs rather than refuses is slower than SLIRP, and a
 # false-positive hang report would be worse than the flake it replaces. Costs
 # nothing normally: the poll loop breaks as soon as the marker lands.
-timeout -s KILL 60 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
+# -smp 2 (M2065): every concurrency self-test this boot runs -- CFS vruntime
+# charging, the CMOS and PCI config register pairs, kprintf line serialisation,
+# and now the TLB shootdown -- is ABOUT two cores racing, and they were all
+# being run on one. A single-core boot cannot fail any of them, which made a
+# green result mean less than it read. The TLB shootdown check is the first one
+# that says so out loud: on one core it prints "nothing to shoot down".
+timeout -s KILL 60 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 2 -kernel "$KERNEL" \
     -append "selftest termtest" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -129,6 +135,21 @@ require "AML method evaluation OK"           "ACPI AML method-evaluation VM (rec
 require "eBPF JIT OK"                         "eBPF JIT: bytecode compiled to native x86-64, == interpreter (M1290)"
 require "sched: 64 sub-millisecond yields advanced vruntime"  "CFS charges sub-ms yields (M1912: a yield-spinner cannot starve a lock holder)"
 require "concurrent CMOS reads from 2 tasks"  "RTC CMOS index/data pair is atomic under concurrent readers (M1913)"
+# M2065: a TLB shootdown that times out printed "they will flush on next entry"
+# and then, one line later, zeroed every per-core flag -- "give up cleanly: owe
+# nothing". Both cannot be true, and clearing them is what made the message a
+# lie: the only record that a core still held a stale translation was thrown
+# away, so nothing would ever flush it. The obligation now survives, and every
+# kernel entry plus every timer tick pays it. Reverting the one line makes the
+# last check below report "only 0 of 3 non-acking core(s) still owe a flush".
+require "still owe a flush after the timeout"  "a TLB shootdown that times out KEEPS the flush obligation (M2065)"
+require "shootdown nobody answered reports failure"  "...and reports failure rather than success, so a caller does not free a frame another core still maps (M2065)"
+require "TLBSELFTEST PASSED"                   "the TLB shootdown self-test (M2065)"
+if grep -aq "^\[tlbtest\] FAIL" "$LOG"; then
+    echo "  FAIL: the TLB shootdown self-test reported a failing check"
+    grep -a "^\[tlbtest\] FAIL" "$LOG" | head -3 | sed 's/^/           /'
+    fail=1
+fi
 require "concurrent config reads of 2 devices"  "PCI 0xCF8/0xCFC address/data pair is indivisible under concurrent readers (M1914)"
 # M1915: kprintf had no lock, so two tasks logging at once spliced their lines
 # together character-by-character -- corrupting the very serial log every headless

@@ -112,4 +112,10 @@ static inline void *dma_alloc_page(void) {
  * lock -- a core spinning for that lock with interrupts off cannot ack. */
 int      vmm_tlb_shootdown(void);       /* 1 = every other core acked; 0 = gave up (M2043) */
 void     vmm_tlb_shootdown_ack(void);   /* the IPI handler's side */
+/* Pay this core's outstanding flush debt, if any. Called on every kernel entry
+ * and every timer tick: a shootdown that times out LEAVES the obligation set
+ * (M2065), so this is what makes "they will flush on next entry" true. A plain
+ * byte test when nothing is owed. */
+void     vmm_tlb_discharge(void);
 unsigned long vmm_tlb_shootdown_count(void);   /* how many have actually fired -- lets a test prove the mechanism runs */
+int      vmm_tlb_selftest(void);        /* -append selftest: a shootdown nobody answers must KEEP the obligation (M2065) */

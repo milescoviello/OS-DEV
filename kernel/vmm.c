@@ -658,6 +658,12 @@ static void tlb_discharge(void) {
 }
 
 void vmm_tlb_shootdown_ack(void) { tlb_discharge(); }
+/* PUBLIC, because a deferred obligation is only real if somebody discharges it
+ * (M2065). See the timeout path in vmm_tlb_shootdown for what this is for.
+ * Called on every kernel entry and on every timer tick, so a core that missed
+ * the IPI cannot execute user code or read a user buffer through a stale
+ * translation. It is a plain byte test in the common case. */
+void vmm_tlb_discharge(void) { tlb_discharge(); }
 
 /* Returns 1 if EVERY other core acknowledged, 0 if we gave up waiting.
  *
@@ -669,7 +675,7 @@ void vmm_tlb_shootdown_ack(void) { tlb_discharge(); }
  * on its next entry to the address space, and that is no comfort at all if the
  * frame has been reallocated to somebody else in the meantime. A caller that is
  * about to free has to be able to ASK. */
-int vmm_tlb_shootdown(void) {
+static int tlb_shootdown_inner(int send_ipi, int spin_budget) {
     if (smp_cpu_count <= 1) return 1;           /* uniprocessor: invlpg was enough */
     int others = smp_cpu_count - 1;
     /* One shootdown at a time: the pending counter is global. A second caller
@@ -682,7 +688,11 @@ int vmm_tlb_shootdown(void) {
         __asm__ volatile("pause");
     }
     tlb_discharge();                            /* and once more before we own it */
-    for (int c = 0; c < 32; c++) g_tlb_owed[c] = 0;
+    /* Do NOT clear the other cores' flags first (M2065): a core carrying a
+     * debt from a previous shootdown that timed out still needs its flush, and
+     * one CR3 reload settles any number of generations. Setting them again is
+     * idempotent; zeroing them first would cancel exactly the obligation this
+     * milestone exists to keep. */
     {   /* Mark every OTHER present core as owing a flush. */
         int me = tlb_me(), n = smp_cpu_count;
         if (n > 32) n = 32;
@@ -690,25 +700,110 @@ int vmm_tlb_shootdown(void) {
     }
     __atomic_store_n(&g_tlb_pending, others, __ATOMIC_RELEASE);
     __atomic_add_fetch(&g_tlb_shootdowns, 1, __ATOMIC_RELAXED);
-    smp_send_tlb_shootdown_ipi();
+    if (send_ipi) smp_send_tlb_shootdown_ipi();  /* the self-test deliberately does not, to exercise the timeout */
     /* A few milliseconds, not seconds. The first version spun 20 million times
      * and a boot-time self-test measured the giving-up path at 15.9 SECONDS --
      * which would have stalled every mprotect on a threaded process for that
      * long the first time a core was slow to ack. An ack is an interrupt on an
      * already-running core: if it has not arrived in this many spins it is not
      * coming, and waiting longer buys nothing. (M1963) */
-    for (int spin = 0; spin < 200000 && __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) > 0; spin++)
+    for (int spin = 0; spin < spin_budget && __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) > 0; spin++)
         __asm__ volatile("pause");
-    if (__atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) > 0 && !g_tlb_gaveup) {
+    int left = __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE);
+    /* `send_ipi == 0` is the self-test, which times out ON PURPOSE -- reporting
+     * it as news would make the suite's own real-timeout detector fire on a
+     * passing run, and would burn the one-shot so a genuine timeout later in
+     * the same boot went unreported. */
+    if (left > 0 && send_ipi && !g_tlb_gaveup) {
         g_tlb_gaveup = 1;
-        kprintf("[vmm] TLB shootdown timed out waiting for %d core(s) -- they will flush on next entry\n",
-                __atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE));
+        kprintf("[vmm] TLB shootdown timed out waiting for %d core(s) -- they still OWE a flush "
+                "and will take it on their next kernel entry or timer tick\n", left);
     }
-    int acked = (__atomic_load_n(&g_tlb_pending, __ATOMIC_ACQUIRE) == 0);
-    for (int c = 0; c < 32; c++) g_tlb_owed[c] = 0;   /* give up cleanly: owe nothing */
+    int acked = (left == 0);
+    /* THE OBLIGATION SURVIVES THE TIMEOUT (M2065).
+     *
+     * This used to `for (c) g_tlb_owed[c] = 0;` here, with the comment "give
+     * up cleanly: owe nothing" -- one line after printing "they will flush on
+     * next entry". Both cannot be true. Clearing the flags is what made the
+     * message a lie: the only record that a core still held a stale
+     * translation was thrown away, and nothing would ever flush it. A core
+     * that missed the IPI kept a cached mapping for a page that had been
+     * unmapped, mprotected or COW-privatised, FOR THE REST OF ITS LIFE.
+     *
+     * What that looks like from userspace is a threaded runtime whose memory
+     * quietly stops agreeing with itself -- a write that another thread never
+     * sees, or a read that returns the pre-fork contents -- and then a program
+     * that stops making progress with nothing in the log. It was hit for real:
+     * the log carries both this line and "a COW frame was LEAKED rather than
+     * freed" from the same run of Claude Code.
+     *
+     * So leave the flags set. `tlb_discharge` is now called on every kernel
+     * entry and every timer tick, so the debt is paid before the core can use
+     * the stale entry from ring 3 or read a user buffer from ring 0 -- and
+     * `g_tlb_pending` is reset only for the cores that DID ack, so the next
+     * shootdown starts from a clean count without cancelling anyone's debt.
+     *
+     * The caller still learns the truth from the return value, which is what
+     * makes the COW path leak a page rather than free one another core may
+     * still be writing (M2043). */
     __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
     return acked;
+}
+int vmm_tlb_shootdown(void) { return tlb_shootdown_inner(1, 200000); }
+
+/* PROVE THE DEBT SURVIVES A TIMEOUT (M2065).
+ *
+ * The bug this exists for cannot be reached from userspace on demand: it needs
+ * a shootdown whose IPI a core does not answer, which happens under load and
+ * not to order. So reproduce the condition directly -- run the real shootdown
+ * path with the IPI deliberately NOT sent and a small spin budget, so it is
+ * guaranteed to give up, and then assert on the thing that was wrong: whether
+ * the non-acking cores are still recorded as owing a flush.
+ *
+ * Before the fix this returned 0 owed and the message "they will flush on next
+ * entry" was false for every one of them. Printed markers, not a bare return,
+ * because the harness greps the log. */
+int vmm_tlb_selftest(void) {
+    int fails = 0;
+    if (smp_cpu_count <= 1) {
+        kprintf("[tlbtest] single core: nothing to shoot down (skipped)\n");
+        kprintf("[tlbtest] TLBSELFTEST PASSED (0 check(s), uniprocessor)\n");
+        return 0;
+    }
+    /* 1. A core with no debt must not be charged for one. */
+    tlb_discharge();
+    if (g_tlb_owed[tlb_me()]) { kprintf("[tlbtest] FAIL a discharged core still owes a flush\n"); fails++; }
+    else kprintf("[tlbtest] ok   a discharged core owes nothing\n");
+
+    /* 2. A core with a debt pays it when asked. */
+    g_tlb_owed[tlb_me()] = 1;
+    __atomic_add_fetch(&g_tlb_pending, 1, __ATOMIC_RELEASE);
+    vmm_tlb_discharge();
+    if (g_tlb_owed[tlb_me()]) { kprintf("[tlbtest] FAIL vmm_tlb_discharge did not clear this core's debt\n"); fails++; }
+    else kprintf("[tlbtest] ok   vmm_tlb_discharge pays this core's own debt\n");
+    __atomic_store_n(&g_tlb_pending, 0, __ATOMIC_RELEASE);
+
+    /* 3. THE REGRESSION. A shootdown nobody answers must GIVE UP and KEEP the
+     *    obligation -- the old code zeroed every flag one line after printing
+     *    that the targets would flush later. */
+    int acked = tlb_shootdown_inner(0 /* no IPI: guarantee a timeout */, 2000);
+    if (acked) { kprintf("[tlbtest] FAIL a shootdown with no IPI reported success\n"); fails++; }
+    else kprintf("[tlbtest] ok   a shootdown nobody answered reports failure, not success\n");
+    int still_owed = 0, me = tlb_me(), n = smp_cpu_count > 32 ? 32 : smp_cpu_count;
+    for (int c = 0; c < n; c++) if (c != me && g_tlb_owed[c]) still_owed++;
+    if (still_owed != n - 1) {
+        kprintf("[tlbtest] FAIL only %d of %d non-acking core(s) still owe a flush -- "
+                "the timeout CANCELLED the obligation it promised to keep\n", still_owed, n - 1);
+        fails++;
+    } else {
+        kprintf("[tlbtest] ok   all %d non-acking core(s) still owe a flush after the timeout\n", still_owed);
+    }
+    /* Leave the flags set: those cores will pay on their next timer tick,
+     * which is exactly the behaviour under test. */
+    if (fails) kprintf("[tlbtest] TLBSELFTEST FAILED (%d)\n", fails);
+    else       kprintf("[tlbtest] TLBSELFTEST PASSED (4 checks)\n");
+    return fails;
 }
 
 int vmm_protect(uint64_t virt, uint64_t flags) {

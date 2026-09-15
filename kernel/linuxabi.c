@@ -826,6 +826,12 @@ void linux_syscall_dispatch(struct registers *r) {
      * shared-mutable-global class as the recvmsg staging buffer in M2001 --
      * worth grepping the whole file for. */
     unsigned long ring_slot;
+    /* PAY ANY TLB DEBT BEFORE TOUCHING USER MEMORY (M2065). Almost every
+     * handler below dereferences a user pointer directly after vmm_user_ok,
+     * so a stale translation here reads the WRONG PAGE -- silently, with the
+     * right permissions. A shootdown that timed out leaves this core's flag
+     * set precisely so that this line settles it. */
+    vmm_tlb_discharge();
     lx_syscall_count++;
     app_count_lx_syscall();          /* per-process, for the stall watchdog (M2004) */
     /* Always record; print only on demand. The rate-limited trace below is for

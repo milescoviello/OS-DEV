@@ -453,6 +453,9 @@ int syscall_histogram_format(char *b, int max) {
 }
 
 void syscall_dispatch(struct registers *r) {
+    /* Pay any deferred TLB flush before a handler dereferences a user pointer
+     * (M2065) -- same reason as the Linux entry. */
+    vmm_tlb_discharge();
     app_t *self = app_current();
     vfs_sync_cwd();                     /* make the live cwd this process's own (M1144) */
 
