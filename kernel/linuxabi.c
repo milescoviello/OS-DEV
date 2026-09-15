@@ -1291,6 +1291,20 @@ void linux_syscall_dispatch(struct registers *r) {
                 r->rax = (bp < 0) ? (uint64_t)-(long)LX_EINVAL : 0;
                 break;
             }
+            /* PORT 0 IS NOT CONNECTABLE (M2055). A connect() to port 0 was
+             * accepted and reported success:
+             *
+             *   [net] connect -> 160.79.104.10:0 = 0
+             *
+             * Nothing can answer on port 0 -- Linux returns ECONNREFUSED (or
+             * EADDRNOTAVAIL) and every client handles that by moving on. Saying
+             * "connected" instead hands back a socket that will never deliver a
+             * byte, and a client that trusts us then waits for a reply for
+             * ever, with no error anywhere to explain it. Refusing is both
+             * correct and the kinder failure: the same shape as pipe2's flags,
+             * wait4's options and openat's dirfd -- a request accepted and not
+             * actually honourable. */
+            if (port == 0) { r->rax = (uint64_t)-(long)LX_ECONNREFUSED; break; }
             int crc = app_connect((int)a1, ip, port);
             /* ALWAYS, not only under a trace flag (M2004). An outbound
              * connection is a rare, structural event, and "which address did it
