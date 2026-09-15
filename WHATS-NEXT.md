@@ -1,5 +1,76 @@
 # What's next
 
+> **(M2028-M2035) CLAUDE CODE RUNS ITS OWN TOOLS INSIDE OS-DEV.**
+>
+> ripgrep and git now execute under OS-DEV and index OS-DEV's own source tree,
+> with Claude Code's workspace correctly at `/src`:
+>
+> ```
+> ripgrep 14.1.1 (rev 047f2e8e64)   features:+pcre2
+> simd(runtime):+SSE2,+SSSE3,+AVX2  PCRE2 10.45 is available (JIT is available)
+> /src/kernel/vmm.c  /src/kernel/wayland.c  /src/kernel/x509.c  ...
+> ```
+>
+> **The biggest find: `fork()` copied only the first 512 GiB of a 32 TiB address
+> space.** `vmm_fork_cow` walked `pml4[0]` and stopped. What hid it is that the
+> child does not *fault* on the missing memory -- the VMA table is copied, so
+> the address is valid, in a real region, with the right permissions, and it
+> faults in a **fresh zero page**. The child reads zeros where the parent wrote
+> data and every check on the way passes. Bun's heap sits around 5 TiB, so every
+> child inherited an argv and a path that were readable, aligned, and empty. It
+> called `execve("")`, got ENOENT, and exited 127 -- nine times in a row, with
+> nothing in any error naming a pointer or a page.
+>
+> | | |
+> |---|---|
+> | **M2028** | a typed hostname went to **port 80**, where most of the web no longer answers; plus a leading space turning a hostname into a web search for itself |
+> | **M2029** | the browser had **no cookies at all** -- nothing parsed `Set-Cookie`, nothing ever sent one, so nothing could stay logged in anywhere |
+> | **M2030** | a failed `execve` named nothing, and **127 is the shell's code for "command not found"** -- a number that means something different depending on who produced it |
+> | **M2031** | **`fork()` copied only the first 512 GiB** (above) |
+> | **M2032** | **`openat` discarded its dirfd** -- so every directory walker read the wrong directory. 197 bogus ENOENTs became 1 |
+> | **M2033** | cwd was not inherited (workspace `/` instead of `/src`); and **COW freed a frame another core was still using** |
+> | **M2035** | probes that proved the **mmap subsystem innocent** of the pointer-cage crash, which is what redirected the search to SMP |
+>
+> **Open, and measured rather than guessed:** Claude Code still crashes ~25 s in
+> on `-smp 4` and **not once on `-smp 1`**, with identical progress on both. So
+> what is left is a multi-core race, not a missing feature -- the same class as
+> the Firefox paint blocker.
+
+> **(M2021-M2027) CLAUDE CODE RUNS PAST ITS FIRST SUBPROCESS, AND GETS ITS REPLY.**
+>
+> It hung with every core halted, no syscall for 45 seconds, and its main
+> thread parked in `wait4()` for children that had **already exited**.
+>
+> `app_reap` is the only thing that turns an exited child into a collectable
+> zombie, and it demanded `TASK_DEAD`. But `exit_group` **stops** a process's
+> main task whenever some other thread is the one exiting -- and a `TASK_STOPPED`
+> task is never scheduled again, so it can never reach `TASK_DEAD`. The gate was
+> unsatisfiable by exactly the processes that needed it.
+>
+> A plain `fork()`ed child exits from its own main task and reaps fine, which is
+> why this survived so long. A child spawned by a **threaded** runtime does not:
+> `posix_spawn` from Bun exits from a helper thread, every time. The first helper
+> Claude Code spawned wedged the machine permanently.
+>
+> Alongside it, `wait4` was **discarding its options argument**, so `WNOHANG` --
+> "look, do not block" -- blocked for ever. That is the **fifth** instance of the
+> same shape: `pipe2` (M2009), `socketpair` (M2012), `eventfd2` (M2017), `bind`
+> (M2020). A request accepted and then silently not honoured. Refusing would
+> have been safer than agreeing, every time.
+>
+> Proven by reverting: `lxwait` clears 40 plain `fork` children, then hangs for
+> ever on the threaded one.
+>
+> | | |
+> |---|---|
+> | **M2021** | the NIC's **interrupt handler ACKed the IRQ and dropped the packet** -- it never touched the receive ring, so a frame survived only if a thread happened to be asking for one |
+> | **M2022** | RX queues sized for a self-test (8/16/16/8) against a real TLS handshake; plus a **boot assertion** that a second consumer can no longer destroy an ICMP reply |
+> | **M2023** | `-append lxout`: read what the guest **printed** instead of photographing the screen -- transcribing an OAuth URL from a screenshot got one character wrong |
+> | **M2024** | arrow keys arrived as **one byte in a private alphabet**; a terminal sends `ESC [ A`, so Claude Code's menus could not be navigated at all |
+> | **M2025** | **the reaper gate + `WNOHANG` above** |
+> | **M2026** | a receive **timeout was returned as `0`** -- which `read()` defines as **end of stream**. The capture shows the reply (`len=1367`) arriving and being ACKed, with no FIN anywhere, while the reader was told the connection had ended. **Sixth** instance of the same shape |
+> | **M2027** | the browser's failure page **listed four causes instead of naming one**; `tls_get` now records which stage it actually reached. Plus `sendfile` and `fadvise64`, which a guest was calling in a loop for ENOSYS |
+
 > **(M2017-M2020) CLAUDE CODE REACHES ITS LOGIN PROMPT INSIDE OS-DEV.**
 >
 > ```
