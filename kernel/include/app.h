@@ -23,7 +23,8 @@ void        app_futex_forget(void *t);                                 /* drop a
 int         app_last_spawn_pid(void);
 int         app_state_of(int pid);
 void        app_dump_threads(int pid);                                /* where every thread of a pid is parked (M1996) */                                     /* task state of a live pid, -1 if gone (M1996) */                                  /* pid of the last successful spawn (M1988) */
-void        app_count_lx_syscall(void);                                /* one more Linux syscall by the caller (M2004) */
+void        app_count_lx_syscall(unsigned long nr);                    /* one more Linux syscall by the caller, counted BY NUMBER (M2004/M2066) */
+void        app_lx_syshist_dump(app_t *a, int want);                   /* the top `want` syscall numbers since the last sample -- what a stuck program is actually doing (M2066) */
 void        app_stall_watchdog(void);                                  /* WM: report any Linux process that has stopped making syscalls (M2004) */
 int         app_open_console_alias(void);                              /* a new fd for the controlling terminal: open("/dev/tty") (M2004) */
 app_t      *app_out_to_of(app_t *a);                                   /* the window this app's output goes to, or NULL (M2004) */

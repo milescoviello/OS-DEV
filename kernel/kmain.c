@@ -270,6 +270,11 @@ static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claud
  * what it said. */
 static volatile int g_lxask;
 static volatile int g_termtest;               /* -append termtest: the VT/ANSI terminal self-test (M2057) */
+/* -append lxhist: every 15 s, print the top syscall numbers each live Linux
+ * process has made SINCE THE LAST SAMPLE (M2066). The one instrument that
+ * distinguishes "parked", "looping on a timer" and "doing work" -- three
+ * states that were previously all silent. */
+static volatile int g_lxhist;
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
@@ -534,6 +539,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
         if (cmdline_has(cl, "termtest")) g_termtest = 1;                               /* assert on the terminal's CELLS (M2057) */
+        if (cmdline_has(cl, "lxhist")) { g_lxhist = 1; extern int g_lx_syshist; g_lx_syshist = 1; }   /* what each Linux process is actually doing (M2066) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */

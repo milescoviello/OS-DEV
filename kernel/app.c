@@ -395,6 +395,9 @@ struct app {
 #define APP_NUNVEIL 8
     struct { char path[48]; uint8_t perms; } uv[APP_NUNVEIL];  /* unveil() allowed path prefixes */
     int      nuv;                        /* number of unveil entries */
+#define LX_SYSHIST_N 460                 /* Linux x86-64 numbers we could plausibly see; 460 covers every one staged here */
+    unsigned int syshist[LX_SYSHIST_N];      /* per-syscall-number call counts (M2066) */
+    unsigned int syshist_seen[LX_SYSHIST_N]; /* ...as of the previous sample, so a dump shows a DELTA */
     int      uv_active;                  /* 1 once unveil() has been called (then file paths are checked) */
     int      uv_locked;                  /* 1 after unveil(NULL): no more unveils accepted */
     const void *exec_img; uint64_t exec_imgsz;          /* execve hand-off, PER-PROCESS (M1952) */
@@ -2698,7 +2701,49 @@ int app_open_console_alias(void) {
  *
  * Called from the window manager's loop, which runs anyway.
  */
-void app_count_lx_syscall(void) { struct app *a = cur(); if (a) a->lxcalls++; }
+/* WHAT IT IS DOING, NOT JUST WHETHER IT IS DOING SOMETHING (M2066).
+ *
+ * `lxcalls` alone answers "is this process making syscalls", and that is the
+ * wrong question. Claude Code parks with its event loop still running: it
+ * makes plenty of calls, so the stall watchdog stays quiet, and it makes no
+ * progress, so nothing else says anything either. The only two readings
+ * available were "no syscall in 45s" (parked) and silence -- and silence meant
+ * both "healthy" and "looping for ever".
+ *
+ * A per-number histogram separates them at a glance: all clock_gettime and
+ * epoll_pwait2 is a loop waiting for something that is not coming; all futex
+ * is lock churn; read/openat in the mix is real work. The global syscall RING
+ * cannot answer this, because it is shared -- the last process to run,
+ * normally a short-lived `git` child, overwrites the parent's history
+ * completely, which is why every dump I took of a stalled Claude Code showed
+ * the same git exit. */
+void app_count_lx_syscall(unsigned long nr) {
+    struct app *a = cur();
+    if (!a) return;
+    a->lxcalls++;
+    if (nr < LX_SYSHIST_N) a->syshist[nr]++;
+}
+/* The top `want` syscall numbers by count SINCE THE PREVIOUS CALL, for one
+ * process. Deltas, not totals: what it is doing now is the question. */
+void app_lx_syshist_dump(app_t *ap, int want) {
+    struct app *a = (struct app *)ap;
+    if (!a || !a->used) return;
+    unsigned long total = 0;
+    for (int i = 0; i < LX_SYSHIST_N; i++) total += (unsigned long)(a->syshist[i] - a->syshist_seen[i]);
+    kprintf("[syshist] pid %d '%s': %lu call(s) since the last sample\n",
+            a->pid, a->title ? a->title : "?", total);
+    for (int n = 0; n < want; n++) {
+        int best = -1; unsigned long bestv = 0;
+        for (int i = 0; i < LX_SYSHIST_N; i++) {
+            unsigned long d = (unsigned long)(a->syshist[i] - a->syshist_seen[i]);
+            if (d > bestv) { bestv = d; best = i; }
+        }
+        if (best < 0) break;
+        kprintf("[syshist]   %6lu x syscall %d (%s)\n", bestv, best, lx_syscall_name(best));
+        a->syshist_seen[best] = a->syshist[best];      /* consumed: let the next-highest win */
+    }
+    for (int i = 0; i < LX_SYSHIST_N; i++) a->syshist_seen[i] = a->syshist[i];
+}
 
 /* A CONNECTION THAT HAS GONE QUIET (M2016).
  *
@@ -2735,11 +2780,21 @@ void app_net_stall_watch(void) {
     }
 }
 
+int g_lx_syshist;   /* -append lxhist: sample every live Linux process every 15 s (M2066) */
+
 void app_stall_watchdog(void) {
     static uint64_t next_check;
     uint64_t now = timer_ms();
     if (now < next_check) return;
     next_check = now + 15000;
+    /* WHAT, not just WHETHER (M2066). The loop below only speaks when a
+     * process has gone quiet, and the interesting failure is the opposite: a
+     * process whose event loop is running and whose work is not. Sample every
+     * one of them, unconditionally, when asked. */
+    if (g_lx_syshist)
+        for (int i = 0; i < MAX_APPS; i++)
+            if (apps[i].used && !apps[i].exited && apps[i].lxcalls)
+                app_lx_syshist_dump((app_t *)&apps[i], 8);
     for (int i = 0; i < MAX_APPS; i++) {
         struct app *a = &apps[i];
         if (!a->used || a->exited || !a->lxcalls) continue;

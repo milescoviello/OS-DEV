@@ -760,6 +760,15 @@ static const char *lx_proc_self_tail(const char *p) {
 int g_poll_trace;
 static int g_poll_reports;
 
+/* HOW MANY SYSCALLS THIS THREAD HAS MADE (M2066). Per-task, so a thread that
+ * dies young can say how far it got -- "exited after 6 syscalls" is a failed
+ * startup, "after 40000" is a worker that finished its work. 16 slots keyed on
+ * the task id, which is enough to be informative and cannot grow unboundedly;
+ * a collision only mixes two counters in a diagnostic. */
+static unsigned long g_thr_calls[16];
+static void lx_thread_calls_bump(void) { g_thr_calls[task_current_id() & 15]++; }
+static unsigned long lx_thread_calls(void) { return g_thr_calls[task_current_id() & 15]; }
+
 /* Output from a Linux process goes to the window that launched it, or to the
  * kernel console when there is none. Which of the two it took is the whole
  * question when a program "produces no output" -- so say, once per process,
@@ -810,6 +819,163 @@ static void lx_emit(const char *b, unsigned long n) {
  * chances to see it; a loop parked on nothing costs what it did before. */
 static int lx_poll_nap(int spins) { return spins < 200 ? 1 : 10; }
 
+/* A syscall NUMBER is not a name, and a histogram of numbers is unreadable
+ * (M2066). Generated from the LXS_* table in this file, so it cannot drift
+ * from what is actually dispatched. "?" means we have never handled it. */
+const char *lx_syscall_name(unsigned long nr) {
+    switch (nr) {
+    case 0: return "read";
+    case 1: return "write";
+    case 2: return "open";
+    case 3: return "close";
+    case 4: return "stat";
+    case 5: return "fstat";
+    case 6: return "lstat";
+    case 7: return "poll";
+    case 8: return "lseek";
+    case 9: return "mmap";
+    case 10: return "mprotect";
+    case 11: return "munmap";
+    case 12: return "brk";
+    case 13: return "rt_sigaction";
+    case 14: return "rt_sigprocmask";
+    case 15: return "rt_sigreturn";
+    case 16: return "ioctl";
+    case 17: return "pread64";
+    case 19: return "readv";
+    case 20: return "writev";
+    case 21: return "access";
+    case 22: return "pipe";
+    case 24: return "sched_yield";
+    case 25: return "mremap";
+    case 28: return "madvise";
+    case 32: return "dup";
+    case 33: return "dup2";
+    case 34: return "pause";
+    case 35: return "nanosleep";
+    case 39: return "getpid";
+    case 40: return "sendfile";
+    case 41: return "socket";
+    case 42: return "connect";
+    case 43: return "accept";
+    case 44: return "sendto";
+    case 45: return "recvfrom";
+    case 46: return "sendmsg";
+    case 47: return "recvmsg";
+    case 48: return "shutdown";
+    case 49: return "bind";
+    case 50: return "listen";
+    case 51: return "getsockname";
+    case 52: return "getpeername";
+    case 53: return "socketpair";
+    case 54: return "setsockopt";
+    case 55: return "getsockopt";
+    case 56: return "clone";
+    case 57: return "fork";
+    case 58: return "vfork";
+    case 59: return "execve";
+    case 60: return "exit";
+    case 61: return "wait4";
+    case 62: return "kill";
+    case 63: return "uname";
+    case 72: return "fcntl";
+    case 74: return "fsync";
+    case 75: return "fdatasync";
+    case 77: return "ftruncate";
+    case 79: return "getcwd";
+    case 80: return "chdir";
+    case 81: return "fchdir";
+    case 82: return "rename";
+    case 83: return "mkdir";
+    case 84: return "rmdir";
+    case 86: return "link";
+    case 87: return "unlink";
+    case 88: return "symlink";
+    case 89: return "readlink";
+    case 90: return "chmod";
+    case 91: return "fchmod";
+    case 95: return "umask";
+    case 96: return "gettimeofday";
+    case 98: return "getrusage";
+    case 99: return "sysinfo";
+    case 102: return "getuid";
+    case 104: return "getgid";
+    case 107: return "geteuid";
+    case 108: return "getegid";
+    case 110: return "getppid";
+    case 118: return "getresuid";
+    case 120: return "getresgid";
+    case 125: return "capget";
+    case 127: return "rt_sigpending";
+    case 130: return "rt_sigsuspend";
+    case 131: return "sigaltstack";
+    case 137: return "statfs";
+    case 138: return "fstatfs";
+    case 140: return "getpriority";
+    case 141: return "setpriority";
+    case 142: return "sched_setparam";
+    case 143: return "sched_getparam";
+    case 144: return "sched_setscheduler";
+    case 145: return "sched_getscheduler";
+    case 157: return "prctl";
+    case 158: return "arch_prctl";
+    case 186: return "gettid";
+    case 187: return "readahead";
+    case 200: return "tkill";
+    case 201: return "time";
+    case 202: return "futex";
+    case 204: return "sched_getaffinity";
+    case 217: return "getdents64";
+    case 218: return "set_tid_address";
+    case 221: return "fadvise64";
+    case 228: return "clock_gettime";
+    case 229: return "clock_getres";
+    case 230: return "clock_nanosleep";
+    case 231: return "exit_group";
+    case 232: return "epoll_wait";
+    case 233: return "epoll_ctl";
+    case 234: return "tgkill";
+    case 254: return "inotify_add_watch";
+    case 255: return "inotify_rm_watch";
+    case 257: return "openat";
+    case 258: return "mkdirat";
+    case 262: return "newfstatat";
+    case 263: return "unlinkat";
+    case 265: return "linkat";
+    case 266: return "symlinkat";
+    case 267: return "readlinkat";
+    case 268: return "fchmodat";
+    case 269: return "faccessat";
+    case 271: return "ppoll";
+    case 273: return "set_robust_list";
+    case 280: return "utimensat";
+    case 281: return "epoll_pwait";
+    case 284: return "eventfd";
+    case 285: return "fallocate";
+    case 288: return "accept4";
+    case 290: return "eventfd2";
+    case 291: return "epoll_create1";
+    case 293: return "pipe2";
+    case 294: return "inotify_init1";
+    case 295: return "preadv";
+    case 296: return "pwritev";
+    case 299: return "recvmmsg";
+    case 302: return "prlimit64";
+    case 307: return "sendmmsg";
+    case 318: return "getrandom";
+    case 319: return "memfd_create";
+    case 327: return "preadv2";
+    case 328: return "pwritev2";
+    case 332: return "statx";
+    case 334: return "rseq";
+    case 434: return "pidfd_open";
+    case 435: return "clone3";
+    case 436: return "close_range";
+    case 441: return "epoll_pwait2";
+    default: return "?";
+    }
+}
+
 void linux_syscall_dispatch(struct registers *r) {
     /* WHICH RING SLOT THIS CALL OWNS -- a LOCAL, not a shared cursor (M2003).
      *
@@ -826,6 +992,7 @@ void linux_syscall_dispatch(struct registers *r) {
      * shared-mutable-global class as the recvmsg staging buffer in M2001 --
      * worth grepping the whole file for. */
     unsigned long ring_slot;
+    lx_thread_calls_bump();
     /* PAY ANY TLB DEBT BEFORE TOUCHING USER MEMORY (M2065). Almost every
      * handler below dereferences a user pointer directly after vmm_user_ok,
      * so a stale translation here reads the WRONG PAGE -- silently, with the
@@ -833,7 +1000,7 @@ void linux_syscall_dispatch(struct registers *r) {
      * set precisely so that this line settles it. */
     vmm_tlb_discharge();
     lx_syscall_count++;
-    app_count_lx_syscall();          /* per-process, for the stall watchdog (M2004) */
+    app_count_lx_syscall(r->rax);    /* per-process, BY NUMBER, for the stall watchdog + histogram (M2004/M2066) */
     /* Always record; print only on demand. The rate-limited trace below is for
      * finding a SPIN (the same call repeating), and deliberately samples one in
      * 4096 so a compiler does not drown the log -- but that makes it useless for
@@ -3683,7 +3850,22 @@ void linux_syscall_dispatch(struct registers *r) {
          * sibling the moment a pthread returned -- but the MAIN thread calling
          * exit(2) really does end the process, or a program returning from
          * main would leave a husk nothing ever reaps. (M1959) */
-        if (!app_is_main_thread()) { app_thread_exit(); break; }
+        if (!app_is_main_thread()) {
+            /* NAME THE THREAD THAT DIED (M2066). A per-process syscall
+             * histogram showed Claude Code spawning three threads and losing
+             * three, over and over: prctl(PR_SET_NAME), gettid,
+             * sched_getaffinity, set_robust_list, getrandom -- and then
+             * exit(2). Which POOL that is decides everything, and prctl has
+             * already told us its name by this point. M2003 chased the same
+             * signature to a missing getpriority; the name is what makes the
+             * next one a lookup instead of a hunt. */
+            extern int g_lx_syshist;
+            if (g_lx_syshist)
+                kprintf("[syshist] thread %d '%s' exited with %ld after %lu syscall(s)\n",
+                        task_current_id(), task_name_of(task_self()), a1,
+                        (unsigned long)lx_thread_calls());
+            app_thread_exit(); break;
+        }
         /* fall through */
     case LXS_exit_group:
         kprintf("[linuxabi] guest exited with status %ld\n", a1);

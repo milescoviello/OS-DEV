@@ -102,12 +102,44 @@ static long gen_acpi(char *b, int max) {
     }
     b[p] = 0; return p;
 }
+/* MEMAVAILABLE WAS MISSING, AND THAT MEANT "NO MEMORY" (M2066).
+ *
+ * This reported three lines: MemTotal, MemFree, and a MemUsed that Linux does
+ * not have. Every Linux memory-pressure estimator written in the last decade
+ * reads **MemAvailable** -- it is the field that exists precisely so a program
+ * does not have to guess how much of Cached is reclaimable. A reader that
+ * scans for it and does not find it gets zero, and zero available memory is
+ * not "unknown", it is CRITICAL PRESSURE.
+ *
+ * JavaScriptCore's MemoryPressureHandler does exactly that. Told the machine
+ * has nothing left, it collects continuously and never returns to running the
+ * program -- which is what Claude Code was doing: alive, its event loop
+ * ticking about four times a second, no network, no output, and a fresh batch
+ * of three `HeapHelper` GC marker threads spawning and dying every few
+ * seconds, for ever. Nothing faulted and nothing was logged, because from the
+ * kernel's side every answer was a success.
+ *
+ * So report what Linux reports. Buffers and Cached are honestly 0 here -- this
+ * kernel has a block cache but does not account it as reclaimable page cache --
+ * and MemAvailable is therefore MemFree, which is the truth rather than a
+ * flattering estimate. MemUsed stays at the end: it is not a Linux field, but
+ * three of our own programs (httpd, shell's `mem`, sysgraph) parse it
+ * positionally and there is no reason to break them. */
 static long gen_meminfo(char *b, int max) {
     uint64_t total = pmm_total_bytes() / 1024, freeb = pmm_free_bytes() / 1024;
     int p = 0;
     p = sapp(b, p, max, "MemTotal:     "); p = sdec(b, p, max, total); p = sapp(b, p, max, " kB\n");
     p = sapp(b, p, max, "MemFree:      "); p = sdec(b, p, max, freeb); p = sapp(b, p, max, " kB\n");
     p = sapp(b, p, max, "MemUsed:      "); p = sdec(b, p, max, total - freeb); p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "MemAvailable: "); p = sdec(b, p, max, freeb); p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "Buffers:      "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "Cached:       "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "SwapCached:   "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "Active:       "); p = sdec(b, p, max, total - freeb); p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "Inactive:     "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "SwapTotal:    "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "SwapFree:     "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
+    p = sapp(b, p, max, "Shmem:        "); p = sdec(b, p, max, 0);     p = sapp(b, p, max, " kB\n");
     b[p] = 0; return p;
 }
 static long gen_uptime(char *b, int max) {
