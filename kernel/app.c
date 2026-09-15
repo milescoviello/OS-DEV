@@ -2730,8 +2730,12 @@ void app_lx_syshist_dump(app_t *ap, int want) {
     if (!a || !a->used) return;
     unsigned long total = 0;
     for (int i = 0; i < LX_SYSHIST_N; i++) total += (unsigned long)(a->syshist[i] - a->syshist_seen[i]);
-    kprintf("[syshist] pid %d '%s': %lu call(s) since the last sample\n",
-            a->pid, a->title ? a->title : "?", total);
+    /* FREE RAM in the same line (M2066). A runtime that collects in a loop is
+     * either being lied to about memory or genuinely out of it, and those two
+     * want opposite fixes. Printing both numbers together is the difference. */
+    kprintf("[syshist] pid %d '%s': %lu call(s) since the last sample, %luK free of %luK\n",
+            a->pid, a->title ? a->title : "?", total,
+            (unsigned long)(pmm_free_bytes() >> 10), (unsigned long)(pmm_total_bytes() >> 10));
     for (int n = 0; n < want; n++) {
         int best = -1; unsigned long bestv = 0;
         for (int i = 0; i < LX_SYSHIST_N; i++) {
@@ -7723,6 +7727,27 @@ static void eof_spin_watch(struct app *a, int fd, long n) {
                     a->fd[fd].path, (long)a->fd[fd].off);
     }
 }
+/* RUN A BLOCKING NETWORK CALL WITH INTERRUPTS ON (M2068).
+ *
+ * Every syscall arrives with IF clear (the gate is 0xEE), and net.c's receive
+ * wait is measured in TIMER TICKS -- which only advance from the PIT
+ * interrupt. So a socket read entered with interrupts off cannot ever reach
+ * its own timeout: it spins on a frozen clock, on a core that can no longer be
+ * preempted or take the NIC's IRQ. Two cores doing that is a dead machine, and
+ * that is exactly what a monitor dump showed the first time Claude Code did
+ * enough socket I/O to block.
+ *
+ * M1863 recorded this trap for the NATIVE syscalls and fixed SYS_fdread; the
+ * Linux ABI's read/recv/send paths were never given the same treatment. Save
+ * the caller's flag and restore it, so a caller that legitimately had
+ * interrupts off gets them back. */
+#define NET_BLOCKING(expr) ({                                             \
+    uint64_t _nf; __asm__ volatile("pushfq; pop %0" : "=r"(_nf));          \
+    __asm__ volatile("sti");                                               \
+    __typeof__(expr) _nr = (expr);                                         \
+    if (!(_nf & (1u << 9))) __asm__ volatile("cli");                       \
+    _nr; })
+
 static long app_fd_read_inner(int fd, void *buf, unsigned long max);
 /* AN EDGE THAT HAPPENS BETWEEN TWO POLLS (M2059/M2062). See epoll_note_drain
  * for the consumer side and epoll_note_post for the producer side. */
@@ -7807,7 +7832,7 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
         }
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 16) {  /* accepted AF_INET connection (M2020) */
-        long n = net_tcp_accept_recv((uint8_t *)buf, (int)max, app_fd_nonblock(fd) ? 0 : 20);
+        long n = NET_BLOCKING(net_tcp_accept_recv((uint8_t *)buf, (int)max, app_fd_nonblock(fd) ? 0 : 20));
         if (n < 0) return 0;                       /* peer closed: EOF */
         if (n == 0 && app_fd_nonblock(fd)) return APP_FD_EAGAIN;
         return n;
@@ -7898,7 +7923,7 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 10) {  /* TCP socket: recv (M1268) */
         net_tcp_sock_set_nonblock(a->fd[fd].obj, a->fd[fd].nonblock);   /* O_NONBLOCK is a per-FD property (M1967) */
-        long n = net_tcp_sock_recv(a->fd[fd].obj, buf, max);
+        long n = NET_BLOCKING(net_tcp_sock_recv(a->fd[fd].obj, buf, max));
         /* WHERE A TLS HANDSHAKE ACTUALLY STOPS (M2016). "Connection timed out
          * after 10 seconds" is the only thing the application can tell us, and
          * it is true of a socket that never connected, one that connected and
@@ -8039,7 +8064,7 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 16) {  /* accepted AF_INET connection (M2020) */
-        int w = net_tcp_accept_send((const uint8_t *)buf, (int)len);
+        int w = NET_BLOCKING(net_tcp_accept_send((const uint8_t *)buf, (int)len));
         return (w < 0) ? APP_FD_EPIPE : (long)len;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 14) {  /* console alias (M1972) */
@@ -8060,7 +8085,7 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         return app_sendto(fd, a->fd[fd].peer_ip, a->fd[fd].peer_port, buf, (int)len);
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 10) {  /* TCP socket: send (M1268) */
-        long w = net_tcp_sock_send(a->fd[fd].obj, buf, (int)len);
+        long w = NET_BLOCKING(net_tcp_sock_send(a->fd[fd].obj, buf, (int)len));
         g_net_calls++;
         if (g_net_trace)
             kprintf("[nettrace] t=%lums pid %d fd %d send(%u) -> %ld\n",

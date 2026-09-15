@@ -184,7 +184,46 @@ static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
  * frames (M1264) are drained first so a NIC flood can't starve them. */
 static int recv_timeout(uint8_t *buf, int max, uint64_t ticks) {
     uint64_t deadline = timer_ticks() + ticks;
-    while (timer_ticks() <= deadline) {
+    /* A TICK DEADLINE IS NOT A BOUND WITH INTERRUPTS OFF (M2068).
+     *
+     * This loop waited on `timer_ticks()`, and the tick only advances from the
+     * PIT interrupt. A caller that arrives with IF clear -- every syscall does,
+     * the gate is 0xEE -- freezes the clock, so `timer_ticks() <= deadline` is
+     * true FOR EVER and the `pause` branch below spins on a core that can no
+     * longer be preempted, take the NIC's IRQ, or run another task.
+     *
+     * That is a whole-machine wedge, and it is what it looked like: the guest
+     * stopped, the taskbar clock froze, the log stopped mid-line, and a
+     * QEMU-monitor register dump showed TWO cores at this exact instruction
+     * with RFL=0x46 -- no IF bit -- while the other two sat in HLT. Claude
+     * Code reached it the first time it did enough socket I/O to block on a
+     * read.
+     *
+     * The caller should enable interrupts, and the Linux socket paths now do.
+     * But a function that can hang the machine if ONE caller forgets is the
+     * wrong shape, so bound it by WORK as well: with IF clear the tick budget
+     * is meaningless, so spend a spin budget instead and SAY SO, once, naming
+     * the condition rather than quietly tolerating it. */
+    uint64_t ifl; __asm__ volatile("pushfq; pop %0" : "=r"(ifl));
+    int no_irq = !(ifl & (1u << 9));
+    if (no_irq) {
+        static int told;
+        if (!told) { told = 1;
+            kprintf("[net] recv_timeout entered with INTERRUPTS OFF -- the tick clock cannot "
+                    "advance, so its timeout can never expire; spinning a bounded budget instead\n"); }
+    }
+    /* ZERO TICKS MEANS ONE PASS (M2068). `recv_timeout(.., 0)` is how every
+     * readiness check asks "is there a frame RIGHT NOW" -- poll, epoll, and
+     * M2059's drain hook all reach it through tcpsock_pump. The loop condition
+     * `timer_ticks() <= deadline` is TRUE on the first iteration when the
+     * deadline is now, so a zero-tick "non-blocking" wait was a LOOP: with
+     * interrupts on it happened to leave after one tick, and with interrupts
+     * off it never left at all. A non-blocking poll must not be able to block,
+     * let alone hang the machine. */
+    long budget = no_irq ? 4000000 : -1;          /* only consumed on the IF-clear path */
+    int once = (ticks == 0);
+    while (once || (no_irq ? (--budget > 0) : (timer_ticks() <= deadline))) {
+        if (once) once = 0, budget = 1;           /* this iteration, then out */
         int l = oring_take(buf, max);                  /* frames another consumer filed for us (M2018) */
         if (l > 0) {
             if (arp_maybe_reply(buf, l)) continue;
@@ -213,6 +252,7 @@ static int recv_timeout(uint8_t *buf, int max, uint64_t ticks) {
          * moment a packet lands, waking us promptly; the ~10ms timer tick is the
          * fallback (and drives loopback). Only `hlt` with interrupts enabled —
          * else the CPU would wedge; then it degrades to the old busy-poll. */
+        if (budget == 1) return 0;                     /* the zero-tick single pass found nothing */
         uint64_t fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl));
         if (fl & (1u << 9)) __asm__ volatile("hlt");   /* IF set: wake on NIC IRQ or timer */
         else                __asm__ volatile("pause");
