@@ -141,10 +141,61 @@ const uint8_t *e1000_mac(void) { return mac; }
  * loop falls back to its timer-tick wakeups). */
 static volatile uint64_t g_e1000_irqs;
 uint64_t e1000_irq_count(void) { return g_e1000_irqs; }
+
+/* ---- the software receive queue (M2021) -----------------------------------
+ *
+ * The hardware ring is 64 descriptors and the card stops writing when it is
+ * full. Until now the ONLY thing that emptied it was a consumer calling
+ * e1000_receive -- so packets that arrived while the machine was busy doing
+ * something else sat there, and once 64 had piled up the card dropped the
+ * rest on the floor with nobody to tell.
+ *
+ * That is exactly the shape of the failures that led here: a program deep in
+ * startup, doing no socket I/O for a while, quietly losing the server's reply.
+ * Interrupt-driven RX (M1858) woke a sleeper but never MOVED anything, so the
+ * ring filled just the same when nobody happened to be sleeping on it.
+ *
+ * Now the interrupt drains the ring into this queue and hands the descriptors
+ * straight back to the card, so the hardware always has somewhere to write and
+ * arrival is decoupled from whoever eventually asks for the bytes. The queue is
+ * deliberately much deeper than the ring: its whole purpose is to absorb a
+ * burst that the consumer is not ready for. */
+#define SWRX_N   256
+#define SWRX_MAX 1600
+static struct { uint8_t buf[SWRX_MAX]; uint16_t len; } g_swrx[SWRX_N];
+static volatile uint32_t g_swrx_head, g_swrx_tail;    /* empty when head == tail */
+static volatile uint64_t g_swrx_dropped;              /* queue full: the honest count */
+uint64_t e1000_rx_dropped(void) { return g_swrx_dropped; }
+
+/* Move every ready descriptor into the software queue. Safe from the ISR: no
+ * allocation, no locks taken by anyone else, and it only advances indices this
+ * function and e1000_receive own. */
+static void e1000_drain_ring(void) {
+    for (;;) {
+        uint32_t i = rx_cur;
+        if (!(rx_ring[i].status & RXSTAT_DD)) return;
+        uint16_t len = rx_ring[i].length;
+        if (len > SWRX_MAX) len = SWRX_MAX;
+        uint32_t n = (g_swrx_head + 1) % SWRX_N;
+        if (n == g_swrx_tail) {
+            g_swrx_dropped++;          /* consumer is that far behind: say so */
+        } else {
+            memcpy(g_swrx[g_swrx_head].buf, hhdm(rx_buf[i]), len);
+            g_swrx[g_swrx_head].len = len;
+            g_swrx_head = n;
+        }
+        rx_ring[i].status = 0;
+        reg_write(REG_RDT, i);         /* give the descriptor back immediately */
+        rx_cur = (i + 1) % RX_COUNT;
+    }
+}
+
 static void e1000_isr(struct registers *r) {
     (void)r;
     uint32_t cause = reg_read(REG_ICR);              /* read = ack/clear the causes (no storm) */
-    if (cause) g_e1000_irqs++;                        /* 0 => not our (shared) IRQ */
+    if (!cause) return;                               /* 0 => not our (shared) IRQ */
+    g_e1000_irqs++;
+    e1000_drain_ring();                               /* the ring must never be the buffer (M2021) */
 }
 
 /* Intel Gigabit controllers this driver supports. 0x100E is the classic 82540EM
@@ -286,16 +337,18 @@ int e1000_send(const void *frame, uint16_t len) {
 }
 
 int e1000_receive(void *out, uint16_t max) {
-    uint32_t i = rx_cur;
-    if (!(rx_ring[i].status & RXSTAT_DD))
-        return 0;                       /* nothing received */
-
-    uint16_t len = rx_ring[i].length;
-    if (len > max) len = max;
-    memcpy(out, hhdm(rx_buf[i]), len);                            /* CPU side: through the HHDM (M1970) */
-
-    rx_ring[i].status = 0;
-    reg_write(REG_RDT, i);              /* return the buffer to the card */
-    rx_cur = (i + 1) % RX_COUNT;
+    /* Drain the hardware ring first, so this works identically whether or not
+     * the interrupt is being delivered -- a missed or masked IRQ must never
+     * mean a missed packet, only a later one. (M2021) */
+    uint64_t fl; __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl));
+    e1000_drain_ring();
+    uint16_t len = 0;
+    if (g_swrx_tail != g_swrx_head) {
+        len = g_swrx[g_swrx_tail].len;
+        if (len > max) len = max;
+        memcpy(out, g_swrx[g_swrx_tail].buf, len);
+        g_swrx_tail = (g_swrx_tail + 1) % SWRX_N;
+    }
+    __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
     return len;
 }
