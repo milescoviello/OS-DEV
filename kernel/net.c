@@ -2341,17 +2341,23 @@ void tcp_close(tcp_conn *c) {
  * clearance cookie on the way must have that cookie survive the scheme change.
  * Two jars would silently lose it exactly where it matters. */
 static cj_jar g_jar;
+/* timer_TICKS, not timer_ms. net.c is compiled into the host test harness too,
+ * and only the tick clock is stubbed there -- calling timer_ms() breaks the
+ * nettest/tcpreliabletest link with an "undefined reference" that names the
+ * COOKIE functions and says nothing about why. Exactly the coupling M2018 hit
+ * in this same file. A tick is 10 ms (timer.c's tick_ms). */
+static unsigned long long cj_now_ms(void) { return (unsigned long long)timer_ticks() * 10ull; }
 int cookie_header_for(const char *host, const char *path, int secure, char *out, int max) {
-    return cj_header(&g_jar, host, path, secure, 1, timer_ms(), out, max);
+    return cj_header(&g_jar, host, path, secure, 1, cj_now_ms(), out, max);
 }
 int cookie_script_view(const char *host, const char *path, int secure, char *out, int max) {
-    return cj_header(&g_jar, host, path, secure, 0, timer_ms(), out, max);   /* document.cookie: no HttpOnly */
+    return cj_header(&g_jar, host, path, secure, 0, cj_now_ms(), out, max);   /* document.cookie: no HttpOnly */
 }
 int cookie_harvest_from(const char *host, const char *path, const char *resp, int len) {
-    return cj_harvest(&g_jar, host, path, resp, len, timer_ms());
+    return cj_harvest(&g_jar, host, path, resp, len, cj_now_ms());
 }
 int cookie_set_one(const char *host, const char *path, const char *hdr) {
-    return cj_set(&g_jar, host, path, hdr, timer_ms());
+    return cj_set(&g_jar, host, path, hdr, cj_now_ms());
 }
 void cookie_reset(void) { cj_clear(&g_jar); }
 
