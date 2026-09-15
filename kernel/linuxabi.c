@@ -3104,8 +3104,17 @@ void linux_syscall_dispatch(struct registers *r) {
          * Static was also wrong once two processes can list at once; a build
          * runs several. Per-call from the heap costs a kmalloc on a syscall
          * that already walks a filesystem. */
+        /* A dirent is 264 bytes since M2062 (a 256-byte name, because every
+         * listing used to truncate at 31 characters), so 1024 of them is a
+         * 270 KB allocation on a syscall a directory walker makes in a loop.
+         * The full count is still needed -- this re-lists on every call and
+         * indexes by position, so a short buffer would drop entries the next
+         * call has to find. Fall back to 256 rather than fail the readdir
+         * outright when the heap cannot spare it; a truncated listing is
+         * reported below, which is more than a lost directory would be. */
         int ecap = 1024;                    /* NB: `cap` is already the user buffer size */
         vfs_dirent *ents = kmalloc((unsigned long)ecap * sizeof *ents);
+        if (!ents) { ecap = 256; ents = kmalloc((unsigned long)ecap * sizeof *ents); }
         if (!ents) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
         int n = vfs_list_path(dp, ents, ecap);
         if (n < 0) { kfree(ents); r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }

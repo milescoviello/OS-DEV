@@ -1,5 +1,74 @@
 # What's next
 
+> **(M2061-M2062) THE DIAGNOSTIC THAT PANICKED, AND A FILENAME CUT AT 31 CHARACTERS.**
+>
+> Both were found by finally being able to READ things: M2056 made a Linux
+> program's output land in the log as text, and that is what turned two
+> long-standing mysteries into one-line reads.
+>
+> | | |
+> |---|---|
+> | **M2061** | `make check`'s only red -- *"in-guest compile of OS-DEV's own source"*, Phase 5's own demo -- was **the failure report killing the kernel**. M2030 added a line to say which path a failed `execve` could not find; it printed `av[0]` with `%s`, and `av` is `kfree`'d two lines above. So the message read the allocator's `0xde` poison and took a General Protection Fault *inside `kprintf`*. The log stops mid-format at `argv0="`, which is both where the pointer was dereferenced and the only clue that the message itself was the bug. **And the thing it was trying to report was real**: the gcc driver finds `cc1` through a prefix computed from its own `argv[0]`, so exec'd as `/usr/bin/gcc` it looks in `/libexec/gcc/...`, not `/usr/libexec/gcc/...` where `cc1` was staged. Fixed, the in-guest compile runs in **fifteen seconds** -- the "twenty minutes at 85% CPU" I had written down as its runtime was the panicked machine spinning |
+> | **M2062** | **every directory listing truncated filenames at 31 characters.** `find /root/.claude` said it outright: two files reporting *"No such file or directory"* at exactly 31 characters each. One struct -- shared by FAT32, ext2 and ISO9660 -- had a 32-byte name field, and a truncated name is not cosmetic, it is a name that does not exist. A program writes a file, lists the directory, acts on what it read, and gets ENOENT for its own data. Claude Code names its session keys with a 64-hex hash and its backups with a millisecond timestamp, so nearly everything it owns was invisible to it. Both name fields are now 256 and every listing buffer moved to the heap -- which is what the old comment's stack-size argument should have concluded in the first place |
+>
+> The old comment in `partition.h` is worth quoting against itself: it reasoned
+> that 31 was safe *because* the struct lives in `[64]` arrays on a 16 KB
+> kernel stack. The reasoning was sound and the conclusion was wrong. **When a
+> correct implementation does not fit, move the storage -- do not return the
+> wrong answer.** That sentence would have prevented four of the last seven
+> defects.
+>
+> A second path limit sits behind it and is now LOUD instead of silent:
+> `lx_xlate` built its translated path with `n < max - 1` and said nothing, so
+> a path over `VFS_PATH_MAX` quietly named something else. That is the
+> **eleventh** "granted in name only" defect this campaign and the only one
+> with no diagnostic at all. Raising the budget (256 against Linux's 4096) is
+> its own milestone: seventy stack buffers are declared `[VFS_PATH_MAX]` and
+> several nest in one call chain.
+
+> **(M2056-M2060) THE PROGRAM'S OUTPUT, THE TERMINAL IT LANDS IN, AND AN EPOLL EDGE.**
+>
+> This block is five defects found chasing one symptom -- Claude Code painting
+> an interface that looked like an empty window, then going idle forever. Not
+> one of them was in the network stack, which a packet capture and a new
+> probe (HTTP/1.1 *and* HTTP/2 POSTs to api.anthropic.com, both answered `401`
+> in nine seconds from inside OS-DEV) between them cleared entirely.
+>
+> | | |
+> |---|---|
+> | **M2056** | **`-append lxout` captured nothing from the one program it was built for.** M2023 put the mirror in `lx_emit`, which only runs while fd 1 and 2 are *untouched* -- and every Linux process here gets real fd-table entries for 0/1/2 on purpose, so that a dup of stdout keeps working. I grepped 1067 log lines for the TUI the program had just painted on screen, found not one escape byte, and concluded it had printed nothing. It had printed everything |
+> | **M2057** | **the terminal was a tiny VT100 subset, and a TUI cannot live in it.** Right-margin wrap was EAGER, so a full-width row line-fed immediately and, on the bottom row, scrolled the whole screen -- a frame scrolling itself off the top as it was drawn. There was **no per-cell background at all**, so every dark-on-light panel collapsed onto one grey on a near-black backdrop: painted, and invisible. The CSI buffer was 24 bytes and a combined fg+bg truecolour SGR is 27, so the tail `;0m` was printed as literal text. TAB drew a CP437 dither block. `ESC[?25l`, `ESC[?1049h`, `ESC[6n`, `ESC[r`, `ESC[s`/`ESC[u`, insert/delete and bracketed paste did not exist |
+> | **M2058** | **the compositor drew whichever surface committed LAST**, from one global slot -- correct for a client with exactly one surface, which is every test client here and nothing Firefox does. Plus object destruction, which did not exist at all, and `wl_shm_pool.resize` |
+> | **M2059** | **a polled epoll cannot see an edge.** `last_ready` was cleared only when a wait happened to *observe* an fd not-ready, and a wake-up eventfd is never observed in that state: write, wait, drain, write again -- the dip to zero fell between two waits, so the second write was suppressed and the waiter slept forever with the fd ready in front of it. On Linux readiness is *pushed*, so the transition is an event whether or not anybody is looking |
+> | **M2060** | **a read of a PROT_NONE page returned zeros**, because the fault handler consulted only WRITE and EXEC and never READ. JavaScriptCore reserves its structure heap PROT_NONE and leaves block zero uncommitted so that `StructureID 0` segfaults; here it read zeros, and a null `ClassInfo` faulted in the GC pages away from the cause. Also: **`close()` on a live TCP socket never returned** -- its flush loop waits on `timer_ticks()` and a syscall runs with interrupts off, so the deadline was unreachable; and **mremap's shrink had no TLB shootdown**, M2000's madvise bug verbatim in a function nobody revisited |
+>
+> The through-line: **M2056, M2059 and M2060 are all the same mistake in
+> different clothes -- a mechanism that answers a question with a plausible
+> wrong value instead of failing.** A mirror that silently covers the wrong
+> path, an edge detector that samples state instead of transitions, and a
+> mapping that hands back zeros where it should fault. Each one costs far more
+> than an outright error would, because every assertion still passes.
+>
+> `app_term_selftest` (`-append termtest`, 34 checks) exists because the
+> terminal's only output is pixels and the only way anyone had ever checked it
+> was to look at a screenshot -- a dropped escape sequence and an honoured one
+> produce the same green tree. `tools/lx/lxepoll.c` drives the losing
+> drain/re-arm sequence 100 times and also asserts the opposite failure, an fd
+> that stays ready firing twice. Every one of those was verified by reverting
+> its fix and watching the specific assertion fail.
+>
+> **Where Phase 7 stands, honestly.** `claude --version` prints `2.1.272
+> (Claude Code)` in eight seconds, and its output is now readable as text in
+> the log. `claude -p` with a real login still produces **zero bytes** and then
+> sits idle -- and it does that on one core as well as four, so it is not the
+> multi-core race the earlier failures were. The one thing measurement has
+> definitively removed from the list is the network. Phase 7 is **not done**.
+>
+> Still open and named: the **lxbox pipeline flakes ~1 in 10 on a clean
+> baseline too** (`0 vmas` plus a present read-only page with no COW bit -- the
+> fork/exec teardown race M2050 documents), and the per-address-space page-table
+> lock that race really wants.
+
 > **(M2052-M2055) A STALE TASK POINTER, AND A LOCK REPLACED BY A CAS.**
 >
 > | | |
