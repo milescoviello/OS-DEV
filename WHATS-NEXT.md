@@ -1,5 +1,48 @@
 # What's next
 
+> **(M2065-M2069) A MACHINE WEDGE, A GARBAGE COLLECTOR TOLD IT WAS OUT OF MEMORY,
+> AND TWO INSTRUMENTS THAT WERE LYING.**
+>
+> This block is what happened when the instruments got good enough to see.
+>
+> | | |
+> |---|---|
+> | **M2065** | the TLB shootdown printed *"they will flush on next entry"* and then, one line later, `for (c) g_tlb_owed[c] = 0; /* give up cleanly: owe nothing */`. Both cannot be true. Clearing the flags destroyed the **only record** that a core still held a stale translation, so nothing ever flushed it -- a core that missed the IPI kept a cached mapping for an unmapped, mprotected or COW-privatised page **for the rest of its life**. The obligation now survives, and the timer tick plus both syscall entries pay it |
+> | **M2066** | **`/proc/meminfo` had no `MemAvailable`** -- the field every Linux memory-pressure estimator reads. Absent, a reader gets zero, and zero available memory is not "unknown", it is CRITICAL PRESSURE. JavaScriptCore believed the machine had nothing left and collected garbage continuously instead of running the program. Found with a new per-process **syscall histogram**, which answered in one sample what days of staring had not: `prctl`+`gettid`+`sched_getaffinity`+`set_robust_list`+`getrandom` ×3, then `exit` ×3, for ever -- three GC marker threads spawning and dying, 25 of them in 200 seconds |
+> | **M2067** | M2065's surviving flags and the old `g_tlb_pending` counter beside them could no longer agree: a core paying a debt from a timed-out shootdown drove the counter NEGATIVE, after which the next shootdown reported that every core acked when none had -- worse than the bug M2065 fixed. The counter is gone; one bit per core says everything |
+> | **M2068** | **a non-blocking receive was an infinite spin, and it wedged the machine.** `recv_timeout` waited on `timer_ticks()`, which only advances from the PIT -- and every syscall arrives with interrupts off, so the clock it was waiting on was frozen. A QEMU-monitor dump of a dead guest showed **two cores at the same instruction with `RFL=0x46`** (no IF bit) while the other two idled. Worse, `recv_timeout(.., 0)` -- how every readiness check asks "is there a frame right now" -- was a LOOP, because `timer_ticks() <= deadline` is true on the first iteration when the deadline is now |
+> | **M2069** | the syscall ring is **one global 256-entry buffer for every process**, so a short-lived `git` child erased the parent's history. Every dump I took of a stalled Claude Code showed the same git exit. Hours of "the ring says nothing useful" was the instrument, not the program |
+>
+> **Two of these five were diagnostics that lied**, and they cost more than the
+> bugs did. A message that promises a deferred flush and then cancels it; a ring
+> that shows you another process's last words. The rule earned here: *when an
+> instrument and the thing it measures disagree, suspect the instrument first --
+> and make the instrument assert its own invariant.* `vmm_tlb_selftest` now
+> reproduces a shootdown nobody answers and checks the obligation survives; put
+> the one deleted line back and it says so.
+>
+> **Where Phase 7 stands.** The kernel is off the list. With the per-process
+> ring, Claude Code's own idle loop reads:
+>
+>     t14 441(3, ..., 400) = 0        epoll_pwait2 -> 0, TIMED OUT, nothing ready
+>     t14 202(546ba18, 81, 1) = 1     futex WAKE -> woke one
+>     t16 202(546ba18, 80, 0) = 0     ...the scavenger, which sleeps again
+>     t14 441(3, ..., 400) = <blocked>
+>
+> A JavaScript event loop with one periodic timer and **no pending I/O**,
+> cycling for ever. epoll returns 0 because nothing is ready, and nothing is
+> ready because no request is outstanding: it is awaiting a promise that will
+> never resolve, and every answer this kernel gives it is correct. Its own
+> `--debug-file` output stops at `Cleared mTLS configuration cache`, which
+> places the remaining work in the startup promise chain immediately after the
+> settings reload. Phase 7 is **not done**, and for the first time the next step
+> is not a kernel step.
+>
+> Also measured today: Claude Code needs **more than 4 GB** on this kernel --
+> at `-m 4G` the GC thrash returns, at `-m 8G` it does not. Our copy-on-write
+> always copies since M2044, so a forking runtime costs far more here than on
+> Linux. That is a real cost of a correctness fix, and worth paying.
+
 > **(M2063) SIGNALS WERE ACCEPTED AND NEVER DELIVERED.**
 >
 > `rt_sigaction` and `rt_sigprocmask` were, verbatim, `r->rax = 0; /*
