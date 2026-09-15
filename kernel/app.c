@@ -4643,33 +4643,39 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
      * on the shared frame (the other process keeps it). vmm_set_raw invlpg's. */
     if ((pte & PTE_PRESENT) && (pte & PTE_COW) && (err & 2)) {
         uint64_t old = pte & PTE_ADDR_MASK;
-        /* ALWAYS COPY. The "refcount is 0, so I am the sole owner, so I can
-         * just make it writable in place" fast path is a RACE and cannot be
-         * made safe by reading more carefully (M2044).
+        /* DECIDE UNDER THE PAGE-TABLE LOCK (M2046).
          *
-         * pmm_refcount() is an unlocked read, and vmm_fork_cow on another core
-         * takes its reference and write-protects in a sequence this handler is
-         * not synchronised against at all:
+         * M2044 deleted the "refcount is 0, so I am the sole owner, so just
+         * make it writable in place" fast path because it was a race: the
+         * refcount was read unlocked, and vmm_fork_cow on another core could
+         * take its reference and map the frame into a child between the read
+         * and the commit -- leaving this process with a writable non-COW
+         * mapping of a page the child shares, so every later write leaked
+         * across, silently.
          *
-         *   this core:  read pmm_refcount(old) == 0   -> decide "sole owner"
-         *   other core: fork: pmm_addref(old), map old into the CHILD as COW
-         *   this core:  commit the decision: PTE := WRITABLE, PTE_COW cleared
-         *
-         * The page is now writable and non-COW here while the child shares the
-         * same frame, so every later write silently appears in the child, with
-         * nothing faulting and no refcount left wrong to notice afterwards.
-         * M2036 fixed the ordering INSIDE fork_cow; this is the same bug
-         * re-entered from the reader's side, and no ordering in fork can close
-         * it while the decision here is made on an unlocked read.
-         *
-         * Copying unconditionally is correct in every interleaving. If nobody
-         * forks, we copy and free the old frame, which then really is free. If
-         * a fork lands in the middle, it has already taken its own reference,
-         * so our free just drops ours and the child becomes the sole owner --
-         * which is exactly right. The cost is one 4 KiB copy on a fault that
-         * could sometimes have been a flag flip; the alternative is silent
-         * cross-process corruption, and this is what was corrupting
-         * JavaScriptCore's hash tables into an infinite probe loop. */
+         * Deleting it was correct and it cost a page copy on every COW fault,
+         * which more than doubled an in-guest GCC compile. M2045 changed the
+         * picture: fork_cow now performs its addref-and-write-protect under
+         * vmm_lock. Taking the same lock here makes the decision and its commit
+         * atomic with respect to fork, so the fast path is sound again --
+         * re-reading the PTE inside the lock as well, because the value that
+         * brought us into this handler is itself only a snapshot. */
+        int sole = 0;
+        {
+            uint64_t lf = vmm_lock_acquire();
+            uint64_t cur = vmm_pte_raw(fpage);
+            if ((cur & PTE_PRESENT) && (cur & PTE_COW) &&
+                (cur & PTE_ADDR_MASK) == old && pmm_refcount(old) == 0) {
+                vmm_set_raw(fpage, (cur & ~PTE_COW) | PTE_WRITABLE);   /* lock-free by design */
+                sole = 1;
+            }
+            vmm_lock_release(lf);
+        }
+        if (sole) {
+            app_tlb_sync(a);      /* siblings must not keep the read-only entry */
+            a->minflt++;
+            return 1;
+        }
         {
             uint64_t nf = pmm_alloc_frame();
             if (!nf) return 0;                      /* OOM -> let it fault/die */
@@ -8491,6 +8497,21 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
     if (!a->cr3) { a->used = 0; return -1; }
     vdso_map(a->cr3);                                   /* the RO vDSO page (shared, RO — not COW) */
     if (vmm_fork_cow(a->cr3) != 0) { vmm_destroy_address_space(a->cr3); a->used = 0; return -1; }
+    /* NOW make the parent's siblings drop their WRITABLE entries (M2047).
+     *
+     * vmm_fork_cow just write-protected every shared page of the PARENT, and
+     * that is only effective if every core that could write one takes the
+     * fault. A sibling thread on another core still holds a cached writable
+     * translation and would scribble straight into a frame the child now
+     * shares.
+     *
+     * Done here rather than inside fork_cow because only this side knows
+     * whether the address space is live elsewhere at all. app_tlb_sync fires
+     * only when the parent has a live thread -- and the overwhelmingly common
+     * fork is single-threaded (a shell, make, the gcc driver), where there is
+     * nothing to shoot down and an unconditional IPI plus its bounded ack wait
+     * on every fork is pure cost. gcc forks once per compilation stage. */
+    app_tlb_sync(p);
     if (share_vm) a->vfork_parent = p->pid;             /* suspend the parent until we exec or exit */
 
     /* Inherit the parent's process state (NOT its window/grid/task/identity). */

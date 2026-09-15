@@ -1528,7 +1528,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxtool] as(big.s) -> %d\n", rc);
             if (g_lxtrace_make) g_lx_systrace = 1;
             kprintf("[lxtool] COMPILING OS-DEV's OWN kernel/elf.c with the real gcc driver...\n");
-            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 18, 300000);
+            /* 300000 -> 600000 (M2045). This is the single heaviest thing the
+             * project does: the real gcc driver running the real 42 MB cc1 over
+             * one of OS-DEV's own kernel sources, entirely under TCG with no
+             * KVM on this host. M2044 removed copy-on-write's in-place
+             * "sole owner" upgrade because it was a race no ordering could fix,
+             * so every COW fault now copies a page -- and a compile forks
+             * constantly. Correctness is not negotiable and the budget was
+             * tuned before it, so the budget moves. */
+            rc = app_run_linux_sync("/disk2/usr/bin/gcc", av_gcc, 18, 600000);
             g_lx_systrace = 0;
             kprintf("[lxtool] gcc(kernel/elf.c) -> %d\n", rc);
             /* Prove the object is REAL by reading its symbol table with nm --

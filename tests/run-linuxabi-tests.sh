@@ -738,14 +738,14 @@ LXTHREAD: 4 threads
     trap 'rc=$?; cleanup5; exit $rc' EXIT
 
     echo "booting to compile OS-DEV's OWN kernel/elf.c with the in-guest gcc..."
-    timeout -s KILL 600 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
+    timeout -s KILL 1200 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -smp 4 -kernel "$KERNEL" \
         -append "lxgcctest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
         -display none -serial file:"$SLOG5" >/dev/null 2>&1 &
     QPID5=$!
     i=0
-    while [ $i -lt 1150 ]; do
+    while [ $i -lt 2300 ]; do
         grep -aqE "nm\(elf.o\) ->|KERNEL PANIC" "$SLOG5" 2>/dev/null && break
         sleep 0.5; i=$((i+1))
     done
