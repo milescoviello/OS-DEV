@@ -1,5 +1,43 @@
 # What's next
 
+> **(M2036-M2039) CLAUDE CODE DRAWS ITS INTERFACE INSIDE OS-DEV.**
+>
+> ```
+> Claude Code v2.1.270
+> Opus 5 (1M context) - Claude Enterprise
+> /src
+>                                              high - /effort
+> . manual mode on - ? for shortcuts
+> ```
+>
+> Logged in, workspace on OS-DEV's **own source tree** (now a real git
+> repository inside the guest), interface rendered cleanly, four cores.
+>
+> **The fix that got it there was one bit.** `app_dup2` carried `FD_CLOEXEC` to
+> the new descriptor. POSIX says it must not -- and the reason the whole world
+> writes `pipe2(fds, O_CLOEXEC)` then `dup2(fds[1], 1)` is precisely that dup2
+> clears it. Here fd 1 stayed CLOEXEC, so exec's own (correct) cloexec sweep
+> closed it again immediately before the new image took over. Two symptoms from
+> one flag: ripgrep's output scrolled over the terminal and destroyed the TUI,
+> **and** Claude Code's end of the pipe saw an instant EOF. Eighth instance this
+> campaign of a documented guarantee accepted and not honoured.
+>
+> | | |
+> |---|---|
+> | **M2036** | fork **shared pages before counting them** (a racing COW fault saw refcount 0 and privatised in place), the parent's write-protect was **flushed only locally**, `dup2` carried CLOEXEC, and an **OOM in the fault handler said nothing** -- it presents as a write to a not-present page *inside a good RW VMA*, in glibc's AVX memset |
+> | **M2038** | the Phase-5 "toolchain regression" was **a stopwatch**: `as --version` had 60 s where its neighbours get 120-240, and lost the race under host contention. Verified 5/5 from a clean worktree |
+> | **M2039** | the cookie jar broke two host suites' **link**, because net.c compiles into the harness where only the tick clock is stubbed |
+>
+> **Open, and measured rather than guessed:** it still faults during startup on
+> four cores. A subagent disassembled the binary and placed the fault exactly --
+> JavaScriptCore's conservative GC root scan, `MarkedBlock::Handle::isLive()`,
+> matched instruction-for-instruction against the WebKit fork it was built from.
+> A candidate pointer of `1` reaches a dereference that a Bloom filter and a
+> registered-block hash set should have rejected, which means **that registry
+> reads back corrupt**. So the remaining work is memory ownership under SMP --
+> the same class as the Firefox paint blocker, which is why fixing it moves both
+> north stars.
+
 > **(M2028-M2035) CLAUDE CODE RUNS ITS OWN TOOLS INSIDE OS-DEV.**
 >
 > ripgrep and git now execute under OS-DEV and index OS-DEV's own source tree,
