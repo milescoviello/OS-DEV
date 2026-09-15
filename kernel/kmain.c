@@ -269,6 +269,7 @@ static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claud
  * Implies lxout -- there is no point running this and not being able to read
  * what it said. */
 static volatile int g_lxask;
+static volatile int g_termtest;               /* -append termtest: the VT/ANSI terminal self-test (M2057) */
 static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-DEV's OWN KERNEL in-guest (M1961) */
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
@@ -532,6 +533,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
+        if (cmdline_has(cl, "termtest")) g_termtest = 1;                               /* assert on the terminal's CELLS (M2057) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
@@ -1816,6 +1818,10 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         console_selftest(); /* M1915: concurrent kprintf lines are never spliced */
     }
     ipc_selftest();
+    /* The terminal, asserted on CELLS rather than on a screenshot (M2057).
+     * Opt-in for the same reason as the block above: boot-to-desktop under a
+     * second is a number this project keeps deliberately low. */
+    if (g_termtest) app_term_selftest();
 
     kprintf("[main] launching the desktop environment...\n");
     speaker_chime();              /* a little startup arpeggio */

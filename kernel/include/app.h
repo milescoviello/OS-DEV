@@ -259,6 +259,7 @@ long app_memfd_size(int fd);                                   /* a memfd's size
 uint64_t app_mmap_hint(uint64_t addr, uint64_t len);           /* mmap's addr WITHOUT MAP_FIXED: place there only if free, else 0 (M2000) */
 void app_set_next_env(const char *e);                          /* one extra env var for the NEXT Linux spawn only (M1999) */
 void app_set_next_cwd(const char *p);                          /* working directory for the NEXT Linux spawn only (M2056) */
+void app_term_selftest(void);                                  /* -append termtest: assert on the terminal's CELLS, not a screenshot (M2057) */
 int  app_current_pid(void);                                    /* the calling process's pid, or -1 (M1998) */
 void app_describe_fault_addr(void);                             /* describe the page CR2 points at: VMA, prot, PTE bits (M2005) */
 void app_describe_addr(uint64_t addr);                          /* print the file+offset an address maps to, for a fault report (M2003) */

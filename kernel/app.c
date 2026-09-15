@@ -71,6 +71,23 @@
 #define HIST_N   32          /* command-history depth (up/down recall) */
 #define CLIP_MAX 2048        /* system clipboard + per-app paste buffer size */
 
+/* THE ALTERNATE SCREEN (M2057). ESC[?1049h saves the primary screen and hands
+ * the program a blank one; ESC[?1049l puts the original back, cursor and
+ * colours included. Every full-screen TUI opens with it, and without it the
+ * shell's scrollback and prompt stay underneath whatever the TUI paints -- and
+ * are lost for good when it exits.
+ *
+ * Heap-allocated on first use: this is 27 KB, and most programs never ask. */
+struct altscreen {
+    char    grid[APP_ROWS_MAX][APP_COLS_MAX];
+    uint8_t gcol[APP_ROWS_MAX][APP_COLS_MAX];
+    uint8_t gbg[APP_ROWS_MAX][APP_COLS_MAX];
+    int     cx, cy;
+    uint8_t curcol, curbg, bold, inv;
+    int     sr_top, sr_bot;
+    int     sb_count, view;
+};
+
 #define USTACK_BASE  0x50000000ull
 /* 512 KiB was sized for our own apps (DOOM's BSP renderer recurses deeply).
  * It is nowhere near what a Linux program expects: Linux's default is 8 MiB,
@@ -282,11 +299,49 @@ struct app {
     volatile int ms_dx, ms_dy;           /* accumulated relative motion (mouselook) */
     char     grid[APP_ROWS_MAX][APP_COLS_MAX];
     uint8_t  gcol[APP_ROWS_MAX][APP_COLS_MAX];   /* per-cell colour (palette index, 0 = default) for the live grid */
+    /* PER-CELL BACKGROUND (M2057). 0 = "the window's own translucent backdrop",
+     * otherwise 1 + a palette index -- so a zeroed grid means default, which is
+     * what grid_clear and grid_scroll already produce.
+     *
+     * Its absence was not cosmetic. A terminal with no background has no way to
+     * render dark-text-on-light, and ansi_rgb folds every dark near-grey onto
+     * palette 8 -- so Claude Code's black-on-white panels came out as dim grey
+     * on near-black. Every cell was painted and the window looked empty. */
+    uint8_t  gbg[APP_ROWS_MAX][APP_COLS_MAX];
     int      cols, rows;                 /* CURRENT visible grid size (<= _MAX); the WM sets it from the window size on resize (M1473) */
     uint8_t  curcol;                     /* colour applied to chars printed now (set via SYS_setcolor) */
-    uint8_t  esc;                        /* ANSI escape state: 0 normal, 1 saw ESC, 2 in CSI */
+    uint8_t  curbg;                      /* background for chars printed now: 0 = default, else 1 + palette index (M2057) */
+    uint8_t  sgr_bold, sgr_inv;          /* SGR attributes that PERSIST between sequences (M2057) */
+    uint8_t  esc;                        /* ANSI escape state: 0 normal, 1 saw ESC, 2 in CSI, 3/4 OSC, 5 string, 6 string+ESC, 7 discard one */
     uint8_t  csilen;                     /* bytes buffered in csi[] */
-    char     csi[24];                    /* CSI parameter bytes (between '[' and the final letter) */
+    /* 24 -> 64 (M2057). A single SGR that sets foreground AND background in
+     * truecolour is 27 parameter bytes ("38;2;255;255;255;48;2;0;0;0"), and the
+     * old buffer bailed out of the sequence on byte 25 -- which dropped the
+     * parser back to ground state MID-SEQUENCE, so the tail ";0m" was printed
+     * into the grid as literal text. That is where the stray characters in an
+     * otherwise blank window came from. */
+    char     csi[64];                    /* CSI parameter bytes (between '[' and the final letter) */
+    char     csipriv;                    /* the private-mode introducer, if any: '?', '>', '<', '=' (M2057) */
+    /* DEFERRED WRAP (M2057) -- the single biggest rendering defect this
+     * terminal had. grid_putc line-fed as soon as the cursor passed the last
+     * column, so writing exactly `cols` characters moved to the next row
+     * immediately and, on the bottom row, SCROLLED THE WHOLE SCREEN. A real
+     * VT100 parks the cursor in the last column behind a pending-wrap flag and
+     * only wraps when the NEXT printable character arrives. A TUI that draws
+     * full-width box borders -- which is every frame Claude Code paints -- was
+     * scrolling itself off the top of the grid as it drew. */
+    uint8_t  wrap_pend;
+    uint8_t  no_wrap;                    /* DECAWM off: ESC[?7l -- print in place at the margin */
+    uint8_t  bracket_paste;              /* ESC[?2004h: wrap a paste in ESC[200~ / ESC[201~ */
+    int      sr_top, sr_bot;             /* DECSTBM scroll region, 0-based inclusive; sr_bot <= 0 = whole screen */
+    int      sv_cx, sv_cy;               /* DECSC / ESC[s saved cursor + attributes */
+    uint8_t  sv_col, sv_bg, sv_bold, sv_inv, sv_valid;
+    /* The primary screen, parked while the ALTERNATE screen is active
+     * (ESC[?1049h). Allocated on first use -- most programs never ask, and a
+     * second full screen in every one of the 32 process slots is 27 KB each
+     * for nothing. */
+    struct altscreen *alt;
+    uint8_t  alt_on;
     /* UTF-8 decoder state (M2015): bytes still owed on the current character,
      * and the code point built so far. One code point becomes one cell. */
     uint8_t  u8need;
@@ -298,6 +353,7 @@ struct app {
     uint8_t  keyseq_n, keyseq_i;
     int      cx, cy;
     char     sb[SB_ROWS][APP_COLS_MAX];  /* scrollback: lines that scrolled off */
+    uint8_t  sbcol[SB_ROWS][APP_COLS_MAX];   /* ...and their colours: the render path used to hardcode green (M2057) */
     int      sb_count;                   /* how many scrollback lines are stored */
     int      view;                       /* rows scrolled up from the live bottom */
     char     iq[IQ_SIZE];
@@ -1292,30 +1348,77 @@ int app_unveil_ok(app_t *a, const char *path, int need_write) {
 }
 
 /* ---- text grid ---- */
+/* The rows the scroll region covers. sr_bot <= 0 means "never set" = the whole
+ * screen, which is also what a reset leaves behind. Clamped on READ rather
+ * than on write, so a window resize can never leave a region pointing off the
+ * bottom of a grid that just shrank. (M2057) */
+static int sr_bottom(struct app *a) {
+    return (a->sr_bot > 0 && a->sr_bot < a->rows) ? a->sr_bot : a->rows - 1;
+}
+static int sr_topr(struct app *a) {
+    int t = (a->sr_top > 0 && a->sr_top < a->rows) ? a->sr_top : 0;
+    return (t <= sr_bottom(a)) ? t : 0;
+}
+static int sr_is_full(struct app *a) { return sr_topr(a) == 0 && sr_bottom(a) == a->rows - 1; }
+
+static void grid_blank_row(struct app *a, int r) {
+    for (int c = 0; c < a->cols; c++) { a->grid[r][c] = ' '; a->gcol[r][c] = 0; a->gbg[r][c] = 0; }
+}
 static void grid_clear(struct app *a) {
     if (a->cols <= 0) { a->cols = APP_DEF_COLS; a->rows = APP_DEF_ROWS; }   /* first use: default size */
     for (int r = 0; r < APP_ROWS_MAX; r++)                                 /* blank the FULL array so cells exposed by a later grow are clean */
-        for (int c = 0; c < APP_COLS_MAX; c++) { a->grid[r][c] = ' '; a->gcol[r][c] = 0; }
+        for (int c = 0; c < APP_COLS_MAX; c++) { a->grid[r][c] = ' '; a->gcol[r][c] = 0; a->gbg[r][c] = 0; }
     a->cx = a->cy = 0;
+    a->wrap_pend = 0;
     a->sb_count = 0; a->view = 0;
     a->gdirty = 1;
 }
+/* Scroll the region up by one row. Only the PRIMARY screen with NO scroll
+ * region feeds the scrollback: a TUI that pins a header and scrolls a pane
+ * inside it is not producing history, and an alternate screen never is. */
 static void grid_scroll(struct app *a) {
-    /* the top line is about to scroll off — keep it in the scrollback ring */
-    if (a->sb_count < SB_ROWS) {
-        memcpy(a->sb[a->sb_count++], a->grid[0], a->cols);
-        if (a->view > 0 && a->view < a->sb_count) a->view++;   /* stay on the same lines */
-    } else {
-        for (int r = 1; r < SB_ROWS; r++) memcpy(a->sb[r-1], a->sb[r], a->cols);
-        memcpy(a->sb[SB_ROWS-1], a->grid[0], a->cols);
+    int top = sr_topr(a), bot = sr_bottom(a);
+    if (sr_is_full(a) && !a->alt_on) {
+        /* the top line is about to scroll off -- keep it in the scrollback ring */
+        if (a->sb_count < SB_ROWS) {
+            memcpy(a->sb[a->sb_count], a->grid[0], a->cols);
+            memcpy(a->sbcol[a->sb_count], a->gcol[0], a->cols);   /* WITH its colours (M2057) */
+            a->sb_count++;
+            if (a->view > 0 && a->view < a->sb_count) a->view++;   /* stay on the same lines */
+        } else {
+            for (int r = 1; r < SB_ROWS; r++) {
+                memcpy(a->sb[r-1], a->sb[r], a->cols);
+                memcpy(a->sbcol[r-1], a->sbcol[r], a->cols);
+            }
+            memcpy(a->sb[SB_ROWS-1], a->grid[0], a->cols);
+            memcpy(a->sbcol[SB_ROWS-1], a->gcol[0], a->cols);
+        }
     }
-    for (int r = 1; r < a->rows; r++) memcpy(a->grid[r-1], a->grid[r], a->cols);
-    for (int c = 0; c < a->cols; c++) a->grid[a->rows-1][c] = ' ';
-    for (int r = 1; r < a->rows; r++) memcpy(a->gcol[r-1], a->gcol[r], a->cols);   /* live colours scroll with their rows */
-    for (int c = 0; c < a->cols; c++) a->gcol[a->rows-1][c] = 0;
-    a->cy = a->rows - 1;
+    for (int r = top + 1; r <= bot; r++) {
+        memcpy(a->grid[r-1], a->grid[r], a->cols);
+        memcpy(a->gcol[r-1], a->gcol[r], a->cols);
+        memcpy(a->gbg[r-1],  a->gbg[r],  a->cols);
+    }
+    grid_blank_row(a, bot);
+    a->cy = bot;
 }
-static void grid_nl(struct app *a) { a->cx = 0; if (++a->cy >= a->rows) grid_scroll(a); }
+/* Scroll the region DOWN by one row (ESC[L, ESC M). Nothing enters the
+ * scrollback: these rows are moving away from history, not into it. */
+static void grid_rscroll(struct app *a) {
+    int top = sr_topr(a), bot = sr_bottom(a);
+    for (int r = bot; r > top; r--) {
+        memcpy(a->grid[r], a->grid[r-1], a->cols);
+        memcpy(a->gcol[r], a->gcol[r-1], a->cols);
+        memcpy(a->gbg[r],  a->gbg[r-1],  a->cols);
+    }
+    grid_blank_row(a, top);
+}
+/* Index: down one row, column kept -- ESC D, and what a deferred wrap does. */
+static void grid_index(struct app *a) {
+    if (a->cy == sr_bottom(a)) { int x = a->cx; grid_scroll(a); a->cx = x; }
+    else if (a->cy < a->rows - 1) a->cy++;
+}
+static void grid_nl(struct app *a) { a->cx = 0; a->wrap_pend = 0; grid_index(a); }
 /* Erase up to `n` echoed chars, but never past the input start (cx0,cy0) — so
  * history recall can't blank the prompt or earlier output. Handles wrapping. */
 static void grid_erase(struct app *a, int n, int cx0, int cy0) {
@@ -1325,15 +1428,56 @@ static void grid_erase(struct app *a, int n, int cx0, int cy0) {
         if (a->cx > 0) a->cx--;
         else if (a->cy > 0) { a->cy--; a->cx = a->cols - 1; }
         a->grid[a->cy][a->cx] = ' ';
+        a->gcol[a->cy][a->cx] = 0; a->gbg[a->cy][a->cx] = 0;
     }
+    a->wrap_pend = 0;
+}
+/* The colours a cell printed NOW should carry, inverse video applied (M2057).
+ * SGR 7 swaps foreground and background, and with no background set that means
+ * "default foreground on the current foreground" -- which is how every TUI
+ * draws a selected row. Without it, a highlighted line was indistinguishable
+ * from an unhighlighted one. */
+static void cur_attrs(struct app *a, uint8_t *fg, uint8_t *bg) {
+    uint8_t f = a->curcol, b = a->curbg;
+    if (a->sgr_inv) {
+        uint8_t nf = b ? (uint8_t)(b - 1) : 1;      /* default background reads as white */
+        uint8_t nb = (uint8_t)(f + 1);
+        f = nf; b = nb;
+    }
+    *fg = f; *bg = b;
 }
 static void grid_putc(struct app *a, char ch) {
     a->gdirty = 1;
     if (ch == '\n') { grid_nl(a); return; }
-    if (ch == '\r') { a->cx = 0; return; }
+    if (ch == '\r') { a->cx = 0; a->wrap_pend = 0; return; }
+    /* TAB IS NOT A GLYPH (M2057). font_glyphs[] populates rows 0x00-0x1F with
+     * CP437 dingbats and dither blocks, and grid_putc drew them -- so a tab
+     * painted a 25%-dither cell (a grey smudge) and advanced ONE column
+     * instead of to the next tab stop. Those smudges were the visible
+     * "artifacts" in an otherwise empty-looking terminal. */
+    if (ch == '\t') {
+        int stop = (a->cx + 8) & ~7;
+        if (stop > a->cols - 1) stop = a->cols - 1;
+        while (a->cx < stop) { a->grid[a->cy][a->cx] = ' '; a->cx++; }
+        a->wrap_pend = 0;
+        return;
+    }
+    if (ch == 8) { if (a->cx > 0) a->cx--; a->wrap_pend = 0; return; }     /* BS */
+    if ((unsigned char)ch < 0x20 || (unsigned char)ch == 0x7F) return;     /* every other C0: not printable */
+    /* DEFERRED WRAP: the pending flag set by the PREVIOUS character is spent
+     * here, not when that character was printed. */
+    if (a->wrap_pend) {
+        if (a->no_wrap) a->cx = a->cols - 1;
+        else { a->cx = 0; grid_index(a); }
+        a->wrap_pend = 0;
+    }
+    if (a->cx >= a->cols) a->cx = a->cols - 1;
+    uint8_t fg, bg; cur_attrs(a, &fg, &bg);
     a->grid[a->cy][a->cx] = ch;
-    a->gcol[a->cy][a->cx] = a->curcol;
-    if (++a->cx >= a->cols) grid_nl(a);
+    a->gcol[a->cy][a->cx] = fg;
+    a->gbg[a->cy][a->cx]  = bg;
+    if (a->cx + 1 >= a->cols) a->wrap_pend = 1;    /* park in the last column */
+    else a->cx++;
 }
 
 /* Move the echo cursor over already-painted cells (no clearing), for in-line
@@ -1347,7 +1491,8 @@ static void cursor_back(struct app *a, int k) {
 }
 static void cursor_fwd(struct app *a, int k) {
     while (k-- > 0)
-        if (++a->cx >= a->cols) { a->cx = 0; if (++a->cy >= a->rows) grid_scroll(a); }
+        if (++a->cx >= a->cols) { a->cx = 0; grid_index(a); }
+    a->wrap_pend = 0;
     a->gdirty = 1;
 }
 static void emit_range(struct app *a, const char *buf, unsigned i, unsigned j) {
@@ -1410,14 +1555,28 @@ void app_render(app_t *a, int px, int py, int focused) {
     for (int r = 0; r < a->rows; r++) {
         int L = (a->sb_count - a->view) + r;        /* logical row in the combined buffer */
         for (int c = 0; c < a->cols; c++) {
-            char ch = ' '; uint32_t fg = 0x33FF66;
-            if (L >= 0 && L < a->sb_count) ch = a->sb[L][c];               /* scrollback: default green */
-            else if (L >= a->sb_count && (L - a->sb_count) < a->rows) {
+            char ch = ' '; uint32_t fg = 0x33FF66; uint8_t bgi = 0;
+            if (L >= 0 && L < a->sb_count) {
+                ch = a->sb[L][c];
+                /* SCROLLBACK KEEPS ITS COLOURS (M2057). This used to hardcode
+                 * green, so anything that scrolled off turned uniformly green
+                 * -- including a diff, a syntax-highlighted listing, or the
+                 * error a program printed before the prompt came back. */
+                uint8_t sc = a->sbcol[L][c];
+                fg = sc ? app_palette[sc & 15] : 0x33FF66;
+            } else if (L >= a->sb_count && (L - a->sb_count) < a->rows) {
                 int gr = L - a->sb_count; ch = a->grid[gr][c];
                 fg = app_palette[a->gcol[gr][c] & 15];                     /* live grid: per-cell colour */
+                bgi = a->gbg[gr][c];
             }
             int cx = px + c * font_width, cy = py + r * font_height;
-            fb_glyph(cx, cy, ch, fg, term_bg_blend(desktop_wallpaper_sample(cx, cy)));
+            /* A cell with no background of its own keeps the window's own
+             * translucent wallpaper tint; one that has asked for a background
+             * gets it OPAQUE, because a highlight blended 18% into the desktop
+             * is not a highlight. (M2057) */
+            uint32_t bg = bgi ? app_palette[(bgi - 1) & 15]
+                              : term_bg_blend(desktop_wallpaper_sample(cx, cy));
+            fb_glyph(cx, cy, ch, fg, bg);
         }
     }
     /* Scrollback scrollbar on the right edge (only when there's scrollback): a
@@ -1949,6 +2108,7 @@ int app_reap(app_t *a) {
         a->cr3_borrowed = 0;
         a->cr3 = 0;
         if (a->gfx) { kfree(a->gfx); a->gfx = 0; }   /* graphics canvas (kernel heap) */
+        if (a->alt) { kfree(a->alt); a->alt = 0; a->alt_on = 0; }   /* alternate screen (M2057) */
         /* `a` is fully dead from here on (resources above already freed) --
          * regardless of whether its OWN slot zombifies or frees immediately
          * below, notify any LIVE child that registered via PR_SET_PDEATHSIG
@@ -2149,43 +2309,162 @@ static uint8_t ansi_rgb(int r, int g, int b) {
     return bright ? 14 : 6;                                       /* blue */
 }
 
+static const uint8_t ansi_base8[8]   = { 8, 2, 0, 3, 6, 5, 4, 1 };   /* blk red grn yel blu mag cyn wht */
+static const uint8_t ansi_bright8[8] = { 8, 13, 9, 12, 14, 11, 10, 1 };
 static uint8_t ansi_color(int code, int bold) {
-    static const uint8_t base[8]   = { 8, 2, 0, 3, 6, 5, 4, 1 };   /* blk red grn yel blu mag cyn wht */
-    static const uint8_t bright[8] = { 8, 13, 9, 12, 14, 11, 10, 1 };
-    if (code >= 90 && code <= 97) return bright[code - 90];
-    if (code >= 30 && code <= 37) return (bold ? bright : base)[code - 30];
+    if (code >= 90 && code <= 97) return ansi_bright8[code - 90];
+    if (code >= 30 && code <= 37) return (bold ? ansi_bright8 : ansi_base8)[code - 30];
     return 0;
 }
+/* Brighten a colour ALREADY CHOSEN, for "ESC[1m" arriving on its own after the
+ * foreground was set -- which is the normal order, and which the old local-
+ * variable `bold` could not express at all. (M2057) */
+static uint8_t ansi_bold(uint8_t col) {
+    for (int i = 0; i < 8; i++) if (ansi_base8[i] == col) return ansi_bright8[i];
+    return col;
+}
 
-/* Execute one buffered CSI sequence (a->csi[0..csilen)) ending in `final`. A
- * tiny VT100 subset: SGR colours (m), cursor moves (A/B/C/D/H/f), erase (J/K). */
+/* ---- the CSI layer (M2057) -------------------------------------------------
+ *
+ * What used to be here was "a tiny VT100 subset": SGR foreground, four cursor
+ * moves, J and K. Everything else was swallowed, and an unrecognised final
+ * byte left no trace -- which made the gaps invisible. They were not small:
+ *
+ *   - no background colour at all, so dark-on-light was unrenderable
+ *   - no alternate screen, so a TUI painted over the shell's own scrollback
+ *   - no scroll region, so a pinned header scrolled with its pane
+ *   - no cursor hide, so the blinking block caret ate a cell of every frame
+ *   - no DSR reply, so a program that asks where the cursor is waits forever
+ *   - no insert/delete, so a redraw that shifts a line had to repaint it
+ *
+ * The parser keeps its shape: buffer the parameter bytes, dispatch on the
+ * final. The private-mode introducer ('?', '>', '<', '=') is now RECORDED
+ * rather than parsed as a digit -- without it "ESC[?25l" and "ESC[25l" are the
+ * same sequence, and "ESC[>4;2m" was being executed as an SGR. */
+static void iq_push_raw(struct app *a, char c) {
+    if (!a) return;
+    uint64_t f = irq_save();
+    int n = (a->ih + 1) % IQ_SIZE;
+    if (n != a->it) { a->iq[a->ih] = c; a->ih = n; }
+    irq_restore(f);
+}
+/* Answer a query ON THE INPUT QUEUE -- the terminal talking back to the
+ * program, which nothing here had ever done. A TUI that sends ESC[6n and
+ * blocks until it reads the report hangs forever against a terminal that never
+ * replies, and "hangs with every core idle" is exactly the symptom that is
+ * hardest to attribute. */
+static void term_reply(struct app *a, const char *s) {
+    for (int i = 0; s[i]; i++) iq_push_raw(a, s[i]);
+    if (a->task) task_wake(a->task);
+}
+static void term_num(char *out, int v) {          /* small unsigned -> decimal */
+    char t[8]; int n = 0;
+    if (v <= 0) { out[0] = '0'; out[1] = 0; return; }
+    while (v && n < 7) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    int k = 0; while (n) out[k++] = t[--n];
+    out[k] = 0;
+}
+static void term_erase_cells(struct app *a, int r, int x0, int x1) {
+    if (r < 0 || r >= a->rows) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > a->cols) x1 = a->cols;
+    /* Erasing paints the CURRENT background, which is what makes "ESC[41m
+     * ESC[2J" a red screen rather than a transparent one. */
+    uint8_t fg, bg; cur_attrs(a, &fg, &bg); (void)fg;
+    for (int x = x0; x < x1; x++) { a->grid[r][x] = ' '; a->gcol[r][x] = 0; a->gbg[r][x] = bg; }
+}
+static void alt_enter(struct app *a) {
+    if (a->alt_on) return;
+    if (!a->alt) { a->alt = kmalloc(sizeof *a->alt); if (!a->alt) return; }
+    struct altscreen *s = a->alt;
+    memcpy(s->grid, a->grid, sizeof s->grid);
+    memcpy(s->gcol, a->gcol, sizeof s->gcol);
+    memcpy(s->gbg,  a->gbg,  sizeof s->gbg);
+    s->cx = a->cx; s->cy = a->cy;
+    s->curcol = a->curcol; s->curbg = a->curbg; s->bold = a->sgr_bold; s->inv = a->sgr_inv;
+    s->sr_top = a->sr_top; s->sr_bot = a->sr_bot;
+    s->sb_count = a->sb_count; s->view = a->view;
+    a->alt_on = 1;
+    /* A fresh screen, and NO scrollback: an alternate screen has none, which is
+     * why scrolling a full-screen TUI must not push history. */
+    for (int r = 0; r < a->rows; r++) grid_blank_row(a, r);
+    a->cx = a->cy = 0; a->wrap_pend = 0;
+    a->sr_top = 0; a->sr_bot = 0;
+    a->view = 0;
+    a->gdirty = 1;
+}
+static void alt_leave(struct app *a) {
+    if (!a->alt_on || !a->alt) { a->alt_on = 0; return; }
+    struct altscreen *s = a->alt;
+    memcpy(a->grid, s->grid, sizeof s->grid);
+    memcpy(a->gcol, s->gcol, sizeof s->gcol);
+    memcpy(a->gbg,  s->gbg,  sizeof s->gbg);
+    a->cx = s->cx; a->cy = s->cy; a->wrap_pend = 0;
+    a->curcol = s->curcol; a->curbg = s->curbg; a->sgr_bold = s->bold; a->sgr_inv = s->inv;
+    a->sr_top = s->sr_top; a->sr_bot = s->sr_bot;
+    a->sb_count = s->sb_count; a->view = s->view;
+    a->alt_on = 0;
+    a->gdirty = 1;
+}
+/* ESC[?<n>h / ESC[?<n>l -- the DEC private modes. Recognising the four that
+ * matter and IGNORING the rest deliberately: mouse reporting (1000/1002/1003/
+ * 1006) and focus events (1004) have no input path to encode into, and
+ * pretending otherwise would be the "granted in name only" mistake again. */
+static void term_priv_mode(struct app *a, int n, int set) {
+    switch (n) {
+    case 7:    a->no_wrap = set ? 0 : 1; break;            /* DECAWM */
+    case 25:   a->caret_off = set ? 0 : 1; break;          /* DECTCEM: show/hide the cursor */
+    case 1047:
+    case 1049: if (set) alt_enter(a); else alt_leave(a); break;
+    case 2004: a->bracket_paste = set ? 1 : 0; break;
+    default:   break;
+    }
+}
 static void ansi_csi(struct app *a, char final) {
-    int p[8] = {0}, np = 0, cur = 0;
+    int p[16] = {0}, np = 0, cur = 0;
     for (int i = 0; i < a->csilen; i++) {
         char c = a->csi[i];
         if (c >= '0' && c <= '9') cur = cur * 10 + (c - '0');
-        else if (c == ';') { if (np < 7) p[np++] = cur; cur = 0; }
+        else if (c == ';') { if (np < 15) p[np++] = cur; cur = 0; }
     }
-    p[np++] = cur;                       /* the last/only param; np >= 1 */
+    if (np < 16) p[np++] = cur;          /* the last/only param; np >= 1 */
     int n = p[0] ? p[0] : 1;             /* default-1 count for cursor moves */
+    int top = sr_topr(a), bot = sr_bottom(a);
+
+    if (a->csipriv == '?') {             /* a DEC private mode, not a cursor op */
+        if (final == 'h' || final == 'l')
+            for (int i = 0; i < np; i++) term_priv_mode(a, p[i], final == 'h');
+        a->gdirty = 1;
+        return;
+    }
+    if (a->csipriv) { a->gdirty = 1; return; }   /* '>' / '<' / '=' : queries we do not answer */
+
     switch (final) {
-    case 'm': {                          /* SGR: text colour */
-        int bold = 0;
+    case 'm': {                          /* SGR: colour + the attributes that persist */
         for (int i = 0; i < np; i++) {
             int v = p[i];
-            if (v == 0) { a->curcol = 0; bold = 0; }
-            else if (v == 1) bold = 1;
+            if (v == 0) { a->curcol = 0; a->curbg = 0; a->sgr_bold = 0; a->sgr_inv = 0; }
+            /* BOLD IS STATE, NOT A MODIFIER ON THIS SEQUENCE. It used to be a
+             * local `int`, so "ESC[1m" alone did nothing and only "ESC[1;31m"
+             * brightened -- which is not how any program emits it. */
+            else if (v == 1) { a->sgr_bold = 1; a->curcol = ansi_bold(a->curcol); }
+            else if (v == 22) a->sgr_bold = 0;
+            else if (v == 7)  a->sgr_inv = 1;
+            else if (v == 27) a->sgr_inv = 0;
             else if (v == 39) a->curcol = 0;
-            else if ((v >= 30 && v <= 37) || (v >= 90 && v <= 97)) a->curcol = ansi_color(v, bold);
+            else if (v == 49) a->curbg = 0;
+            else if ((v >= 30 && v <= 37) || (v >= 90 && v <= 97)) a->curcol = ansi_color(v, a->sgr_bold);
+            else if (v >= 40 && v <= 47) a->curbg = (uint8_t)(1 + ansi_color(v - 10, 0));
+            else if (v >= 100 && v <= 107) a->curbg = (uint8_t)(1 + ansi_color(v - 60, 0));
             /* 256-COLOUR (M2004): "38;5;N" is a foreground index, and it is
              * what every modern TUI actually emits -- Claude Code uses almost
              * nothing else. Skipping it left the colour at whatever came
              * before AND left the two following parameters to be misread as
              * colours in their own right. Fold the cube onto our 16. */
             else if (v == 38 && i + 2 < np && p[i + 1] == 5) { a->curcol = ansi_256(p[i + 2]); i += 2; }
-            else if (v == 48 && i + 2 < np && p[i + 1] == 5) { i += 2; }   /* background: no per-cell bg yet */
+            else if (v == 48 && i + 2 < np && p[i + 1] == 5) { a->curbg = (uint8_t)(1 + ansi_256(p[i + 2])); i += 2; }
             else if (v == 38 && i + 4 < np && p[i + 1] == 2) { a->curcol = ansi_rgb(p[i+2], p[i+3], p[i+4]); i += 4; }
-            else if (v == 48 && i + 4 < np && p[i + 1] == 2) { i += 4; }
+            else if (v == 48 && i + 4 < np && p[i + 1] == 2) { a->curbg = (uint8_t)(1 + ansi_rgb(p[i+2], p[i+3], p[i+4])); i += 4; }
         }
         break;
     }
@@ -2195,38 +2474,139 @@ static void ansi_csi(struct app *a, char final) {
          * one of them printed as text and nothing lined up. */
         a->cx = (p[0] ? p[0] : 1) - 1;
         if (a->cx < 0) a->cx = 0; if (a->cx >= a->cols) a->cx = a->cols - 1;
+        a->wrap_pend = 0;
         break;
     case 'd':                            /* VPA: cursor to an absolute ROW */
         a->cy = (p[0] ? p[0] : 1) - 1;
         if (a->cy < 0) a->cy = 0; if (a->cy >= a->rows) a->cy = a->rows - 1;
         break;
-    case 'A': a->cy -= n; if (a->cy < 0) a->cy = 0; break;
-    case 'B': a->cy += n; if (a->cy >= a->rows) a->cy = a->rows - 1; break;
-    case 'C': a->cx += n; if (a->cx >= a->cols) a->cx = a->cols - 1; break;
-    case 'D': a->cx -= n; if (a->cx < 0) a->cx = 0; break;
+    case 'A': a->cy -= n; if (a->cy < 0) a->cy = 0; a->wrap_pend = 0; break;
+    case 'B': a->cy += n; if (a->cy >= a->rows) a->cy = a->rows - 1; a->wrap_pend = 0; break;
+    case 'C': a->cx += n; if (a->cx >= a->cols) a->cx = a->cols - 1; a->wrap_pend = 0; break;
+    case 'D': a->cx -= n; if (a->cx < 0) a->cx = 0; a->wrap_pend = 0; break;
+    case 'E': a->cx = 0; a->cy += n; if (a->cy >= a->rows) a->cy = a->rows - 1; a->wrap_pend = 0; break;  /* CNL */
+    case 'F': a->cx = 0; a->cy -= n; if (a->cy < 0) a->cy = 0; a->wrap_pend = 0; break;                   /* CPL */
     case 'H': case 'f': {                /* cursor to row;col (1-based) */
         int row = p[0] ? p[0] : 1, col = (np >= 2 && p[1]) ? p[1] : 1;
         a->cy = row - 1; a->cx = col - 1;
         if (a->cy < 0) a->cy = 0; if (a->cy >= a->rows) a->cy = a->rows - 1;
         if (a->cx < 0) a->cx = 0; if (a->cx >= a->cols) a->cx = a->cols - 1;
+        a->wrap_pend = 0;
         break;
     }
-    case 'J': {                          /* erase in display (2 = whole screen) */
+    case 'J': {                          /* erase in display: 0 fwd, 1 back, 2 all, 3 all + scrollback */
         int m = p[0];
-        int y0 = (m == 2) ? 0 : a->cy;
-        if (m == 2) { a->cx = a->cy = 0; }
-        for (int x = (m == 2 ? 0 : a->cx); x < a->cols; x++) { a->grid[y0][x] = ' '; a->gcol[y0][x] = 0; }
-        for (int y = y0 + 1; y < a->rows; y++)
-            for (int x = 0; x < a->cols; x++) { a->grid[y][x] = ' '; a->gcol[y][x] = 0; }
+        if (m == 1) {                    /* BACKWARD -- this used to erase forward (M2057) */
+            for (int y = 0; y < a->cy; y++) term_erase_cells(a, y, 0, a->cols);
+            term_erase_cells(a, a->cy, 0, a->cx + 1);
+        } else if (m == 2 || m == 3) {
+            for (int y = 0; y < a->rows; y++) term_erase_cells(a, y, 0, a->cols);
+            /* ED does NOT home the cursor. Doing it anyway was harmless only
+             * because Ink follows ESC[2J with ESC[H; anything that does not
+             * got its cursor moved out from under it. */
+            if (m == 3) { a->sb_count = 0; a->view = 0; }
+        } else {
+            term_erase_cells(a, a->cy, a->cx, a->cols);
+            for (int y = a->cy + 1; y < a->rows; y++) term_erase_cells(a, y, 0, a->cols);
+        }
+        a->wrap_pend = 0;
         break;
     }
     case 'K': {                          /* erase in line (0 to-eol, 1 from-bol, 2 whole) */
         int m = p[0];
         int x0 = (m == 1 || m == 2) ? 0 : a->cx;
         int x1 = (m == 1) ? a->cx + 1 : a->cols;
-        for (int x = x0; x < x1 && x < a->cols; x++) { a->grid[a->cy][x] = ' '; a->gcol[a->cy][x] = 0; }
+        term_erase_cells(a, a->cy, x0, x1);
+        a->wrap_pend = 0;
         break;
     }
+    case 'L':                            /* IL: insert n blank lines at the cursor, within the region */
+        if (a->cy >= top && a->cy <= bot)
+            for (int k = 0; k < n; k++) {
+                for (int r = bot; r > a->cy; r--) {
+                    memcpy(a->grid[r], a->grid[r-1], a->cols);
+                    memcpy(a->gcol[r], a->gcol[r-1], a->cols);
+                    memcpy(a->gbg[r],  a->gbg[r-1],  a->cols);
+                }
+                grid_blank_row(a, a->cy);
+            }
+        break;
+    case 'M':                            /* DL: delete n lines at the cursor, within the region */
+        if (a->cy >= top && a->cy <= bot)
+            for (int k = 0; k < n; k++) {
+                for (int r = a->cy; r < bot; r++) {
+                    memcpy(a->grid[r], a->grid[r+1], a->cols);
+                    memcpy(a->gcol[r], a->gcol[r+1], a->cols);
+                    memcpy(a->gbg[r],  a->gbg[r+1],  a->cols);
+                }
+                grid_blank_row(a, bot);
+            }
+        break;
+    case 'P': {                          /* DCH: delete n characters, shifting the rest of the line left */
+        int cnt = n; if (cnt > a->cols - a->cx) cnt = a->cols - a->cx;
+        for (int x = a->cx; x < a->cols - cnt; x++) {
+            a->grid[a->cy][x] = a->grid[a->cy][x + cnt];
+            a->gcol[a->cy][x] = a->gcol[a->cy][x + cnt];
+            a->gbg[a->cy][x]  = a->gbg[a->cy][x + cnt];
+        }
+        term_erase_cells(a, a->cy, a->cols - cnt, a->cols);
+        break;
+    }
+    case '@': {                          /* ICH: insert n blanks, shifting the rest of the line right */
+        int cnt = n; if (cnt > a->cols - a->cx) cnt = a->cols - a->cx;
+        for (int x = a->cols - 1; x >= a->cx + cnt; x--) {
+            a->grid[a->cy][x] = a->grid[a->cy][x - cnt];
+            a->gcol[a->cy][x] = a->gcol[a->cy][x - cnt];
+            a->gbg[a->cy][x]  = a->gbg[a->cy][x - cnt];
+        }
+        term_erase_cells(a, a->cy, a->cx, a->cx + cnt);
+        break;
+    }
+    case 'X':                            /* ECH: erase n characters in place */
+        term_erase_cells(a, a->cy, a->cx, a->cx + n);
+        break;
+    case 'S': for (int k = 0; k < n; k++) grid_scroll(a);  break;   /* SU */
+    case 'T': for (int k = 0; k < n; k++) grid_rscroll(a); break;   /* SD */
+    case 'r': {                          /* DECSTBM: set the scroll region */
+        int t = p[0] ? p[0] : 1;
+        int b = (np >= 2 && p[1]) ? p[1] : a->rows;
+        if (t < 1) t = 1;
+        if (b > a->rows) b = a->rows;
+        if (t >= b) { a->sr_top = 0; a->sr_bot = 0; }     /* degenerate = reset to full screen */
+        else { a->sr_top = t - 1; a->sr_bot = b - 1; }
+        a->cx = 0; a->cy = sr_topr(a); a->wrap_pend = 0;  /* DECSTBM homes into the region */
+        break;
+    }
+    case 's':                            /* SCOSC: save cursor */
+        a->sv_cx = a->cx; a->sv_cy = a->cy; a->sv_col = a->curcol; a->sv_bg = a->curbg;
+        a->sv_bold = a->sgr_bold; a->sv_inv = a->sgr_inv; a->sv_valid = 1;
+        break;
+    case 'u':                            /* SCORC: restore cursor */
+        if (a->sv_valid) {
+            a->cx = a->sv_cx; a->cy = a->sv_cy; a->curcol = a->sv_col; a->curbg = a->sv_bg;
+            a->sgr_bold = a->sv_bold; a->sgr_inv = a->sv_inv;
+            if (a->cx >= a->cols) a->cx = a->cols - 1;
+            if (a->cy >= a->rows) a->cy = a->rows - 1;
+            a->wrap_pend = 0;
+        }
+        break;
+    case 'n': {                          /* DSR: the terminal ANSWERS */
+        if (p[0] == 6) {
+            char b[16]; char rr[8], cc[8];
+            term_num(rr, a->cy + 1); term_num(cc, a->cx + 1);
+            int k = 0; b[k++] = 0x1B; b[k++] = '[';
+            for (int i = 0; rr[i]; i++) b[k++] = rr[i];
+            b[k++] = ';';
+            for (int i = 0; cc[i]; i++) b[k++] = cc[i];
+            b[k++] = 'R'; b[k] = 0;
+            term_reply(a, b);
+        } else if (p[0] == 5) term_reply(a, "\x1b[0n");    /* "terminal OK" */
+        break;
+    }
+    case 'c':                            /* DA: primary device attributes -- "a VT102" */
+        term_reply(a, "\x1b[?6c");
+        break;
+    default: break;
     }
     a->gdirty = 1;
 }
@@ -2628,7 +3008,7 @@ void grid_write(struct app *a, const char *buf, unsigned len) {
             else if ((ch & 0xF8) == 0xF0) { a->u8cp = ch & 0x07; a->u8need = 3; }
             /* else: a stray continuation or 0xFE/0xFF -- not a character, drop it */
         } else if (a->esc == 1) {                /* after ESC */
-            if (ch == '[') { a->esc = 2; a->csilen = 0; }
+            if (ch == '[') { a->esc = 2; a->csilen = 0; a->csipriv = 0; }
             /* OSC: ESC ] Ps ; Pt (BEL | ESC \) -- an OPERATING SYSTEM COMMAND,
              * and dropping only the two-byte introducer leaves its whole
              * payload to be printed as text. Claude Code's login screen is
@@ -2638,22 +3018,272 @@ void grid_write(struct app *a, const char *buf, unsigned len) {
              * OSC 8 sequences, which is exactly what survives once the
              * sequences themselves are consumed. (M2020) */
             else if (ch == ']') { a->esc = 3; }
+            /* THE OTHER STRING-INTRODUCERS (M2057). DCS, APC, PM and SOS all
+             * run to an ST exactly like an OSC does, and consuming only the
+             * two-byte introducer printed their whole payload as text -- the
+             * same defect M2020 fixed for OSC, left in place for its four
+             * siblings. tmux passthrough and DECRQSS use DCS. */
+            else if (ch == 'P' || ch == '_' || ch == '^' || ch == 'X') a->esc = 5;
+            /* Charset designation and friends take ONE more byte, which used to
+             * be printed: "ESC(B" put a literal B on the screen. */
+            else if (ch == '(' || ch == ')' || ch == '*' || ch == '+' ||
+                     ch == '-' || ch == '.' || ch == '/' || ch == '#' || ch == '%') a->esc = 7;
+            else if (ch == '7') {                /* DECSC: save cursor + attributes */
+                a->sv_cx = a->cx; a->sv_cy = a->cy; a->sv_col = a->curcol; a->sv_bg = a->curbg;
+                a->sv_bold = a->sgr_bold; a->sv_inv = a->sgr_inv; a->sv_valid = 1; a->esc = 0;
+            } else if (ch == '8') {              /* DECRC: restore it */
+                if (a->sv_valid) {
+                    a->cx = a->sv_cx; a->cy = a->sv_cy; a->curcol = a->sv_col; a->curbg = a->sv_bg;
+                    a->sgr_bold = a->sv_bold; a->sgr_inv = a->sv_inv;
+                    if (a->cx >= a->cols) a->cx = a->cols - 1;
+                    if (a->cy >= a->rows) a->cy = a->rows - 1;
+                    a->wrap_pend = 0; a->gdirty = 1;
+                }
+                a->esc = 0;
+            }
+            else if (ch == 'D') { grid_index(a); a->gdirty = 1; a->esc = 0; }        /* IND */
+            else if (ch == 'E') { grid_nl(a); a->gdirty = 1; a->esc = 0; }           /* NEL */
+            else if (ch == 'M') {                                                    /* RI: reverse index */
+                if (a->cy == sr_topr(a)) grid_rscroll(a); else if (a->cy > 0) a->cy--;
+                a->wrap_pend = 0; a->gdirty = 1; a->esc = 0;
+            }
+            else if (ch == 'c') {                                                    /* RIS: full reset */
+                a->curcol = 0; a->curbg = 0; a->sgr_bold = 0; a->sgr_inv = 0;
+                a->sr_top = 0; a->sr_bot = 0; a->no_wrap = 0; a->bracket_paste = 0;
+                a->caret_off = 0; a->sv_valid = 0;
+                if (a->alt_on) alt_leave(a);
+                grid_clear(a);
+                a->esc = 0;
+            }
             else if (ch == '\\') a->esc = 0;      /* a stray ST: nothing to end */
             else a->esc = 0;                     /* unsupported ESC x: consume + drop */
-        } else if (a->esc == 3) {                /* in OSC: swallow to BEL or ST */
+        } else if (a->esc == 3 || a->esc == 5) { /* in an OSC/DCS/APC string: swallow to BEL or ST */
             if (ch == 0x07) a->esc = 0;          /* BEL terminates */
-            else if (ch == 0x1B) a->esc = 4;     /* maybe ESC \ */
-        } else if (a->esc == 4) {                /* saw ESC inside an OSC */
-            a->esc = (ch == '\\') ? 0 : 3;       /* ESC \ ends it; anything else stays in the string */
+            else if (ch == 0x1B) a->esc = (a->esc == 3) ? 4 : 6;   /* maybe ESC \ */
+        } else if (a->esc == 4 || a->esc == 6) { /* saw ESC inside a string */
+            a->esc = (ch == '\\') ? 0 : (a->esc == 4 ? 3 : 5);   /* ESC \ ends it; anything else stays in the string */
+        } else if (a->esc == 7) {                /* ESC ( B and friends: one byte to drop */
+            a->esc = 0;
         } else {                                 /* in CSI: collect until the final byte */
-            if (ch >= 0x40 && ch <= 0x7E) { ansi_csi(a, (char)ch); a->esc = 0; }
+            /* The PRIVATE-MODE INTRODUCER is not a parameter (M2057). Held
+             * separately, because "ESC[?25l" and "ESC[25l" mean entirely
+             * different things and the digit-only parser could not tell them
+             * apart -- so every "?" mode looked like a cursor operation with a
+             * huge argument, and "ESC[>4;2m" ran as an SGR. */
+            if (a->csilen == 0 && (ch == '?' || ch == '>' || ch == '<' || ch == '=')) { a->csipriv = (char)ch; }
+            else if (ch >= 0x40 && ch <= 0x7E) { ansi_csi(a, (char)ch); a->esc = 0; }
             else if (a->csilen < sizeof(a->csi)) a->csi[a->csilen++] = (char)ch;
-            else a->esc = 0;                     /* overlong: bail (no runaway) */
+            /* OVERLONG: STAY IN THE SEQUENCE (M2057). Dropping to ground state
+             * here printed the tail of the sequence -- including its final
+             * letter -- as literal text. Keep discarding parameter bytes and
+             * still honour the final, which is the only byte that could change
+             * anything the extra parameters would have. */
         }
     }
 }
 
 void app_sys_write(const char *buf, unsigned len) { grid_write(cur(), buf, len); }
+
+/* ---- terminal self-test (M2057) ------------------------------------------
+ *
+ * Why this exists AT ALL: every defect this milestone fixes was invisible to
+ * the tests we had, because the terminal's only output is PIXELS and the only
+ * way anyone ever checked it was to look at a screenshot. A sequence that was
+ * silently dropped and a sequence that was correctly honoured produced the
+ * same green tree. So drive grid_write on a scratch grid and assert on CELLS.
+ *
+ * Every check below fails if its fix is reverted -- which is the point, and
+ * which was verified by reverting each one.
+ *
+ * Gated behind `-append termtest`: it costs a few milliseconds, and this OS
+ * keeps boot-to-desktop under a second on purpose. */
+static struct app g_termtest;          /* .bss: a struct app is far too big for a stack frame */
+static int g_tt_pass, g_tt_fail;
+
+static void tt_ck(const char *what, int ok) {
+    if (ok) { g_tt_pass++; kprintf("[termtest] ok   %s\n", what); }
+    else    { g_tt_fail++; kprintf("[termtest] FAIL %s\n", what); }
+}
+static void tt_w(const char *s) {
+    unsigned n = 0; while (s[n]) n++;
+    grid_write(&g_termtest, s, n);
+}
+static void tt_fresh(void) {
+    struct app *a = &g_termtest;
+    a->cols = 20; a->rows = 5;
+    a->esc = 0; a->csilen = 0; a->csipriv = 0; a->u8need = 0;
+    a->curcol = 0; a->curbg = 0; a->sgr_bold = 0; a->sgr_inv = 0;
+    a->sr_top = 0; a->sr_bot = 0; a->no_wrap = 0; a->bracket_paste = 0;
+    a->caret_off = 0; a->sv_valid = 0; a->alt_on = 0;
+    a->ih = a->it = 0; a->paste_len = a->paste_pos = 0;
+    a->task = 0;
+    grid_clear(a);
+}
+static int tt_row_is(int r, const char *want) {
+    struct app *a = &g_termtest;
+    for (int c = 0; want[c]; c++) if (a->grid[r][c] != want[c]) return 0;
+    return 1;
+}
+void app_term_selftest(void) {
+    struct app *a = &g_termtest;
+    g_tt_pass = g_tt_fail = 0;
+    kprintf("[termtest] driving grid_write on a %dx%d scratch grid\n", 20, 5);
+
+    /* 1. DEFERRED WRAP. Exactly `cols` characters on the LAST row must leave
+     *    the cursor parked in the last column with nothing scrolled. The old
+     *    eager wrap line-fed on the 20th character and scrolled the screen,
+     *    which is what made a full-width TUI frame march off the top. */
+    tt_fresh();
+    tt_w("TOPROW\n");                                  /* row 0 = TOPROW */
+    tt_w("\x1b[5;1H");                                 /* to the last row */
+    tt_w("12345678901234567890");                      /* exactly 20 = cols */
+    tt_ck("20 chars on the last row does not scroll", tt_row_is(0, "TOPROW"));
+    tt_ck("cursor parks in the last column", a->cx == 19 && a->cy == 4 && a->wrap_pend);
+    tt_w("A");                                         /* the 21st: NOW it wraps */
+    tt_ck("the next character wraps and scrolls", a->cy == 4 && a->cx == 1 && tt_row_is(4, "A"));
+
+    /* 2. PER-CELL BACKGROUND. Without it there is no way to render a
+     *    highlight, a selected row, or dark-on-light text at all. */
+    tt_fresh();
+    tt_w("\x1b[41mR\x1b[0mP");
+    tt_ck("SGR 41 sets a cell background", a->gbg[0][0] != 0 && a->gbg[0][1] == 0);
+    tt_fresh();
+    tt_w("\x1b[48;5;21mB");
+    tt_ck("SGR 48;5;N sets a cell background", a->gbg[0][0] != 0);
+    tt_fresh();
+    tt_w("\x1b[48;2;200;30;30mT");
+    tt_ck("SGR 48;2;R;G;B sets a cell background", a->gbg[0][0] != 0);
+
+    /* 3. INVERSE VIDEO swaps them -- how every TUI draws a selected line. */
+    tt_fresh();
+    tt_w("\x1b[32mN\x1b[7mI\x1b[27mN");
+    tt_ck("SGR 7 inverts, SGR 27 restores",
+          a->gbg[0][0] == 0 && a->gbg[0][1] != 0 && a->gbg[0][2] == 0);
+
+    /* 4. BOLD IS STATE. "ESC[31m" then "ESC[1m" is the order programs use, and
+     *    a bold flag local to one sequence could not represent it. */
+    tt_fresh();
+    tt_w("\x1b[31mr");
+    { uint8_t plain = a->gcol[0][0];
+      tt_fresh();
+      tt_w("\x1b[31m\x1b[1mb");
+      tt_ck("ESC[1m after a colour brightens it", a->gcol[0][0] != plain); }
+
+    /* 5. THE CSI PARAMETER BUFFER. 27 parameter bytes used to overflow a
+     *    24-byte buffer, drop the parser to ground state mid-sequence, and
+     *    print the tail (";0m") into the grid as text. */
+    tt_fresh();
+    tt_w("\x1b[38;2;255;255;255;48;2;0;0;0mZ");
+    tt_ck("a 27-byte SGR leaves no literal text", tt_row_is(0, "Z") && a->cx == 1);
+
+    /* 6. CURSOR VISIBILITY. Without it the blinking block caret stamps itself
+     *    over a cell of every frame a full-screen program paints. */
+    tt_fresh();
+    tt_w("\x1b[?25l");
+    tt_ck("ESC[?25l hides the caret", a->caret_off == 1);
+    tt_w("\x1b[?25h");
+    tt_ck("ESC[?25h shows it again", a->caret_off == 0);
+
+    /* 7. THE ALTERNATE SCREEN. Enter, scribble, leave: the primary screen and
+     *    its cursor must come back exactly. */
+    tt_fresh();
+    tt_w("PRIMARY\n");
+    tt_w("\x1b[?1049h");
+    tt_ck("entering the alternate screen blanks it", tt_row_is(0, "       ") && a->alt_on);
+    tt_w("ALT");
+    tt_w("\x1b[?1049l");
+    tt_ck("leaving it restores the primary screen", tt_row_is(0, "PRIMARY") && !a->alt_on);
+    tt_ck("...and the cursor with it", a->cy == 1 && a->cx == 0);
+
+    /* 8. SAVE / RESTORE CURSOR, both spellings. */
+    tt_fresh();
+    tt_w("\x1b[3;5H\x1b[s\x1b[1;1H\x1b[u");
+    tt_ck("ESC[s / ESC[u round-trip the cursor", a->cy == 2 && a->cx == 4);
+    tt_w("\x1b[2;2H\x1b""7\x1b[5;5H\x1b""8");
+    tt_ck("ESC 7 / ESC 8 round-trip the cursor", a->cy == 1 && a->cx == 1);
+
+    /* 9. DSR. A program that asks where the cursor is and BLOCKS on the answer
+     *    hangs forever against a terminal that never replies -- and "hangs with
+     *    every core idle" is the hardest symptom there is to attribute. */
+    tt_fresh();
+    tt_w("\x1b[4;3H\x1b[6n");
+    { char got[16]; int n = 0;
+      while (n < 15) { int c = iq_get(a); if (c < 0) break; got[n++] = (char)c; }
+      got[n] = 0;
+      int ok = (n == 6 && got[0] == 0x1B && got[1] == '[' && got[2] == '4' &&
+                got[3] == ';' && got[4] == '3' && got[5] == 'R');
+      tt_ck("ESC[6n is answered with the cursor position", ok); }
+
+    /* 10. THE SCROLL REGION. Rows outside it must not move. */
+    tt_fresh();
+    tt_w("R0\nR1\nR2\nR3\nR4");
+    tt_w("\x1b[2;4r");                                 /* region = rows 1..3 */
+    tt_w("\x1b[4;1H\n");                               /* newline on the region's last row */
+    tt_ck("a scroll inside a region leaves row 0 alone", tt_row_is(0, "R0"));
+    tt_ck("...scrolls only the region", tt_row_is(1, "R2") && tt_row_is(2, "R3"));
+    tt_ck("...and leaves the rows below it alone", tt_row_is(4, "R4"));
+
+    /* 11. TAB. It used to paint a CP437 dither block and advance one column --
+     *     those smudges were the visible artifacts in a blank-looking window. */
+    tt_fresh();
+    tt_w("ab\tc");
+    tt_ck("TAB advances to the next 8-column stop", a->cx == 9 && tt_row_is(0, "ab      c"));
+    tt_fresh();
+    tt_w("x\x07y");                                    /* BEL is not a glyph */
+    tt_ck("BEL prints nothing", tt_row_is(0, "xy") && a->cx == 2);
+
+    /* 12. ERASE, in the right direction. ESC[1J erased FORWARD. */
+    tt_fresh();
+    tt_w("ABCDE\x1b[1;3H\x1b[1J");
+    tt_ck("ESC[1J erases backward, not forward", tt_row_is(0, "   DE"));
+
+    /* 13-14. INSERT / DELETE, which a redraw uses instead of repainting. */
+    tt_fresh();
+    tt_w("ABCDE\x1b[1;2H\x1b[P");
+    tt_ck("ESC[P deletes a character and shifts left", tt_row_is(0, "ACDE"));
+    tt_fresh();
+    tt_w("ABCDE\x1b[1;2H\x1b[2@");
+    tt_ck("ESC[@ inserts blanks and shifts right", tt_row_is(0, "A  BCD"));
+    tt_fresh();
+    tt_w("R0\nR1\nR2");
+    tt_w("\x1b[2;1H\x1b[L");
+    tt_ck("ESC[L inserts a line", tt_row_is(0, "R0") && tt_row_is(1, "  ") && tt_row_is(2, "R1"));
+    tt_fresh();
+    tt_w("R0\nR1\nR2");
+    tt_w("\x1b[1;1H\x1b[M");
+    tt_ck("ESC[M deletes a line", tt_row_is(0, "R1") && tt_row_is(1, "R2"));
+
+    /* 15-16. ESCAPES THAT ARE NOT CSI. Their payloads used to print. */
+    tt_fresh();
+    tt_w("\x1b(B" "ok");
+    tt_ck("ESC ( B prints no literal B", tt_row_is(0, "ok"));
+    tt_fresh();
+    tt_w("\x1bPtmux;something\x1b\\" "ok");
+    tt_ck("a DCS string prints nothing", tt_row_is(0, "ok"));
+    tt_fresh();
+    tt_w("\x1b_apc payload\x1b\\" "ok");
+    tt_ck("an APC string prints nothing", tt_row_is(0, "ok"));
+
+    /* 17-18. SCROLLBACK: it exists, it keeps its colours, and ESC[3J drops it.
+     *     The render path used to hardcode green for every scrolled-off line. */
+    tt_fresh();
+    tt_w("\x1b[31mRED\x1b[0m\n\n\n\n\n\n");            /* push row 0 off the top */
+    tt_ck("a scrolled-off line enters the scrollback", a->sb_count >= 1 && a->sb[0][0] == 'R');
+    tt_ck("...with its colour", a->sbcol[0][0] != 0);
+    tt_w("\x1b[3J");
+    tt_ck("ESC[3J clears the scrollback", a->sb_count == 0);
+
+    /* 19. A PRIVATE MODE IS NOT A CURSOR MOVE. The digit-only parser could not
+     *     tell "ESC[?25l" from "ESC[25l", so every "?" mode ran as something
+     *     else -- and "ESC[>4;2m" ran as an SGR. */
+    tt_fresh();
+    tt_w("\x1b[3;3H\x1b[>4;2m" "X");
+    tt_ck("ESC[>4;2m is not executed as an SGR", a->cy == 2 && tt_row_is(2, "  X"));
+
+    kprintf("[termtest] %d ok, %d FAILED\n", g_tt_pass, g_tt_fail);
+    if (!g_tt_fail) kprintf("[termtest] TERMSELFTEST PASSED (%d checks)\n", g_tt_pass);
+    else            kprintf("[termtest] TERMSELFTEST FAILED\n");
+}
 
 /* Replace the on-screen line with history entry `idx` (or empty); returns len. */
 static unsigned hist_recall(struct app *a, char *buf, unsigned max, unsigned cur_n,
@@ -5741,7 +6371,30 @@ void app_sel_commit(app_t *a) {
 void app_paste(app_t *a) {
     if (!a) return;
     a->paste_len = 0;                                    /* stop any in-flight drain before we refill */
-    int n = clip_get(a->pastebuf, sizeof a->pastebuf);   /* fill the app's paste buffer... */
+    int n;
+    /* BRACKETED PASTE (M2057). A program that asked for it with ESC[?2004h
+     * expects the text fenced by ESC[200~ / ESC[201~, and the fence is the ONLY
+     * thing that tells it "these newlines are data, not Enter". Without it a
+     * multi-line paste into an editor or a TUI prompt arrives as a burst of
+     * Return presses -- which for a shell means running every line, and for
+     * Claude Code's prompt box means submitting the first line and losing the
+     * rest. We were advertising nothing and sending raw bytes; now we honour
+     * the mode we were silently dropping. */
+    if (a->bracket_paste) {
+        static const char pre[] = "\x1b[200~", post[] = "\x1b[201~";
+        int pl = (int)sizeof pre - 1, sl = (int)sizeof post - 1;
+        int room = (int)sizeof a->pastebuf - pl - sl - 1;
+        char tmp[CLIP_MAX];
+        int m = clip_get(tmp, sizeof tmp);
+        if (m > room) m = room;
+        int k = 0;
+        for (int i = 0; i < pl; i++) a->pastebuf[k++] = pre[i];
+        for (int i = 0; i < m; i++)  a->pastebuf[k++] = tmp[i];
+        for (int i = 0; i < sl; i++) a->pastebuf[k++] = post[i];
+        n = k;
+    } else {
+        n = clip_get(a->pastebuf, sizeof a->pastebuf);   /* fill the app's paste buffer... */
+    }
     a->paste_pos = 0;
     a->paste_len = n;                                    /* ...set last so iq_get sees a complete buffer */
     if (a->view) { a->view = 0; a->gdirty = 1; }         /* a paste returns to the live view */

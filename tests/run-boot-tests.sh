@@ -47,7 +47,7 @@ echo "booting kernel headless under QEMU (COM1 capture)..."
 # false-positive hang report would be worse than the flake it replaces. Costs
 # nothing normally: the poll loop breaks as soon as the marker lands.
 timeout -s KILL 60 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$KERNEL" \
-    -append selftest \
+    -append "selftest termtest" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 \
@@ -146,6 +146,27 @@ elif [ "${cs_n:-0}" -eq 0 ]; then
 else
     echo "  MISSING: $cs_bad of $cs_n concurrent kprintf lines were SPLICED -- the console lock is not serialising whole lines"
     grep '^\[cs\]' "$LOG" | grep 'A.*B\|B.*A' | head -2 | cut -c1-100 | sed 's/^/           /'
+    fail=1
+fi
+# M2057: THE TERMINAL, asserted on CELLS. Everything the VT/ANSI layer got
+# wrong was invisible to every test this project had, because its only output
+# is pixels and the only way anyone checked was to look at a screenshot -- a
+# dropped escape sequence and an honoured one produced the same green tree.
+# app_term_selftest drives grid_write on a scratch grid and reads the cells
+# back. Each of these was verified to FAIL when its fix is reverted.
+require "20 chars on the last row does not scroll"  "deferred right-margin wrap: a full-width row does not line-feed (M2057)"
+require "SGR 41 sets a cell background"             "per-cell background colour exists at all (M2057)"
+require "SGR 7 inverts, SGR 27 restores"            "inverse video, which is how a TUI draws a selected row (M2057)"
+require "a 27-byte SGR leaves no literal text"      "a combined fg+bg truecolour SGR does not overflow into the grid (M2057)"
+require "6n is answered with the cursor position"  "DSR: the terminal answers a cursor query instead of hanging the caller (M2057)"
+require "leaving it restores the primary screen"    "the alternate screen (ESC[?1049h) saves and restores (M2057)"
+require "a scroll inside a region leaves row 0 alone"  "DECSTBM scroll region: a pinned header does not scroll (M2057)"
+require "TAB advances to the next 8-column stop"    "TAB is a tab, not a CP437 dither glyph one column wide (M2057)"
+require "4;2m is not executed as an SGR"      "a private-mode introducer is not parsed as a parameter (M2057)"
+require "TERMSELFTEST PASSED"                       "the whole terminal self-test: 34 cell-level checks (M2057)"
+if grep -aq "^\[termtest\] FAIL" "$LOG"; then
+    echo "  FAIL: terminal self-test reported a failing check"
+    grep -a "^\[termtest\] FAIL" "$LOG" | head -5 | sed 's/^/           /'
     fail=1
 fi
 require "Networking works!"                  "e1000 + ARP + ICMP echo (SLIRP gateway)"
