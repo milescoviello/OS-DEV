@@ -305,6 +305,7 @@ void linux_abi_init_this_cpu(void) {
 #define LXS_inotify_add_watch_ 254   /* Firefox retries this forever on ENOSYS (M1996) */
 #define LXS_inotify_rm_watch_  255  /* epoll_pwait with a timespec instead of a millisecond count (M1992) */
 #define LXS_epoll_pwait_ 281
+#define LXS_eventfd_     284   /* the flagless original; glibc still emits it (M2017) */
 #define LXS_eventfd2_    290
 #define LXS_poll_          7
 #define LXS_ppoll_       271
@@ -1784,8 +1785,27 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = 0;
         break;
     }
+    case LXS_eventfd_:                      /* (initval) -- no flags at all */
     case LXS_eventfd2_: {                   /* (initval, flags) */
-        int efd = app_eventfd_create((unsigned)r->rdi, 0);
+        /* THE FLAGS WERE PASSED AS LITERAL ZERO (M2017), and they are not
+         * decoration. EFD_NONBLOCK on an eventfd is what makes an event loop's
+         * cross-thread wakeup safe to drain: the loop reads until EAGAIN. A
+         * blocking one stops the loop dead on an empty counter -- and it is
+         * the MAIN loop, so everything else the program was going to do,
+         * including handling the HTTP response already sitting in a socket,
+         * simply never happens.
+         *
+         * They also need TRANSLATING rather than passing through: our native
+         * EFD_* are 1/2/4 and Linux's are 1/0x80000/0x800, so handing the raw
+         * Linux value to app_eventfd_create would have set SEMAPHORE on
+         * anything asking for CLOEXEC. Third time this class has bitten in one
+         * session -- see pipe2 (M2009) and socketpair (M2012). */
+        long lf = (r->rax == LXS_eventfd2_) ? (long)r->rsi : 0;
+        int nf = 0;
+        if (lf & 1)       nf |= EFD_SEMAPHORE;   /* EFD_SEMAPHORE: same value on both sides */
+        if (lf & 0x800)   nf |= EFD_NONBLOCK;    /* Linux EFD_NONBLOCK  */
+        if (lf & 0x80000) nf |= EFD_CLOEXEC;     /* Linux EFD_CLOEXEC   */
+        int efd = app_eventfd_create((unsigned)r->rdi, nf);
         r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;
         break;
     }
