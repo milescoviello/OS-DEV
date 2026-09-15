@@ -3567,3 +3567,18 @@ uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
                         const char *const *argv, const char *const *envp) {
     return lx_spawn_stack_dyn(image, base, entry, 0, stack_top, stack_bottom, argv, envp);
 }
+/* -append lxout: mirror a Linux process's output to the kernel log as well as
+ * to its window (M2023).
+ *
+ * Everything a guest program prints has only ever existed as PIXELS -- it goes
+ * to a window text grid, and nothing else. That means the only way to read what
+ * a program said is to screenshot it and transcribe, which I did to get Claude
+ * Code's OAuth URL out and promptly misread one character of a scope string.
+ * The program was not wrong and the terminal was not wrong; the output simply
+ * was not text anywhere.
+ *
+ * It costs nothing on screen: since M2011 the console writes to the serial port
+ * and /proc/kmsg only once the window manager owns the framebuffer. So this is
+ * the same bytes, in a form you can grep. */
+int g_lx_out_log;
+    if (g_lx_out_log) console_write_n(b, n);

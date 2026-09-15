@@ -1730,3 +1730,4 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     speaker_chime();              /* a little startup arpeggio */
     desktop_run();
 }
+        if (cmdline_has(cl, "lxout")) { extern int g_lx_out_log; g_lx_out_log = 1; }   /* guest output -> the log, as TEXT (M2023) */
