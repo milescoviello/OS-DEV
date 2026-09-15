@@ -4641,7 +4641,7 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
         uint64_t old = pte & PTE_ADDR_MASK;
         if (pmm_refcount(old) == 0) {
             vmm_set_raw(fpage, (pte & ~PTE_COW) | PTE_WRITABLE);
-            vmm_tlb_shootdown();   /* re-widened to writable: siblings must not keep the RO entry (M2034) */
+            app_tlb_sync(a);   /* re-widened to writable: siblings must not keep the RO entry (M2034) */
         } else {
             uint64_t nf = pmm_alloc_frame();
             if (!nf) return 0;                      /* OOM -> let it fault/die */
@@ -4667,7 +4667,7 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
              *
              * mprotect and munmap were given this in M1963; the COW path was
              * the one that kept a local invlpg. */
-            vmm_tlb_shootdown();
+            app_tlb_sync(a);
             pmm_free_frame(old);                    /* decrements the shared frame's refcount */
         }
         a->minflt++;                                /* COW resolve: no disk I/O => minor fault (M1150) */
@@ -4833,7 +4833,25 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                 irq_restore(uf);
             }
             uint64_t frame = pmm_alloc_frame();
-            if (!frame) return 0;                       /* OOM -> let it fault/die */
+            if (!frame) {
+                /* SAY THAT IT WAS OUT OF MEMORY (M2036). This returned 0 and
+                 * the caller killed the process with no message at all, so a
+                 * frame shortage was indistinguishable from a genuine bad
+                 * access -- and it presents as the most misleading possible
+                 * fault: a WRITE to a page that is not present but IS inside a
+                 * perfectly good read-write VMA, at a rip somewhere in glibc's
+                 * AVX memset. Nothing about that says "the machine is full". */
+                static int told;
+                if (!told) {
+                    told = 1;
+                    kprintf("[fault] OUT OF PHYSICAL MEMORY resolving %lx for pid %d "
+                            "(%lu KiB free of %lu KiB) -- this is a frame shortage, not a bad access\n",
+                            cr2, a->pid,
+                            (unsigned long)(pmm_free_bytes() >> 10),
+                            (unsigned long)(pmm_total_bytes() >> 10));
+                }
+                return 0;
+            }
             uint8_t *z = (uint8_t *)hhdm(frame);
             for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0; /* never leak stale RAM to userspace */
             if (v.file_backed) {                /* fill the page from the backing file (M1136) */
@@ -6263,6 +6281,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * restrict non-essential traffic, and the preflight is exactly that.
          * (M2004) */
         envp0[23] = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1";
+
         /* THERE IS NO D-BUS HERE, AND THE WAY TO SAY SO IS PER-SUBSYSTEM
          * (M2013).
          *
@@ -7134,6 +7153,28 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].used && a->fd[newfd].type == 10) net_tcp_sock_close(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
     a->fd[newfd] = a->fd[oldfd];                                  /* newfd now references the same end */
+    /* dup2 NEVER CARRIES FD_CLOEXEC (M2037). POSIX is explicit: the new
+     * descriptor does not inherit the close-on-exec flag, whatever oldfd has;
+     * only dup3(..., O_CLOEXEC) may ask for it, and this kernel does not even
+     * implement dup3 as a Linux syscall. Copying the whole fdent struct copied
+     * the flag with it.
+     *
+     * That one bit is why Claude Code never received a word from any child it
+     * spawned. The idiom is pipe2(fds, O_CLOEXEC) -- so the pipe cannot leak
+     * into unrelated descendants -- then dup2(fds[1], 1) in the child, which on
+     * Linux clears the flag, which is precisely WHY the pattern is written that
+     * way. Here fd 1 stayed CLOEXEC, so app_exec's cloexec sweep closed it
+     * again immediately before the new image took over. The exec'd program's
+     * write(1, ...) then found fd 1 unbound and fell through to the console
+     * fallback -- ripgrep's output scrolled over the terminal and destroyed the
+     * TUI -- while Claude Code's end of the pipe saw an instant EOF.
+     *
+     * The existing pipeline test never caught it because tools/lx/lxbox.c uses
+     * plain pipe(), so the precondition never arises. Two other callers already
+     * worked around this by re-setting .cloexec themselves after calling here
+     * (app_fcntl's F_DUPFD path and app_dup3); the raw Linux dup2(2) was the
+     * one that did not, so the fix belongs here rather than at the call sites. */
+    a->fd[newfd].cloexec = 0;
     if (a->fd[newfd].type == 1) pipe_open_end(a->fd[newfd].obj, a->fd[newfd].write_end);
     else if (a->fd[newfd].type == 3) memfd_ref(a->fd[newfd].obj);   /* (M1212) */
     else if (a->fd[newfd].type == 6) epoll_ref(a->fd[newfd].obj);   /* (M1220) */

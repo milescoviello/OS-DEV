@@ -339,6 +339,30 @@ int vmm_fork_cow(uint64_t child_cr3) {
                     continue;
                 }
                 uint64_t flags = e & (PTE_USER | PTE_NX);
+                /* ADDREF BEFORE WRITE-PROTECTING, NOT AFTER (M2036).
+                 *
+                 * The reference for the child's mapping used to be taken at the
+                 * END of this block -- after the parent's PTE was made RO|COW
+                 * and after the child was mapped. That leaves a window in which
+                 * the page is shared but its refcount still says nobody else
+                 * holds it, and a sibling thread of the parent, on another core,
+                 * can COW-fault inside it:
+                 *
+                 *   this core:  parent PTE := RO|COW                  (shared now)
+                 *   other core: COW fault -> pmm_refcount(phys) == 0
+                 *               -> "I am the sole owner" -> make it WRITABLE
+                 *                  in place and clear PTE_COW
+                 *   this core:  map it into the child, pmm_addref
+                 *
+                 * The parent now has a writable, non-COW mapping of a frame the
+                 * child shares, so every later write by the parent silently
+                 * appears in the child. Nothing faults and no count is wrong
+                 * afterwards -- the damage is already done.
+                 *
+                 * Taking the reference first makes the refcount an OVER-estimate
+                 * for a moment, which is the safe direction: the worst a racing
+                 * fault can then do is copy a page it did not strictly need to. */
+                pmm_addref(phys);                         /* one extra ref for the child's mapping */
                 if (e & PTE_WRITABLE) pt[k] = (e & ~PTE_WRITABLE) | PTE_COW;  /* first share: write-protect both sides, mark COW */
                 /* Either this page just became RO+COW above, OR it already was
                  * (a second-or-later fork of a page an EARLIER child already
@@ -353,13 +377,34 @@ int vmm_fork_cow(uint64_t child_cr3) {
                  * nothing before this had a 3rd-generation-or-later child
                  * write to a page any earlier sibling had already touched. */
                 if (e & (PTE_WRITABLE | PTE_COW)) flags |= PTE_COW;
-                if (vmm_map_to(child_cr3, va, phys, flags) != 0) { rc = -1; break; }
-                pmm_addref(phys);                         /* one extra ref for the child's mapping */
+                if (vmm_map_to(child_cr3, va, phys, flags) != 0) {
+                    pmm_free_frame(phys);                 /* undo the reference taken above */
+                    rc = -1; break;
+                }
             }
         }
     }
     }   /* end of the PML4 loop (M2031) */
+    /* AND EVERY OTHER CORE HAS TO LOSE THE WRITABLE ENTRY TOO (M2036).
+     *
+     * This reloaded CR3 to flush the parent's TLB on THIS core, which is right
+     * and not enough. Write-protecting a page for copy-on-write is only
+     * effective if every core that could write it takes the fault -- and a
+     * sibling thread of the parent, running on another core, keeps a cached
+     * WRITABLE translation for pages this loop has already marked COW. It
+     * writes straight into a frame that is now shared with the child, without
+     * faulting, and the child sees the write.
+     *
+     * That is silent cross-process corruption, and it explains why Claude Code
+     * died only on -smp 4 and never once on -smp 1, with identical progress on
+     * both: it forks constantly and every fork left the other three cores able
+     * to scribble on shared pages.
+     *
+     * Barely reachable before M2031, which widened this walk from the bottom
+     * 512 GiB to the whole user half -- a threaded runtime keeps its heap far
+     * above 512 GiB, so before that there was almost nothing here to race on. */
     __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");   /* flush parent TLB (we write-protected it) */
+    vmm_tlb_shootdown();                                         /* ...and the parent's threads elsewhere */
     return rc;
 }
 
