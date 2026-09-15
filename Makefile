@@ -389,7 +389,12 @@ $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 # Depends on lxwl as well: the libwayland-client closure is staged FROM that
 # binary, so it has to exist first. Without the dependency the staging step ran
 # before the client was built and silently skipped it. (M1978)
-$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl
+# Makefile is a prerequisite ON PURPOSE (M2054): this is a STAMP file, so
+# changing the LXTOOLS list alone does not re-run the recipe -- the stamp is
+# still newer than its prerequisites. That is how bash and git were added to
+# LXTOOLS and never actually staged, leaving every ext2 rebuild without them
+# while manual injections into the image kept being wiped.
+$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile
 	@mkdir -p $(LXROOT)
 	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@tools/stage-linux-tool.sh $(LXROOT) make "$$(command -v gmake || command -v make)"

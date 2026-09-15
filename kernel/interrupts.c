@@ -269,6 +269,14 @@ void isr_dispatch(struct registers *r) {
                 if (vexemu_try(r)) return;
             }
             if (app_signal_deliver(r, 11)) return;  /* SIGSEGV: a registered handler catches the fault */
+            /* REPORT FS_BASE (M2054). A ring-3 fault at CR2=0x28 is almost
+             * always `mov %fs:0x28,%rax` -- glibc's stack canary -- read with
+             * a ZERO thread pointer, and the dump could not distinguish "the
+             * TLS base is zero" from "something dereferenced a null struct at
+             * offset 0x28". Those are completely different bugs and they look
+             * identical. One number separates them. */
+            kprintf("[fault] FS_BASE=%p (a CR2 of 0x28 with FS_BASE=0 is the stack canary, not a null deref)\n",
+                    (void *)(unsigned long)task_fs_base_live_value());
             kprintf("[fault] %s (vector %lu) err=0x%lx in a ring-3 task at rip=%p (CR2=%p) -- terminating it\n",
                     exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2);
             app_describe_addr(r->rip);   /* which library, and where inside it (M2003) */
