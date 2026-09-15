@@ -1,5 +1,46 @@
 # What's next
 
+> **(M2017-M2020) CLAUDE CODE REACHES ITS LOGIN PROMPT INSIDE OS-DEV.**
+>
+> ```
+> Browser didn't open? Use the url below to sign in (c to copy)
+>
+> https://claude.com/cai/oauth/authorize?code=true&client_id=...&state=...
+>
+> Paste code here if prompted >
+> ```
+>
+> **The blocker was packet loss in our own RX path, and a `ping` found it.**
+> `ping api.anthropic.com` reported **1/3 echo replies** while the wire capture
+> showed all three arriving. There is one NIC and several independent consumers
+> -- a TCP read loop, a UDP socket, an ARP resolve, a ping -- and every one of
+> them drained the NIC directly and **destroyed whatever it did not recognise**.
+> `udp_pump_once` said so in its own comment: *"everything else discarded"*.
+>
+> So a `connect()`'s ARP resolve ate TCP segments from a TLS handshake already
+> in flight on another socket. M1908 had fixed one quadrant of this and M1967
+> another; the general rule was missing — **a consumer may take what is its own
+> and must FILE everything else where its owner will find it.** After that,
+> 3/3 replies, and Claude Code's connectivity preflight passes.
+>
+> | | |
+> |---|---|
+> | **M2017** | `eventfd2`'s flags were passed as literal **zero** — fourth instance of "granted in name only" (see `pipe2` M2009, `socketpair` M2012, `bind` M2020) |
+> | **M2018** | the RX demux above, plus a blocking `recv` that bypassed its own socket ring — two consumers of one byte stream, served **out of order** with a byte count that still matches the wire |
+> | **M2019** | **one 4 KiB disk read per page fault** for a 214 MB executable; now a 64 KiB cluster per fault, one disk request instead of sixteen |
+> | **M2020** | `bind()` on AF_INET was accepted and ignored, so the OAuth callback server could not start; plus OSC-8 hyperlinks printed as text, which showed the sign-in URL three times over |
+>
+> **The method that worked, twice:** ask the program, then check the wire. Claude
+> Code named its own crash site (`ipc_channel_posix.cc:128`), its own invalid
+> machine-id, and its own missing callback server. A QEMU packet capture then
+> settled every "is it us?" question — including ruling our TCP *out*, which was
+> worth as much as finding a bug in it.
+>
+> `make check` is at **492 checkpoints**. Still open: Firefox does not paint, and
+> the login itself is the user's to complete.
+
+---
+
 > **(M2014-M2016) CLAUDE CODE'S ONBOARDING RUNS IN OS-DEV, AND THE RETURN KEY
 > WAS WHY IT DIDN'T.**
 >
