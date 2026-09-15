@@ -2349,11 +2349,14 @@ void app_stall_watchdog(void) {
         kprintf("[stall]   main state=%d wchan=%lx\n",
                 a->task ? (int)a->task->state : -1,
                 a->task ? (unsigned long)a->task->wchan : 0UL);
+        task_report_why_idle(a->task);            /* which of the three reasons it is (M2039) */
         for (int k = 0; k < APP_MAXTHREAD; k++)
-            if (a->thr[k])
+            if (a->thr[k]) {
                 kprintf("[stall]   thread %d state=%d wchan=%lx wake_pending=%d\n",
                         a->thr[k]->id, (int)a->thr[k]->state,
                         (unsigned long)a->thr[k]->wchan, a->thr[k]->wake_pending);
+                if (a->thr[k]->state == TASK_READY) task_report_why_idle(a->thr[k]);
+            }
         app_futex_dump();
         lx_trace_dump_last("the stall", 40);
     }
@@ -7884,6 +7887,13 @@ int app_fd_is_open(int fd) {
 const char *app_fd_path_of(int fd) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return 0;
+    /* ONLY fd TYPES WHOSE `path` REALLY IS A FILESYSTEM PATH (M2038). An
+     * AF_UNIX socket (type 12) stores its bind() NAME in this same field, so
+     * answering for it would hand *at() a socket name as a base directory and
+     * resolve every relative path under it. Nothing does that today -- as, ld,
+     * cc1 and make never pass a socket as a dirfd -- which is exactly what
+     * makes it worth closing now rather than after something does. */
+    if (a->fd[fd].type != 2) return 0;            /* 2 is the only type whose `path` is a real path */
     return a->fd[fd].path[0] ? a->fd[fd].path : 0;
 }
 const char *app_fd_path(int fd) {

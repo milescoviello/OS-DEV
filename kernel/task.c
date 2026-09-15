@@ -1177,6 +1177,35 @@ int task_retire_stopped(task_t *t) {
     return ok;
 }
 
+/* WHY IS THIS TASK NOT RUNNING? (M2039)
+ *
+ * A stall dump that says `state=0` -- TASK_READY -- while every core is halted
+ * is a contradiction on its face: a runnable task and four idle cores. The dump
+ * could not say which of the three possible reasons it was, so this reports all
+ * of them. A READY task is skipped if it is not LINKED INTO THE RING (nothing
+ * walks it), if its affinity mask excludes every online core, or if it is
+ * pinned to a core that is not the one looking. Each is a different bug and
+ * they are indistinguishable from the outside. */
+void task_report_why_idle(task_t *t) {
+    if (!t) { kprintf("[sched]   (no task)\n"); return; }
+    uint64_t f = irq_save();
+    rq_lock_take();
+    int in_ring = 0, hops = 0;
+    for (task_t *u = t->next; u && hops < 4096; u = u->next, hops++) {
+        if (u == t) { in_ring = 1; break; }
+    }
+    int on_cpu = 0;
+    for (int c = 0; c < MAX_SCHED_CPUS; c++) if (cur[c] == t) { on_cpu = 1; break; }
+    unsigned om = online_mask();
+    rq_lock_give();
+    irq_restore(f);
+    kprintf("[sched]   tid %d state=%d in_ring=%d ring_hops=%d on_cpu=%d "
+            "affinity=%x online=%x eligible_anywhere=%d pin=%d wake_pending=%d off_cpu=%d\n",
+            t->id, (int)t->state, in_ring, hops, on_cpu,
+            (unsigned)t->affinity, om, (t->affinity & om) != 0, t->pin_core,
+            t->wake_pending, (int)__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE));
+}
+
 /* Resume a STOPPED task. */
 void task_cont(task_t *t) {
     uint64_t f = irq_save();

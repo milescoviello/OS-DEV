@@ -1313,7 +1313,17 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             vfs_remove("/disk2/t.o");
             vfs_remove("/disk2/t.elf");
             kprintf("[lxtool] running the borrowed GNU assembler...\n");
-            int rc = app_run_linux_sync("/disk2/usr/bin/as", av_asver, 1, 60000);
+            /* 60000 -> 120000 (M2038). This step was given HALF the budget of
+             * every neighbouring one while doing equivalent-or-more work: it is
+             * the first dynamically-linked program of the run, so it pays for
+             * the loader plus five shared objects with nothing warm. Under host
+             * CPU contention -- and this suite is deliberately run concurrently
+             * with others -- it blew the budget, app_run_linux_sync killed it
+             * before its fully-buffered non-tty stdout ever flushed the "GNU
+             * assembler" banner, and the first assertion failed with every
+             * later one cascading off it. That reads exactly like a broken
+             * toolchain and is a stopwatch. */
+            int rc = app_run_linux_sync("/disk2/usr/bin/as", av_asver, 1, 120000);
             kprintf("[lxtool] as --version -> %d\n", rc);
             kprintf("[lxtool] assembling /hello.s -> /t.o ...\n");
             rc = app_run_linux_sync("/disk2/usr/bin/as", av_as, 3, 120000);
