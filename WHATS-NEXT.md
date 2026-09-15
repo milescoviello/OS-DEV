@@ -1,5 +1,42 @@
 # What's next
 
+> **(M2040-M2050) A MEMORY-OWNERSHIP AUDIT, AND ONE FIX REVERTED ON ITS OWN EVIDENCE.**
+>
+> The `-smp 1` vs `-smp 4` split said the remaining corruption was a multi-core
+> race, so the next pass audited the **class** rather than the symptom. What it
+> found, in the order it matters:
+>
+> | | |
+> |---|---|
+> | **M2043** | `vmm_tlb_shootdown` returned **void**, and its ack wait is deliberately bounded -- so it could flush nobody and say nothing, while every caller went straight on to `pmm_free_frame`. A missed IPI was a **use-after-free**. It now reports, and the COW path leaks one 4 KiB page rather than releasing a frame another core may be writing. Both diagnostics fired on the first run |
+> | **M2043** | `memfd`'s refcount was a **non-atomic counter on a cross-process object** -- inherited across fork, passed by SCM_RIGHTS, opened by name. Two cores dropping the last reference could both `kfree`, and a double free corrupts the kernel heap's own free list: a fully generic way for unrelated memory to read back wrong |
+> | **M2043** | `wl_surface.frame` had **no dispatch at all**, so a toolkit asking "tell me when to draw again" was never answered -- a client that binds every global, builds its widgets and waits for ever |
+> | **M2049** | **`brk` refused to shrink**, returning the unchanged higher break, which glibc reads as failure. Its heap trim asked thousands of times and the in-guest compile hung at 12% CPU |
+> | **M2050** | **my own fork-locking fix, reverted on measurement** |
+>
+> **M2050 is the one worth reading.** `vmm_fork_cow` rewrites page tables with no
+> lock while every other mutator takes `vmm_lock`; M2045 gave it that lock,
+> chunked, with an interrupt window. Correct in the small. Then:
+>
+> ```
+> baseline:            46.6% CPU,  1m42s of CPU in 220s   -- working
+> with the locking:     4-6% CPU,  8s of CPU in 204s      -- stalled
+> after reverting:     49.7% CPU,  1m56s of CPU in 235s   -- working
+> ```
+>
+> I could not explain the stall in the time I had. An unexplained stall is worse
+> than a documented race, so the race went back **written down in the code**,
+> along with why a patch cannot fix it: `vmm_lock` is global, and holding it for
+> a walk proportional to a process's resident set freezes memory management
+> everywhere. The real repair is a **per-address-space** page-table lock, which
+> means teaching every `vmm_map`/`vmm_unmap`/`vmm_protect` site which space it
+> touches. That is the next milestone, not a patch.
+>
+> Also: `build/ext2.img` is a **build artifact** -- `make check` rebuilds it and
+> destroys anything that lived only inside it. That cost the in-guest login
+> three times before M2040 moved the state to a host directory with
+> `tools/inject-guest-state.sh`.
+
 > **(M2036-M2039) CLAUDE CODE DRAWS ITS INTERFACE INSIDE OS-DEV.**
 >
 > ```
