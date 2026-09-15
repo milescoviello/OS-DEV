@@ -9302,3 +9302,46 @@ int app_take_browse(char *out, int max) {          /* WM drains; 1 if returned *
     bq_t = (bq_t + 1) % MAX_BROWSE;
     return 1;
 }
+    /* Bytes owed to a Linux reader from a key that expands to an ESCAPE
+     * SEQUENCE -- arrows, Home, End, Delete (M2024). Our keyboard hands the
+     * kernel one sentinel byte per key; a terminal sends three or four. */
+    char     keyseq[8];
+    uint8_t  keyseq_n, keyseq_i;
+        /* Finish handing over a sequence started by a previous read, before
+         * looking for another key (M2024). */
+        if (a->keyseq_i < a->keyseq_n) {
+            unsigned long k = 0;
+            while (k < max && a->keyseq_i < a->keyseq_n) ((char *)buf)[k++] = a->keyseq[a->keyseq_i++];
+            if (a->keyseq_i >= a->keyseq_n) a->keyseq_i = a->keyseq_n = 0;
+            return (long)k;
+        }
+                /* ARROW KEYS ARE ESCAPE SEQUENCES (M2024).
+                 *
+                 * Our keyboard delivers one sentinel byte per extended key --
+                 * 0x11..0x14 for the arrows -- which is what every OS-DEV app
+                 * reads. A terminal sends `ESC [ A`, and a Linux TUI matches on
+                 * exactly that. So Claude Code's menus could be SEEN but not
+                 * NAVIGATED: every arrow press arrived as a control character
+                 * it had no meaning for, and the selection never moved. Same
+                 * class as the Return key in M2014 -- the key was delivered,
+                 * in an encoding the program does not speak. */
+                const char *seq = 0;
+                switch (c) {
+                case 0x11: seq = "\x1b[A"; break;   /* up    */
+                case 0x12: seq = "\x1b[B"; break;   /* down  */
+                case 0x13: seq = "\x1b[D"; break;   /* left  */
+                case 0x14: seq = "\x1b[C"; break;   /* right */
+                case 0x15: seq = "\x1b[5~"; break;  /* page up   */
+                case 0x16: seq = "\x1b[6~"; break;  /* page down */
+                default: break;
+                }
+                if (seq) {
+                    a->keyseq_n = 0;
+                    for (int q = 0; seq[q] && q < (int)sizeof a->keyseq; q++)
+                        a->keyseq[a->keyseq_n++] = seq[q];
+                    a->keyseq_i = 0;
+                    unsigned long k = 0;
+                    while (k < max && a->keyseq_i < a->keyseq_n) ((char *)buf)[k++] = a->keyseq[a->keyseq_i++];
+                    if (a->keyseq_i >= a->keyseq_n) a->keyseq_i = a->keyseq_n = 0;
+                    return (long)k;
+                }
