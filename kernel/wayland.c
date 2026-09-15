@@ -38,6 +38,7 @@
 #include "timer.h"
 #include "task.h"
 #include "app.h"    /* app_scm_take_memfd: the client's pixels (M1979) */
+#include "kheap.h"  /* the self-test's stand-in pool (M2058) */
 #include "xkbmap.h" /* our own XKB keymap, handed over as a memfd (M1984) */
 
 /* The path clients connect to. It carries the compat root because a Linux
@@ -66,31 +67,55 @@
 #define WL_CALLBACK_EV_DONE      0
 /* wl_compositor requests */
 #define WL_COMPOSITOR_CREATE_SURFACE 0
+#define WL_COMPOSITOR_CREATE_REGION  1
 /* wl_shm requests/events */
 #define WL_SHM_CREATE_POOL       0
+#define WL_SHM_RELEASE           1
 #define WL_SHM_EV_FORMAT         0
+/* wl_shm errors, for the `code` word of wl_display.error */
+#define WL_SHM_ERR_INVALID_FD    2
 /* wl_shm_pool requests */
 #define WL_SHM_POOL_CREATE_BUFFER 0
+#define WL_SHM_POOL_DESTROY       1
+#define WL_SHM_POOL_RESIZE        2
 /* wl_surface requests */
 #define WL_SURFACE_DESTROY       0
 #define WL_SURFACE_ATTACH        1
 #define WL_SURFACE_DAMAGE        2
 #define WL_SURFACE_FRAME         3
 #define WL_SURFACE_COMMIT        6
-/* wl_buffer events */
+/* wl_buffer requests/events */
+#define WL_BUFFER_DESTROY        0
 #define WL_BUFFER_EV_RELEASE     0
+/* wl_region requests */
+#define WL_REGION_DESTROY        0
 /* xdg_wm_base / xdg_surface / xdg_toplevel -- the shell protocol GTK and
  * Firefox use to get a real, titled, sized window. */
+#define XDG_WM_BASE_DESTROY           0
+#define XDG_WM_BASE_CREATE_POSITIONER 1
 #define XDG_WM_BASE_GET_XDG_SURFACE 2
 #define XDG_WM_BASE_PONG            3
+#define XDG_SURFACE_DESTROY         0
 #define XDG_SURFACE_GET_TOPLEVEL    1
+#define XDG_SURFACE_GET_POPUP       2
 #define XDG_SURFACE_ACK_CONFIGURE   4
 #define XDG_SURFACE_EV_CONFIGURE    0
+#define XDG_TOPLEVEL_DESTROY        0
 #define XDG_TOPLEVEL_SET_TITLE      2
 #define XDG_TOPLEVEL_EV_CONFIGURE   0
+#define XDG_POPUP_DESTROY           0
+#define XDG_POSITIONER_DESTROY      0
 /* wl_seat / wl_pointer / wl_keyboard -- input, back out to the client. */
 #define WL_SEAT_GET_POINTER      0
 #define WL_SEAT_GET_KEYBOARD     1
+#define WL_SEAT_RELEASE          3
+/* wl_pointer.set_cursor is what makes a surface A CURSOR, and it is the only
+ * way to know: a cursor's buffer is a wl_shm buffer like any other. A
+ * compositor that cannot tell one apart from a window eventually paints a
+ * window with a mouse pointer. (M2058) */
+#define WL_POINTER_SET_CURSOR    0
+#define WL_POINTER_RELEASE       1
+#define WL_KEYBOARD_RELEASE      0
 #define WL_SEAT_EV_CAPABILITIES  0
 #define WL_SEAT_EV_NAME          1
 #define WL_SEAT_CAP_POINTER      1
@@ -127,7 +152,12 @@
 #define WL_DDM_CREATE_DATA_SOURCE 0
 #define WL_DDM_GET_DATA_DEVICE    1
 /* wl_subcompositor -- subsurfaces. GTK uses them for tooltips and popups. */
+#define WL_SUBCOMP_DESTROY        0
 #define WL_SUBCOMP_GET_SUBSURFACE 1
+#define WL_SUBSURFACE_DESTROY     0
+#define WL_DATA_SOURCE_DESTROY    1
+#define WL_DATA_DEVICE_RELEASE    2
+#define WL_OUTPUT_RELEASE         0
 
 /* Pixel formats, by the protocol's numbering. These two are the ones every
  * client can produce and the only ones worth claiming until we composite. */
@@ -141,7 +171,29 @@ enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
                WLK_SURFACE, WLK_SHM_POOL, WLK_BUFFER,
                WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL, WLK_POINTER, WLK_KEYBOARD,
                WLK_OUTPUT, WLK_DDM, WLK_DATA_DEVICE, WLK_DATA_SOURCE,
-               WLK_SUBCOMPOSITOR, WLK_SUBSURFACE };
+               WLK_SUBCOMPOSITOR, WLK_SUBSURFACE,
+               WLK_REGION, WLK_XDG_POPUP, WLK_XDG_POSITIONER };
+
+/* WHAT A SURFACE IS FOR -- and why a compositor has to know (M2058).
+ *
+ * A wl_surface on its own is a rectangle of pixels with no meaning. What it
+ * MEANS comes from the ROLE object the client attaches to it afterwards, and
+ * the role is the only thing separating "this is the window" from "this is the
+ * mouse cursor": the buffers are indistinguishable. So a compositor that keeps
+ * one "last committed surface" and draws that draws whatever the client
+ * touched most recently -- which for any real toolkit is a cursor, a tooltip,
+ * or a popup's shadow, not the window. A single-surface demo client never
+ * shows it; Firefox shows it immediately.
+ *
+ * Wayland gives a surface exactly one role, permanently, set by the request
+ * that creates the role object: xdg_surface.get_toplevel,
+ * xdg_surface.get_popup, wl_subcompositor.get_subsurface,
+ * wl_pointer.set_cursor. */
+enum wl_role { WLR_NONE = 0,     /* no role yet -- or a client with no shell at all */
+               WLR_TOPLEVEL,     /* xdg_toplevel: THE window */
+               WLR_POPUP,        /* xdg_popup: a menu, positioned against a parent */
+               WLR_SUBSURFACE,   /* wl_subsurface: part of a parent's window */
+               WLR_CURSOR };     /* wl_pointer.set_cursor: never a window */
 
 struct wl_global { const char *iface; uint32_t version; int kind; };
 /* Advertised in this order; `name` is the index + 1. Version numbers are the
@@ -176,13 +228,29 @@ static const struct wl_global g_globals[] = {
  * talking. (M1986) */
 #define WL_MAXOBJ 512
 struct wl_object {
-    uint32_t id;
+    uint32_t id;                   /* 0 = a FREE slot (see obj_free) */
     int      kind;
     /* wl_shm_pool: the client's shared memory, taken from the passed memfd.
-     * wl_buffer: geometry into its pool. wl_surface: the attached buffer. */
+     * wl_buffer: geometry into its pool.
+     * wl_surface: THE COMMITTED FRAME -- base already includes the buffer's
+     *   offset, so base/stride/width/height is exactly what the window manager
+     *   blits, and `size` is how many bytes from base are known readable. A
+     *   surface with width==0 is UNMAPPED and must not be drawn. This is the
+     *   state that used to live in four file-scope globals. (M2058) */
     uint8_t *base; unsigned long size;
     uint32_t off, width, height, stride, format;
-    uint32_t attached;             /* wl_surface: the wl_buffer id last attached */
+    /* wl_shm_pool: how many bytes the BACKING OBJECT actually owns, which is
+     * the ceiling a resize may not pass. The client's claimed size and the
+     * memfd's real capacity are different numbers and only one of them is
+     * safe to read through. (M2058) */
+    unsigned long cap;
+    int      mfd;                  /* wl_shm_pool: the memfd object behind it, -1 = none */
+    uint32_t attached;             /* wl_surface: the wl_buffer id last attached (PENDING, applied on commit) */
+    int      attach_set;           /* wl_surface: an attach arrived since the last commit. Distinguishes
+                                    * "attached nothing" (keep showing the current frame) from
+                                    * "attached NULL", which is how a toolkit UNMAPS a window. */
+    int      role;                 /* wl_surface: enum wl_role -- what it IS */
+    uint32_t role_id;              /* wl_surface: the role object that gave it that role */
     /* THE VERSION THE CLIENT BOUND AT. A compositor may not send an event that
      * is newer than the interface version its client asked for: the client's
      * proxy has no listener slot for the opcode, and libwayland treats an
@@ -190,7 +258,8 @@ struct wl_object {
      * skip. It kills the connection, and a client whose display is dead just
      * stops -- which from outside is indistinguishable from a hang. (M1998) */
     uint32_t version;
-    uint32_t link;                 /* xdg_surface -> its wl_surface; xdg_toplevel -> its xdg_surface */
+    uint32_t link;                 /* xdg_surface -> its wl_surface; xdg_toplevel/xdg_popup -> its xdg_surface;
+                                    * wl_subsurface -> its wl_surface; wl_buffer -> its wl_shm_pool */
     uint32_t frame_cb;             /* wl_surface: a pending wl_surface.frame callback id (M2042) */
 };
 
@@ -226,52 +295,143 @@ struct wl_client {
                                     * Wayland, and a client ignores input for a surface it has
                                     * not been told it has. */
     uint32_t seat_version;         /* what the client bound wl_seat at: wl_pointer.frame is v5, wl_keyboard.repeat_info is v4 (M1998) */
-    char     title[64];            /* xdg_toplevel.set_title, for the window's titlebar */
+    char     title[64];            /* the most recent xdg_toplevel.set_title, as a fallback */
+    /* TITLES ARE PER TOPLEVEL, not per client (M2058). Firefox names every
+     * window it owns, and one `title` for the whole connection means the
+     * titlebar shows whichever window was named last. Small and keyed by
+     * object id rather than an array slot, because a toplevel can be destroyed
+     * and remade. */
+    struct { uint32_t tl; char s[64]; } tl_title[8];
     struct wl_object obj[WL_MAXOBJ]; int nobj;
 };
 static struct wl_client g_cl[WL_MAXCLIENT];
 static int g_listener = -1;
 int g_wl_verbose;                 /* -append wlverbose: log every message both ways */
 static unsigned g_nconn, g_nmsg, g_nglobal, g_ncommit;
-static uint32_t g_last_pixel;     /* the top-left pixel of the last committed surface */
-static uint32_t g_last_w, g_last_h;
-
-/* The most recently committed surface, for the desktop to draw. Returns NULL
- * until a client has actually committed one. The pointer is into the CLIENT'S
- * shared memory, so what the desktop blits is what the client wrote -- there is
- * no intermediate copy anywhere in the path. (M1980) */
-static uint8_t *g_last_base; static uint32_t g_last_stride;
-const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride) {
-    if (!g_last_base || !g_last_w || !g_last_h) return 0;
-    if (w) *w = g_last_w;
-    if (h) *h = g_last_h;
-    if (stride) *stride = g_last_stride;
-    return (const uint32_t *)g_last_base;
-}
-
-/* The last committed surface's window title, or "" if the client never set
- * one (a client that uses wl_surface without xdg_shell has no title to give). */
-static const char *g_last_title = "";
-const char *wl_surface_title(void) { return g_last_title; }
-
-unsigned wl_commits(void)      { return g_ncommit; }
-uint32_t wl_last_pixel(void)   { return g_last_pixel; }
-uint32_t wl_last_width(void)   { return g_last_w; }
-uint32_t wl_last_height(void)  { return g_last_h; }
+static unsigned g_ndestroy;       /* objects released back to the table (M2058) */
+static unsigned g_nprotoerr;      /* wl_display.error events we had to post (M2058) */
 
 static struct wl_object *obj_find(struct wl_client *c, uint32_t id) {
+    if (!id) return 0;                      /* 0 is the free-slot marker, never an object */
     for (int i = 0; i < c->nobj; i++) if (c->obj[i].id == id) return &c->obj[i];
     return 0;
 }
+static struct wl_object *obj_find_kind(struct wl_client *c, uint32_t id, int kind) {
+    struct wl_object *o = obj_find(c, id);
+    return (o && o->kind == kind) ? o : 0;
+}
+/* A FREED SLOT IS REUSED, so every field has to be reset here (M2058).
+ *
+ * The table used to be append-only: obj_add took c->obj[c->nobj++] and nothing
+ * ever came back, so 512 objects was a hard ceiling on a connection's
+ * LIFETIME rather than on how many objects it holds at once. It got away with
+ * initialising only some fields because a fresh slot was always zero BSS. Now
+ * that slots come back round, a missed field is a value inherited from an
+ * unrelated object -- a stale `link` or `role` is exactly the sort of thing
+ * that reads as "the compositor drew the wrong surface". */
 static struct wl_object *obj_add(struct wl_client *c, uint32_t id, int kind) {
-    if (c->nobj >= WL_MAXOBJ) { kprintf("[wl] object table full\n"); return 0; }
-    struct wl_object *o = &c->obj[c->nobj++];
-    o->id = id; o->kind = kind;
-    o->base = 0; o->size = 0;
-    o->off = o->width = o->height = o->stride = o->format = 0;
-    o->attached = 0;
+    struct wl_object *o = 0;
+    for (int i = 0; i < c->nobj; i++) if (!c->obj[i].id) { o = &c->obj[i]; break; }
+    if (!o) {
+        if (c->nobj >= WL_MAXOBJ) { kprintf("[wl] object table full\n"); return 0; }
+        o = &c->obj[c->nobj++];
+    }
+    for (unsigned b = 0; b < sizeof *o; b++) ((char *)o)[b] = 0;
+    o->id = id; o->kind = kind; o->mfd = -1;
     return o;
 }
+
+/* --- which surface is the WINDOW (M2058) ---------------------------------- *
+ *
+ * This replaced four file-scope globals -- last base, stride, width, height --
+ * that the commit handler overwrote every time ANY surface committed. For the
+ * single-surface demo client that is the same thing as "the window". For a
+ * toolkit it is not: GTK commits a cursor surface as soon as the pointer
+ * enters, so the window's contents became a 24x24 cursor, and Firefox commits
+ * subsurfaces and popups on top of that.
+ *
+ * The committed frame now lives ON THE SURFACE, and this picks one. The rule is
+ * the ROLE, not the clock:
+ *
+ *   - a mapped xdg_toplevel is the window,
+ *   - a surface with no role at all is the window only if there is no
+ *     toplevel: a client that never binds xdg_wm_base (our raw test client,
+ *     and weston-simple-shm) still deserves to be drawn,
+ *   - a popup, a subsurface or a cursor is NEVER the window on its own.
+ *
+ * Ties go to the lowest object id, which is the earliest-created surface, so
+ * the choice is STABLE frame to frame. Picking "most recent" among equals
+ * would make the window flicker between a toolkit's own windows. */
+static int wl_surface_rank(const struct wl_object *o) {
+    if (o->kind != WLK_SURFACE) return 0;
+    if (!o->base || !o->width || !o->height || !o->stride) return 0;   /* unmapped */
+    switch (o->role) {
+    case WLR_TOPLEVEL:   return 3;
+    case WLR_NONE:       return 2;
+    case WLR_POPUP:
+    case WLR_SUBSURFACE: return 1;
+    default:             return 0;      /* WLR_CURSOR: not a window, ever */
+    }
+}
+static struct wl_object *wl_draw_surface(struct wl_client **owner) {
+    struct wl_object *best = 0; int bestrank = 0; struct wl_client *bestc = 0;
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used) continue;
+        for (int j = 0; j < c->nobj; j++) {
+            struct wl_object *o = &c->obj[j];
+            int r = wl_surface_rank(o);
+            if (!r) continue;
+            if (r > bestrank) { best = o; bestrank = r; bestc = c; }
+            /* Among equals: the same client's earliest surface. A DIFFERENT
+             * client of equal rank does not displace one already chosen, so
+             * the desktop's one Wayland window keeps belonging to whoever
+             * mapped first. */
+            else if (r == bestrank && c == bestc && best && o->id < best->id) best = o;
+        }
+    }
+    if (owner) *owner = bestc;
+    return best;
+}
+
+/* The surface the window manager should draw. NULL until one exists. The
+ * pointer is into the CLIENT'S shared memory, so what the desktop blits is what
+ * the client wrote -- there is no intermediate copy anywhere in the path.
+ * (M1980) */
+const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride) {
+    struct wl_object *o = wl_draw_surface(0);
+    if (!o) return 0;
+    if (w) *w = o->width;
+    if (h) *h = o->height;
+    if (stride) *stride = o->stride;
+    return (const uint32_t *)o->base;
+}
+
+/* That surface's window title, or "" if it has none (a client that uses
+ * wl_surface without xdg_shell has no title to give). Looked up from the
+ * surface's own role object, so a client with several windows gets the right
+ * one rather than whichever it named last. */
+const char *wl_surface_title(void) {
+    struct wl_client *c = 0;
+    struct wl_object *o = wl_draw_surface(&c);
+    if (!o || !c) return "";
+    if (o->role == WLR_TOPLEVEL && o->role_id)
+        for (int i = 0; i < (int)(sizeof c->tl_title / sizeof c->tl_title[0]); i++)
+            if (c->tl_title[i].tl == o->role_id && c->tl_title[i].s[0])
+                return c->tl_title[i].s;
+    return c->title[0] ? c->title : "Wayland client";
+}
+
+unsigned wl_commits(void)      { return g_ncommit; }
+unsigned wl_destroys(void)     { return g_ndestroy; }
+unsigned wl_proto_errors(void) { return g_nprotoerr; }
+uint32_t wl_last_pixel(void) {
+    struct wl_object *o = wl_draw_surface(0);
+    return o ? ((uint32_t)o->base[0] | ((uint32_t)o->base[1] << 8) |
+                ((uint32_t)o->base[2] << 16) | ((uint32_t)o->base[3] << 24)) : 0;
+}
+uint32_t wl_last_width(void)  { struct wl_object *o = wl_draw_surface(0); return o ? o->width : 0; }
+uint32_t wl_last_height(void) { struct wl_object *o = wl_draw_surface(0); return o ? o->height : 0; }
 
 unsigned wl_clients_connected(void) { return g_nconn; }
 unsigned wl_messages_handled(void)  { return g_nmsg; }
@@ -435,6 +595,184 @@ static void wl_unhandled(int kind, uint32_t obj, int opcode) {
 }
 unsigned wl_unhandled_count(void) { return (unsigned)g_nunhandled; }
 
+/* wl_display.error(object_id, code, message) -- and then the connection is
+ * OVER: libwayland treats it as fatal, stops dispatching, and reports it
+ * through wl_display_get_error. That is the point. A request we cannot honour
+ * and answer with SILENCE leaves the client waiting for a frame that will never
+ * arrive, which from outside is a hang with no cause anywhere. Naming it costs
+ * the connection and buys a diagnosis. (M2058) */
+static void wl_post_error(struct wl_client *c, uint32_t obj, uint32_t code, const char *msg) {
+    uint8_t b[256]; int p = 0;
+    wr32(b + p, obj);  p += 4;
+    wr32(b + p, code); p += 4;
+    p = put_string(b, p, msg);
+    wl_send(c, WL_DISPLAY_ID, WL_DISPLAY_EV_ERROR, b, p);
+    g_nprotoerr++;
+    kprintf("[wl] protocol error posted on object %u: code %u, \"%s\"\n", obj, code, msg);
+}
+
+static const char *wl_role_name(int r) {
+    switch (r) {
+    case WLR_TOPLEVEL:   return "toplevel";
+    case WLR_POPUP:      return "popup";
+    case WLR_SUBSURFACE: return "subsurface";
+    case WLR_CURSOR:     return "cursor";
+    default:             return "no role";
+    }
+}
+
+/* An unmapped surface has no frame and is not drawn. Attaching a NULL buffer
+ * and committing is how a toolkit hides a window, and losing a role object
+ * does the same thing implicitly. */
+static void wl_surface_unmap(struct wl_object *sf) {
+    sf->base = 0; sf->size = 0;
+    sf->off = sf->width = sf->height = sf->stride = sf->format = 0;
+}
+
+/* From a ROLE object back to the wl_surface it speaks for. The links are the
+ * ones the creating requests recorded: one hop for an xdg_surface or a
+ * subsurface, two for a toplevel or a popup. */
+static struct wl_object *wl_role_surface(struct wl_client *c, struct wl_object *o) {
+    switch (o->kind) {
+    case WLK_XDG_SURFACE:
+    case WLK_SUBSURFACE:
+        return obj_find_kind(c, o->link, WLK_SURFACE);
+    case WLK_XDG_TOPLEVEL:
+    case WLK_XDG_POPUP: {
+        struct wl_object *xs = obj_find_kind(c, o->link, WLK_XDG_SURFACE);
+        return xs ? obj_find_kind(c, xs->link, WLK_SURFACE) : 0;
+    }
+    default: return 0;
+    }
+}
+
+/* Give `sid` a role. A Wayland surface has exactly one, for life, so an
+ * attempt to change it is a client bug -- and refusing to overwrite is also
+ * what stops a bug HERE from quietly demoting a window to a cursor. */
+static void wl_give_role(struct wl_client *c, uint32_t sid, int role, uint32_t role_id) {
+    struct wl_object *sf = obj_find_kind(c, sid, WLK_SURFACE);
+    if (!sf) return;
+    if (sf->role != WLR_NONE && sf->role != role) {
+        kprintf("[wl] surface %u already has the %s role; refusing to make it a %s\n",
+                sid, wl_role_name(sf->role), wl_role_name(role));
+        return;
+    }
+    sf->role = role; sf->role_id = role_id;
+    kprintf("[wl] surface %u is a %s (role object %u)\n", sid, wl_role_name(role), role_id);
+}
+
+/* A surface whose role object is destroyed is unmapped: it is no longer a
+ * window, a popup or anything else, and a compositor that keeps drawing it
+ * shows a window the client has already taken down. */
+static void wl_role_gone(struct wl_client *c, struct wl_object *role) {
+    struct wl_object *sf = wl_role_surface(c, role);
+    if (!sf) return;
+    if (!sf->role_id || sf->role_id == role->id) { sf->role = WLR_NONE; sf->role_id = 0; }
+    wl_surface_unmap(sf);
+}
+
+/* THE DESTRUCTOR OPCODE OF EACH INTERFACE, from the protocol XML. It is not
+ * always 0: wl_shm_pool.destroy is 1 (create_buffer took 0), wl_pointer.release
+ * is 1, wl_data_device.release is 2, wl_seat.release is 3. Getting one wrong
+ * turns a live object into a freed slot, or leaks it forever. -1 = the
+ * interface has no destructor (wl_compositor, wl_data_device_manager). */
+static int wl_destructor_op(int kind) {
+    switch (kind) {
+    case WLK_SURFACE:        return WL_SURFACE_DESTROY;
+    case WLK_BUFFER:         return WL_BUFFER_DESTROY;
+    case WLK_REGION:         return WL_REGION_DESTROY;
+    case WLK_SUBSURFACE:     return WL_SUBSURFACE_DESTROY;
+    case WLK_SUBCOMPOSITOR:  return WL_SUBCOMP_DESTROY;
+    case WLK_XDG_WM_BASE:    return XDG_WM_BASE_DESTROY;
+    case WLK_XDG_SURFACE:    return XDG_SURFACE_DESTROY;
+    case WLK_XDG_TOPLEVEL:   return XDG_TOPLEVEL_DESTROY;
+    case WLK_XDG_POPUP:      return XDG_POPUP_DESTROY;
+    case WLK_XDG_POSITIONER: return XDG_POSITIONER_DESTROY;
+    case WLK_KEYBOARD:       return WL_KEYBOARD_RELEASE;
+    case WLK_OUTPUT:         return WL_OUTPUT_RELEASE;
+    case WLK_SHM_POOL:       return WL_SHM_POOL_DESTROY;
+    case WLK_POINTER:        return WL_POINTER_RELEASE;
+    case WLK_SHM:            return WL_SHM_RELEASE;
+    case WLK_DATA_SOURCE:    return WL_DATA_SOURCE_DESTROY;
+    case WLK_DATA_DEVICE:    return WL_DATA_DEVICE_RELEASE;
+    case WLK_SEAT:           return WL_SEAT_RELEASE;
+    default:                 return -1;
+    }
+}
+
+/* OBJECT DESTRUCTION (M2058).
+ *
+ * There was none at all: obj_add only ever appended, so WL_MAXOBJ was a budget
+ * for a connection's whole LIFETIME and every destroyed object stayed in the
+ * table with its state intact. The visible consequence is not the ceiling but
+ * the staleness -- a destroyed surface kept its committed frame, so a window
+ * the client had already taken down was still eligible to be drawn.
+ *
+ * Releasing the slot means dropping everything that names it first, and then
+ * telling the client, because a client may NOT reuse an object id until the
+ * server has sent wl_display.delete_id for it. Without that a toolkit's ids
+ * climb forever, which is why WL_MAXOBJ had to be raised to 512 to begin
+ * with. */
+static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
+    uint32_t id = o->id;
+    int kind = o->kind;
+    switch (kind) {
+    case WLK_SURFACE:
+        /* Input may not keep being delivered to a surface that is gone, and
+         * clearing ptr_in/kbd_in makes the next enter() be sent for whatever
+         * surface replaces it. */
+        if (c->surface == id) { c->surface = 0; c->ptr_in = c->kbd_in = 0; }
+        break;
+    case WLK_BUFFER:
+        /* The COMMITTED frame stays: a wl_surface owns its content and the
+         * pool owns the memory, which is what the protocol says and what lets
+         * a client destroy a buffer the moment it has committed it. But no
+         * surface may keep the id PENDING, because it is about to be handed
+         * back out -- possibly to an object of a different kind, and then the
+         * next commit would resolve it to something that is not a buffer. */
+        for (int i = 0; i < c->nobj; i++)
+            if (c->obj[i].id && c->obj[i].kind == WLK_SURFACE && c->obj[i].attached == id)
+                { c->obj[i].attached = 0; c->obj[i].attach_set = 0; }
+        break;
+    case WLK_SHM_POOL:
+        /* Buffers cut from this pool stay valid -- the protocol is explicit
+         * that destroying a pool does not invalidate them -- so they keep the
+         * base and size they copied. They only lose the BACKLINK, so a reused
+         * pool id cannot be mistaken for their pool.
+         *
+         * NOT RELEASED HERE: the memfd reference app_scm_take_memfd took. There
+         * is no call to hand one back, and dropping it while buffers still read
+         * through the memory would be far worse than leaking it -- doing this
+         * properly needs the pool refcounted by its buffers. */
+        break;
+    case WLK_XDG_SURFACE:
+    case WLK_XDG_TOPLEVEL:
+    case WLK_XDG_POPUP:
+    case WLK_SUBSURFACE:
+        wl_role_gone(c, o);
+        if (kind == WLK_XDG_TOPLEVEL)
+            for (int i = 0; i < (int)(sizeof c->tl_title / sizeof c->tl_title[0]); i++)
+                if (c->tl_title[i].tl == id) { c->tl_title[i].tl = 0; c->tl_title[i].s[0] = 0; }
+        break;
+    case WLK_POINTER:  if (c->pointer  == id) { c->pointer  = 0; c->ptr_in = 0; } break;
+    case WLK_KEYBOARD: if (c->keyboard == id) { c->keyboard = 0; c->kbd_in = 0; } break;
+    default: break;
+    }
+    /* NOBODY MAY STILL NAME IT. The id is about to be handed back out, so a
+     * surviving `link` would silently re-point at whatever object takes the
+     * slot next: a toplevel would find a stranger's xdg_surface, a buffer a
+     * stranger's pool. One sweep covers every relationship in the table rather
+     * than one per kind, which is also one fewer place to forget. */
+    for (int i = 0; i < c->nobj; i++)
+        if (c->obj[i].id && c->obj[i].link == id) c->obj[i].link = 0;
+    for (unsigned b = 0; b < sizeof *o; b++) ((char *)o)[b] = 0;   /* id 0 = the slot is free */
+    o->mfd = -1;
+    g_ndestroy++;
+    uint8_t d[4]; wr32(d, id);
+    wl_send(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, d, 4);
+    if (g_wl_verbose) kprintf("[wl] destroyed %s@%u\n", wl_kind_name(kind), id);
+}
+
 /* Handle one complete message. Returns 0 always (an unknown object or opcode is
  * ignored rather than fatal: a client may create objects we do not model yet,
  * and killing the connection would turn a missing feature into a hang). */
@@ -550,10 +888,25 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     struct wl_object *o = obj_find(c, obj);
     if (!o) { wl_unhandled(WLK_NONE, obj, opcode); return; }   /* an object we do not model: ignore, never fatal -- but SAY SO */
 
+    /* DESTRUCTORS FIRST (M2058). Every one of them is checked here rather than
+     * scattered through the handlers below, because the opcode differs per
+     * interface and a destructor that falls through to wl_unhandled leaks the
+     * object AND leaves the client unable to reuse its id. No opcode below
+     * collides with its own interface's destructor -- see wl_destructor_op. */
+    if (opcode == wl_destructor_op(o->kind)) { wl_destroy_obj(c, o); return; }
+
     if (o->kind == WLK_COMPOSITOR && opcode == WL_COMPOSITOR_CREATE_SURFACE && alen >= 4) {
         uint32_t sid = rd32(args);
         obj_add(c, sid, WLK_SURFACE);
-        if (!c->surface) c->surface = sid;      /* input goes to the first surface */
+        if (!c->surface) c->surface = sid;      /* input goes to the first surface, until a toplevel appears */
+        return;
+    }
+    /* wl_region: a shape, used for the opaque and input regions. We model the
+     * OBJECT and nothing else -- we do not clip yet -- but it has to exist, or
+     * its destroy has no object to find and the client never gets a delete_id
+     * for an id it makes one of per window per frame. */
+    if (o->kind == WLK_COMPOSITOR && opcode == WL_COMPOSITOR_CREATE_REGION && alen >= 4) {
+        obj_add(c, rd32(args), WLK_REGION);
         return;
     }
     if (o->kind == WLK_SHM && opcode == WL_SHM_CREATE_POOL && alen >= 8) {
@@ -565,14 +918,71 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         uint32_t size = rd32(args + 4);
         struct wl_object *po = obj_add(c, nid, WLK_SHM_POOL);
         if (!po) return;
-        void *base = 0; unsigned long msz = 0;
-        if (app_scm_take_memfd(c->ep, &base, &msz) == 0) {
+        void *base = 0; unsigned long msz = 0; int mi = -1;
+        if (app_scm_take_memfd_idx(c->ep, &base, &msz, &mi) == 0) {
             po->base = (uint8_t *)base;
             po->size = msz < size ? msz : size;
-            kprintf("[wl] shm pool %u: %lu bytes of the client's own memory\n", nid, po->size);
+            /* KEEP THE OBJECT, not just the pointer (M2058). wl_shm_pool.resize
+             * has to ask how big the backing memfd actually IS: the client's
+             * claimed size is the size it WANTED, and its ftruncate can have
+             * been refused. */
+            po->mfd  = mi;
+            po->cap  = po->size;
+            unsigned long mcap = 0;
+            if (app_memfd_obj_info(mi, 0, 0, &mcap) == 0 && mcap > po->cap) po->cap = mcap;
+            kprintf("[wl] shm pool %u: %lu bytes of the client's own memory (%lu usable)\n",
+                    nid, po->size, po->cap);
         } else {
             kprintf("[wl] shm pool %u: NO descriptor arrived (SCM_RIGHTS missing)\n", nid);
         }
+        return;
+    }
+    /* wl_shm_pool.resize(size) -- the client grew the file behind the pool and
+     * is telling us so. THIS IS NOT A FORMALITY: GTK doubles its pool whenever
+     * a window grows, and until now the request fell through to wl_unhandled,
+     * so the compositor kept the old size, every buffer cut past it failed the
+     * bounds check in commit, and the window stayed blank with no error
+     * anywhere.
+     *
+     * The size is CHECKED against the object rather than believed. A client
+     * grows a pool with ftruncate, and ftruncate on a memfd that is already
+     * mapped is refused by memfd_grow (reallocating would leave live mappings
+     * pointing at freed kernel heap) -- so a client can reach this request
+     * having failed to grow anything, and a compositor that takes the number on
+     * trust reads off the end of the pool. (M2058) */
+    if (o->kind == WLK_SHM_POOL && opcode == WL_SHM_POOL_RESIZE && alen >= 4) {
+        uint32_t want = rd32(args + 0);
+        void *nb = 0; unsigned long mcap = 0;
+        if (o->mfd >= 0 && app_memfd_obj_info(o->mfd, &nb, 0, &mcap) == 0) {
+            o->base = (uint8_t *)nb;              /* the object is the truth, not our copy */
+            o->cap  = mcap;
+        }
+        if ((unsigned long)want <= o->size) {
+            kprintf("[wl] shm pool %u: resize to %u is not bigger than the current %lu -- "
+                    "the protocol only allows growing\n", o->id, want, o->size);
+            wl_post_error(c, o->id, WL_SHM_ERR_INVALID_FD,
+                          "wl_shm_pool.resize can only make a pool bigger");
+            return;
+        }
+        if ((unsigned long)want > o->cap) {
+            kprintf("[wl] shm pool %u: resize to %u but the backing memfd owns only %lu bytes. "
+                    "The client's ftruncate was refused because the object is already MAPPED "
+                    "(memfd_grow would have to reallocate and every live mapping would dangle). "
+                    "Refusing rather than reading past the pool.\n", o->id, want, o->cap);
+            wl_post_error(c, o->id, WL_SHM_ERR_INVALID_FD,
+                          "the file behind this pool is smaller than the requested size");
+            return;
+        }
+        o->size = want;
+        /* Every buffer already cut from this pool now has more room behind it.
+         * They keep their own base/size so they survive the pool's destruction,
+         * which means they have to be refreshed here rather than re-deriving
+         * it at commit. */
+        for (int i = 0; i < c->nobj; i++)
+            if (c->obj[i].id && c->obj[i].kind == WLK_BUFFER && c->obj[i].link == o->id) {
+                c->obj[i].base = o->base; c->obj[i].size = o->size;
+            }
+        kprintf("[wl] shm pool %u: resized to %lu bytes\n", o->id, o->size);
         return;
     }
     if (o->kind == WLK_SHM_POOL && opcode == WL_SHM_POOL_CREATE_BUFFER && alen >= 24) {
@@ -580,6 +990,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         struct wl_object *bo = obj_add(c, rd32(args + 0), WLK_BUFFER);
         if (!bo) return;
         bo->base   = o->base; bo->size = o->size;
+        bo->link   = o->id;                          /* its pool, so a resize can refresh it */
         bo->off    = rd32(args + 4);
         bo->width  = rd32(args + 8);
         bo->height = rd32(args + 12);
@@ -599,8 +1010,21 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         return;
     }
     if (o->kind == WLK_SUBCOMPOSITOR && opcode == WL_SUBCOMP_GET_SUBSURFACE && alen >= 12) {
+        uint32_t sid = rd32(args + 4);                /* the wl_surface it wraps */
         struct wl_object *ss = obj_add(c, rd32(args + 0), WLK_SUBSURFACE);
-        if (ss) ss->link = rd32(args + 4);            /* the wl_surface it wraps */
+        if (ss) { ss->link = sid; wl_give_role(c, sid, WLR_SUBSURFACE, ss->id); }
+        return;
+    }
+    /* wl_pointer.set_cursor(serial, surface, hotspot_x, hotspot_y). THE REASON
+     * THIS EXISTS HERE (M2058): a cursor is a wl_surface with a wl_shm buffer,
+     * indistinguishable from a window unless the compositor listens to this.
+     * GTK sets a cursor as soon as the pointer enters, so with a single
+     * "last committed surface" the window's contents became a 24x24 cursor
+     * bitmap the moment the mouse moved over it. `surface` may be nil, which
+     * means "hide the pointer". */
+    if (o->kind == WLK_POINTER && opcode == WL_POINTER_SET_CURSOR && alen >= 8) {
+        uint32_t sid = rd32(args + 4);
+        if (sid) wl_give_role(c, sid, WLR_CURSOR, o->id);
         return;
     }
     if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_POINTER && alen >= 4) {
@@ -649,10 +1073,55 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         if (xs) xs->link = rd32(args + 4);              /* the wl_surface it wraps */
         return;
     }
+    if (o->kind == WLK_XDG_WM_BASE && opcode == XDG_WM_BASE_CREATE_POSITIONER && alen >= 4) {
+        obj_add(c, rd32(args + 0), WLK_XDG_POSITIONER);
+        return;
+    }
+    /* xdg_positioner.set_size(width, height): the only thing we read off a
+     * positioner. Placement -- anchor, gravity, constraint adjustment -- is
+     * NOT implemented, so a popup appears at the origin of its parent rather
+     * than where the client asked. */
+    if (o->kind == WLK_XDG_POSITIONER && opcode == 1 && alen >= 8) {
+        o->width = rd32(args + 0); o->height = rd32(args + 4);
+        return;
+    }
+    /* get_popup(new_id, parent, positioner). A popup is a menu: it has pixels
+     * and commits like anything else, and it is NOT the window.
+     *
+     * It needs BOTH configures, in this order. xdg_popup.configure carries the
+     * geometry and xdg_surface.configure closes the sequence; a popup that gets
+     * only the second one has been told it is configured without being told how
+     * big it is, and a popup that gets neither -- which is what fell out of
+     * get_popup having no handler at all -- never maps and never says why. */
+    if (o->kind == WLK_XDG_SURFACE && opcode == XDG_SURFACE_GET_POPUP && alen >= 12) {
+        uint32_t pid = rd32(args + 0);
+        struct wl_object *ps = obj_find_kind(c, rd32(args + 8), WLK_XDG_POSITIONER);
+        struct wl_object *pp = obj_add(c, pid, WLK_XDG_POPUP);
+        if (pp) { pp->link = o->id; wl_give_role(c, o->link, WLR_POPUP, pid); }
+        uint8_t pb[16]; int pq = 0;
+        wr32(pb + pq, 0); pq += 4;                             /* x: see the positioner note */
+        wr32(pb + pq, 0); pq += 4;                             /* y */
+        wr32(pb + pq, ps && ps->width  ? ps->width  : 1); pq += 4;
+        wr32(pb + pq, ps && ps->height ? ps->height : 1); pq += 4;
+        wl_send(c, pid, 0 /* xdg_popup.configure */, pb, pq);
+        uint8_t sb2[4]; wr32(sb2, ++c->serial);
+        wl_send(c, o->id, XDG_SURFACE_EV_CONFIGURE, sb2, 4);
+        return;
+    }
     if (o->kind == WLK_XDG_SURFACE && opcode == XDG_SURFACE_GET_TOPLEVEL && alen >= 4) {
         uint32_t tid = rd32(args + 0);
         struct wl_object *tl = obj_add(c, tid, WLK_XDG_TOPLEVEL);
         if (tl) tl->link = o->id;
+        /* THE SURFACE IS NOW THE WINDOW. This is the one fact the compositor
+         * needs in order to draw the right buffer, and it arrives here -- in
+         * the request that creates the role -- not at commit time. */
+        wl_give_role(c, o->link, WLR_TOPLEVEL, tid);
+        /* Input follows the window, not creation order. "the first surface
+         * created" is right for a one-surface demo and wrong for a toolkit,
+         * which makes cursor and popup surfaces too. */
+        if (o->link && c->surface != o->link) {
+            c->surface = o->link; c->ptr_in = c->kbd_in = 0;
+        }
         /* A toplevel is not mapped until the client has acknowledged a
          * configure, so the compositor has to send one UNPROMPTED -- a client
          * that never gets configure never attaches a buffer, and waits
@@ -674,6 +1143,15 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             if (n > sizeof c->title - 1) n = sizeof c->title - 1;
             for (unsigned i = 0; i < n; i++) c->title[i] = (char)args[4 + i];
             c->title[n] = 0;
+            /* ...and keyed by the TOPLEVEL, so a client with several windows
+             * does not have them all named after the last one it titled. */
+            int nt = (int)(sizeof c->tl_title / sizeof c->tl_title[0]), slot = -1;
+            for (int i = 0; i < nt; i++) if (c->tl_title[i].tl == o->id) { slot = i; break; }
+            if (slot < 0) for (int i = 0; i < nt; i++) if (!c->tl_title[i].tl) { slot = i; break; }
+            if (slot >= 0) {
+                c->tl_title[slot].tl = o->id;
+                for (unsigned i = 0; i <= n; i++) c->tl_title[slot].s[i] = c->title[i];
+            }
             kprintf("[wl] toplevel title: \"%s\"\n", c->title);
         }
         return;
@@ -681,9 +1159,21 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     if (o->kind == WLK_XDG_SURFACE && opcode == XDG_SURFACE_ACK_CONFIGURE) return;  /* nothing to do yet */
 
     if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_ATTACH && alen >= 4) {
-        o->attached = rd32(args + 0);                /* the wl_buffer id */
+        o->attached = rd32(args + 0);                /* the wl_buffer id, or 0 = detach */
+        o->attach_set = 1;                           /* ...applied at the next commit */
         return;
     }
+    /* Requests a surface makes constantly and that need no reply. Named
+     * explicitly so the log stops reporting them as gaps the client is waiting
+     * on -- they are not. We do not clip to regions or scale buffers yet, which
+     * is a missing FEATURE rather than a missing answer. */
+    if (o->kind == WLK_SURFACE && (opcode == WL_SURFACE_DAMAGE || opcode == 4 /* set_opaque_region */ ||
+                                   opcode == 5 /* set_input_region */ || opcode == 7 /* set_buffer_transform */ ||
+                                   opcode == 8 /* set_buffer_scale */ || opcode == 9 /* damage_buffer */ ||
+                                   opcode == 10 /* offset */)) return;
+    if (o->kind == WLK_REGION) return;               /* add/subtract: nothing to clip against yet */
+    if (o->kind == WLK_XDG_POSITIONER) return;       /* the whole interface is setters */
+    if (o->kind == WLK_XDG_SURFACE && opcode == 3 /* set_window_geometry */) return;
     /* wl_surface.frame HAD NO DISPATCH AT ALL (M2042).
      *
      * The opcode was #defined and then fell through to wl_unhandled, so the
@@ -703,22 +1193,39 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     }
     if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_COMMIT) {
         /* THE POINT OF ALL OF IT: the client's pixels are now ours to read,
-         * in the memory it wrote them to. Nothing was copied to get here. */
-        struct wl_object *b = o->attached ? obj_find(c, o->attached) : 0;
-        if (b && b->base && b->height && b->stride) {
+         * in the memory it wrote them to. Nothing was copied to get here.
+         *
+         * A commit applies the PENDING state. No attach since the last commit
+         * means "keep showing the current frame" (a client commits to answer a
+         * frame callback or to update damage); an attach of NULL means UNMAP,
+         * which is how a toolkit hides a window. Treating the two the same
+         * either loses a frame or keeps drawing a window that is gone. */
+        struct wl_object *b = obj_find_kind(c, o->attached, WLK_BUFFER);
+        if (o->attach_set && !o->attached) {
+            wl_surface_unmap(o);
+            o->attach_set = 0;
+            kprintf("[wl] commit: surface %u attached NULL -- unmapped\n", o->id);
+        } else if (b && b->base && b->height && b->stride) {
             unsigned long need = (unsigned long)b->off + (unsigned long)b->stride * b->height;
             if (need <= b->size) {
-                g_last_pixel = rd32(b->base + b->off);
-                g_last_w = b->width; g_last_h = b->height;
-                g_last_base = b->base + b->off; g_last_stride = b->stride;
-                g_last_title = c->title[0] ? c->title : "Wayland client";
+                /* THE COMMITTED FRAME BELONGS TO THE SURFACE (M2058). This used
+                 * to be four file-scope globals, so the last surface to commit
+                 * anything became the window's contents. */
+                o->base   = b->base + b->off;
+                o->size   = b->size - b->off;
+                o->off    = 0;
+                o->width  = b->width; o->height = b->height;
+                o->stride = b->stride; o->format = b->format;
                 g_ncommit++;
-                kprintf("[wl] commit: %ux%u stride %u format %u -> first pixel 0x%08x\n",
-                        b->width, b->height, b->stride, b->format, g_last_pixel);
+                kprintf("[wl] commit: %ux%u stride %u format %u -> first pixel 0x%08x"
+                        " (surface %u, %s)\n",
+                        b->width, b->height, b->stride, b->format, rd32(o->base),
+                        o->id, wl_role_name(o->role));
             } else {
                 kprintf("[wl] commit: buffer claims %lu bytes but the pool holds %lu -- refusing\n",
                         need, b->size);
             }
+            o->attach_set = 0;
             /* Tell the client it may reuse the buffer. Without this a client
              * that double-buffers waits forever for its first frame back. */
             wl_send(c, b->id, WL_BUFFER_EV_RELEASE, 0, 0);
@@ -731,11 +1238,235 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             ts[0] = (uint8_t)ms; ts[1] = (uint8_t)(ms >> 8);
             ts[2] = (uint8_t)(ms >> 16); ts[3] = (uint8_t)(ms >> 24);
             wl_send(c, o->frame_cb, WL_CALLBACK_EV_DONE, ts, 4);
+            /* ...and RELEASE THE ID. A wl_callback has no destructor request:
+             * the server destroys it after `done`, and the client cannot reuse
+             * the id until delete_id says so. A toolkit asks for a frame
+             * callback before every frame, so leaving this out leaks an id per
+             * frame -- thousands of them in a minute of animation, which is the
+             * other half of why the object table only ever grew. (M2058) */
+            uint8_t dq[4]; wr32(dq, o->frame_cb);
+            wl_send(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, dq, 4);
             o->frame_cb = 0;                       /* one done per request */
         }
         return;
     }
     wl_unhandled(o->kind, obj, opcode);
+}
+
+
+/* ===== SELF-TEST: WHICH SURFACE IS THE WINDOW? (M2058) ====================
+ *
+ * The bug this exists to keep dead: the compositor kept ONE file-scope "last
+ * committed surface" -- base, stride, width, height -- and the window blit read
+ * it. Every client we had ever run made exactly one surface, so it looked
+ * right. Every real toolkit makes several, and the LAST one to commit won: GTK
+ * commits a cursor surface as soon as the pointer enters a window, so the
+ * window's contents became a 24x24 cursor bitmap.
+ *
+ * That cannot be caught by a single-surface client, which is why the existing
+ * libwayland test passed throughout. So this drives the dispatcher with the
+ * exact message sequence that produces it, on a synthetic client whose socket
+ * goes nowhere, and asserts the compositor picks the TOPLEVEL. It needs no
+ * client, no socket and no display, so it runs in the same boot as the real
+ * one.
+ *
+ * Every event the compositor sends is read back OUT OF THE OUTPUT QUEUE and
+ * checked as bytes (st_seen), because "we called wl_send" and "the client will
+ * receive a well-formed message" are different claims.
+ */
+static int g_st_fail, g_st_checks;
+static void st_ck(const char *what, int ok) {
+    g_st_checks++;
+    if (!ok) g_st_fail++;
+    kprintf("WLSELFTEST: %s -- %s\n", ok ? "ok" : "FAIL", what);
+}
+
+/* One request, straight into the dispatcher: all-u32 arguments covers every
+ * request this test needs except set_title. */
+static void st_req(struct wl_client *c, uint32_t obj, uint16_t op, const uint32_t *a, int n) {
+    uint8_t m[128];
+    int total = 8 + 4 * n;
+    wr32(m + 0, obj);
+    wr32(m + 4, ((uint32_t)total << 16) | op);
+    for (int i = 0; i < n; i++) wr32(m + 8 + 4 * i, a[i]);
+    wl_dispatch(c, m, total);
+}
+static void st_title(struct wl_client *c, uint32_t tl, const char *t) {
+    uint8_t m[128];
+    int p = put_string(m, 8, t);
+    wr32(m + 0, tl);
+    wr32(m + 4, ((uint32_t)p << 16) | XDG_TOPLEVEL_SET_TITLE);
+    wl_dispatch(c, m, p);
+}
+/* Did we actually put that event on the wire? The queue is never drained here
+ * (the endpoint is -1, so unix_send fails), which makes it a transcript. */
+static int st_seen(struct wl_client *c, uint32_t obj, uint16_t op, uint32_t a0, int check_a0) {
+    int off = 0;
+    while (off + 8 <= c->outlen) {
+        uint32_t o = rd32(c->out + off);
+        uint32_t so = rd32(c->out + off + 4);
+        int sz = (int)(so >> 16);
+        uint16_t opc = (uint16_t)(so & 0xFFFF);
+        if (sz < 8 || off + sz > c->outlen) break;
+        if (o == obj && opc == op &&
+            (!check_a0 || (sz >= 12 && rd32(c->out + off + 8) == a0))) return 1;
+        off += sz;
+    }
+    return 0;
+}
+static int st_streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+static void st_fill(uint8_t *p, int npix, uint32_t v) {
+    for (int i = 0; i < npix; i++) wr32(p + 4 * i, v);
+}
+
+void wl_selftest(void) {
+    /* THE COUNTERS ARE RESTORED AT THE END. The boot self-test and the harness
+     * both read wl_commits()/wl_messages_handled(), and kmain hands over to the
+     * desktop as soon as a commit has been seen -- a self-test that leaves
+     * those moved would break the very test it is meant to protect. */
+    unsigned s_nmsg = g_nmsg, s_ncommit = g_ncommit, s_nglobal = g_nglobal;
+    unsigned s_ndestroy = g_ndestroy, s_nproto = g_nprotoerr, s_nconn = g_nconn;
+    int s_nunh = g_nunhandled;
+    int slot = -1;
+    for (int i = 0; i < WL_MAXCLIENT; i++) if (!g_cl[i].used) { slot = i; break; }
+    if (slot < 0) { kprintf("WLSELFTEST: FAIL -- no free client slot\n"); return; }
+    struct wl_client *c = &g_cl[slot];
+    for (unsigned b = 0; b < sizeof *c; b++) ((char *)c)[b] = 0;
+    c->used = 1;
+    c->ep = -1;                  /* goes nowhere: the queue fills and stays */
+    g_st_fail = 0; g_st_checks = 0;
+
+    const unsigned long PSZ = 64 * 1024;
+    uint8_t *pool = kmalloc(PSZ);
+    if (!pool) { kprintf("WLSELFTEST: FAIL -- out of memory\n"); c->used = 0; return; }
+    for (unsigned long i = 0; i < PSZ; i++) pool[i] = 0;
+    st_fill(pool + 0,     32 * 16, 0x11223344u);   /* window one   32x16 */
+    st_fill(pool + 4096,  24 * 24, 0xCC00CC00u);   /* a CURSOR     24x24 */
+    st_fill(pool + 8192,  48 *  8, 0x33333333u);   /* window two   48x8  */
+
+    /* The objects a bind would have made, made directly: the real client test
+     * covers the registry and SCM_RIGHTS paths, and this one is about what
+     * happens afterwards. */
+    obj_add(c, 2, WLK_COMPOSITOR);
+    obj_add(c, 3, WLK_XDG_WM_BASE);
+    obj_add(c, 4, WLK_SEAT);
+    struct wl_object *po = obj_add(c, 10, WLK_SHM_POOL);
+    po->base = pool; po->size = 16384; po->cap = PSZ; po->mfd = -1;
+
+    uint32_t a[6];
+    /* create_buffer(new_id, offset, width, height, stride, format) */
+    a[0]=20; a[1]=0;    a[2]=32; a[3]=16; a[4]=128; a[5]=0; st_req(c, 10, WL_SHM_POOL_CREATE_BUFFER, a, 6);
+    a[0]=21; a[1]=4096; a[2]=24; a[3]=24; a[4]=96;  a[5]=0; st_req(c, 10, WL_SHM_POOL_CREATE_BUFFER, a, 6);
+    a[0]=22; a[1]=8192; a[2]=48; a[3]=8;  a[4]=192; a[5]=0; st_req(c, 10, WL_SHM_POOL_CREATE_BUFFER, a, 6);
+    a[0]=30; st_req(c, 2, WL_COMPOSITOR_CREATE_SURFACE, a, 1);
+    a[0]=31; st_req(c, 2, WL_COMPOSITOR_CREATE_SURFACE, a, 1);
+    a[0]=32; st_req(c, 2, WL_COMPOSITOR_CREATE_SURFACE, a, 1);
+    /* surface 30 becomes a WINDOW */
+    a[0]=40; a[1]=30; st_req(c, 3, XDG_WM_BASE_GET_XDG_SURFACE, a, 2);
+    a[0]=41;          st_req(c, 40, XDG_SURFACE_GET_TOPLEVEL, a, 1);
+    st_title(c, 41, "window one");
+    /* surface 31 becomes a CURSOR */
+    a[0]=50; st_req(c, 4, WL_SEAT_GET_POINTER, a, 1);
+    a[0]=1; a[1]=31; a[2]=12; a[3]=12; st_req(c, 50, WL_POINTER_SET_CURSOR, a, 4);
+
+    uint32_t w = 0, h = 0, st = 0;
+    st_ck("a surface with no committed buffer is not drawn", wl_surface_pixels(&w, &h, &st) == 0);
+
+    /* Commit the window. */
+    a[0]=20; a[1]=0; a[2]=0; st_req(c, 30, WL_SURFACE_ATTACH, a, 3);
+    st_req(c, 30, WL_SURFACE_COMMIT, 0, 0);
+    const uint32_t *px = wl_surface_pixels(&w, &h, &st);
+    st_ck("the committed toplevel is the drawn surface (32x16, stride 128)",
+          px && w == 32 && h == 16 && st == 128 && px[0] == 0x11223344u);
+    st_ck("wl_buffer.release was sent for the committed buffer",
+          st_seen(c, 20, WL_BUFFER_EV_RELEASE, 0, 0));
+    st_ck("the title comes from that toplevel", st_streq(wl_surface_title(), "window one"));
+
+    /* THE BUG, exactly: commit a CURSOR surface afterwards. With one global
+     * "last committed surface" the window's contents became this 24x24 buffer. */
+    a[0]=21; a[1]=0; a[2]=0; st_req(c, 31, WL_SURFACE_ATTACH, a, 3);
+    st_req(c, 31, WL_SURFACE_COMMIT, 0, 0);
+    px = wl_surface_pixels(&w, &h, &st);
+    st_ck("a CURSOR committing last does NOT become the window's contents",
+          px && w == 32 && h == 16 && px[0] == 0x11223344u);
+
+    /* A second window. The choice has to be STABLE, or the desktop's one
+     * Wayland window flickers between a toolkit's own toplevels. */
+    a[0]=42; a[1]=32; st_req(c, 3, XDG_WM_BASE_GET_XDG_SURFACE, a, 2);
+    a[0]=43;          st_req(c, 42, XDG_SURFACE_GET_TOPLEVEL, a, 1);
+    st_title(c, 43, "window two");
+    a[0]=22; a[1]=0; a[2]=0; st_req(c, 32, WL_SURFACE_ATTACH, a, 3);
+    st_req(c, 32, WL_SURFACE_COMMIT, 0, 0);
+    px = wl_surface_pixels(&w, &h, &st);
+    st_ck("a second toplevel does not displace the first", px && w == 32 && h == 16);
+    st_ck("and the title is still the first window's", st_streq(wl_surface_title(), "window one"));
+
+    /* Destroying the first window hands the display to the second -- which
+     * only works if destruction actually drops the surface's state. */
+    int nobj_before = c->nobj;
+    st_req(c, 30, WL_SURFACE_DESTROY, 0, 0);
+    st_ck("wl_display.delete_id was sent for the destroyed surface",
+          st_seen(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, 30, 1));
+    px = wl_surface_pixels(&w, &h, &st);
+    st_ck("destroying the drawn surface promotes the other toplevel (48x8)",
+          px && w == 48 && h == 8 && st == 192 && px[0] == 0x33333333u);
+    st_ck("...and the titlebar follows it", st_streq(wl_surface_title(), "window two"));
+
+    /* A freed slot is REUSED rather than appended, so a client that churns
+     * objects no longer walks into WL_MAXOBJ. */
+    a[0]=30; st_req(c, 2, WL_COMPOSITOR_CREATE_SURFACE, a, 1);
+    st_ck("a destroyed object's table slot is reused, not leaked",
+          c->nobj == nobj_before);
+    struct wl_object *re = obj_find(c, 30);
+    st_ck("and the reused slot carries none of the old object's state",
+          re && re->role == WLR_NONE && re->width == 0 && re->base == 0 &&
+          re->link == 0 && re->attached == 0);
+
+    /* Losing the ROLE unmaps the surface: a window the client has taken down
+     * must stop being drawn, and a cursor is never a fallback for it. */
+    st_req(c, 43, XDG_TOPLEVEL_DESTROY, 0, 0);
+    st_ck("destroying an xdg_toplevel unmaps its surface, and no cursor takes over",
+          wl_surface_pixels(&w, &h, &st) == 0);
+
+    /* Attaching NULL and committing is how a toolkit HIDES a window. */
+    a[0]=44; a[1]=30; st_req(c, 3, XDG_WM_BASE_GET_XDG_SURFACE, a, 2);
+    a[0]=45;          st_req(c, 44, XDG_SURFACE_GET_TOPLEVEL, a, 1);
+    a[0]=21; a[1]=0; a[2]=0; st_req(c, 30, WL_SURFACE_ATTACH, a, 3);
+    st_req(c, 30, WL_SURFACE_COMMIT, 0, 0);
+    st_ck("a remapped surface is drawn again", wl_surface_pixels(&w, &h, &st) != 0);
+    a[0]=0; a[1]=0; a[2]=0; st_req(c, 30, WL_SURFACE_ATTACH, a, 3);
+    st_req(c, 30, WL_SURFACE_COMMIT, 0, 0);
+    st_ck("attaching NULL and committing unmaps it", wl_surface_pixels(&w, &h, &st) == 0);
+
+    /* wl_shm_pool.resize: within what the backing object holds it works, and
+     * past it the client is TOLD rather than left with a blank window. */
+    unsigned perr = g_nprotoerr;
+    a[0]=32768; st_req(c, 10, WL_SHM_POOL_RESIZE, a, 1);
+    struct wl_object *b21 = obj_find(c, 21);
+    st_ck("wl_shm_pool.resize grows the pool within the object's capacity",
+          po->size == 32768 && b21 && b21->size == 32768 && g_nprotoerr == perr);
+    a[0]=1048576; st_req(c, 10, WL_SHM_POOL_RESIZE, a, 1);
+    st_ck("a resize past the backing memfd is refused, not believed",
+          po->size == 32768 && g_nprotoerr == perr + 1);
+    st_ck("...and the client is told with wl_display.error",
+          st_seen(c, WL_DISPLAY_ID, WL_DISPLAY_EV_ERROR, 10, 1));
+    a[0]=4096; st_req(c, 10, WL_SHM_POOL_RESIZE, a, 1);
+    st_ck("a SHRINKING resize is refused too", po->size == 32768 && g_nprotoerr == perr + 2);
+
+    st_ck("every request this test sent had a handler", g_nunhandled == s_nunh);
+
+    /* Hand the slot back exactly as it was found, and only then free the pool
+     * the surfaces point into. */
+    c->nobj = 0; c->used = 0; c->ep = -1;
+    kfree(pool);
+    g_nmsg = s_nmsg; g_ncommit = s_ncommit; g_nglobal = s_nglobal;
+    g_ndestroy = s_ndestroy; g_nprotoerr = s_nproto; g_nconn = s_nconn;
+    g_nunhandled = s_nunh;
+    kprintf("WLSELFTEST: %s -- %d check(s), %d failure(s)\n",
+            g_st_fail ? "FAILED" : "PASSED", g_st_checks, g_st_fail);
 }
 
 int wl_compositor_init(void) {
@@ -890,6 +1621,9 @@ int wl_compositor_poll(void) {
         c->serial = 0; c->title[0] = 0;
         c->pointer = c->keyboard = c->surface = 0;
         c->ptr_in = c->kbd_in = 0;
+        c->seat_version = 0;
+        for (unsigned t = 0; t < sizeof c->tl_title / sizeof c->tl_title[0]; t++)
+            { c->tl_title[t].tl = 0; c->tl_title[t].s[0] = 0; }
         g_nconn++;
         kprintf("[wl] client connected (ep %d)\n", ep);
         worked++;

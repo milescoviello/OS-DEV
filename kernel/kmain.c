@@ -1102,6 +1102,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * exited. A background task is the next step, once the compositor
              * owns a window. */
             vfs_mkdir("/disk2/run");
+            /* Before any client exists, so it owns the object tables outright:
+             * the surface-SELECTION assertions (M2058). A real client can only
+             * ever exercise one surface at a time; this one drives a toplevel,
+             * a cursor and a second window through the dispatcher and checks
+             * which of them the window manager would draw. */
+            wl_selftest();
             if (wl_compositor_init() == 0) {
                 /* The compositor runs as its OWN TASK. Driving it from here in
                  * lockstep with one synchronous client was a scaffold, and a

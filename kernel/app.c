@@ -7363,7 +7363,7 @@ uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
  * The pointer is the memfd's own page-aligned buffer, so the compositor reads
  * exactly the memory the client wrote -- the same object, not a copy. Returns
  * 0 on success. */
-int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
+int app_scm_take_memfd_idx(int ep, void **base, unsigned long *size, int *idx_out) {
     struct scmq *q = scm_in(ep); if (!q) return -1;
     if (scmq_empty(q)) return -1;                    /* nothing pending */
     if (q->fe[q->head].type != 3) return -1;         /* not a memfd: not ours to interpret */
@@ -7371,9 +7371,38 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used || !memfds[idx].buf) return -1;
     if (base) *base = memfds[idx].buf;
     if (size) *size = memfds[idx].size ? memfds[idx].size : memfds[idx].cap;
-    memfds[idx].refs++;                              /* the compositor holds it now */
+    if (idx_out) *idx_out = idx;
+    memfd_ref(idx);                                  /* the compositor holds it now */
     q->head = (q->head + 1) % SCM_QDEPTH;
     return 0;
+}
+int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
+    return app_scm_take_memfd_idx(ep, base, size, 0);
+}
+
+/* WHY A COMPOSITOR MAY NOT BELIEVE THE CLIENT'S SIZE (M2058).
+ *
+ * wl_shm_pool.resize(size) says "the fd is now this big". The truthful answer
+ * lives here, in the object: a client grows its pool with ftruncate, and
+ * ftruncate on a memfd that some process has already MAPPED is refused
+ * (memfd_grow bails on m->mapped, because reallocating would leave every live
+ * mapping pointing at freed kernel heap). So a resize request can name a size
+ * the object does not have, and a compositor that takes it on trust reads off
+ * the end of the pool.
+ *
+ * `cap` is the useful bound: whole pages the object already owns, which a
+ * resize can claim without anything moving. */
+int app_memfd_obj_info(int idx, void **base, unsigned long *size, unsigned long *cap) {
+    if (idx < 0 || idx >= NMEMFD) return -1;
+    uint64_t f = memfd_lock_take();
+    int ok = memfds[idx].used && memfds[idx].buf;
+    if (ok) {
+        if (base) *base = memfds[idx].buf;
+        if (size) *size = memfds[idx].size;
+        if (cap)  *cap  = memfds[idx].cap;
+    }
+    memfd_lock_give(f);
+    return ok ? 0 : -1;
 }
 
 /* The OTHER direction: the KERNEL hands a client a descriptor (M1984).

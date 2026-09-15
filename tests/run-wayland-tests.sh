@@ -59,6 +59,25 @@ f=0
 if grep -aq "KERNEL PANIC" "$SLOG"; then
     echo "  FAIL: KERNEL PANIC:"; grep -a -A2 "KERNEL PANIC" "$SLOG" | head -3; f=1
 fi
+# WHICH SURFACE IS THE WINDOW (M2058). The compositor used to keep ONE global
+# "last committed surface", so for any client with more than one surface -- and
+# every real toolkit has several: a toplevel, popups, subsurfaces, a cursor --
+# the window was painted from whichever committed last. GTK commits a cursor
+# surface as soon as the pointer enters, so the window's contents became a
+# 24x24 cursor. The libwayland client below cannot catch that: it has exactly
+# one surface, which is why it passed throughout.
+#
+# So the compositor drives its own dispatcher with the multi-surface message
+# sequence that produces the bug and asserts the toplevel is what gets drawn --
+# plus object destruction, role loss, NULL-attach unmapping and
+# wl_shm_pool.resize, none of which a one-surface client reaches either.
+stn=$(grep -ac "^WLSELFTEST: ok" "$SLOG")
+if grep -aq "WLSELFTEST: PASSED" "$SLOG" && ! grep -aq "WLSELFTEST: FAIL" "$SLOG"; then
+    echo "  ok: the surface-selection self-test passed ($(grep -ao 'WLSELFTEST: PASSED -- .*' "$SLOG" | head -1 | sed 's/^WLSELFTEST: PASSED -- //'))"
+else
+    echo "  FAIL: the surface-selection self-test did not pass ($stn ok):"
+    grep -a "WLSELFTEST: FAIL" "$SLOG" | head -8; f=1
+fi
 # The raw client checks the BYTES independently of libwayland's opinion of
 # them: it parses the handshake by hand, so a framing bug shows up here rather
 # than as a silent stall inside the library.
@@ -100,7 +119,10 @@ fi
 # different pixel; a copy would still give the right one, which is why the
 # SIZE is checked too.
 if grep -aq "first pixel 0xff3366cc" "$SLOG"; then
-    echo "  ok: the compositor READ THE CLIENT'S PIXELS ($(grep -ao 'commit: [0-9]*x[0-9]* stride [0-9]*' "$SLOG" | head -1))"
+    # ...from the line that actually carries the client's colour. `head -1` on a
+    # bare "commit:" pattern would find the surface-selection self-test's own
+    # commit, which is a different surface and a different size.
+    echo "  ok: the compositor READ THE CLIENT'S PIXELS ($(grep -a "first pixel 0xff3366cc" "$SLOG" | head -1 | sed 's/^.*commit: /commit: /'))"
 else
     echo "  FAIL: the committed pixels did not arrive:"; grep -aE "\[wl\] (commit|shm pool)" "$SLOG" | head -3; f=1
 fi

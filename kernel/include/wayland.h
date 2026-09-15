@@ -27,13 +27,20 @@ unsigned wl_messages_handled(void);
 unsigned wl_globals_sent(void);
 unsigned wl_unhandled_count(void);  /* distinct requests we had no handler for (M1998) */
 unsigned wl_commits(void);      /* surfaces committed with a readable buffer (M1979) */
-uint32_t wl_last_pixel(void);   /* top-left pixel of the last commit */
+unsigned wl_destroys(void);     /* objects released back to a client's table (M2058) */
+unsigned wl_proto_errors(void); /* wl_display.error events we had to post (M2058) */
+uint32_t wl_last_pixel(void);   /* top-left pixel of the DRAWN surface */
 uint32_t wl_last_width(void);
 uint32_t wl_last_height(void);
-/* The last committed surface, for the window manager to draw. NULL until one
+/* THE SURFACE THE WINDOW MANAGER DRAWS -- the client's mapped xdg_toplevel,
+ * not whichever surface committed most recently (M2058). NULL until one
  * exists; the pixels are the client's own memory, not a copy. (M1980) */
 const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride);
-const char     *wl_surface_title(void);   /* xdg_toplevel.set_title, for the titlebar (M1981) */
+const char     *wl_surface_title(void);   /* that surface's xdg_toplevel.set_title (M1981) */
+/* Drive the dispatcher with a multi-surface client and assert the compositor
+ * draws the toplevel rather than the cursor. No socket, no client, no display:
+ * it runs inside the same boot as the real libwayland test. (M2058) */
+void wl_selftest(void);
 
 /* Input, forwarded from the window manager to the focused client (M1983).
  * Coordinates are SURFACE-relative; keycodes are raw evdev, not characters. */
