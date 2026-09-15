@@ -3322,6 +3322,32 @@ void linux_syscall_dispatch(struct registers *r) {
         char pbuf[VFS_PATH_MAX];
         { char t[VFS_PATH_MAX]; const char *xp = lx_xlate(path, t, sizeof t);
           int k = 0; while (xp[k] && k < (int)sizeof pbuf - 1) { pbuf[k] = xp[k]; k++; } pbuf[k] = 0; }
+        /* COPY argv[0] BEFORE THE FREES (M2061).
+         *
+         * The failure diagnostic below printed `av[0]` with %s -- and `av` and
+         * the `abuf` its entries point into are kfree'd two lines above it. So
+         * the one line added to EXPLAIN a failed execve dereferenced freed
+         * kernel heap, read the allocator's 0xde poison, and took a General
+         * Protection Fault inside kprintf:
+         *
+         *   *** KERNEL PANIC: CPU EXCEPTION ***
+         *     General Protection Fault ... r15=dededededededede
+         *     [0] kvprintf+0x2b9  [1] kprintf+0x40
+         *     [2] linux_syscall_dispatch+0x3547
+         *
+         * That is `make check`'s only red: gcc cannot find cc1 (a real and
+         * separate problem -- exec'd as /usr/bin/gcc, its relative prefix
+         * resolves to /libexec/gcc/... where nothing is staged), falls back to
+         * /bin/cc1, and the ENOENT report then kills the machine. A recoverable
+         * "command not found" became a dead kernel, and the log stopped
+         * mid-format at `argv0="` -- which is exactly where the bad pointer was
+         * dereferenced, and the only clue that the message itself was the bug.
+         *
+         * A diagnostic that CRASHES is worse than none, for the same reason
+         * M2003's ring-slot race made a diagnostic that LIES worse than none. */
+        char a0buf[128];
+        { const char *a0 = (na > 0 && av[0]) ? av[0] : "<none>";
+          int k = 0; while (a0[k] && k < (int)sizeof a0buf - 1) { a0buf[k] = a0[k]; k++; } a0buf[k] = 0; }
         long xrc = app_execve_linux(r, pbuf, av, ev);
         /* Safe on both paths: lx_spawn_stack has already copied the strings
          * into the NEW user stack by the time app_exec returns. */
@@ -3335,7 +3361,7 @@ void linux_syscall_dispatch(struct registers *r) {
             kprintf("[linuxabi] execve(\"%s\") -> ENOENT (raw=\"%s\" ptr=%lx readable=%d argv0=\"%s\" na=%d) (child exits 127)\n",
                     pbuf, (path && vmm_user_ok(r->rdi, 1)) ? path : "<unreadable>",
                     (unsigned long)r->rdi, (path && vmm_user_ok(r->rdi, 1)) ? 1 : 0,
-                    na > 0 ? av[0] : "<none>", na);
+                    a0buf, na);
             r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
         }
         break;

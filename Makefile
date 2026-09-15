@@ -452,6 +452,16 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile
 	 if [ -d "$$gi" ]; then mkdir -p $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15 && \
 	   cp -r "$$gi" $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15/ && \
 	   echo "  STAGE   gcc freestanding headers (also at /lib/gcc/...)"; fi
+	@# ...AND cc1/collect2 AT /libexec/gcc/..., for exactly the reason the
+	@# headers are duplicated above (M2061). The gcc driver finds its
+	@# subprograms through a prefix computed from its own argv[0]: exec'd as
+	@# /usr/bin/gcc it looks in /usr/bin/../../../libexec/gcc/<triplet>/<ver>/,
+	@# which normalises to /libexec/gcc/..., not /usr/libexec/gcc/.... On this
+	@# host that resolves only because the real driver lives three levels
+	@# deeper (/usr/x86_64-pc-linux-gnu/gcc-bin/15/). Without this, gcc probes
+	@# four paths, finds nothing, falls back to searching PATH, and execs
+	@# /bin/cc1 -- so the Phase 5 in-guest compile could never start.
+	@gv=15; gt=x86_64-pc-linux-gnu; 	 mkdir -p $(LXROOT)/libexec/gcc/$$gt/$$gv; 	 for p in cc1 collect2; do 	   src="$$(gcc -print-prog-name=$$p 2>/dev/null)"; 	   if [ -f "$$src" ]; then cp -f "$$src" $(LXROOT)/libexec/gcc/$$gt/$$gv/$$p; fi; 	 done; 	 echo "  STAGE   cc1 + collect2 (also at /libexec/gcc/$$gt/$$gv, where the driver looks)"
 	@for t in mkdir rm cp touch printf nm; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@mkdir -p $(LXROOT)/bin && for t in mkdir rm cp touch printf; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@tools/stage-linux-tool.sh $(LXROOT) bash
