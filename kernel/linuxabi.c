@@ -588,7 +588,13 @@ static int64_t lx_realtime_sec(void) {
  * FUTEX_WAKE appeared to return -110 (ETIMEDOUT), which it cannot: a slow
  * futex WAIT elsewhere finished and wrote its timeout into a stranger's entry.
  * Checking the ticket makes a late return drop its patch instead of lying. */
-struct lxring_ent { uint32_t nr; int tid; unsigned long seq; uint64_t a1, a2, a3, ret; char path[56]; };
+/* `pid` as well as `tid` (M2069). The ring is GLOBAL and shared by every Linux
+ * process, so a short-lived child overwrites its parent's history completely:
+ * every dump I took of a stalled Claude Code showed the same `git` exit, and
+ * the parent's last 256 syscalls -- the only record of what it was doing -- had
+ * been gone since before the stall began. One extra int makes the dump
+ * filterable, which is the difference between an instrument and a decoration. */
+struct lxring_ent { uint32_t nr; int tid; int pid; unsigned long seq; uint64_t a1, a2, a3, ret; char path[56]; };
 static struct lxring_ent g_lxring[LXRING_N];
 static unsigned long g_lxring_i;
 
@@ -668,9 +674,39 @@ void lx_user_backtrace(struct registers *r) {
 
 unsigned long lx_syscalls_made(void) { return lx_syscall_count; }
 
-void lx_trace_dump_last(const char *why, unsigned long want) {
-    unsigned long n = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
-    if (want && n > want) n = want;
+void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid);
+void lx_trace_dump_last(const char *why, unsigned long want) { lx_trace_dump_pid(why, want, 0); }
+
+/* `only_pid` != 0 restricts the dump to one process and SCANS THE WHOLE RING
+ * for its entries, rather than taking the last `want` slots -- otherwise a
+ * chatty child still crowds the parent out of the window. (M2069) */
+void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid) {
+    unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
+    unsigned long n = have;
+    if (!only_pid && want && n > want) n = want;
+    if (only_pid) {
+        unsigned long shown = 0;
+        kprintf("[linuxabi] last syscalls by pid %d before %s (oldest first):\n", only_pid, why);
+        /* Count backwards to find where the last `want` of THIS pid's entries
+         * start, then print forwards so the order reads chronologically. */
+        unsigned long start = have, found = 0;
+        for (unsigned long k = 0; k < have && found < (want ? want : have); k++) {
+            struct lxring_ent *e = &g_lxring[(g_lxring_i - 1 - k) & (LXRING_N - 1)];
+            if (e->pid == only_pid) { found++; start = have - 1 - k; }
+        }
+        for (unsigned long k = start; k < have; k++) {
+            struct lxring_ent *e = &g_lxring[(g_lxring_i - have + k) & (LXRING_N - 1)];
+            if (e->pid != only_pid) continue;
+            if (e->ret == LX_INFLIGHT) {
+                if (e->path[0]) kprintf("   t%d %u(%lx, %lx, %lx) = <still blocked in this call>  \"%s\"\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->path);
+                else            kprintf("   t%d %u(%lx, %lx, %lx) = <still blocked in this call>\n", e->tid, e->nr, e->a1, e->a2, e->a3);
+            } else if (e->path[0]) kprintf("   t%d %u(%lx, %lx, %lx) = %lx  \"%s\"\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret, e->path);
+            else            kprintf("   t%d %u(%lx, %lx, %lx) = %lx\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret);
+            shown++;
+        }
+        if (!shown) kprintf("   (no entries for pid %d are left in the ring -- another process filled it)\n", only_pid);
+        return;
+    }
     kprintf("[linuxabi] last %lu syscalls before %s (oldest first):\n", n, why);
     for (unsigned long k = 0; k < n; k++) {
         struct lxring_ent *e = &g_lxring[(g_lxring_i - n + k) & (LXRING_N - 1)];
@@ -1015,7 +1051,7 @@ void linux_syscall_dispatch(struct registers *r) {
          * other's call. (M2003) */
         ring_slot = __atomic_fetch_add(&g_lxring_i, 1, __ATOMIC_RELAXED);
         struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
-        re->nr = (uint32_t)r->rax; re->tid = task_current_id(); re->seq = ring_slot;
+        re->nr = (uint32_t)r->rax; re->tid = task_current_id(); re->pid = app_current_pid(); re->seq = ring_slot;
         re->a1 = r->rdi; re->a2 = r->rsi; re->a3 = r->rdx;
         /* MARK IT IN FLIGHT (M2004). `ret` is only written when the dispatch
          * RETURNS, so an entry for a call that is still blocked -- which is

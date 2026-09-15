@@ -40,3 +40,4 @@ void lx_trace_dump_fault(void);   /* the ring at a ring-3 fault: deep under lxsy
 void lx_user_backtrace(struct registers *r);   /* walk the user stack for return addresses (M1970) */
 unsigned long lx_syscalls_made(void);          /* 0 = nothing has used the Linux ABI this boot */
 const char *lx_syscall_name(unsigned long nr);   /* a readable name for a syscall number, for the per-process histogram (M2066) */
+void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid);   /* the ring, filtered to ONE process (M2069) */

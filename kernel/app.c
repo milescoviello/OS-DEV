@@ -2747,6 +2747,9 @@ void app_lx_syshist_dump(app_t *ap, int want) {
         a->syshist_seen[best] = a->syshist[best];      /* consumed: let the next-highest win */
     }
     for (int i = 0; i < LX_SYSHIST_N; i++) a->syshist_seen[i] = a->syshist[i];
+    /* ...and, when the sample is SMALL, the actual calls. A histogram says
+     * "it is idling"; only the sequence says what it is idling ON. (M2069) */
+    if (total && total < 400) lx_trace_dump_pid("this sample", 24, a->pid);
 }
 
 /* A CONNECTION THAT HAS GONE QUIET (M2016).
@@ -2827,7 +2830,7 @@ void app_stall_watchdog(void) {
                 if (a->thr[k]->state == TASK_READY) task_report_why_idle(a->thr[k]);
             }
         app_futex_dump();
-        lx_trace_dump_last("the stall", 40);
+        lx_trace_dump_pid("the stall", 40, a->pid);   /* THIS process's history, not a child's (M2069) */
     }
 }
 
