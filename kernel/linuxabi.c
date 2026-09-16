@@ -1152,7 +1152,16 @@ const char *lx_syscall_name(unsigned long nr) {
     }
 }
 
+static void lx_dispatch_body(struct registers *r);
+/* A STOP AIMED AT A TASK IN THE KERNEL IS HONOURED HERE (M2093). Wrapped
+ * rather than inlined so every `return` inside the dispatcher -- and there are
+ * many -- passes through the leave. */
 void linux_syscall_dispatch(struct registers *r) {
+    task_kernel_enter();
+    lx_dispatch_body(r);
+    task_kernel_leave();               /* may not return: see task_t::in_kernel */
+}
+static void lx_dispatch_body(struct registers *r) {
     /* WHICH RING SLOT THIS CALL OWNS -- a LOCAL, not a shared cursor (M2003).
      *
      * g_lxring_cur was a single global pointer set on entry and patched with

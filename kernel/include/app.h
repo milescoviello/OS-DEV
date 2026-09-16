@@ -140,6 +140,7 @@ int  app_sock_getopt(int fd, int level, int opt, void *out, int max);        /* 
 int  app_sock_setopt(int fd, int level, int opt, const void *in, int len);   /* 0, or -errno (M2088) */
 int  app_unix_peek_fd(int sockfd);        /* are MORE descriptors queued than were taken? for MSG_CTRUNC (M2090) */
 void app_fd_dump(const char *why);        /* every open descriptor and what it is -- the question an EBADF raises (M2091) */
+void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other);   /* every fault KIND, summed over all processes -- a split that adds up (M2093) */
 int    app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsigned long len);  /* the kernel hands a client a readable memfd: wl_keyboard.keymap (M1984) */
 int    app_eventfd_create(unsigned int initval, int flags);  /* pollable u64-counter fd (M1242) */
 int    app_inotify_init(void);                       /* a pollable filesystem-watch fd (M1266) */

@@ -3084,6 +3084,29 @@ int app_last_spawn_pid(void) { return g_last_spawn_pid; }
  * caller and the budget printer share one definition. */
 uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
 
+/* MAJOR VERSUS MINOR, SUMMED OVER EVERY PROCESS (M2093).
+ *
+ * 505476 ring-3 faults is the largest named cost in a Firefox boot, and the
+ * next move depends entirely on which kind they are. A MAJOR fault is filled
+ * from a file and already has 16-page readahead in front of it; a MINOR one is
+ * a demand-zero anonymous page, which has no readahead at all and no disk in
+ * it -- so if the count is mostly minor then every hour spent on the disk path
+ * was spent on the smaller half, and the lever is batching anonymous pages or
+ * backing big regions with 2 MiB pages.
+ *
+ * Summed across processes and including exited ones, because Firefox's
+ * children are most of the population and they are gone by the time anything
+ * asks. */
+uint64_t g_flt_major, g_flt_minor, g_flt_cow, g_flt_other;
+void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other) {
+    extern unsigned long g_spurious_faults;
+    if (maj)   *maj   = g_flt_major;
+    if (min)   *min   = g_flt_minor;
+    if (cow)   *cow   = g_flt_cow;
+    if (spur)  *spur  = g_spurious_faults;
+    if (other) *other = g_flt_other;
+}
+
 void app_describe_fault_addr(void) {
     struct app *a = cur();
     uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -5755,6 +5778,14 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
      * make it writable again; otherwise allocate a private copy and drop our ref
      * on the shared frame (the other process keeps it). vmm_set_raw invlpg's. */
     if ((pte & PTE_PRESENT) && (pte & PTE_COW) && (err & 2)) {
+        /* COPY-ON-WRITE BREAKS WERE 82% OF THE FAULTS AND NOTHING COUNTED THEM
+         * (M2093). The budget split faults into MAJOR (file-filled) and MINOR
+         * (demand-zero) and those two came to 81215 of 462065 -- so four fifths
+         * of the largest named cost in a Firefox boot were in a bucket that did
+         * not exist. Firefox forks a content process per tab and the fork
+         * server forks again, so every write to an inherited page lands here.
+         * A split that does not add up is not a split. */
+        g_flt_cow++;
         uint64_t old = pte & PTE_ADDR_MASK;
         /* ALWAYS COPY (M2044, and re-affirmed in M2050).
          *
@@ -6166,9 +6197,9 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                         kprintf("[fault] EMPTY READ filling %lx from %s+%lx: wanted %lu, got %ld -- the page is a HOLE\n",
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got);
                 }
-                a->majflt++;                            /* page filled from disk => major fault (M1150) */
+                a->majflt++; g_flt_major++;             /* page filled from disk => major fault (M1150) */
             } else {
-                a->minflt++;                            /* demand-zero anonymous page => minor fault (M1150) */
+                a->minflt++; g_flt_minor++;             /* demand-zero anonymous page => minor fault (M1150) */
             }
             /* Honour the VMA's protection. This used to be unconditionally
              * WRITABLE|NX, which was survivable only because app_mprotect goes

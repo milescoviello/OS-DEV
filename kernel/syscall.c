@@ -453,7 +453,16 @@ int syscall_histogram_format(char *b, int max) {
     return p;
 }
 
+static void syscall_dispatch_body(struct registers *r);
+/* Same wrapper as the Linux entry (M2093): every return out of the native
+ * dispatcher passes through task_kernel_leave, which is where a deferred stop
+ * becomes an exit -- at the one point the task holds no kernel lock. */
 void syscall_dispatch(struct registers *r) {
+    task_kernel_enter();
+    syscall_dispatch_body(r);
+    task_kernel_leave();
+}
+static void syscall_dispatch_body(struct registers *r) {
     /* Pay any deferred TLB flush before a handler dereferences a user pointer
      * (M2065) -- same reason as the Linux entry. */
     vmm_tlb_discharge();

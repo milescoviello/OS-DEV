@@ -21,6 +21,25 @@ typedef struct task {
     uint64_t      run_ms;      /* total ms this task has been RUNNING (CPU time)   */
     uint64_t      last_in;     /* timer_ms() when it last became `current`         */
     uint64_t      nswitch;     /* times it has been scheduled in (context switches) */
+    /* KILLING A TASK THAT IS INSIDE THE KERNEL ORPHANS WHATEVER IT HOLDS
+     * (M2093). exit_group calls task_stop on every sibling, and task_stop set
+     * TASK_STOPPED on a task that could be halfway through a syscall -- inside
+     * ata_read_drive, holding ata_lock. It never ran again, so it never
+     * released it, and every disk access in the machine hung for ever:
+     *
+     *   [ata] LOCK STUCK: task 0 has waited ~minutes for ata_lock, held by
+     *         task 333. Nothing that touches the disk can proceed.
+     *
+     * That is the "inconsistent" in "fast and consistent": one Firefox thread
+     * dying at the wrong instant takes the whole machine's disk with it, and
+     * it presents as a boot that simply never finishes.
+     *
+     * So a stop aimed at a task in kernel mode is RECORDED and honoured at the
+     * syscall exit, which is the one point where it holds nothing. `in_kernel`
+     * is a depth rather than a flag because the native and Linux entries can
+     * nest through a fault handler. */
+    volatile int  in_kernel;   /* >0 = inside a syscall: a stop must wait (M2093) */
+    volatile int  stop_pending;/* a stop arrived while in the kernel; exit at the syscall boundary */
     uint64_t      utime_ms;    /* CPU time charged in user mode (ring 3), tick-sampled (getrusage, M1150) */
     uint64_t      stime_ms;    /* CPU time charged in kernel mode (ring 0), tick-sampled (M1150) */
     uint64_t      nvcsw;       /* voluntary context switches: it blocked/yielded (M1150) */
@@ -166,6 +185,9 @@ uint64_t task_fs_base_live_value(void);                                  /* the 
 void    task_fs_base_live(uint64_t *live, uint64_t *cached, int *core);  /* the CPU's real FS base vs what we think we loaded (M2013) */
 void    task_fs_base_last(int *tid, uint64_t *seq, uint64_t *now);       /* WHO last wrote this core's FS_BASE, and when (M2089) */
 uint64_t task_nswitch_of(task_t *t);                                     /* has this task ever been switched in? (M2089) */
+void    task_kernel_enter(void);   /* a syscall began: a stop aimed here must wait (M2093) */
+void    task_kernel_leave(void);   /* ...and is honoured here, where no lock is held. May not return. */
+int     task_stop_pending(void);   /* should this task bail out of a blocking wait? (M2093) */
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */
 struct registers *task_uframe(task_t *t);  /* the task's most recent ring-3 trap frame, or 0 (M1119) */
 void    task_stop(task_t *t);              /* suspend another task (READY/RUNNING -> STOPPED); not self */

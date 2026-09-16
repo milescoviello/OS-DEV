@@ -547,6 +547,24 @@ void kmain_budget(const char *when) {
                       "multi-sector request is being shredded\n", sect / cmds);
     kprintf("[budget]   faults   %7lu Mcycles elapsed   %lu ring-3 faults, %lu repaired by demand paging\n",
             pf / 1000000, g_pf_count, g_pf_repaired);
+    {   uint64_t maj = 0, min = 0, cow = 0, spur = 0, oth = 0;
+        app_fault_kinds(&maj, &min, &cow, &spur, &oth);
+        kprintf("[budget]     %8lu MAJOR   filled from a file (16-page readahead in front of them)\n", maj);
+        kprintf("[budget]     %8lu MINOR   demand-zero anonymous: no readahead, no disk\n", min);
+        kprintf("[budget]     %8lu COW     a write to a page inherited from a fork\n", cow);
+        kprintf("[budget]     %8lu STALE   the PTE already allowed it: a stale TLB entry, invalidated and retried\n", spur);
+        uint64_t named = maj + min + cow + spur;
+        /* A SPLIT THAT DOES NOT ADD UP IS NOT A SPLIT. The first version of
+         * this had only MAJOR and MINOR and they came to 81215 of 462065 --
+         * four fifths of the biggest cost in the boot sat in a bucket nobody
+         * had named. Printing the remainder is what made that visible, so it
+         * stays printed even when it is zero. (M2093) */
+        if (g_pf_count > named)
+            kprintf("[budget]     %8lu UNCLASSIFIED -- faults the handler took that none of the above explains\n",
+                    g_pf_count - named);
+        if (cow > maj + min)
+            kprintf("[budget]     COPY-ON-WRITE DOMINATES: the cost is fork, not the disk and not demand-zero\n");
+    }
     kprintf("[budget]   console  %7lu Mcycles elapsed   %lu lines, %lu full-screen scrolls\n",
             con / 1000000, ln, sc);
     if (busy) {

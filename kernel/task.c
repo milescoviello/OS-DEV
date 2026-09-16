@@ -298,6 +298,24 @@ void task_fs_base_live(uint64_t *live, uint64_t *cached, int *core) {
 
 uint64_t task_nswitch_of(task_t *t) { return t ? t->nswitch : 0; }
 
+/* THE SYSCALL BOUNDARY (M2093). See task_t::in_kernel. Entering marks the task
+ * as holding-things-possibly; leaving is the one point at which a deferred stop
+ * can be honoured safely, because by then every lock the handler took has been
+ * given back. */
+void task_kernel_enter(void) { if (current) current->in_kernel++; }
+void task_kernel_leave(void) {
+    task_t *t = current;
+    if (!t) return;
+    if (t->in_kernel > 0) t->in_kernel--;
+    /* Only at depth zero: a fault taken inside a syscall nests, and exiting
+     * from the inner one would still be holding the outer one's locks. */
+    if (t->in_kernel == 0 && t->stop_pending) {
+        t->stop_pending = 0;
+        task_exit();                     /* does not return */
+    }
+}
+int task_stop_pending(void) { return current ? current->stop_pending : 0; }
+
 void task_copy_tls(task_t *dst, task_t *src) {
     if (!dst || !src) return;
     dst->fs_base = src->fs_base;
@@ -1153,6 +1171,38 @@ void task_stop(task_t *t) {
      *
      * TASK_DEAD is the one state to leave alone: a dead task is already on its
      * way out and app_reap keys its FREEING decision on that exact state. */
+    /* NOT WHILE IT IS INSIDE THE KERNEL (M2093). See the comment on
+     * task_t::in_kernel: freezing a task mid-syscall orphans every lock it
+     * holds, and ata_lock orphaned is a machine whose disk never works again.
+     * Record it and let the syscall exit honour it, where it holds nothing.
+     * Woken, because a task blocked in the kernel has to reach that exit. */
+    /* ONLY FOR A TASK THAT IS ACTUALLY RUNNING IN THE KERNEL. A BLOCKED task is
+     * in the kernel too, and deferring for it would be wrong in the other
+     * direction: it is parked in a wait it may never be released from, and
+     * waking it only to have it re-check its condition and block again leaves
+     * a thread alive that exit_group asked to end.
+     *
+     * And it is not needed, because a task cannot block while holding one of
+     * these locks: every blocking path in this tree releases its irq-spinlock
+     * BEFORE task_block -- unix_recv, app_futex and pipe_read all do, and they
+     * have to, since an irq-spinlock held across a switch would deadlock the
+     * core that next takes it. So a BLOCKED task holds nothing and can be
+     * stopped exactly as before. The dangerous case is the one that was
+     * hanging the machine: RUNNING, inside ata_read_drive, holding ata_lock. */
+    if (t && t != current && t->in_kernel > 0 &&
+        t->state != TASK_BLOCKED &&
+        t->state != TASK_DEAD && t->state != TASK_STOPPED) {
+        t->stop_pending = 1;
+        t->wake_at = 0;
+        rq_lock_give();
+        irq_restore(f);
+        /* task_wake, not a hand-rolled state change: it already knows the one
+         * case that matters here -- a task that is BLOCKED but still executing
+         * on its own stack must bank a wake_pending rather than be made
+         * pickable, or two cores end up running one stack (M1994). */
+        task_wake(t);
+        return;
+    }
     if (t && t != current && t->state != TASK_DEAD && t->state != TASK_STOPPED) {
         t->state = TASK_STOPPED;
         t->wake_at = 0;             /* cancel any deadline the sleeper scan would honour */
