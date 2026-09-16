@@ -290,6 +290,7 @@ int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL,
 int  app_fd_obj(int fd);                                       /* the object index behind an fd (pipe no., memfd idx), or -1 (M2004) */
 int  app_fd_type(int fd);
 long app_memfd_size(int fd);                                   /* a memfd's size, or -1 if fd is not one (M2000) */
+void app_memfd_selftest(void);                                 /* boot-time: a MAPPED memfd can grow, and its old buffer is retired (M2082) */
 uint64_t app_mmap_hint(uint64_t addr, uint64_t len);           /* mmap's addr WITHOUT MAP_FIXED: place there only if free, else 0 (M2000) */
 void app_set_next_env(const char *e);                          /* one extra env var for the NEXT Linux spawn only (M1999) */
 void app_set_next_cwd(const char *p);                          /* working directory for the NEXT Linux spawn only (M2056) */

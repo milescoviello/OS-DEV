@@ -959,12 +959,19 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
      * bounds check in commit, and the window stayed blank with no error
      * anywhere.
      *
-     * The size is CHECKED against the object rather than believed. A client
-     * grows a pool with ftruncate, and ftruncate on a memfd that is already
-     * mapped is refused by memfd_grow (reallocating would leave live mappings
-     * pointing at freed kernel heap) -- so a client can reach this request
-     * having failed to grow anything, and a compositor that takes the number on
-     * trust reads off the end of the pool. (M2058) */
+     * The size is CHECKED against the object rather than believed, because a
+     * client can reach this request having failed to grow anything and a
+     * compositor that takes the number on trust reads off the end of the pool.
+     * (M2058)
+     *
+     * Until M2082 that failure was the NORMAL case rather than the exception:
+     * growing a memfd that any process had already mapped was refused outright,
+     * and resizing an already-mapped pool is what every wl_shm client does.
+     * Firefox's startup made that call 107 times, got ENOSPC every time, and
+     * the only thing the compositor could do about it was kill the connection
+     * with the protocol error below. A mapped object can grow now; the check
+     * remains because a grow can still legitimately fail (at MEMFD_MAX), and a
+     * client is not told when it did. */
     if (o->kind == WLK_SHM_POOL && opcode == WL_SHM_POOL_RESIZE && alen >= 4) {
         uint32_t want = rd32(args + 0);
         void *nb = 0; unsigned long mcap = 0;
@@ -980,10 +987,10 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             return;
         }
         if ((unsigned long)want > o->cap) {
-            kprintf("[wl] shm pool %u: resize to %u but the backing memfd owns only %lu bytes. "
-                    "The client's ftruncate was refused because the object is already MAPPED "
-                    "(memfd_grow would have to reallocate and every live mapping would dangle). "
-                    "Refusing rather than reading past the pool.\n", o->id, want, o->cap);
+            kprintf("[wl] shm pool %u: resize to %u but the backing memfd owns only %lu bytes -- "
+                    "the client's own ftruncate/fallocate must have failed (MEMFD_MAX is the "
+                    "remaining reason it can). Refusing rather than reading past the pool.\n",
+                    o->id, want, o->cap);
             wl_post_error(c, o->id, WL_SHM_ERR_INVALID_FD,
                           "the file behind this pool is smaller than the requested size");
             return;

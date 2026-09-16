@@ -37,13 +37,18 @@ timeout -s KILL 90 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -kernel "$K
 QPID=$!
 i=0
 while [ $i -lt 160 ]; do
-    grep -q "ipc self-test:" "$SLOG" 2>/dev/null && break
+    grep -q "ipc self-test:" "$SLOG" 2>/dev/null && grep -q "memfd self-test:" "$SLOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
 kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
+if ! grep -q "memfd self-test:" "$SLOG" 2>/dev/null; then
+    echo "FAIL: the memfd self-test never ran (boot problem, not a memfd regression)"
+    tail -12 "$SLOG" 2>/dev/null | sed 's/^/      /'
+    exit 1
+fi
 if ! grep -q "ipc self-test:" "$SLOG" 2>/dev/null; then
     echo "FAIL: the IPC self-test never ran (boot problem, not an IPC regression)"
     tail -12 "$SLOG" 2>/dev/null | sed 's/^/      /'
@@ -109,6 +114,36 @@ require "/dev/urandom yields more at a large offset: a char device is a stream, 
 # scheduler that migrates tasks between cores. It did not.
 require "FS_BASE: loading an FS selector really does zero it"     "the hazard itself is real: an FS selector write clears FS_BASE"
 require "FS_BASE: reloading the SAME base after the register was zeroed behind us still writes it" "FS_BASE is restored unconditionally (this FAILS if the per-core cache comes back)"
+
+# A MAPPED memfd MUST BE ABLE TO GROW (M2082). Resizing an already-mapped
+# shared-memory pool is what every wl_shm client does -- libwayland-cursor's
+# shm_pool_resize and Firefox's WaylandShmPool::Resize are posix_fallocate /
+# ftruncate on a mapped fd -- and it was refused outright, because growing means
+# reallocating and the old buffer's pages are aliased into the process. Firefox's
+# startup made that call 107 times and got ENOSPC every time; wayland.c's own
+# M2058 comment records that the compositor then has to answer the follow-up
+# wl_shm_pool.resize with a FATAL protocol error.
+#
+# Two separate things can regress, so both are asserted. Put the
+# `if (m->mapped) return -1` guard back and the first one fails. Remove it
+# WITHOUT retiring the outgoing buffer -- the obvious fix -- and the second one
+# fails instead, which is the important one: the kernel heap hands that block
+# straight back out while a process still has its pages mapped, and nothing
+# anywhere else in the tree would notice.
+require "growing a MAPPED memfd past its capacity SUCCEEDS"                 "a mapped wl_shm pool can be resized at all"
+require "the pre-grow buffer was RETIRED rather than freed"                 "the outgoing buffer is retired, not handed to kfree"
+require "and the retired buffer's pages were NOT handed back out by the heap" "the retired buffer really is still ours (this FAILS if it is kfree'd)"
+require "the bytes written before the grow survived it"                     "a resize preserves the pool's contents"
+require "a further resize within the new capacity moves nothing at all"     "a grown mapped object has headroom, so the next resize does not move it"
+require "teardown released the object and every buffer it outgrew"          "retired buffers are freed with the object, not leaked"
+if grep -qE "memfd self-test: [0-9]+ passed, 0 failed" "$SLOG"; then
+    n=$(grep -oE "memfd self-test: [0-9]+ passed" "$SLOG" | grep -oE "[0-9]+" | head -1)
+    echo "  ok: all $n memfd-growth assertions passed in-guest"
+else
+    echo "  FAIL: the memfd self-test reported failures:"
+    grep -E "^\[FAIL\] memfd|memfd self-test:" "$SLOG" | sed 's/^/      /'
+    fail=1
+fi
 
 # And the summary must report zero failures.
 if grep -qE "ipc self-test: [0-9]+ passed, 0 failed" "$SLOG"; then

@@ -1915,6 +1915,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         app_pendq_selftest();/* M2076: a live app must not lose its window to a dead one */
         console_panic_selftest();/* M2080: the panic path must not wait for a lock it cannot win */
     }
+    /* UNCONDITIONAL, like ipc_selftest below it (M2082): it is a few dozen
+     * kmallocs, and the bug it guards is a silent kernel-heap double-use that
+     * nothing else in the tree would notice. Asserted by
+     * tests/run-ipc-tests.sh, which already boots headless and greps COM1. */
+    app_memfd_selftest();
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).
      * Opt-in for the same reason as the block above: boot-to-desktop under a

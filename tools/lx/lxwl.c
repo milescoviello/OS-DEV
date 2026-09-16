@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <wayland-client.h>
+#include <wayland-cursor.h>
 #include "xdg-shell-client-protocol.h"
 #include <poll.h>
 #include <stdint.h>
@@ -204,6 +205,38 @@ int main(void) {
      * socket as the protocol (SCM_RIGHTS), so the pixels themselves are never
      * copied -- the compositor reads the very bytes written below. */
     if (!shm) { printf("LXWL: wl_shm was not advertised\n"); fflush(stdout); return 7; }
+
+    /* THE MEMFD-GROWTH DEMO, THROUGH THE REAL LIBRARY (M2082).
+     *
+     * wl_cursor_theme_load is the call Firefox makes, and libwayland-cursor
+     * grows its shm pool with ftruncate/fallocate as it adds each cursor
+     * image -- 2304 bytes for one 24x24 ARGB cursor, then past 6912 as more
+     * arrive. Our memfd refused to grow an object that was already mapped, so
+     * os_resize_anonymous_file failed, shm_pool_allocate returned -1, and the
+     * whole theme load returned NULL. Firefox reported it as eight lines of
+     * "Unable to load nw-resize from the cursor theme" and carried on with no
+     * cursors.
+     *
+     * libwayland-cursor has a compiled-in fallback theme, so this needs no
+     * XCursor files staged: passing NULL for the name still exercises the
+     * exact resize path at the exact sizes. A count means the growth worked;
+     * zero or NULL means it did not. This is the demo the in-kernel self-test
+     * is not -- real library, real call, real sizes. */
+    {
+        struct wl_cursor_theme *th = wl_cursor_theme_load(NULL, 24, shm);
+        if (!th) {
+            printf("LXWL-CURSOR: wl_cursor_theme_load returned NULL -- the shm pool could not grow\n");
+        } else {
+            static const char *want[] = { "left_ptr", "xterm", "watch", "hand1", "sb_h_double_arrow" };
+            int got = 0;
+            for (unsigned i = 0; i < sizeof want / sizeof want[0]; i++)
+                if (wl_cursor_theme_get_cursor(th, want[i])) got++;
+            printf("LXWL-CURSOR: loaded %d cursors from the fallback theme\n", got);
+            wl_cursor_theme_destroy(th);
+        }
+        fflush(stdout);
+    }
+
 
     const int W = 64, H = 32, STRIDE = W * 4;
     const int SZ = STRIDE * H;

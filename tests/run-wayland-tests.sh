@@ -118,6 +118,17 @@ fi
 # going to draw. Firefox's whole symptom is "never creates a wl_surface", and
 # the only way to observe that was -append wlverbose, which dumps every message
 # and, before M2080, was the flag most likely to wedge the machine.
+# M2082: libwayland-cursor grows its shm pool with ftruncate/fallocate as it
+# adds each cursor image, and our memfd refused to grow an object that was
+# already mapped -- so wl_cursor_theme_load returned NULL and Firefox reported
+# eight lines of "Unable to load nw-resize from the cursor theme". This is the
+# real library making Firefox's real call at Firefox's real sizes; the
+# in-kernel self-test is not a demo.
+if grep -aqE "LXWL-CURSOR: loaded [1-9][0-9]* cursors" "$SLOG"; then
+    echo "  ok: $(grep -ao 'LXWL-CURSOR: loaded .*' "$SLOG" | head -1) -- a MAPPED shm pool can grow (M2082)"
+else
+    echo "  FAIL: libwayland-cursor could not grow its pool:"; grep -a "LXWL-CURSOR" "$SLOG" | tail -2; f=1
+fi
 if grep -aqE "\[wl\] surface [0-9]+ created \(client ep [0-9]+" "$SLOG"; then
     echo "  ok: the compositor NAMES each surface as it is created ($(grep -ac "\[wl\] surface .* created" "$SLOG") seen, incl. one from the real client) (M2081)"
 else
