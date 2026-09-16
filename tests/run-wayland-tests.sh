@@ -151,6 +151,36 @@ if grep -aq "LXWL-POOLCYCLE: 300 pools created and destroyed, none leaked" "$SLO
 else
     echo "  FAIL: a destroyed shm pool is still holding its memory:"; grep -a "LXWL-POOLCYCLE\|TABLE FULL" "$SLOG" | tail -3; f=1
 fi
+# M2089 -- A WINDOW IS A TREE OF SURFACES, AND THERE IS MORE THAN ONE CLIENT.
+# Two defects that hid each other. get_subsurface read its first two arguments
+# and discarded the third -- the PARENT -- so a subsurface knew which surface
+# it wrapped and not which surface it belonged to, and wl_subsurface.set_position
+# fell through to wl_unhandled. And the window manager opened exactly ONE
+# Wayland window ever, latched, so the first client to commit anything took the
+# display for the rest of the boot.
+# Measured on Firefox: it committed 768 frames at 1204x916 into a SUBSURFACE of
+# a toplevel that has no buffer of its own (which is what GTK does), while the
+# 64x32 test client -- which commits two minutes earlier -- held the only
+# window. Both had to be fixed before anything could appear.
+if grep -aqE "\[wl\] subsurface [0-9]+: surface [0-9]+ is now a child of surface [0-9]+" "$SLOG"; then
+    echo "  ok: a subsurface records the PARENT it was given, not just the surface it wraps (M2089)"
+else
+    echo "  FAIL: get_subsurface is still discarding its parent argument:"; grep -a "subsurface" "$SLOG" | tail -3; f=1
+fi
+if grep -aqE "\[wl\] desktop window for client slot [0-9]+" "$SLOG"; then
+    echo "  ok: the window manager opens a window PER CLIENT ($(grep -ac 'desktop window for client slot' "$SLOG") seen) (M2089)"
+else
+    echo "  FAIL: no per-client Wayland window was opened:"; grep -a "desktop window" "$SLOG" | tail -3; f=1
+fi
+# And the pixel report must describe the WHOLE buffer. "first pixel" alone read
+# 0x00000000 for 762 consecutive Firefox frames, which is equally consistent
+# with a blank window and with the transparent corner of a client-side-decorated
+# one -- opposite conclusions from one number.
+if grep -aqE "sampled pixels have colour" "$SLOG"; then
+    echo "  ok: a commit reports how much of the buffer has colour, not just pixel 0 ($(grep -ao '[0-9]*/[0-9]* sampled pixels have colour' "$SLOG" | tail -1)) (M2089)"
+else
+    echo "  FAIL: the commit report still describes one pixel:"; grep -a "\[wl\] commit" "$SLOG" | tail -2; f=1
+fi
 # PIXELS. The client wrote 0xFF3366CC into a memfd, passed the DESCRIPTOR over
 # the protocol socket, and committed a surface. The compositor reading that
 # exact value back proves the whole zero-copy path: SCM_RIGHTS carried the

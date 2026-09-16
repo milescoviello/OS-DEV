@@ -38,6 +38,23 @@ uint32_t wl_last_height(void);
  * not whichever surface committed most recently (M2058). NULL until one
  * exists; the pixels are the client's own memory, not a copy. (M1980) */
 const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride);
+/* A WINDOW IS A TREE OF SURFACES (M2089). GTK gives an xdg_toplevel no buffer
+ * of its own and renders into a subsurface of it, so a compositor that draws
+ * one surface draws nothing at all for Firefox. `x`/`y` are relative to the
+ * window's origin and MAY be negative -- a subsurface is allowed to overhang,
+ * and the caller clips. */
+struct wl_layer { int x, y; uint32_t w, h, stride; const uint32_t *px; };
+int  wl_layers(struct wl_layer *out, int max);       /* how many were written, parents first */
+void wl_window_extent(uint32_t *w, uint32_t *h);     /* the bounding box of all of them */
+/* ...AND PER CLIENT (M2089). A compositor serves clients, plural. One global
+ * window meant the 64x32 test client kept the only slot while Firefox painted
+ * full-size frames with nowhere to go. */
+int  wl_client_used(int ci);
+int  wl_client_count(void);
+int  wl_client_layers(int ci, struct wl_layer *out, int max);
+void wl_client_extent(int ci, uint32_t *w, uint32_t *h);
+const char *wl_client_title_of(int ci);
+void wl_largest_window(uint32_t *w, uint32_t *h);   /* has ANY client painted a real window? (M2089) */
 const char     *wl_surface_title(void);   /* that surface's xdg_toplevel.set_title (M1981) */
 /* Drive the dispatcher with a multi-surface client and assert the compositor
  * draws the toplevel rather than the cursor. No socket, no client, no display:

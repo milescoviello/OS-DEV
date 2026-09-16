@@ -164,6 +164,8 @@ void    task_set_name(const char *n);      /* record prctl(PR_SET_NAME) for the 
 const char *task_name_of(task_t *t);       /* ...and read it back; "" if the thread never named itself */
 uint64_t task_fs_base_live_value(void);                                  /* the CPU's real FS base, read straight from the MSR (M2013) */
 void    task_fs_base_live(uint64_t *live, uint64_t *cached, int *core);  /* the CPU's real FS base vs what we think we loaded (M2013) */
+void    task_fs_base_last(int *tid, uint64_t *seq, uint64_t *now);       /* WHO last wrote this core's FS_BASE, and when (M2089) */
+uint64_t task_nswitch_of(task_t *t);                                     /* has this task ever been switched in? (M2089) */
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */
 struct registers *task_uframe(task_t *t);  /* the task's most recent ring-3 trap frame, or 0 (M1119) */
 void    task_stop(task_t *t);              /* suspend another task (READY/RUNNING -> STOPPED); not self */

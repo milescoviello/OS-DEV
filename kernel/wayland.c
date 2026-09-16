@@ -261,6 +261,15 @@ struct wl_object {
     uint32_t link;                 /* xdg_surface -> its wl_surface; xdg_toplevel/xdg_popup -> its xdg_surface;
                                     * wl_subsurface -> its wl_surface; wl_buffer -> its wl_shm_pool */
     uint32_t frame_cb;             /* wl_surface: a pending wl_surface.frame callback id (M2042) */
+    /* SUBSURFACE PLACEMENT (M2089). A wl_surface that has been made a
+     * subsurface records which surface it is a child OF, and where inside it.
+     * Both were thrown away: get_subsurface's third argument -- the parent --
+     * was read past, and wl_subsurface.set_position fell through to
+     * wl_unhandled. Without them a compositor cannot place a child, so it can
+     * only ever draw ONE surface, and for Firefox the one with the pixels in
+     * it is a child. */
+    uint32_t parent;               /* wl_surface: the surface this is a subsurface of, 0 = none */
+    int32_t  sub_x, sub_y;         /* wl_surface: its offset inside that parent */
 };
 
 struct wl_client {
@@ -372,16 +381,43 @@ static struct wl_object *obj_add(struct wl_client *c, uint32_t id, int kind) {
  * Ties go to the lowest object id, which is the earliest-created surface, so
  * the choice is STABLE frame to frame. Picking "most recent" among equals
  * would make the window flicker between a toolkit's own windows. */
-static int wl_surface_rank(const struct wl_object *o) {
+/* A TOPLEVEL WITH NO BUFFER OF ITS OWN IS STILL THE WINDOW (M2089), provided
+ * something inside it has one. GTK renders into a subsurface and leaves the
+ * toplevel blank, so "unmapped" as a test of `base` disqualified exactly the
+ * surface that identifies Firefox's window -- and promoted the child, which
+ * then had nowhere to be placed. `has_content` is passed in because only the
+ * caller can walk the client's other objects. */
+static int wl_surface_rank_ex(const struct wl_object *o, int has_content) {
     if (o->kind != WLK_SURFACE) return 0;
-    if (!o->base || !o->width || !o->height || !o->stride) return 0;   /* unmapped */
+    int mapped = o->base && o->width && o->height && o->stride;
+    if (!mapped && !has_content) return 0;
     switch (o->role) {
     case WLR_TOPLEVEL:   return 3;
-    case WLR_NONE:       return 2;
+    case WLR_NONE:       return mapped ? 2 : 0;   /* a roleless surface speaks only for itself */
     case WLR_POPUP:
-    case WLR_SUBSURFACE: return 1;
+    case WLR_SUBSURFACE: return mapped ? 1 : 0;
     default:             return 0;      /* WLR_CURSOR: not a window, ever */
     }
+}
+/* Does anything in this client's tree, below `id`, have pixels? One level of
+ * children is enough to answer it for every toolkit we have seen, and it is
+ * the question wl_surface_rank_ex needs rather than a general walk. */
+static int wl_has_mapped_child(struct wl_client *c, uint32_t id) {
+    for (int j = 0; j < c->nobj; j++) {
+        struct wl_object *o = &c->obj[j];
+        if (!o->id || o->kind != WLK_SURFACE || o->parent != id) continue;
+        if (o->base && o->width && o->height && o->stride) return 1;
+        /* One more level, spelled out rather than recursed: GTK nests a
+         * content child inside a toplevel and nothing we run goes deeper, and
+         * a client-supplied parent link can be a cycle -- which recursion
+         * would follow until the kernel stack ran out. */
+        for (int k = 0; k < c->nobj; k++) {
+            struct wl_object *g = &c->obj[k];
+            if (!g->id || g->kind != WLK_SURFACE || g->parent != o->id) continue;
+            if (g->base && g->width && g->height && g->stride) return 1;
+        }
+    }
+    return 0;
 }
 static struct wl_object *wl_draw_surface(struct wl_client **owner) {
     struct wl_object *best = 0; int bestrank = 0; struct wl_client *bestc = 0;
@@ -390,7 +426,7 @@ static struct wl_object *wl_draw_surface(struct wl_client **owner) {
         if (!c->used) continue;
         for (int j = 0; j < c->nobj; j++) {
             struct wl_object *o = &c->obj[j];
-            int r = wl_surface_rank(o);
+            int r = wl_surface_rank_ex(o, wl_has_mapped_child(c, o->id));
             if (!r) continue;
             if (r > bestrank) { best = o; bestrank = r; bestc = c; }
             /* Among equals: the same client's earliest surface. A DIFFERENT
@@ -415,6 +451,165 @@ const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride) {
     if (h) *h = o->height;
     if (stride) *stride = o->stride;
     return (const uint32_t *)o->base;
+}
+
+/* THE WINDOW IS A TREE, NOT A SURFACE (M2089).
+ *
+ * wl_surface_pixels returns ONE surface, and that is the whole reason Firefox
+ * committed 768 frames at 1204x916 without anything appearing on screen: GTK
+ * gives the xdg_toplevel no buffer of its own and renders the page into a
+ * SUBSURFACE of it. wl_surface_rank scores a subsurface 1 and a toplevel 3, so
+ * the window chosen was another client's -- and had Firefox been alone, the
+ * subsurface would have been drawn with no idea where inside the window it
+ * belonged.
+ *
+ * So enumerate instead: the chosen window's own surface first (it may have no
+ * pixels, which is legal), then every descendant subsurface in creation order,
+ * each with the offset it was given. Creation order is the z-order we have --
+ * place_above/place_below are accepted and do not reorder yet, which is honest
+ * and is written down at their handler rather than implied here.
+ *
+ * Returns how many layers were written. Coordinates are relative to the
+ * window's origin and may be negative: a subsurface is allowed to stick out,
+ * and the caller clips. */
+/* ONE WINDOW PER CLIENT, NOT ONE PER MACHINE (M2089).
+ *
+ * wl_draw_surface picks a single surface across every client, and its
+ * tie-break deliberately keeps the window belonging to whoever mapped first.
+ * That was right when there was one test client. With Firefox it is fatal: the
+ * 64x32 lxwl window is created two minutes earlier, ranks equal, and keeps the
+ * only window slot -- so a browser painting 1204x916 frames had nowhere to be
+ * drawn. A compositor serves clients, plural, and so must the window manager.
+ *
+ * `ci` is a client slot index; wl_client_used says whether it holds one. */
+static int wl_layers_of(struct wl_client *c, struct wl_object *root, struct wl_layer *out, int max);
+/* THE BIGGEST WINDOW ANY CLIENT HAS PAINTED (M2089). The boot needs to know
+ * "has a real application window appeared", and the global wl_window_extent
+ * answers for whichever client mapped FIRST -- which is the 64x32 test client,
+ * every time. */
+void wl_largest_window(uint32_t *w, uint32_t *h) {
+    uint32_t bw = 0, bh = 0;
+    for (int ci = 0; ci < WL_MAXCLIENT; ci++) {
+        uint32_t cw = 0, ch = 0;
+        wl_client_extent(ci, &cw, &ch);
+        if ((unsigned long)cw * ch > (unsigned long)bw * bh) { bw = cw; bh = ch; }
+    }
+    if (w) *w = bw;
+    if (h) *h = bh;
+}
+int wl_client_used(int ci) {
+    return ci >= 0 && ci < WL_MAXCLIENT && g_cl[ci].used;
+}
+int wl_client_count(void) { return WL_MAXCLIENT; }
+
+/* That client's own window root: the same ranking, scoped to one client. */
+static struct wl_object *wl_client_root(struct wl_client *c) {
+    if (!c || !c->used) return 0;
+    struct wl_object *best = 0; int bestrank = 0;
+    for (int j = 0; j < c->nobj; j++) {
+        struct wl_object *o = &c->obj[j];
+        int r = wl_surface_rank_ex(o, wl_has_mapped_child(c, o->id));
+        if (!r) continue;
+        if (r > bestrank) { best = o; bestrank = r; }
+        else if (r == bestrank && best && o->id < best->id) best = o;
+    }
+    return best;
+}
+
+int wl_client_layers(int ci, struct wl_layer *out, int max) {
+    if (!wl_client_used(ci) || !out || max <= 0) return 0;
+    struct wl_client *c = &g_cl[ci];
+    struct wl_object *root = wl_client_root(c);
+    if (!root) return 0;
+    return wl_layers_of(c, root, out, max);
+}
+
+void wl_client_extent(int ci, uint32_t *w, uint32_t *h) {
+    struct wl_layer l[24];
+    int n = wl_client_layers(ci, l, 24);
+    int maxx = 0, maxy = 0;
+    for (int i = 0; i < n; i++) {
+        int rx = l[i].x + (int)l[i].w, ry = l[i].y + (int)l[i].h;
+        if (rx > maxx) maxx = rx;
+        if (ry > maxy) maxy = ry;
+    }
+    if (w) *w = maxx > 0 ? (uint32_t)maxx : 0;
+    if (h) *h = maxy > 0 ? (uint32_t)maxy : 0;
+}
+
+const char *wl_client_title_of(int ci) {
+    if (!wl_client_used(ci)) return "";
+    struct wl_client *c = &g_cl[ci];
+    struct wl_object *o = wl_client_root(c);
+    if (!o) return "";
+    if (o->role == WLR_TOPLEVEL && o->role_id)
+        for (int i = 0; i < (int)(sizeof c->tl_title / sizeof c->tl_title[0]); i++)
+            if (c->tl_title[i].tl == o->role_id && c->tl_title[i].s[0])
+                return c->tl_title[i].s;
+    return c->title[0] ? c->title : "Wayland client";
+}
+
+static int wl_layers_of(struct wl_client *c, struct wl_object *root, struct wl_layer *out, int max) {
+    int n = 0;
+    /* The root itself, if it has anything to draw. */
+    if (root->base && root->width && root->height && root->stride) {
+        out[n].x = 0; out[n].y = 0;
+        out[n].w = root->width; out[n].h = root->height;
+        out[n].stride = root->stride;
+        out[n].px = (const uint32_t *)root->base;
+        n++;
+    }
+    /* Then its descendants. Walked as a bounded number of GENERATIONS rather
+     * than recursively: the parent links come from a client and a client can
+     * make a cycle, which recursion would follow until the kernel stack ran
+     * out. Four levels is deeper than any real toolkit nests. */
+    uint32_t gen[16]; int ngen = 1; gen[0] = root->id;
+    for (int depth = 0; depth < 4 && ngen && n < max; depth++) {
+        uint32_t next[16]; int nnext = 0;
+        for (int j = 0; j < c->nobj && n < max; j++) {
+            struct wl_object *o = &c->obj[j];
+            if (!o->id || o->kind != WLK_SURFACE || !o->parent) continue;
+            int isChild = 0;
+            for (int g = 0; g < ngen; g++) if (o->parent == gen[g]) { isChild = 1; break; }
+            if (!isChild) continue;
+            if (nnext < 16) next[nnext++] = o->id;
+            if (!o->base || !o->width || !o->height || !o->stride) continue;   /* unmapped child */
+            out[n].x = o->sub_x; out[n].y = o->sub_y;
+            out[n].w = o->width; out[n].h = o->height;
+            out[n].stride = o->stride;
+            out[n].px = (const uint32_t *)o->base;
+            n++;
+        }
+        ngen = nnext;
+        for (int g = 0; g < ngen; g++) gen[g] = next[g];
+    }
+    return n;
+}
+
+/* The single-window view, kept for the callers that still want "the" window
+ * (the boot's readiness print, and the selftest). */
+int wl_layers(struct wl_layer *out, int max) {
+    struct wl_client *c = 0;
+    struct wl_object *root = wl_draw_surface(&c);
+    if (!root || !c || !out || max <= 0) return 0;
+    return wl_layers_of(c, root, out, max);
+}
+
+/* The window's extent: the bounding box of everything wl_layers would draw.
+ * For a toplevel with no buffer of its own -- which is what GTK gives us --
+ * the size comes entirely from its children, and reporting the toplevel's own
+ * zero would size the window to nothing. */
+void wl_window_extent(uint32_t *w, uint32_t *h) {
+    struct wl_layer l[24];
+    int n = wl_layers(l, 24);
+    int maxx = 0, maxy = 0;
+    for (int i = 0; i < n; i++) {
+        int rx = l[i].x + (int)l[i].w, ry = l[i].y + (int)l[i].h;
+        if (rx > maxx) maxx = rx;
+        if (ry > maxy) maxy = ry;
+    }
+    if (w) *w = maxx > 0 ? (uint32_t)maxx : 0;
+    if (h) *h = maxy > 0 ? (uint32_t)maxy : 0;
 }
 
 /* That surface's window title, or "" if it has none (a client that uses
@@ -1081,9 +1276,41 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         return;
     }
     if (o->kind == WLK_SUBCOMPOSITOR && opcode == WL_SUBCOMP_GET_SUBSURFACE && alen >= 12) {
+        /* get_subsurface(new_id, surface, PARENT) -- and the parent is the
+         * whole point (M2089). It was read past: the handler took the first
+         * two arguments and discarded the third, so a subsurface knew which
+         * surface it wrapped and not which surface it belonged to. A child
+         * with no parent cannot be placed, and a compositor that cannot place
+         * children can only draw one surface. */
         uint32_t sid = rd32(args + 4);                /* the wl_surface it wraps */
+        uint32_t pid = rd32(args + 8);                /* ...and the surface it is a child OF */
         struct wl_object *ss = obj_add(c, rd32(args + 0), WLK_SUBSURFACE);
-        if (ss) { ss->link = sid; wl_give_role(c, sid, WLR_SUBSURFACE, ss->id); }
+        if (ss) {
+            ss->link = sid;
+            wl_give_role(c, sid, WLR_SUBSURFACE, ss->id);
+            struct wl_object *child = obj_find_kind(c, sid, WLK_SURFACE);
+            if (child) { child->parent = pid; child->sub_x = child->sub_y = 0; }
+            kprintf("[wl] subsurface %u: surface %u is now a child of surface %u\n",
+                    ss->id, sid, pid);
+        }
+        return;
+    }
+    if (o->kind == WLK_SUBSURFACE && opcode == 1 /*set_position*/ && alen >= 8) {
+        /* WHERE THE CHILD SITS INSIDE ITS PARENT. Swallowed by wl_unhandled
+         * until now, which means every child was drawn at the parent's origin
+         * -- fine for Firefox, whose content child sits at 0,0, and wrong for
+         * any menu or tooltip, which is what subsurfaces are usually for. */
+        struct wl_object *child = obj_find_kind(c, o->link, WLK_SURFACE);
+        if (child) { child->sub_x = (int32_t)rd32(args + 0); child->sub_y = (int32_t)rd32(args + 4); }
+        return;
+    }
+    if (o->kind == WLK_SUBSURFACE && (opcode == 2 || opcode == 3 || opcode == 4 || opcode == 5)) {
+        /* place_above / place_below / set_sync / set_desync. Accepted rather
+         * than swallowed: we draw children in creation order and commit them
+         * immediately, so these are requests whose effect we already have. The
+         * distinction matters because wl_unhandled is what SCOPES the next
+         * milestone, and a request listed there that needs nothing done is
+         * noise in the one instrument that names real gaps. */
         return;
     }
     /* wl_pointer.set_cursor(serial, surface, hotspot_x, hotspot_y). THE REASON
@@ -1301,10 +1528,42 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                 o->width  = b->width; o->height = b->height;
                 o->stride = b->stride; o->format = b->format;
                 g_ncommit++;
-                kprintf("[wl] commit: %ux%u stride %u format %u -> first pixel 0x%08x"
-                        " (surface %u, %s)\n",
-                        b->width, b->height, b->stride, b->format, rd32(o->base),
-                        o->id, wl_role_name(o->role));
+                /* THE FIRST PIXEL IS THE WRONG PIXEL TO REPORT (M2089).
+                 *
+                 * It was the only one printed, and for 762 consecutive Firefox
+                 * frames it read 0x00000000 -- which is equally consistent with
+                 * "the window is blank" and "the top-left corner of a
+                 * client-side-decorated window is transparent, as it is meant
+                 * to be". Those are opposite conclusions from one number, and
+                 * the difference decides whether the compositor or the client
+                 * is the thing to fix.
+                 *
+                 * So: sample the whole buffer on a strided walk and say how
+                 * much of it is non-transparent, plus the middle pixel. Rate-
+                 * limited hard, because a browser commits at 60 Hz and this
+                 * reads a megabyte. */
+                {   static unsigned nth;
+                    int loud = (nth++ % 64) == 0;
+                    if (loud) {
+                        unsigned long need2 = (unsigned long)b->stride * b->height;
+                        unsigned nz = 0, seen = 0;
+                        if (need2 <= o->size) {
+                            for (unsigned y = 0; y < b->height; y += 16)
+                                for (unsigned x = 0; x < b->width; x += 16) {
+                                    uint32_t px = rd32(o->base + (unsigned long)y * b->stride + (unsigned long)x * 4);
+                                    if (px & 0x00FFFFFFu) nz++;
+                                    seen++;
+                                }
+                        }
+                        uint32_t mid = 0;
+                        if (need2 <= o->size && b->height && b->width)
+                            mid = rd32(o->base + (unsigned long)(b->height / 2) * b->stride + (unsigned long)(b->width / 2) * 4);
+                        kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
+                                "%u/%u sampled pixels have colour (surface %u, %s)\n",
+                                b->width, b->height, b->stride, b->format, rd32(o->base), mid,
+                                nz, seen, o->id, wl_role_name(o->role));
+                    }
+                }
             } else {
                 kprintf("[wl] commit: buffer claims %lu bytes but the pool holds %lu -- refusing\n",
                         need, b->size);

@@ -838,8 +838,17 @@ void lx_trace_dump_addr(const char *why, unsigned long addr) {
                 e->a1, e->a2, e->a3, e->ret);
     }
     if (!shown)
-        kprintf("[linuxabi] NOTHING this process asked for ever covered %lx -- it was handed a "
-                "pointer into memory it never mapped (%s)\n", addr, why);
+        /* CAREFUL WITH THIS SENTENCE. It first read "NOTHING this process
+         * asked for ever covered %lx -- it was handed a pointer into memory it
+         * never mapped", and the first fault it printed for was a page that IS
+         * mapped, present, and merely read-only. The ring holds the last
+         * LXRING_N calls, not the process's history: minutes into a Firefox
+         * startup the mmap that decided a page happened millions of syscalls
+         * ago. Say what was actually searched. */
+        kprintf("[linuxabi] no mmap/munmap/mprotect covering %lx appears in the last %d "
+                "syscalls -- which does NOT mean it was never mapped, only that the call "
+                "that decided it is older than the ring (%s)\n",
+                addr, LXRING_N, why);
     else if (shown > 24)
         kprintf("   ... and %d more\n", shown - 24);
 }

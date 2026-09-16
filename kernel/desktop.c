@@ -684,14 +684,31 @@ static void draw_content(const window_t *w, int focused) {
         /* A Wayland client's surface. The pixels are the CLIENT'S memory,
          * mapped into the compositor by wl_shm -- this blit is the only copy
          * in the whole path, and it goes straight to the framebuffer. */
-        uint32_t sw2 = 0, sh2 = 0, st = 0;
-        const uint32_t *px = wl_surface_pixels(&sw2, &sh2, &st);
-        if (px && sw2 && sh2) {
+        /* EVERY LAYER, NOT ONE SURFACE (M2089). A toolkit's window is a
+         * toplevel plus its subsurfaces, and GTK puts the pixels in a child --
+         * so drawing "the surface" drew a blank toplevel, or the child with no
+         * idea where in the window it belonged. wl_layers gives the tree,
+         * parents first, each with its offset. */
+        struct wl_layer ly[24];
+        /* w->app carries the CLIENT SLOT this window belongs to, plus one so
+         * that zero still means "no client chosen" for any window created
+         * before per-client windows existed (M2089). */
+        int wci = (int)(long)w->app - 1;
+        int nly = (wci >= 0) ? wl_client_layers(wci, ly, 24) : wl_layers(ly, 24);
+        if (nly > 0) {
             int maxw = w->w - 8, maxh = w->h - TITLEBAR_H - 8;
-            for (uint32_t yy = 0; yy < sh2 && (int)yy < maxh; yy++) {
-                const uint32_t *row = (const uint32_t *)((const uint8_t *)px + (unsigned long)yy * st);
-                for (uint32_t xx = 0; xx < sw2 && (int)xx < maxw; xx++)
-                    fb_pixel(bx - 2 + (int)xx, by - 2 + (int)yy, row[xx] & 0x00FFFFFF);
+            for (int i = 0; i < nly; i++) {
+                if (!ly[i].px) continue;
+                for (uint32_t yy = 0; yy < ly[i].h; yy++) {
+                    int dy = ly[i].y + (int)yy;
+                    if (dy < 0 || dy >= maxh) continue;            /* a child may overhang */
+                    const uint32_t *row = (const uint32_t *)((const uint8_t *)ly[i].px + (unsigned long)yy * ly[i].stride);
+                    for (uint32_t xx = 0; xx < ly[i].w; xx++) {
+                        int dx = ly[i].x + (int)xx;
+                        if (dx < 0 || dx >= maxw) continue;
+                        fb_pixel(bx - 2 + dx, by - 2 + dy, row[xx] & 0x00FFFFFF);
+                    }
+                }
             }
         } else {
             fb_text(bx + 4, by + 4, "waiting for a client to commit a surface...", THEME_TEXT_DIM, 1);
@@ -1748,18 +1765,44 @@ static unsigned desktop_key_to_evdev(int ch) {
 
 static int wl_window_open;
 static void wl_window_poll(void) {
-    uint32_t sw2 = 0, sh2 = 0, st = 0;
-    if (wl_window_open || win_count >= MAX_WINDOWS) return;
-    if (!wl_surface_pixels(&sw2, &sh2, &st)) return;
-    spawn_n++;
-    int x = 150 + (spawn_n % 6) * 26, y = 60 + (spawn_n % 6) * 26;
-    /* The title comes from xdg_toplevel.set_title, which is how a Wayland
-     * client names its own window -- the same call Firefox uses to put a page
-     * title in the titlebar. */
-    windows[win_count++] = (window_t){ x, y, (int)sw2 + 14, (int)sh2 + TITLEBAR_H + 14,
-                                       THEME_PANEL, wl_surface_title(), KIND_WAYLAND, 0,
-                                       0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
-    wl_window_open = 1;
+    /* ONE WINDOW PER CLIENT (M2089). This used to open exactly one, ever,
+     * latched by wl_window_open -- so the first client to commit anything took
+     * the display for the rest of the boot. lxwl commits a 64x32 test pattern
+     * two minutes before Firefox finishes starting, which is how a browser
+     * painting full-size frames ended up with nowhere to be drawn.
+     *
+     * SIZED BY THE WHOLE TREE, too. GTK gives its xdg_toplevel no buffer and
+     * renders into a subsurface, so asking the root surface for its pixels
+     * answered NULL for a client that was committing 1204x916 frames. */
+    for (int ci = 0; ci < wl_client_count(); ci++) {
+        if (win_count >= MAX_WINDOWS) return;
+        if (!wl_client_used(ci)) continue;
+        int taken = 0;
+        for (int i = 0; i < win_count; i++)
+            if (windows[i].kind == KIND_WAYLAND && (int)(long)windows[i].app - 1 == ci) { taken = 1; break; }
+        if (taken) continue;
+        uint32_t sw2 = 0, sh2 = 0;
+        wl_client_extent(ci, &sw2, &sh2);
+        if (!sw2 || !sh2) continue;
+        spawn_n++;
+        int x = 150 + (spawn_n % 6) * 26, y = 60 + (spawn_n % 6) * 26;
+        int ww = (int)sw2 + 14, wh = (int)sh2 + TITLEBAR_H + 14;
+        /* A 1204x916 browser plus chrome is wider than an 800x600 display, and
+         * a window bigger than the screen cannot be moved to where its close
+         * button is. Clamp to the framebuffer; the blit already clips. */
+        if (ww > fb_width() - 8)  ww = fb_width() - 8;
+        if (wh > fb_height() - 8) wh = fb_height() - 8;
+        /* The title comes from xdg_toplevel.set_title, which is how a Wayland
+         * client names its own window -- the same call Firefox uses to put a
+         * page title in the titlebar. */
+        windows[win_count++] = (window_t){ x, y, ww, wh,
+                                           THEME_PANEL, wl_client_title_of(ci), KIND_WAYLAND,
+                                           (void *)(long)(ci + 1),
+                                           0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
+        kprintf("[wl] desktop window for client slot %d: %ux%u ('%s')\n",
+                ci, sw2, sh2, wl_client_title_of(ci));
+        wl_window_open = 1;
+    }
 }
 
 /* Open a browser window at `url` (NULL -> its default). */

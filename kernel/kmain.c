@@ -812,6 +812,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the readable-byte-count probe...\n");
         {   int nrrc = app_run_linux_sync("/disk2/lxnread", 0, 0, 120000);
             kprintf("[lxabi] LXNREAD exit -> %d\n", nrrc); }
+        /* ...and the same invariant at FIREFOX'S SCALE. Eight threads never
+         * reproduced the FS_BASE loss; a hundred and twenty might. (M2089) */
+        kprintf("[lxabi] launching the 120-thread TLS probe...\n");
+        {   int tmrc = app_run_linux_sync("/disk2/lxtlsmany", 0, 0, 300000);
+            kprintf("[lxabi] LXTLSMANY exit -> %d\n", tmrc); }
         /* getsockopt answered a confident ZERO to every option ever asked, so
          * Firefox's IPC channel was told its send buffer was nought bytes and
          * aborted at ipc_channel_posix.cc:128. (M2088) */
@@ -1264,6 +1269,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                     (t + 1) * 15, fpid, st, now - prev);
                             prev = now;
                             if (st < 0) { kprintf("[ff] the process is GONE\n"); break; }
+                            /* IF IT HAS PAINTED A WINDOW, STOP WATCHING AND GO
+                             * SHOW IT (M2089). This loop spent a fixed six
+                             * minutes diagnosing a startup before the window
+                             * manager was allowed to run -- which was right
+                             * while Firefox never committed anything, and is
+                             * exactly backwards now that it commits a full
+                             * 1204x916 frame at about two minutes. The point
+                             * of the display is to be looked at. 640x480 is
+                             * the threshold because lxwl's own 64x32 window is
+                             * also in this tree, and handing over for that one
+                             * is what used to happen. */
+                            {   uint32_t pw = 0, ph = 0; wl_largest_window(&pw, &ph);
+                                if (pw >= 640 && ph >= 480) {
+                                    kprintf("[ff] it has PAINTED: a %ux%u window is ready -- "
+                                            "handing over to the desktop now rather than at t=360s\n", pw, ph);
+                                    break;
+                                }
+                            }
                             /* Blocked and quiet is the interesting case: the
                              * ring says WHAT it last asked for, which is the
                              * only way to tell "waiting for the compositor"
@@ -1310,8 +1333,10 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     int frc = app_run_linux_sync("/disk2/usr/lib64/firefox/firefox", av_ff, 1, 1200000);
                     kprintf("[ff] firefox --version -> %d\n", frc);
                 }
-                kprintf("[wl] surface ready: %ux%u -- handing over to the desktop\n",
-                        wl_last_width(), wl_last_height());
+                {   uint32_t ew = 0, eh = 0; wl_largest_window(&ew, &eh);
+                    kprintf("[wl] window ready: root surface %ux%u, biggest client tree %ux%u -- "
+                            "handing over to the desktop\n",
+                            wl_last_width(), wl_last_height(), ew, eh); }
                 /* If the client stalled, the ring says what it was doing --
                  * a compositor that sent everything correctly and a client
                  * that never reads look identical from this side. */

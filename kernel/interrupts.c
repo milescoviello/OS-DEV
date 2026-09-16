@@ -335,6 +335,19 @@ void isr_dispatch(struct registers *r) {
                                 "is running with NO TLS, and the bug is in clone/CLONE_SETTLS or "
                                 "the context switch's FS_BASE restore\n",
                                 (void *)task_fs_base(), (void *)live, (void *)cached, core);
+                        /* AND WHO WROTE THAT ZERO (M2089). saved-good/live-zero
+                         * narrows it to "the MSR was last written with zero on
+                         * this core", and the remaining question -- by which
+                         * task, and has anything happened since -- is the one
+                         * that names the bug. Guessing it from the call sites
+                         * cost most of a session: they all look right. */
+                        {   int who = -1; uint64_t seq = 0, now = 0;
+                            task_fs_base_last(&who, &seq, &now);
+                            kprintf("[fault]   this core's FS_BASE was last written by tid %d "
+                                    "(write #%lu of %lu -- %lu FS_BASE load(s) have happened "
+                                    "elsewhere since), and this thread has been switched in %lu time(s)\n",
+                                    who, seq, now, now - seq, task_nswitch_of(task_self()));
+                        }
                     }
                     /* AND WHAT THE FAULTING PAGE IS. "present and not
                      * writable" and "present, not writable and COW" are

@@ -220,9 +220,32 @@ static uint64_t loaded_fs_base[FSBASE_MAXCPUS];
  * The cost of being right is one wrmsr per context switch. `loaded_fs_base`
  * stays, written but never read for decisions, purely so the fault reporter
  * can say what we last loaded versus what the CPU actually has. */
+/* WHO LOADED IT LAST, AND WITH WHAT (M2089).
+ *
+ * `cached` answers "what did we last write on this core", which is one
+ * question short of useful: a report of live=0 cached=0 while the thread's
+ * SAVED base is perfectly good says the MSR was last written with zero, and
+ * the thing worth knowing is which task did that and how long ago. Guessing
+ * from the code cost most of a session -- every load_fs_base call site looked
+ * correct, and two of them are. Record the tid and the switch count instead. */
+static int      fs_last_tid[FSBASE_MAXCPUS];
+static uint64_t fs_last_seq[FSBASE_MAXCPUS];
+static uint64_t fs_seq;
 static void load_fs_base(uint64_t b) {
     __asm__ volatile("wrmsr" : : "c"(MSR_FS_BASE), "a"((uint32_t)b), "d"((uint32_t)(b >> 32)));
-    loaded_fs_base[mycore()] = b;
+    int c = mycore();
+    loaded_fs_base[c] = b;
+    fs_last_tid[c] = current ? current->id : -1;
+    fs_last_seq[c] = __atomic_add_fetch(&fs_seq, 1, __ATOMIC_RELAXED);
+}
+/* The tid that last wrote this core's FS_BASE, and the global ordinal of that
+ * write -- so the report can say whether anything at all has happened on this
+ * core since. */
+void task_fs_base_last(int *tid, uint64_t *seq, uint64_t *now) {
+    int c = mycore();
+    if (tid) *tid = fs_last_tid[c];
+    if (seq) *seq = fs_last_seq[c];
+    if (now) *now = __atomic_load_n(&fs_seq, __ATOMIC_RELAXED);
 }
 /* Set the CURRENT thread's TLS base (live + saved for restore). M1140. */
 void task_set_fs_base(uint64_t b) { current->fs_base = b; load_fs_base(b); }
@@ -272,6 +295,8 @@ void task_fs_base_live(uint64_t *live, uint64_t *cached, int *core) {
     if (core) *core = mycore();
     if (cached) *cached = loaded_fs_base[mycore()];
 }
+
+uint64_t task_nswitch_of(task_t *t) { return t ? t->nswitch : 0; }
 
 void task_copy_tls(task_t *dst, task_t *src) {
     if (!dst || !src) return;
