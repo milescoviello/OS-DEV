@@ -61,6 +61,47 @@ typedef struct task {
     uint64_t      fs_base;     /* per-thread %fs base for TLS; 0 = unused (restored on switch, M1140) */
     uint64_t      robust;      /* userspace robust_t* (held robust locks); walked on exit (M1141) */
     uint64_t      clear_child_tid;  /* set_tid_address: zeroed + FUTEX_WAKE'd on exit (pthread_join) (M1226) */
+    /* PER-THREAD SIGNAL STATE (M2075).
+     *
+     * All of this used to live in struct app, i.e. once per PROCESS, and every
+     * field of it is per-thread by definition:
+     *
+     *   - pthread_sigmask is a THREAD's mask. One shared mask means a thread
+     *     blocking a signal blocks it for its siblings too.
+     *   - sigaltstack is a THREAD's alternate stack.
+     *   - `in` and `saved` are the interrupted context. ONE slot, shared by
+     *     every thread: two threads taking signals at once overwrite each
+     *     other's saved registers, and the second sigreturn restores the
+     *     first thread's rip into the second thread. That is a jump to an
+     *     address nothing computed -- we saw rip=0x1e, an instruction fetch
+     *     at offset 30 of the first page.
+     *   - tkill(tid) could not be honoured at all: the pending bit had nowhere
+     *     thread-shaped to go, so it was raised on the process and delivered
+     *     to whichever thread next returned to ring 3.
+     *
+     * The last one is why JavaScriptCore's heap was corrupt. It suspends
+     * threads for a collection by pthread_kill-ing each one and having the
+     * handler record ITS OWN registers; the collector then scans from that
+     * thread's stack pointer. Deliver the signal to the wrong thread and the
+     * wrong thread's registers are recorded as the target's, so the scan
+     * starts from an unrelated stack pointer, misses live roots, and the
+     * collector frees objects that are still referenced.
+     *
+     * `sig_pending` here is the THREAD-DIRECTED set (tkill/tgkill/pthread_kill).
+     * Process-directed signals still land in struct app's shared set and are
+     * taken by whichever thread does not block them, exactly as on Linux.
+     *
+     * `sig_saved` is a `struct registers *`, allocated on first delivery --
+     * most threads never take a signal, and 200 bytes times every thread of
+     * every process is not worth reserving for that. */
+    uint64_t      sig_pending;      /* thread-directed, not yet delivered */
+    uint64_t      sig_blocked;      /* pthread_sigmask */
+    void         *sig_saved;        /* struct registers *: the pre-handler context */
+    uint64_t      sig_uctx;         /* SA_SIGINFO: user address of the delivered mcontext */
+    uint64_t      sig_alt_base, sig_alt_size;
+    uint64_t      sig_q_value;      /* si_value for the signal being delivered */
+    int           sig_q_code;       /* si_code  for the signal being delivered */
+    int           sig_in;           /* 1 while this thread runs a handler */
     int           pin_core;    /* CPU AFFINITY (M1531): -1 = may run on any core; >=0 = the ONE core
                                  * (APIC id & 15) allowed to run this task. Used for each core's own
                                  * floor/idle task (must never migrate) AND for task 0 (the kernel's own

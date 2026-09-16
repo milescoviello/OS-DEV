@@ -293,6 +293,7 @@ struct app {
 #define APP_SIGQ_MAX 32
     struct { int signo, code; uint64_t value; } sigq[APP_SIGQ_MAX];  /* RT/sigqueue payload FIFO: real-time signals QUEUE (not coalesce) and carry a sigval (M1271) */
     int      sigq_n;                     /* # valid queued payloads, [0..sigq_n) in arrival (FIFO) order */
+    uint64_t fork_sig_blocked;           /* the mask the CLONING thread had, handed to the new task (M2075) */
     uint64_t sig_q_value;                /* scratch: si_value for the signal currently being delivered */
     int      sig_q_code;                 /* scratch: si_code  for the signal currently being delivered */
     /* WHERE THE FAULT WAS (M2073). si_addr was hardcoded to 0 for every
@@ -6128,18 +6129,33 @@ void app_set_fault_siginfo(uint64_t addr, int code) {
     a->sig_fault_addr = addr; a->sig_fault_code = code; a->sig_fault_valid = 1;
 }
 
+/* The dying thread's saved-context slot, allocated on first use: most threads
+ * never take a signal. (M2075) */
+static struct registers *sig_frame_of(task_t *t) {
+    if (!t) return 0;
+    if (!t->sig_saved) t->sig_saved = kmalloc(sizeof(struct registers));
+    return (struct registers *)t->sig_saved;
+}
+
 int app_signal_deliver(struct registers *r, int signo) {
     struct app *a = cur();
-    if (!a || signo <= 0 || signo >= APP_NSIG) return 0;
-    if (!a->sig_handler[signo] || a->sig_handler[signo] == APP_SIG_IGN || !a->sig_restorer || a->sig_in) return 0;
+    task_t *th = task_self();
+    if (!a || !th || signo <= 0 || signo >= APP_NSIG) return 0;
+    /* DISPOSITIONS ARE PROCESS-WIDE, the rest is this thread's (M2075). That
+     * split is not a simplification, it is what Linux does: sigaction is
+     * shared by every thread, the mask, the alternate stack and the
+     * interrupted context are not. */
+    if (!a->sig_handler[signo] || a->sig_handler[signo] == APP_SIG_IGN || !a->sig_restorer || th->sig_in) return 0;
+    struct registers *saveto = sig_frame_of(th);
+    if (!saveto) return 0;                   /* cannot save the context -> do not enter the handler */
 
     /* SA_ONSTACK (M1276): run the handler on the alternate signal stack set by
      * sigaltstack(), instead of growing down from the interrupted rsp. This is
      * what lets a SIGSEGV handler survive a stack-overflow fault (the normal
      * stack is unusable). The frame is still built downward from the alt top. */
     uint64_t base_sp = r->rsp;
-    if ((a->sig_flags[signo] & APP_SA_ONSTACK) && a->sig_alt_size)
-        base_sp = a->sig_alt_base + a->sig_alt_size;
+    if ((a->sig_flags[signo] & APP_SA_ONSTACK) && th->sig_alt_size)
+        base_sp = th->sig_alt_base + th->sig_alt_size;
 
     if (a->sig_flags[signo] & APP_SA_SIGINFO) {
         /* 3-arg form (M1270): place {mcontext = the interrupted regs, siginfo} on
@@ -6156,14 +6172,14 @@ int app_signal_deliver(struct registers *r, int signo) {
         /* A FAULT SIGNAL CARRIES ITS ADDRESS (M2073); a raised or queued one
          * genuinely has none. sig_fault_valid distinguishes them, so kill()
          * still reports SI_USER with a zero address as it always did. */
-        ((int *)si_addr)[1] = a->sig_fault_valid ? a->sig_fault_code : a->sig_q_code;   /* si_code @4 */
+        ((int *)si_addr)[1] = a->sig_fault_valid ? a->sig_fault_code : th->sig_q_code;  /* si_code @4 */
         ((uint64_t *)si_addr)[1] = a->sig_fault_valid ? a->sig_fault_addr : 0;          /* si_addr @8 */
         a->sig_fault_valid = 0;                           /* consumed: one delivery, one fault */
-        ((uint64_t *)si_addr)[2] = a->sig_q_value;        /* si_value @16 (the sigqueue sigval payload, M1271) */
+        ((uint64_t *)si_addr)[2] = th->sig_q_value;       /* si_value @16 (the sigqueue sigval payload, M1271) */
         *(volatile uint64_t *)ret = a->sig_restorer;
-        a->sig_saved = *r;                                /* safe baseline: cs/ss/rflags for sigreturn */
-        a->sig_uctx = mctx_addr;
-        a->sig_in = 1;
+        *saveto = *r;                                     /* safe baseline: cs/ss/rflags for sigreturn */
+        th->sig_uctx = mctx_addr;
+        th->sig_in = 1;
         r->rsp = ret;
         r->rip = a->sig_handler[signo];
         r->rdi = (uint64_t)signo;                         /* h(signo, */
@@ -6174,9 +6190,9 @@ int app_signal_deliver(struct registers *r, int signo) {
 
     uint64_t nrsp = ((base_sp - 128) & ~15ull) - 8;  /* skip red zone, 16-align, room for ret addr (base_sp = alt stack if SA_ONSTACK) */
     if (!vmm_user_ok(nrsp, 8)) return 0;             /* bad user stack -> don't deliver */
-    a->sig_saved = *r;                               /* save the interrupted context */
-    a->sig_uctx = 0;
-    a->sig_in = 1;
+    *saveto = *r;                                    /* save the interrupted context */
+    th->sig_uctx = 0;
+    th->sig_in = 1;
     *(volatile uint64_t *)nrsp = a->sig_restorer;    /* handler's return address -> trampoline */
     r->rsp = nrsp;
     r->rip = a->sig_handler[signo];
@@ -6224,14 +6240,15 @@ int app_raise_signal_to(int pid, int signo) {
 
 void app_sigreturn(struct registers *r) {
     struct app *a = cur();
-    if (!a || !a->sig_in) return;
+    task_t *th = task_self();
+    if (!a || !th || !th->sig_in || !th->sig_saved) return;
     /* Restore the interrupted context kernel-side. (SA_SIGINFO hands the handler
      * a READABLE ucontext on the stack for fault inspection; resuming at a
      * handler-rewritten register state — JIT-trap style — is a follow-on, which
      * needs the user ucontext restored with cs/ss/rflags forced safe.) */
-    *r = a->sig_saved;
-    a->sig_uctx = 0;
-    a->sig_in = 0;
+    *r = *(struct registers *)th->sig_saved;
+    th->sig_uctx = 0;
+    th->sig_in = 0;
 }
 
 /* sigaltstack (M1276): register an alternate stack for handlers installed with
@@ -6239,11 +6256,13 @@ void app_sigreturn(struct registers *r) {
  * Returns 0/-1. Pairs with SA_SIGINFO so a SIGSEGV handler can run even when
  * the normal stack has overflowed. */
 long app_sigaltstack(uint64_t ss_sp, uint64_t ss_size) {
-    struct app *a = cur(); if (!a) return -1;
-    if (ss_size == 0) { a->sig_alt_base = 0; a->sig_alt_size = 0; return 0; }
+    struct app *a = cur(); task_t *th = task_self();
+    if (!a || !th) return -1;
+    if (ss_size == 0) { th->sig_alt_base = 0; th->sig_alt_size = 0; return 0; }
     if (ss_size < 2048 || !vmm_user_ok(ss_sp, ss_size)) return -1;   /* min usable size + must be mapped */
-    a->sig_alt_base = ss_sp;
-    a->sig_alt_size = ss_size;
+    th->sig_alt_base = ss_sp;                   /* PER-THREAD: a shared one meant a second thread's
+                                                 * SA_ONSTACK handler ran on the first thread's stack (M2075) */
+    th->sig_alt_size = ss_size;
     return 0;
 }
 
@@ -6278,25 +6297,94 @@ void app_request_signal(app_t *a, int signo) {
      * core than the one about to block. */
     uint64_t f = irq_save();
     ap->pending_sigs |= (1ull << signo);       /* OR into the bitset, so a 2nd async signal isn't dropped */
-    task_wake(ap->task);                     /* unblock it if it's parked in read()/sigfd */
+    /* WAKE EVERY THREAD THAT COULD TAKE IT, not just the main one (M2075).
+     * A process-directed signal is delivered by whichever thread does not
+     * block it, and the main thread is routinely the one parked longest -- in
+     * a futex wait behind the very worker that would have handled it. Waking
+     * only ap->task meant the signal sat pending until something unrelated
+     * happened to return to ring 3. */
+    if (ap->task && !(((task_t *)ap->task)->sig_blocked & (1ull << signo))) task_wake(ap->task);
+    else task_wake(ap->task);                  /* still wake it: a blocked mask can change under us */
+    for (int k = 0; k < APP_MAXTHREAD; k++)
+        if (ap->thr[k] && ap->thr[k]->state != TASK_DEAD &&
+            !(ap->thr[k]->sig_blocked & (1ull << signo)))
+            task_wake(ap->thr[k]);
     irq_restore(f);
+}
+
+/* RAISE A SIGNAL AT ONE THREAD (M2075).
+ *
+ * tkill/tgkill/pthread_kill name a thread, and until now that name was
+ * discarded: the bit went into the process-wide pending set and was delivered
+ * to whichever thread next returned to ring 3. For most uses of kill() that is
+ * indistinguishable; for the one that matters it is the whole bug.
+ *
+ * JavaScriptCore suspends a thread for a collection by pthread_kill-ing it and
+ * having the handler record ITS OWN registers, then scans that thread's stack
+ * from the recorded stack pointer. Deliver to the wrong thread and the wrong
+ * thread's registers are recorded as the target's: the target never suspends,
+ * the scan starts from an unrelated stack pointer, live roots are invisible,
+ * and the collector frees objects that are still referenced. The crash arrives
+ * later, in the marker, on a pointer like 0x9000900090, with nothing left to
+ * connect it to a signal.
+ *
+ * Same return convention as app_raise_signal_to: 0 = delivered/discarded,
+ * 1 = the CALLER must terminate, 2 = the target process was killed,
+ * -1 = no such thread. */
+int app_raise_signal_to_thread(int pid, int tid, int signo) {
+    struct app *me = cur();
+    if (signo <= 0 || signo >= APP_NSIG) return -1;
+    struct app *t = (pid <= 0 || (me && pid == me->pid)) ? me : app_by_pid(pid);
+    if (!t) return -1;
+    task_t *th = 0;
+    if (t->task && ((task_t *)t->task)->id == tid) th = (task_t *)t->task;
+    if (!th) for (int k = 0; k < APP_MAXTHREAD; k++)
+        if (t->thr[k] && t->thr[k]->id == tid) { th = t->thr[k]; break; }
+    if (!th) return -1;                                  /* ESRCH: name a thread that exists */
+    if (th->state == TASK_DEAD) return -1;
+    if (t->sig_handler[signo] == APP_SIG_IGN) return 0;  /* explicitly ignored: discard */
+    if (t->sig_handler[signo]) {
+        uint64_t f = irq_save();
+        th->sig_pending |= (1ull << signo);
+        task_wake(th);
+        irq_restore(f);
+        return 0;
+    }
+    /* No handler: a thread-directed signal whose default action is to
+     * terminate takes the WHOLE process down, exactly as on Linux. */
+    switch (signo) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
+    case 9: case 11: case 13: case 14: case 15: case 24: case 25: case 31:
+        if (th == task_self()) return 1;
+        t->kill = 1;
+        if (t->task) task_wake((task_t *)t->task);
+        return 2;
+    default:
+        return 0;                                        /* default-ignore */
+    }
 }
 
 /* sigprocmask (M1208): change the caller's blocked-signal mask and return the
  * previous one. A blocked signal that's raised stays pending (app_deliver_pending
  * skips it) and is delivered once unblocked. SIGKILL/SIGSTOP can't be blocked. */
 uint64_t app_sigprocmask(int how, uint64_t set) {
-    struct app *a = cur();
-    if (!a) return 0;
-    uint64_t old = a->sig_blocked;
+    struct app *a = cur(); task_t *th = task_self();
+    if (!a || !th) return 0;
+    /* THE MASK IS THE THREAD'S (M2075). pthread_sigmask and sigprocmask are
+     * the same syscall, and it has always been per-thread; a shared mask meant
+     * one thread blocking SIGUSR1 -- which is exactly what a runtime does
+     * around its own critical sections -- blocked it for every sibling, so the
+     * signal that suspends a thread for a collection could not be delivered to
+     * any of them. */
+    uint64_t old = th->sig_blocked;
     switch (how) {
-        case 0: a->sig_blocked |= set;  break;       /* SIG_BLOCK */
-        case 1: a->sig_blocked &= ~set; break;       /* SIG_UNBLOCK */
-        case 2: a->sig_blocked = set;   break;       /* SIG_SETMASK */
+        case 0: th->sig_blocked |= set;  break;      /* SIG_BLOCK */
+        case 1: th->sig_blocked &= ~set; break;      /* SIG_UNBLOCK */
+        case 2: th->sig_blocked = set;   break;      /* SIG_SETMASK */
         case 3: break;                               /* query only: report `old` and change nothing (M2063) */
         default: break;
     }
-    a->sig_blocked &= ~((1ull << 9) | (1ull << 19));      /* SIGKILL(9)/SIGSTOP(19) are never blockable */
+    th->sig_blocked &= ~((1ull << 9) | (1ull << 19));     /* SIGKILL(9)/SIGSTOP(19) are never blockable */
     return old;
 }
 
@@ -6304,7 +6392,10 @@ uint64_t app_sigprocmask(int how, uint64_t set) {
  * delivered (because they're blocked) — POSIX sigpending(2). */
 uint64_t app_sigpending(void) {
     struct app *a = cur();
-    return a ? a->pending_sigs : 0;
+    /* Both sets: what was raised at THIS thread and what was raised at the
+     * process and not yet taken by anyone (M2075). */
+    task_t *th = task_self();
+    return a ? (a->pending_sigs | (th ? th->sig_pending : 0)) : 0;
 }
 
 /* Mirrors app_deliver_pending's own inner gate exactly (pending, has a real
@@ -6317,9 +6408,12 @@ uint64_t app_sigpending(void) {
  * a deliverable signal the same way sigsuspend/pause break their own wait. */
 int app_signal_deliverable(void) {
     struct app *a = cur();
+    task_t *th = task_self();
     if (!a) return 0;
+    uint64_t thp = th ? th->sig_pending : 0;
+    uint64_t thb = th ? th->sig_blocked : 0;
     for (int sig = 1; sig < APP_NSIG; sig++)
-        if ((a->pending_sigs & (1ull << sig)) && a->sig_handler[sig] && a->sig_handler[sig] != APP_SIG_IGN && !(a->sig_blocked & (1ull << sig)))
+        if (((a->pending_sigs | thp) & (1ull << sig)) && a->sig_handler[sig] && a->sig_handler[sig] != APP_SIG_IGN && !(thb & (1ull << sig)))
             return 1;
     return 0;
 }
@@ -6341,8 +6435,9 @@ int app_signal_deliverable(void) {
 long app_sigsuspend(struct registers *r, uint64_t mask) {
     struct app *a = cur();
     if (!a) return -1;
-    uint64_t old = a->sig_blocked;
-    a->sig_blocked = mask & ~((1ull << 9) | (1ull << 19));   /* SIGKILL/SIGSTOP never blockable (matches sigprocmask) */
+    task_t *th = task_self(); if (!th) return -1;
+    uint64_t old = th->sig_blocked;
+    th->sig_blocked = mask & ~((1ull << 9) | (1ull << 19));  /* SIGKILL/SIGSTOP never blockable (matches sigprocmask) */
     for (;;) {
         uint64_t f = irq_save();               /* pairs with app_request_signal's own lock (M1612) */
         int deliverable = app_signal_deliverable();
@@ -6353,7 +6448,7 @@ long app_sigsuspend(struct registers *r, uint64_t mask) {
     }
     r->rax = (uint64_t)-1;
     app_deliver_pending(r);
-    a->sig_blocked = old;
+    th->sig_blocked = old;
     return -1;
 }
 
@@ -6364,7 +6459,7 @@ long app_sigsuspend(struct registers *r, uint64_t mask) {
 long app_pause(struct registers *r) {
     struct app *a = cur();
     if (!a) return -1;
-    return app_sigsuspend(r, a->sig_blocked);
+    { task_t *th = task_self(); return app_sigsuspend(r, th ? th->sig_blocked : 0); }
 }
 
 /* --- RT signals / sigqueue(3) (M1271) -----------------------------------
@@ -6612,22 +6707,37 @@ int app_deliver_pending(struct registers *r) {
                                               * sched_init (current==NULL) and on kernel tasks -> guard */
     if (!t || !t->proc) return 0;
     struct app *a = (struct app *)t->proc;
-    if (!a->pending_sigs) return 0;
+    task_t *th = task_self();
+    uint64_t thp = th ? th->sig_pending : 0;
+    uint64_t thb = th ? th->sig_blocked : 0;
+    if (!a->pending_sigs && !thp) return 0;
     if ((r->cs & 3) != 3) return 0;          /* resuming kernel code (mid-syscall) -> defer */
     /* deliver the lowest pending signal that has a handler (one per return, like
      * Linux); handler-less signals stay pending for signalfd to drain. */
     for (int sig = 1; sig < APP_NSIG; sig++) {
-        if (!(a->pending_sigs & (1ull << sig))) continue;
+        /* THIS THREAD'S first, then the process-wide set: a thread-directed
+         * signal names its target and a process-directed one does not. (M2075) */
+        int mine = (thp & (1ull << sig)) != 0;
+        if (!mine && !(a->pending_sigs & (1ull << sig))) continue;
         /* SIG_IGN: DISCARD it, do not leave it pending for ever (M2063). */
-        if (a->sig_handler[sig] == APP_SIG_IGN) { a->pending_sigs &= ~(1ull << sig); continue; }
+        if (a->sig_handler[sig] == APP_SIG_IGN) {
+            a->pending_sigs &= ~(1ull << sig);
+            if (th) th->sig_pending &= ~(1ull << sig);
+            continue;
+        }
         if (!a->sig_handler[sig]) continue;
-        if (a->sig_blocked & (1ull << sig)) continue;   /* sigprocmask: blocked -> stays pending (M1208) */
+        if (thb & (1ull << sig)) continue;             /* this thread blocks it -> stays pending (M1208) */
         int qi = sigq_peek(a, sig);                   /* RT/sigqueue payload (M1271), or -1 = coalesced/no payload */
-        a->sig_q_code  = (qi >= 0) ? a->sigq[qi].code  : SI_USER;
-        a->sig_q_value = (qi >= 0) ? a->sigq[qi].value : 0;
+        if (th) {
+            th->sig_q_code  = (qi >= 0) ? a->sigq[qi].code  : SI_USER;
+            th->sig_q_value = (qi >= 0) ? a->sigq[qi].value : 0;
+        }
         if (app_signal_deliver(r, sig)) {
             if (qi >= 0) sigq_drop(a, qi);            /* consumed one queued instance */
-            if (sigq_peek(a, sig) < 0) a->pending_sigs &= ~(1ull << sig);  /* clear the bit only when none remain -> the next queued instance delivers on the next return to ring 3 (RT queuing) */
+            if (sigq_peek(a, sig) < 0) {   /* clear only when none remain -> the next queued instance delivers on the next return to ring 3 (RT queuing) */
+                a->pending_sigs &= ~(1ull << sig);
+                if (th) th->sig_pending &= ~(1ull << sig);
+            }
             return 1;
         }
         return 0;                            /* couldn't deliver yet (already in a handler) -> stay pending */
@@ -9913,6 +10023,13 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
     a->seccomp_n = p->seccomp_n;                          /* inherit the parent's seccomp filter (M1190) */
     for (int i = 0; i < p->seccomp_n && i < BPF_MAXINSN; i++) a->seccomp_prog[i] = p->seccomp_prog[i];
     /* NOT inherited (POSIX): pending signals, alarms, strace, gfx-mode canvas. */
+    /* The signal MASK is inherited, and it is per-thread now, so it has to be
+     * copied from the CALLING thread rather than from the process (M2075).
+     * glibc's pthread_create blocks every signal around the clone and has the
+     * child restore the saved mask, so a child that starts with an empty mask
+     * has a window in which it can take a signal meant for its creator. */
+    { task_t *pt = task_self();
+      a->fork_sig_blocked = pt ? pt->sig_blocked : 0; }
 
     /* The child's resume context: the parent's trap frame, but returning 0. */
     a->fork_frame = *r;
@@ -9923,6 +10040,7 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
     /* SUSPENDED: the copies below are what make this a working thread, and a
      * child that gets scheduled before them runs with %fs = 0. (M2006) */
     a->task = task_create_stack_suspended(fork_child_trampoline, a->cr3, a, 256 * 1024);
+    if (a->task) ((task_t *)a->task)->sig_blocked = a->fork_sig_blocked;   /* inherited mask (M2075) */
     if (!a->task) {
         if (!a->cr3_borrowed) vmm_destroy_address_space(a->cr3);
         a->used = 0; return -1;
@@ -10347,9 +10465,15 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     }
     a->aslr_mmap_base = aslr_mmap_pick(); a->mmap_next = a->aslr_mmap_base;   /* ASLR: a fresh randomized mmap base per exec (M1287) */
     for (int i = 0; i < APP_NSIG; i++) a->sig_handler[i] = 0;
-    a->sig_in = 0; a->pending_sigs = 0; a->sig_blocked = 0; a->sigfd_armed = 0; a->sigfd_mask = 0; a->alarm_interval = 0; a->alarm_next = 0;
+    a->pending_sigs = 0; a->sigfd_armed = 0; a->sigfd_mask = 0; a->alarm_interval = 0; a->alarm_next = 0;
+    /* The per-thread half as well (M2075): exec keeps the calling thread and
+     * discards every sibling, so the mask, the pending set, the alternate
+     * stack and any in-flight handler all belong to the old program. */
+    { task_t *th = task_self();
+      if (th) { th->sig_in = 0; th->sig_pending = 0; th->sig_blocked = 0;
+                th->sig_uctx = 0; th->sig_alt_base = 0; th->sig_alt_size = 0; } }
     a->sigq_n = 0;                                                  /* drop any queued RT-signal payloads (M1271) */
-    a->sig_alt_base = 0; a->sig_alt_size = 0;                       /* the alternate signal stack is gone across exec (M1276) */
+
     for (int i = 0; i < APP_NPTIMER; i++) a->ptimer[i].used = 0;    /* POSIX timers are not preserved across exec (M1272) */
     if (a->gfx) { kfree(a->gfx); a->gfx = 0; a->gfx_w = a->gfx_h = 0; }
     int ti = 0; if (title) while (title[ti] && ti < 23) { a->titlebuf[ti] = title[ti]; ti++; }

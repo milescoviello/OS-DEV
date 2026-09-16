@@ -235,6 +235,7 @@ void app_request_signal(app_t *a, int signo);      /* async-raise a signal (Ctrl
  * 1 = the CALLER must exit 128+signo, 2 = the target was killed, -1 = ESRCH.
  * The decision needs struct app, so it lives in app.c. (M2063) */
 int  app_raise_signal_to(int pid, int signo);
+int  app_raise_signal_to_thread(int pid, int tid, int signo);   /* tkill/tgkill/pthread_kill: the named THREAD, not just its process (M2075) */
 uint64_t app_sigprocmask(int how, uint64_t set);   /* block/unblock signals; returns the old mask (M1208; 64-bit since M2063) */
 uint64_t app_sigpending(void);                      /* the raised-but-blocked (pending) signal set (M1209) */
 int      app_signal_deliverable(void);              /* 1 if the current task has a real (handled, unblocked) signal pending (M1567) */

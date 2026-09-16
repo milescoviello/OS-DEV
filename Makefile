@@ -280,6 +280,11 @@ $(LXROOT)/lxstack: tools/lx/lxstack.c
 	$(CC) -static-pie -O2 -o $@ $< -lpthread
 	@echo "  HOSTCC  $@ (a thread must be able to find its own stack: GC roots depend on it)"
 
+$(LXROOT)/lxtsig: tools/lx/lxtsig.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $< -lpthread
+	@echo "  HOSTCC  $@ (a signal sent to a thread must arrive at THAT thread)"
+
 $(LXROOT)/lxlongname: tools/lx/lxlongname.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -360,7 +365,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

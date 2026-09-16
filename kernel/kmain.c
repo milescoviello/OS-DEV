@@ -786,6 +786,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the stack-bounds probe...\n");
         {   int strc2 = app_run_linux_sync("/disk2/lxstack", 0, 0, 120000);
             kprintf("[lxabi] LXSTACK exit -> %d\n", strc2); }
+        /* ...and whether a signal sent to a thread arrives at that thread,
+         * which is how a collector suspends one. (M2075) */
+        kprintf("[lxabi] launching the per-thread signal probe...\n");
+        {   int tsrc = app_run_linux_sync("/disk2/lxtsig", 0, 0, 180000);
+            kprintf("[lxabi] LXTSIG exit -> %d\n", tsrc); }
         /* HOME, and the XDG directories under it (M1985). A GTK program writes
          * before it draws -- a profile, a font cache, a dconf directory -- and
          * glib treats a config directory it cannot create as fatal rather than

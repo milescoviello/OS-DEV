@@ -1427,12 +1427,22 @@ void linux_syscall_dispatch(struct registers *r) {
          * visible for what it is. (M1960) */
         if (sig < 0 || sig >= APP_NSIG_LX) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (sig == 0) { r->rax = 0; break; }         /* signal 0 is an existence probe */
-        /* WHICH PROCESS (M2063). tkill names a THREAD, tgkill a thread within
-         * a thread group; signals here are per-PROCESS, so both are treated as
-         * "this process" when the group is ours -- which is what raise() and
-         * pthread_kill(self) need, and is stated rather than pretended. */
+        /* WHICH THREAD (M2075). M2063's note here said signals were
+         * per-PROCESS, "stated rather than pretended" -- and that statement
+         * was the defect: tkill(tid) and tgkill(tgid, tid) NAME a thread, and
+         * discarding the name is what broke JavaScriptCore's collector, which
+         * suspends each thread in turn by signalling it and reading back the
+         * registers the handler saved. Delivered to the wrong thread, the
+         * target never stops and the collector scans from someone else's stack
+         * pointer. tkill's first argument is the tid; tgkill's second is. */
         long tpid = (r->rax == LXS_tkill_) ? 0 : a1;
-        int rc = app_raise_signal_to((int)tpid, sig);
+        int ttid  = (r->rax == LXS_tkill_) ? (int)a1 : (int)r->rsi;
+        int rc = app_raise_signal_to_thread((int)tpid, ttid, sig);
+        /* A tid we do not know is not automatically an error: glibc's raise()
+         * uses tgkill with its own tid, and a runtime may signal a thread that
+         * has just exited. Fall back to the process so a self-raise can never
+         * be lost, which is the case abort() depends on. */
+        if (rc < 0) rc = app_raise_signal_to((int)tpid, sig);
         if (rc == 1) {                               /* SIG_DFL and fatal, at ourselves */
             kprintf("[linuxabi] process raised signal %d at itself with no handler -- terminating\n", sig);
             /* abort() prints nothing of its own and leaves no fault address, so

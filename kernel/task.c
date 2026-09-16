@@ -1286,6 +1286,7 @@ void task_free(task_t *t) {
     if (!t) return;
     if (t->stack_base) kstack_free((void *)t->stack_base, t->kstack_top - t->stack_base);
     if (t->fxbuf) kfree(t->fxbuf);
+    if (t->sig_saved) kfree(t->sig_saved);   /* allocated on this thread's first signal (M2075) */
     kfree(t);
 }
 
