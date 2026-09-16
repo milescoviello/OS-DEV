@@ -3937,6 +3937,34 @@ void linux_syscall_dispatch(struct registers *r) {
      * than at entry because the whole value of the record is the RESULT. */
     { struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
       if (re->seq == ring_slot) re->ret = r->rax;   /* still ours: see `seq` */ }
+    /* EVERY SYSCALL THAT FAILED, EXCEPT THE ONES THAT FAIL BY DESIGN (M2070).
+     *
+     * A histogram says what a program is doing a lot of; it cannot show the
+     * call it made ONCE and could not recover from. That is usually where a
+     * startup stops -- and this whole campaign's dominant bug class is a
+     * syscall that returns a plausible wrong answer, which by definition does
+     * not appear as an error at all until something downstream gives up.
+     *
+     * ENOENT and EAGAIN are excluded because they are the normal vocabulary of
+     * a runtime probing for config files and polling a non-blocking fd; they
+     * would drown everything else by three orders of magnitude. EINTR likewise.
+     * What is left -- EINVAL, ENOSYS, EBADF, EFAULT, EPERM, ENOTTY... -- is
+     * short enough to read and is exactly the set worth reading. */
+    { extern int g_lx_syshist;
+      if (g_lx_syshist) {
+        long rv = (long)r->rax;
+        if (rv < 0 && rv > -4096) {
+            int e = (int)-rv;
+            if (e != LX_ENOENT && e != LX_EAGAIN && e != LX_EINTR) {
+                static int shown;
+                if (++shown <= 200)
+                    kprintf("[syserr] pid %d t%d %s(%lx, %lx, %lx) = -%d\n",
+                            app_current_pid(), task_current_id(),
+                            lx_syscall_name(r->rax), r->rdi, r->rsi, r->rdx, e);
+            }
+        }
+      }
+    }
     /* AND DELIVER ANY SIGNAL THAT CAME DUE (M2063).
      *
      * The native syscall return (syscall.c) and the interrupt return
