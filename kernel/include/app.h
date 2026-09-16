@@ -24,7 +24,8 @@ int         app_last_spawn_pid(void);
 int         app_state_of(int pid);
 void        app_dump_threads(int pid);                                /* where every thread of a pid is parked (M1996) */                                     /* task state of a live pid, -1 if gone (M1996) */                                  /* pid of the last successful spawn (M1988) */
 void        app_count_lx_syscall(unsigned long nr);                    /* one more Linux syscall by the caller, counted BY NUMBER (M2004/M2066) */
-int         app_reap_selftest(void);                                   /* -append selftest: only ONE reaper may tear a process down (M2072) */
+int         app_reap_selftest(void);
+int         app_pendq_selftest(void);                                  /* -append selftest: a live app must not lose its window to a dead one (M2076) */                                   /* -append selftest: only ONE reaper may tear a process down (M2072) */
 #define LX_ENV_CMDLINE 4
 extern const char *g_lx_env_cmdline[LX_ENV_CMDLINE];   /* extra environment for every Linux program, from -append (M2073) */
 void        app_set_fault_siginfo(uint64_t addr, int code);       /* si_addr/si_code for the NEXT fault signal delivered (M2073) */

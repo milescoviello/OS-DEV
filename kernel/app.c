@@ -721,8 +721,58 @@ static const uint32_t app_palette[16] = {
  * The PID is carried alongside the pointer on purpose (M2011): `apps[]` slots
  * are recycled, so a bare pointer cannot tell "the app I queued" from "whatever
  * moved into its slot afterwards". */
-static struct { struct app *a; int pid; } pending[MAX_APPS];
+/* THE WINDOW QUEUE (M2076).
+ *
+ * Every app reaches the window manager through this ring, and it used to drop
+ * a push silently when full -- `if (n != pend_t)` and no else. Nothing ever
+ * removed an entry for a process that had since exited, either, so a boot that
+ * creates and reaps thirty-one short-lived processes (the IPC self-test alone
+ * accounts for a dozen) fills all thirty-two slots with corpses. The next
+ * spawn is then discarded, and the next spawn is THE SHELL: the desktop came
+ * up with a Welcome window, a Files window and no terminal, looking entirely
+ * deliberate. Every keystroke I then typed went to the file manager, where 'd'
+ * deletes and 'n' creates a directory.
+ *
+ * So: reclaim the dead before declaring the queue full, and if it genuinely is
+ * full of live processes, say which one is being dropped. A queue that lies
+ * about having space is worse than one that is too small. */
+struct pendent { struct app *a; int pid; };
+static struct pendent pending[MAX_APPS];
 static int pend_h, pend_t;
+
+/* Drop every queued entry whose process is gone, in place, preserving order.
+ * Called before declaring the ring full: a corpse must never cost a live app
+ * its window. */
+static void pend_reclaim(void) {
+    int rd = pend_t, wr = pend_t, dead = 0;
+    while (rd != pend_h) {
+        struct app *a = pending[rd].a;
+        if (a && a->used && a->pid == pending[rd].pid) {
+            if (wr != rd) pending[wr] = pending[rd];
+            wr = (wr + 1) % MAX_APPS;
+        } else dead++;
+        rd = (rd + 1) % MAX_APPS;
+    }
+    pend_h = wr;
+    if (dead) kprintf("[app] window queue: reclaimed %d entr%s for processes that had exited\n",
+                      dead, dead == 1 ? "y" : "ies");
+}
+
+int app_pendq_selftest(void);   /* below: the invariant this queue exists for */
+
+/* Queue an app for the window manager. Returns 0 if it could not be queued --
+ * which now means the queue is full of LIVE apps, and says so. */
+static int pend_push(struct app *a) {
+    int n = (pend_h + 1) % MAX_APPS;
+    if (n == pend_t) { pend_reclaim(); n = (pend_h + 1) % MAX_APPS; }
+    if (n == pend_t) {
+        kprintf("[app] window queue FULL of live apps: '%s' (pid %d) will not get a window\n",
+                a->title ? a->title : "?", a->pid);
+        return 0;
+    }
+    pending[pend_h].a = a; pending[pend_h].pid = a->pid; pend_h = n;
+    return 1;
+}
 
 /* the embedded programs (see kernel/asm/user_blob.asm) */
 extern char shell_elf_start[], clock_elf_start[], calc_elf_start[], snake_elf_start[],
@@ -7650,8 +7700,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     }
 
     /* queue it for the window manager to give it a window */
-    int n = (pend_h + 1) % MAX_APPS;
-    if (n != pend_t) { pending[pend_h].a = a; pending[pend_h].pid = a->pid; pend_h = n; }
+    pend_push(a);
     g_last_spawn_pid = a->pid;           /* so a kernel-context caller can wait for it (M1955) */
     return a;
 
@@ -10051,8 +10100,7 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
     task_cont(a->task);                /* context complete: now it may run */
 
     /* give the child its own window (the WM consumes the pending queue) */
-    int n = (pend_h + 1) % MAX_APPS;
-    if (n != pend_t) { pending[pend_h].a = a; pending[pend_h].pid = a->pid; pend_h = n; }
+    pend_push(a);
     if (share_vm) {
         /* SUSPEND THE PARENT until the child execs or exits -- the other half
          * of vfork, and the half that makes sharing an address space safe at
@@ -11145,12 +11193,82 @@ int app_list_names(char *buf, int max) {
  * An app that has EXITED but not yet been reaped still gets its window -- it
  * may have printed something worth reading, and the reap loop will close it a
  * moment later. What is skipped is a slot that is no longer the app we queued. */
+/* -append selftest: A LIVE APP MUST NOT LOSE ITS WINDOW TO A DEAD ONE (M2076).
+ *
+ * The queue is a 32-entry ring, nothing ever removed an entry for a process
+ * that had exited, and a push into a full one was discarded with no else
+ * branch. A boot that creates and reaps thirty-one short-lived processes -- the
+ * IPC self-test alone accounts for a dozen -- filled every slot with corpses,
+ * and the next spawn was THE SHELL. The desktop came up with a Welcome window,
+ * a Files window, and no terminal, which looks exactly like a design decision.
+ *
+ * Asserted here rather than from a boot marker because a boot only fills the
+ * ring when it happens to run enough processes: the Shell-window marker in the
+ * boot suite proves the system works, and this proves the property that makes
+ * it work, on every boot, whatever else the boot does. */
+int app_pendq_selftest(void) {
+    int fails = 0, checks = 0;
+    int sh = pend_h, st = pend_t;
+    static struct pendent save[MAX_APPS];
+    for (int i = 0; i < MAX_APPS; i++) save[i] = pending[i];
+
+    /* A slot that passes the liveness check. Fabricated, because the test has
+     * to be deterministic and the real apps at this point in boot are not. */
+    struct app *live = 0;
+    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { live = &apps[i]; break; }
+    if (!live) { kprintf("[pendqtest] FAIL no free app slot to test with\n"); return 1; }
+    live->used = 1; live->pid = 31337; live->out_to = 0; live->exited = 0;
+
+    /* Fill the ring with entries for processes that do not exist. */
+    pend_h = pend_t = 0;
+    for (int i = 0; i < MAX_APPS - 1; i++) {
+        pending[pend_h].a = 0; pending[pend_h].pid = 9000 + i;
+        pend_h = (pend_h + 1) % MAX_APPS;
+    }
+    checks++;
+    if (!pend_push(live)) {
+        kprintf("[pendqtest] FAIL a live app was DROPPED by a queue full of EXITED processes"
+                " -- this is the missing Shell window\n");
+        fails++;
+    } else kprintf("[pendqtest] ok   a live app is queued even when the ring is full of exited processes\n");
+
+    checks++;
+    { app_t *got = app_take_pending();
+      if (got != (app_t *)live) { kprintf("[pendqtest] FAIL the queue returned a different app than the one pushed\n"); fails++; }
+      else kprintf("[pendqtest] ok   ...and it is the app that comes back out\n"); }
+
+    /* And a ring full of LIVE apps must still refuse -- reclaiming must not
+     * become "overwrite something that is still waiting". */
+    checks++;
+    pend_h = pend_t = 0;
+    for (int i = 0; i < MAX_APPS - 1; i++) {
+        pending[pend_h].a = live; pending[pend_h].pid = live->pid;
+        pend_h = (pend_h + 1) % MAX_APPS;
+    }
+    if (pend_push(live)) { kprintf("[pendqtest] FAIL a ring full of LIVE apps accepted another push\n"); fails++; }
+    else kprintf("[pendqtest] ok   a ring full of LIVE apps refuses, and names the app it dropped\n");
+
+    live->used = 0; live->pid = 0;
+    for (int i = 0; i < MAX_APPS; i++) pending[i] = save[i];
+    pend_h = sh; pend_t = st;
+    kprintf("[pendqtest] %s (%d checks)\n",
+            fails ? "PENDQSELFTEST FAILED" : "PENDQSELFTEST PASSED", checks);
+    return fails;
+}
+
 app_t *app_take_pending(void) {
     while (pend_t != pend_h) {
         struct app *a = pending[pend_t].a;
         int pid = pending[pend_t].pid;
         pend_t = (pend_t + 1) % MAX_APPS;
         if (a && a->used && a->pid == pid) return a;
+        /* SAY WHEN AN ENTRY IS DROPPED (M2076). This queue is how every app
+         * gets a window, and the stale-entry check discards silently -- so a
+         * process that spawned fine and then died, or whose slot was reused
+         * before the desktop looked, produces a desktop with a window
+         * missing and nothing anywhere saying which. */
+        kprintf("[app] the window queue dropped pid %d (slot %s, now pid %d)\n",
+                pid, (a && a->used) ? "reused" : "free", a ? a->pid : 0);
     }
     return 0;
 }

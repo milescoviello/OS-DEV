@@ -296,6 +296,13 @@ void isr_dispatch(struct registers *r) {
                             exception_names[r->int_no], r->int_no, r->err_code,
                             (void *)frip, (void *)cr2, task_current_id(), task_name_of(task_self()));
                     app_describe_addr(frip);
+                    /* AND THE REGISTERS. A caught fault on `mov (%rax),%edx`
+                     * says nothing without rax: a #GP there means the address
+                     * is NON-CANONICAL, which is a different bug from a page
+                     * that is merely absent, and the two are indistinguishable
+                     * from the instruction alone. The terminate path below has
+                     * dumped them since M1945; the caught path had nothing. */
+                    dump_registers(r);
                     /* AND WHAT IT WAS DOING. lx_trace_dump_fault runs on the
                      * terminate path only, so a caught fault left no history
                      * at all -- the one case where the program's own message

@@ -791,6 +791,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the per-thread signal probe...\n");
         {   int tsrc = app_run_linux_sync("/disk2/lxtsig", 0, 0, 180000);
             kprintf("[lxabi] LXTSIG exit -> %d\n", tsrc); }
+        /* ...and whether a COW break loses a write when several threads take
+         * one at the same moment, which is what fork() in a threaded process
+         * makes happen. (M2076) */
+        kprintf("[lxabi] launching the concurrent-COW probe...\n");
+        {   int cwrc = app_run_linux_sync("/disk2/lxcow", 0, 0, 300000);
+            kprintf("[lxabi] LXCOW exit -> %d\n", cwrc); }
         /* HOME, and the XDG directories under it (M1985). A GTK program writes
          * before it draws -- a profile, a font cache, a dconf directory -- and
          * glib treats a config directory it cannot create as fatal rather than
@@ -1885,6 +1891,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         console_selftest(); /* M1915: concurrent kprintf lines are never spliced */
         vmm_tlb_selftest(); /* M2065: a shootdown that times out must KEEP the flush obligation */
         app_reap_selftest();/* M2072: two cores must not tear the same process down */
+        app_pendq_selftest();/* M2076: a live app must not lose its window to a dead one */
     }
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).

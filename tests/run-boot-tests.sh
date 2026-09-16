@@ -72,6 +72,15 @@ while [ $i -lt 90 ]; do
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
+# ...and for the desktop to hand out its windows, which happens on the first
+# iteration of its event loop. Without this the Shell-window assertion below
+# would be racing the kill (M2076).
+i=0
+while [ $i -lt 40 ]; do
+    grep -q "window for 'Shell'" "$LOG" 2>/dev/null && break
+    kill -0 "$QPID" 2>/dev/null || break
+    sleep 0.5; i=$((i+1))
+done
 sleep 0.3   # let the last few lines flush
 kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
@@ -233,6 +242,13 @@ require "mounted FAT32 volume"               "FAT32 mount"
 require "AC'97 audio: NAM="                  "AC'97 audio bring-up"
 require "USB tablet active"                  "USB UHCI + tablet"
 require "launching the desktop environment"  "reached desktop launch"
+# M2076: the desktop's window queue is a 32-entry ring that nothing ever
+# garbage-collected, and a push into a full one was discarded silently. A boot
+# that creates and reaps thirty-one short-lived processes -- the IPC self-test
+# alone accounts for a dozen -- filled it with corpses, and the next spawn was
+# THE SHELL. The desktop came up with no terminal, looking deliberate.
+require "window for 'Shell'"                 "the SHELL GOT A WINDOW (M2076: the window queue no longer fills with dead processes)"
+require "PENDQSELFTEST PASSED"               "...and the window queue reclaims exited entries rather than dropping a live app (3 checks)"
 
 # Markers that must NOT appear: a crash anywhere in the boot.
 forbid() {

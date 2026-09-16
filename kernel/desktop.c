@@ -1686,7 +1686,23 @@ static void make_app_window(app_t *a) {
      * Giving it a second, empty window of its own put the program's UI
      * somewhere the person who typed the command was not looking, and left the
      * terminal they WERE looking at frozen behind it. */
-    if (app_out_to_of(a)) return;
+    if (app_out_to_of(a)) {
+        /* SAY WHOSE. This is the only silent `return` in the window path, and
+         * an app that wrongly believes it is someone's foreground job simply
+         * never appears -- which is what a missing Shell window looks like.
+         * (M2076) */
+        kprintf("[desktop] '%s' (pid %d) gets NO window: its output is routed to pid %d's\n",
+                app_title(a) ? app_title(a) : "?", app_pid_of(a), app_pid_of(app_out_to_of(a)));
+        return;
+    }
+    /* NAME EVERY WINDOW AS IT IS CREATED (M2076). The desktop's own state was
+     * unobservable from a log: a window that was never created and one that
+     * was never asked for look identical, and the boot suite could assert
+     * neither. The Shell is the one that matters -- without it the desktop has
+     * no terminal at all, and every keystroke goes to whatever else has
+     * focus. */
+    kprintf("[desktop] window for '%s' (pid %d)\n",
+            app_title(a) ? app_title(a) : "?", app_pid_of(a));
     spawn_n++;
     /* Open to the RIGHT of the boot column and cascade there, instead of at a
      * fixed 150,60 that lands on top of it. Clamped so a window can never open
@@ -1996,8 +2012,14 @@ void desktop_run(void) {
         windows[win_count++] = (window_t){ m, m + wel_h + m / 2, colw, usable - wel_h - m / 2,
                                            THEME_PANEL, "Files", KIND_FILES, 0, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
     }
-    app_spawn_named("shell");           /* a real ring-3 shell (WM gives it a
-                                         * window below; spawn more via Apps) */
+    /* SAY IF IT DID NOT START. A missing Shell window is the most visible
+     * failure this desktop has and the least explained: app_spawn_named
+     * returns -1 and the loop below simply has nothing to give a window to,
+     * so the desktop comes up looking deliberate. Twice in a row I typed a
+     * command into a desktop with no terminal and the keystrokes went to the
+     * file manager, where 'd' deletes and 'n' creates. (M2076) */
+    if (app_spawn_named("shell") != 0)
+        kprintf("[desktop] the SHELL DID NOT START -- there will be no terminal window\n");
 
     int dragging = -1, resizing = -1, gdx = 0, gdy = 0;
     int selecting = -1;                  /* window index whose text we're drag-selecting (terminal) */
