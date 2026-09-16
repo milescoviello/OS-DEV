@@ -1,5 +1,49 @@
 # What's next
 
+> **(M2070-M2083) CLAUDE CODE ANSWERS A QUESTION FROM INSIDE OS-DEV, AND
+> FIREFOX CREATES ITS FIRST `wl_surface`.**
+>
+> Fourteen milestones, and the through-line is one sentence: **"the process" is
+> not a single task, and has not been since threads arrived.** Six of these are
+> the same mistake in six different mechanisms.
+>
+>     > hi
+>     * Hi! What can I help you with today?
+>       I see you're in /src -- a git repo with an OS-DEV kernel source tree.
+>     > how many lines are in kernel/vmm.c
+>     * Read 2 files  ->  /src/kernel/vmm.c has 1194 lines.
+>
+> That is Claude Code, in a window, on this kernel, reading OS-DEV's own source
+> over the real network to answer.
+>
+> | | |
+> |---|---|
+> | **M2070** | log the syscalls that FAIL, minus the two that fail by design. The instrument that made most of what follows findable |
+> | **M2071** | **`read()` on a directory said EBADF.** `ext2_pread` returns -1 for both "no such path" and "is a directory", and `lx_fd_err` maps a bare -1 to EBADF -- so the answer named the descriptor instead of the object, and Claude Code could not proceed past it |
+> | **M2072** | two cores tore the same process down and the kernel died on it: `app_reap` had no single-winner claim, so the second reaper freed a slot the first had already freed |
+> | **M2073** | **the futex was named by its PAGE.** The key was a PHYSICAL address, and fork marks every page COW -- so the parent's next write allocates a fresh frame and every `FUTEX_WAKE` afterwards hashes to a key no waiter answers to. Returning 0 woken is what an uncontended unlock returns, so nothing failed. Claude Code forks to run `git` during startup; from that fork onward its threads could not wake each other, and the machine went fully idle with the TUI never painted. Linux keys on `(mm, address)` for private mappings for exactly this reason |
+> | **M2074** | a fault signal now carries the address it faulted on. `si_addr` was hardcoded to 0, so Bun printed *"Segmentation fault at address 0x0"* while CR2 was `0x500000020` -- our number, not its bug. Plus `timerfd`, without which an event loop falls back to polling nine hundred times every fifteen seconds |
+> | **M2075** | **a signal sent to a thread was delivered to whichever thread answered first.** Every piece of signal state lived in `struct app` -- once per PROCESS -- and every piece of it is per-thread by definition. `tkill(tid)` discarded the tid; one shared `sig_saved` slot meant two concurrent handlers overwrote each other's registers and the second `sigreturn` resumed the wrong thread at the wrong address. JavaScriptCore suspends threads for a collection by signalling each one and reading back the registers its handler saved, so delivering to the wrong thread makes the collector scan from an unrelated stack pointer and free objects that are still live |
+> | **M2076** | the desktop's window queue is a 32-entry ring nothing garbage-collected, and a push into a full one was discarded with no else branch. A boot that creates and reaps thirty-one short-lived processes filled it with corpses, and the next spawn was **the shell**. The desktop came up with no terminal, looking entirely deliberate |
+> | **M2077** | **two cores could break the same copy-on-write page.** M1995 gave the demand-zero path a locked re-check; the COW path kept none. Both faulters copy, both install, and the loser's write is gone -- and both then free the shared frame, so its count drops twice for one reference and it is handed to the next allocation while a forked child still maps it. `-smp 1` clean, `-smp 4` corrupt every time |
+> | **M2078** | the stale-TLB repair was **gated on finding a VMA**. When a PTE is made more permissive x86 does not require the TLB to be updated, and M2005's repair for that sat inside the branch that has already found a VMA -- so a write fault on a page the table reports present, writable and user killed the process, because JSC's JIT region is mapped and has no VMA. Also: fork COW-marked every user PML4 slot since M2031 and teardown still freed only `pml4[0]`, leaking every reference and page table above half a terabyte -- which is where Bun's heap lives |
+> | **M2079** | a tool that cannot write a temp file cannot run. The guest had **no `/tmp` at all**, and `pwrite64` returned ENOSYS. Claude Code diagnosed both itself, from inside the guest, when asked to run a command |
+> | **M2080** | **a kernel fault could not report itself.** The panic path disables interrupts on its core for life and there was no cross-core stop, while `con_lock`'s owner is a TASK taken with interrupts ON -- so a holder can be preempted and the panicking core can neither wait for it nor answer an IPI. Three runs in four on `-smp 4` produced no panic text at all, which makes every observation afterwards unverifiable. Now: one panic owner claimed by CAS, an **NMI** cross-core stop (a core spinning with IF clear cannot take a fixed vector -- that is the whole failure), and a panic-mode console bypass |
+> | **M2081** | the instruments could not name what a stalled toolkit was waiting for. The compositor never said a surface had been created -- the one object whose existence separates a client that is starting up from one that will never draw |
+> | **M2082** | **a shared-memory pool could not grow, and a descriptor in flight did not own its object.** A mapped memfd refused to grow, which is what every `wl_shm` client does; and the SCM_RIGHTS queue held a copy of the fdent and nothing else, so when the sender closed its fd -- which libwayland does immediately, because the protocol says the compositor owns it now -- the object was freed and the queued entry named a dead slot. Fixing the first is what made the second observable |
+> | **M2083** | **fork gave the child the wrong thread's TLS, and a child's exit woke the wrong thread.** `task_copy_tls` copied from the process's MAIN task, so a fork off any other thread handed the child a thread-control block that was not its parent's; and `app_wake_waiter` woke only `a->task`, so `wait4` from any other thread blocked for ever with the child already exited |
+>
+> **Where Firefox stands.** It now brings up GTK, connects to the compositor,
+> loads a cursor theme through the real libwayland-cursor, **creates nine
+> `wl_surface`s**, and reaches `nsWindowWayland::ConfigureToplevelWindow()`. It
+> had never created a surface before. The GDBus theory is dead: `connect()` to
+> the absent bus correctly returns ECONNREFUSED and it carries straight on.
+>
+> **The rule this block earned**, on top of M2069's: *when a fix stops working
+> at the layer you fixed, look for the defect it just exposed.* Three times
+> here the repair made the next one visible -- and twice I concluded a mechanism
+> was innocent from a log that could not have incriminated it yet.
+
 > **(M2065-M2069) A MACHINE WEDGE, A GARBAGE COLLECTOR TOLD IT WAS OUT OF MEMORY,
 > AND TWO INSTRUMENTS THAT WERE LYING.**
 >

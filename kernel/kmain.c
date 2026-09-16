@@ -799,6 +799,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the per-thread TLS probe...\n");
         {   int tlrc = app_run_linux_sync("/disk2/lxtls", 0, 0, 180000);
             kprintf("[lxabi] LXTLS exit -> %d\n", tlrc); }
+        /* fcntl record locks and flock(2) both existed in kernel/flock.c and
+         * neither was reachable from a Linux program -- the fallthrough turned
+         * "no such command" into EBADF on a valid fd. (M2085) */
+        kprintf("[lxabi] launching the record-lock probe...\n");
+        {   int lkrc = app_run_linux_sync("/disk2/lxlock", 0, 0, 120000);
+            kprintf("[lxabi] LXLOCK exit -> %d\n", lkrc); }
         /* ...and whether a COW break loses a write when several threads take
          * one at the same moment, which is what fork() in a threaded process
          * makes happen. (M2076) */

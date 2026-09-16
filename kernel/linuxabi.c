@@ -38,6 +38,7 @@
 #include "wayland.h"   /* g_wl_verbose (M1978) */
 #include "vmm.h"
 #include "app.h"
+#include "flock.h"      /* rlock_get/rlock_set/flock_op -- record locks the NATIVE fcntl has had since M1597 (M2085) */
 #include "rtc.h"
 #include "random.h"
 #include "vfs.h"
@@ -273,6 +274,7 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_dup_          32
 #define LXS_getppid_     110
 #define LXS_fcntl_        72
+#define LXS_flock_        73
 #define LXS_getrusage_    98
 #define LXS_time_        201
 #define LXS_getcwd_       79
@@ -997,6 +999,7 @@ const char *lx_syscall_name(unsigned long nr) {
     case 288: return "accept4";
     case 290: return "eventfd2";
     case 18: return "pwrite64";
+    case 73: return "flock";
     case 283: return "timerfd_create";
     case 286: return "timerfd_settime";
     case 287: return "timerfd_gettime";
@@ -3862,6 +3865,20 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (nf < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)nf;
         break;
     }
+    case LXS_flock_: {                       /* (fd, operation) */
+        /* flock(2) had no case at all -- a bare ENOSYS (M2085). flock_op has
+         * backed the native syscall since M1177, and Linux's LOCK_SH(1),
+         * LOCK_EX(2), LOCK_NB(4) and LOCK_UN(8) are the same integers ours
+         * are, so this is a pass-through once the fd is resolved to a path. */
+        const char *fp2 = app_fd_path((int)a1);
+        if (!fp2) {
+            r->rax = (uint64_t)-(long)(app_fd_is_open((int)a1) ? LX_EINVAL : LX_EBADF);
+            break;
+        }
+        long lo = flock_op(fp2, app_current_pid(), (int)r->rsi);
+        r->rax = (lo < 0) ? (uint64_t)-(long)LX_EAGAIN : 0;
+        break;
+    }
     case LXS_fcntl_: {                      /* (fd, cmd, arg) */
         /* F_DUPFD/F_GETFD/F_SETFD/F_DUPFD_CLOEXEC happen to be numbered
          * identically in our native fcntl, so they pass straight through.
@@ -3906,8 +3923,84 @@ void linux_syscall_dispatch(struct registers *r) {
             r->rax = 0;
             break;
         }
+        /* RECORD LOCKS, WHICH EXISTED AND WERE NEVER WIRED (M2085).
+         *
+         * These fell through to app_fcntl -- which implements four commands
+         * and returns -1 for everything else -- and the line below turned that
+         * into EBADF: the one errno whose meaning is "that descriptor is not
+         * open", answered for a descriptor that is. Firefox asked four times
+         * in one startup (F_GETLK twice, F_SETLK twice) and its IPC channel
+         * setup aborts on a failed CHECK.
+         *
+         * The capability was already here and already tested: kernel/flock.c's
+         * rlock_get/rlock_set have backed the NATIVE fcntl since M1597,
+         * including F_SETLKW's blocking path and release-on-exit. Only the
+         * translation was missing.
+         *
+         * Linux's struct flock is { short l_type; short l_whence; off_t
+         * l_start; off_t l_len; pid_t l_pid; } -- 0, 2, 8, 16, 24 -- and its
+         * F_RDLCK/F_WRLCK/F_UNLCK and F_GETLK/F_SETLK/F_SETLKW values are the
+         * same integers ours are, so only the layout and l_whence need work.
+         *
+         * The OFD variants (36/37/38) are served by the same code. That is a
+         * stated simplification, not a pretence: our locks are owned by a pid
+         * rather than by an open file description, so an OFD lock behaves like
+         * a process one. Two threads of one process contending for the same
+         * range would not conflict where Linux says they should -- and that is
+         * still a far better answer than EBADF on a valid fd. */
+        if (cmd == 5 || cmd == 6 || cmd == 7 ||        /* F_GETLK / F_SETLK / F_SETLKW */
+            cmd == 36 || cmd == 37 || cmd == 38) {     /* the OFD spellings */
+            if (!vmm_user_ok(arg, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            const char *lp = app_fd_path((int)a1);
+            if (!lp) {  /* record locks need a file; a pipe or socket cannot hold one */
+                r->rax = (uint64_t)-(long)(app_fd_is_open((int)a1) ? LX_EINVAL : LX_EBADF);
+                break;
+            }
+            uint8_t *fl = (uint8_t *)arg;
+            int ltype  = *(int16_t *)(fl + 0);
+            int whence = *(int16_t *)(fl + 2);
+            long lstart = (long)*(int64_t *)(fl + 8);
+            long llen   = (long)*(int64_t *)(fl + 16);
+            /* l_whence is relative to the fd, and ignoring it would lock the
+             * wrong range -- silently, which is the worst shape for a lock. */
+            if (whence == 1) {                          /* SEEK_CUR */
+                long cur = app_lseek((int)a1, 0, 1);
+                if (cur < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+                lstart += cur;
+            } else if (whence == 2) {                   /* SEEK_END */
+                struct statx sx;
+                if (vfs_stat(lp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+                lstart += (long)sx.stx_size;
+            } else if (whence != 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            if (lstart < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            int lpid = app_current_pid();
+            if (cmd == 5 || cmd == 36) {                /* F_GETLK: describe any conflict */
+                int hp, ht; long hs, hl;
+                if (rlock_get(lp, lpid, ltype, lstart, llen, &hp, &ht, &hs, &hl)) {
+                    *(int16_t *)(fl + 0) = (int16_t)ht;
+                    *(int64_t *)(fl + 8) = hs;
+                    *(int64_t *)(fl + 16) = hl;
+                    *(int32_t *)(fl + 24) = hp;
+                } else *(int16_t *)(fl + 0) = 2;        /* F_UNLCK: the lock could be placed */
+                *(int16_t *)(fl + 2) = 0;               /* the range we report is absolute now */
+                r->rax = 0;
+                break;
+            }
+            int blocking = (cmd == 7 || cmd == 38);
+            long lr = rlock_set(lp, lpid, ltype, lstart, llen, blocking);
+            /* EAGAIN is what a caller retries on; EBADF is what makes it give
+             * up on the filesystem entirely. */
+            r->rax = (lr < 0) ? (uint64_t)-(long)LX_EAGAIN : 0;
+            break;
+        }
         long fr = app_fcntl((int)a1, (int)cmd, arg);
-        r->rax = (fr < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)fr;
+        /* EINVAL, NOT EBADF, FOR A COMMAND WE DO NOT IMPLEMENT (M2085). EBADF
+         * says the descriptor does not exist; for an open fd that is a lie
+         * about the wrong noun, and it is what sent Firefox's profile locking
+         * and its IPC setup down their failure paths. */
+        r->rax = (fr < 0)
+            ? (uint64_t)-(long)(app_fd_is_open((int)a1) ? LX_EINVAL : LX_EBADF)
+            : (uint64_t)fr;
         break;
     }
     case LXS_getrusage_: {                  /* (who, struct rusage*) */

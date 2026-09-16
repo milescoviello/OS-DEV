@@ -196,6 +196,7 @@ LXEPOLL: ALL PASSED
 LXLONG: ALL PASSED
 LXSIG: ALL PASSED
 LXTLS: OK
+LXLOCK: OK
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -347,6 +348,18 @@ LXWAIT: reaped 40/40 children
         echo "  ok: every thread sees its own TLS across 1600 checks, and a child forked from a NON-MAIN thread keeps that thread's TLS (M2083)"
     else
         echo "  FAIL: per-thread TLS or a non-main-thread fork is broken:"; grep -a "LXTLS" "$SLOG3" | tail -4; f3=1
+    fi
+    # M2085 -- A LOCK THAT EXISTED AND COULD NOT BE ASKED FOR.
+    # kernel/flock.c has backed the NATIVE fcntl's record locks since M1597 and
+    # flock(2) since M1177; neither was reachable from a Linux program. The
+    # fallthrough turned "no such command" into EBADF -- the one errno meaning
+    # "that descriptor is not open" -- for a descriptor that is. Measured on the
+    # real program before the fix: `72/fcntl(b, 5, ...) = -9` four times in one
+    # Firefox startup, F_GETLK twice and F_SETLK twice.
+    if grep -aq "LXLOCK: OK" "$SLOG3"; then
+        echo "  ok: fcntl F_GETLK/F_SETLK/F_UNLCK with l_whence, cross-process conflict reported as EAGAIN, flock(2), and EINVAL rather than EBADF for an unknown command (M2085, 11 checks)"
+    else
+        echo "  FAIL: record locks are not honoured:"; grep -a "LXLOCK" "$SLOG3" | grep -a FAIL | head -4; f3=1
     fi
     # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
     # Every listing in the kernel came through one struct whose name field was
