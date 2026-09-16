@@ -194,6 +194,19 @@ void smp_send_tlb_shootdown_ipi(void) {
     lapic_wr(LAPIC_ICRLO, 0x41 | (1u << 14) | (3u << 18));     /* fixed, assert, all-but-self */
 }
 
+/* STOP EVERY OTHER CORE, FOR A PANIC (M2080).
+ *
+ * NMI, not a fixed vector, and that is the entire point. The cores a panic has
+ * to silence are the ones still writing to the console -- and the specific
+ * failure being fixed is a core spinning inside con_take with interrupts off,
+ * which can never take a fixed-vector IPI. A non-maskable interrupt reaches it
+ * anyway. Delivery mode 100b (NMI), assert, all-but-self; vector bits are
+ * ignored for NMI delivery but written as 2 so a decoder sees what it means. */
+void smp_send_panic_nmi(void) {
+    lapic_wr(LAPIC_ICRHI, 0);
+    lapic_wr(LAPIC_ICRLO, 2u | (4u << 8) | (1u << 14) | (3u << 18));
+}
+
 /* Prove the shootdown IPI round-trip works at boot (M1963).
  *
  * The mechanism is only NEEDED when a multi-threaded process changes its own

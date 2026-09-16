@@ -99,6 +99,36 @@ void console_enable_gfx(void) {
 void console_gfx_release(void) { gfx_owned = true; }    /* the WM owns the screen: log to serial only */
 void console_gfx_reclaim(void) { gfx_owned = false; }   /* a panic/exception must be visible on screen */
 
+/* PANIC MODE (M2080): the console must not be able to swallow a panic.
+ *
+ * The panic path disables interrupts on its own core FOR LIFE and then calls
+ * kprintf a dozen times. Everything about that is hostile to the normal
+ * locking discipline:
+ *
+ *   - con_lock's owner is a TASK, not a core, and M1926 deliberately takes it
+ *     with interrupts ON so serial_putc's ~87us/byte does not eat a tick. So a
+ *     holder can be preempted -- and a panicking core can neither be scheduled
+ *     to wait for it nor answer an IPI to get it released.
+ *   - console_gfx_reclaim() routes output to fbcon, whose newline scrolls the
+ *     whole framebuffer: 4.9 MB of memmove per line, inside the lock.
+ *   - CON_SPIN_LIMIT is 40,000,000 and does NOT accumulate, so each of the
+ *     dozen panic kprintf calls pays it again. Twelve times forty million
+ *     `pause` iterations under TCG is minutes of silence, which is
+ *     indistinguishable from a wedge.
+ *
+ * Measured: three runs in four on -smp 4 produced no panic text at all.
+ *
+ * In panic mode nothing takes the lock and fbcon stops scrolling. Output can
+ * interleave with another core's final bytes for a moment before the NMI stops
+ * them, which is strictly the better outcome -- the same trade M1941 already
+ * made, and the same one this file's own comment demands: a lock must never be
+ * able to silence the panic path. */
+static volatile int panic_mode;
+static volatile unsigned panic_lock_attempts;
+void console_panic_mode(void) { panic_mode = 1; }
+int  console_in_panic(void) { return panic_mode; }
+unsigned console_panic_lock_attempts(void) { return panic_lock_attempts; }
+
 void console_putc(char c) {
     if (gfx_console) {
         if (!gfx_owned) fbcon_putc(c);   /* framebuffer console (silent while the WM owns it) */
@@ -174,6 +204,12 @@ static volatile int con_owner = -1;      /* TASK currently emitting, -1 = none *
 static inline int con_take(uint64_t *fl) {
     int me = task_current_id();
     *fl = 0;
+    /* THE INSTRUMENT ASSERTS ITS OWN INVARIANT (M2080). Nothing may take this
+     * lock once a panic is printing. Counted rather than printed, because
+     * printing from inside the lock's own acquire path would recurse through
+     * kvprintf; the panic path reports the tally on its way out, so a future
+     * code path that violates this says so instead of hanging. */
+    if (panic_mode) { panic_lock_attempts++; return 0; }
     if (con_owner == me && con_lock) return 0;           /* re-entered: don't block */
     for (uint32_t i = 0; i < CON_SPIN_LIMIT; i++) {
         if (!__atomic_exchange_n(&con_lock, 1, __ATOMIC_ACQUIRE)) {
@@ -331,6 +367,71 @@ static void console_selftest_peer(void) {
     }
     __atomic_store_n(&cs_done, 1, __ATOMIC_SEQ_CST);
     task_exit();
+}
+
+/* -append selftest: THE PANIC PATH MUST NOT WAIT FOR A LOCK IT CANNOT WIN (M2080).
+ *
+ * The `kstackover` symptom test does NOT discriminate this fix, and saying so
+ * is the point: a deliberate kernel-stack overflow panics on a QUIET console,
+ * where no other core happens to be holding con_lock, so it prints fine either
+ * way. Four runs passed with the bypass and four passed without it. The wedge
+ * that cost three runs in four needed the other half of the picture -- a core
+ * holding the lock inside fb_scroll's 4.9 MB memmove while the panicking core
+ * spins with interrupts off, which a test cannot reliably schedule.
+ *
+ * So assert the INVARIANT instead of waiting for the symptom: with a FOREIGN
+ * owner holding the lock, a print in panic mode must refuse the lock rather
+ * than spin for it, and must leave the foreigner's lock exactly as it found it.
+ *
+ * `con_lock`/`con_owner` are poked directly because that is the only way to
+ * stage a foreign holder deterministically from one core. Everything is put
+ * back before returning. */
+void console_panic_selftest(void) {
+    int fails = 0, checks = 0;
+    unsigned before = panic_lock_attempts;
+    int save_lock = con_lock, save_owner = con_owner;
+
+    /* Stage a holder that is definitely not us. */
+    con_owner = 0x7FFFFFFF;
+    __atomic_store_n(&con_lock, 1, __ATOMIC_RELEASE);
+    panic_mode = 1;
+
+    /* This print must come straight back. On the reverted code con_take spins
+     * CON_SPIN_LIMIT times first -- bounded, but forty million `pause`
+     * iterations per line, which under TCG is the difference between a report
+     * and a wedge. */
+    kprintf("[conlock] a report-mode print issued with a FOREIGN lock holder\n");
+
+    checks++;
+    if (panic_lock_attempts <= before) {
+        panic_mode = 0;
+        kprintf("[conlock] FAIL report mode did not REFUSE the console lock -- "
+                "the fault reporter is waiting for a lock a stopped core still holds\n");
+        fails++;
+    } else {
+        panic_mode = 0;
+        kprintf("[conlock] ok   a report-mode print refuses the lock instead of spinning for it\n");
+    }
+
+    checks++;
+    if (!con_lock || con_owner != 0x7FFFFFFF) {
+        kprintf("[conlock] FAIL the bypass DISTURBED the foreign holder's lock "
+                "(lock=%d owner=%d)\n", con_lock, con_owner);
+        fails++;
+    } else
+        kprintf("[conlock] ok   ...and left the foreign holder's lock untouched\n");
+
+    /* Put it back exactly as it was. */
+    con_owner = save_owner;
+    __atomic_store_n(&con_lock, save_lock, __ATOMIC_RELEASE);
+    panic_lock_attempts = before;
+    panic_mode = 0;
+
+    /* The tag deliberately avoids the word the boot suite forbids: a crash
+     * guard that greps the log for it must not be weakened so a test can name
+     * itself conveniently. */
+    kprintf("[conlock] %s (%d checks)\n",
+            fails ? "CONLOCKSELFTEST FAILED" : "CONLOCKSELFTEST PASSED", checks);
 }
 
 void console_selftest(void) {

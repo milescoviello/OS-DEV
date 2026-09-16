@@ -249,6 +249,13 @@ require "launching the desktop environment"  "reached desktop launch"
 # THE SHELL. The desktop came up with no terminal, looking deliberate.
 require "window for 'Shell'"                 "the SHELL GOT A WINDOW (M2076: the window queue no longer fills with dead processes)"
 require "PENDQSELFTEST PASSED"               "...and the window queue reclaims exited entries rather than dropping a live app (3 checks)"
+# M2080: the panic path took a console lock whose owner is a TASK, taken with
+# interrupts ON -- so a holder can be preempted while the panicking core has
+# disabled interrupts for life and can neither wait for it nor answer an IPI.
+# Three runs in four on -smp 4 produced no panic text at all. Asserted as an
+# INVARIANT rather than as a symptom: `kstackover` panics on a quiet console and
+# passes either way, so it cannot discriminate this fix.
+require "CONLOCKSELFTEST PASSED"             "a fault-report print refuses the console lock instead of spinning for it (M2080, 2 checks)"
 
 # Markers that must NOT appear: a crash anywhere in the boot.
 forbid() {

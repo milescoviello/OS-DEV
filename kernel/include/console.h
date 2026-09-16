@@ -28,3 +28,10 @@ void klog_write(const char *buf, int n);   /* append userspace bytes to the log 
 void console_capture_begin(char *buf, int max);
 int  console_capture_end(void);
 void console_selftest(void);
+/* PANIC MODE (M2080): while set, nothing takes the console lock and fbcon stops
+ * scrolling, so the panic path can never be silenced by a lock it cannot win or
+ * slowed by a 4.9 MB framebuffer memmove per line. */
+void     console_panic_mode(void);
+int      console_in_panic(void);
+unsigned console_panic_lock_attempts(void);   /* violations of the above, for the panic path to report */
+void     console_panic_selftest(void);        /* -append selftest: a panic-mode print must refuse the lock, not spin (M2080) */

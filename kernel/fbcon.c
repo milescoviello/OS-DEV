@@ -43,6 +43,13 @@ int fbcon_init(void) {
 static void newline(void) {
     cx = 0;
     if (++cy >= rows) {
+        /* NOT WHILE PANICKING (M2080). fb_scroll shifts the whole framebuffer
+         * -- 4.9 MB of memmove at 1280x960x32 -- and the panic path calls this
+         * once per line with interrupts off on its own core. Clamping keeps the
+         * first screenful, which is the part with the exception, the registers
+         * and the top of the backtrace; the complete text is on serial. */
+        extern int console_in_panic(void);
+        if (console_in_panic()) { cy = rows - 1; return; }
         fb_scroll(font_height, bg);
         cy = rows - 1;
     }

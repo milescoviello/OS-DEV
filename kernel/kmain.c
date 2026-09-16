@@ -1893,6 +1893,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         vmm_tlb_selftest(); /* M2065: a shootdown that times out must KEEP the flush obligation */
         app_reap_selftest();/* M2072: two cores must not tear the same process down */
         app_pendq_selftest();/* M2076: a live app must not lose its window to a dead one */
+        console_panic_selftest();/* M2080: the panic path must not wait for a lock it cannot win */
     }
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).

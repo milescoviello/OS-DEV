@@ -32,6 +32,7 @@ void lapic_eoi(void);              /* end-of-interrupt to this core's local APIC
 void smp_parallel_for(int n, smp_fn fn, void *ctx);   /* run fn over [0,n) across all cores */
 void smp_wake_aps(void);           /* IPI every AP awake (M1198's wake vector 0x40) */
 void smp_send_tlb_shootdown_ipi(void);  /* all-but-self IPI at vector 0x41 (M1963) */
+void smp_send_panic_nmi(void);           /* all-but-self NMI: stop every other core so a panic can print (M2080) */
 void smp_tlb_shootdown_selftest(void); /* fire one at boot so the IPI path is exercised every time (M1963) */
 void lapic_timer_start_this_cpu(void);  /* this core's own real periodic preemption source (M1532's vector 0x42) */
 int  smp_current_cpu(void);        /* APIC id of the core running now, for sched_getcpu (M1246) */

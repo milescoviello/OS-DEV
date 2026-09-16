@@ -173,6 +173,20 @@ static void dump_registers(struct registers *r) {
 }
 
 void isr_dispatch(struct registers *r) {
+    /* THE PANIC NMI, FIRST AND UNCONDITIONALLY (M2080).
+     *
+     * A panicking core broadcasts an all-but-self NMI so nothing else can write
+     * to the console while it prints. This has to be the very first thing
+     * checked: the cores worth stopping are the ones mid-line in kvprintf or
+     * spinning in con_take with interrupts off, and anything we do before this
+     * branch is another chance for them to emit a byte. Non-maskable is why it
+     * works at all -- a core spinning with IF clear would never see a fixed
+     * vector, which is exactly the wedge this fixes.
+     *
+     * Park for good. The machine is going down; the only job left is silence. */
+    if (r->int_no == 2 && console_in_panic())
+        for (;;) __asm__ volatile("cli; hlt");
+
     /* Remember the most recent ring-3 trap frame for /proc/<pid>/regs (M1119):
      * while a task is stopped, this stays valid (frozen on its kernel stack). */
     if ((r->cs & 3) == 3) { task_t *ct = task_self(); if (ct) ct->uframe = r; }
@@ -416,7 +430,27 @@ void isr_dispatch(struct registers *r) {
         }
 
         interrupts_disable();
-        console_gfx_reclaim();   /* a panic has to be on the SCREEN, desktop or no desktop (M2011) */
+        /* ONE PANIC, ONE PRINTER (M2080).
+         *
+         * Two cores faulting at once used to interleave two complete panic
+         * reports into the same console, and the second one's registers are
+         * noise. The loser goes quiet without emitting a byte -- its own fault
+         * is real, but a second report nobody can parse is worth less than one
+         * that reads cleanly. */
+        {
+            static volatile int panic_core = -1;
+            int me = (int)smp_current_cpu(), none = -1;
+            if (!__atomic_compare_exchange_n(&panic_core, &none, me, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                for (;;) __asm__ volatile("cli; hlt");
+        }
+        /* Order matters, and it is the reverse of what it was. Panic mode goes
+         * on FIRST so nothing below touches the console lock, then the NMI
+         * silences the other cores, and console_gfx_reclaim() moves to the END
+         * (below) so the screen copy is not paid for with a full-screen scroll
+         * per line while interrupts are off. */
+        console_panic_mode();
+        smp_send_panic_nmi();
         kprintf("\n*** KERNEL PANIC: CPU EXCEPTION ***\n");
         kprintf("  %s (vector %lu)", exception_names[r->int_no], r->int_no);
         kprintf("   error_code=0x%lx\n", r->err_code);
@@ -444,6 +478,19 @@ void isr_dispatch(struct registers *r) {
             for (volatile uint64_t d = 0; d < 8000000000ULL; d++) { }
             acpi_reboot();
         }
+        /* The invariant this path depends on, asserted rather than assumed: if
+         * anything above reached for the console lock, say so. A silent
+         * violation is how the deadlock came back. */
+        if (console_panic_lock_attempts())
+            kprintf("  [con] %u attempt(s) to take the console lock IN PANIC MODE -- refused\n",
+                    console_panic_lock_attempts());
+        /* NOW the screen copy (M2011 still holds: a panic has to be visible
+         * without a serial cable). fbcon clamps instead of scrolling while
+         * panic mode is set, so this is one screenful, not a memmove per line. */
+        console_gfx_reclaim();
+        kprintf("*** KERNEL PANIC ***\n");
+        kprintf("  %s (vector %lu) err=0x%lx rip=%p\n",
+                exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip);
         kprintf("  system halted.\n");
         for (;;)
             __asm__ volatile("cli; hlt");
