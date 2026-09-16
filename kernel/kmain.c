@@ -540,6 +540,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
         if (cmdline_has(cl, "termtest")) g_termtest = 1;                               /* assert on the terminal's CELLS (M2057) */
         if (cmdline_has(cl, "lxhist")) { g_lxhist = 1; extern int g_lx_syshist; g_lx_syshist = 1; }
+        if (cmdline_has(cl, "lxkeys")) { extern int g_lx_keytrace; g_lx_keytrace = 1; }   /* the bytes a TUI actually receives (M2078) */
         /* BISECT SWITCHES FOR A FOREIGN RUNTIME (M2073). JSC reads its options
          * from the environment, so turning its JIT or its concurrent collector
          * off is the cheapest way to ask which of them is involved in a heap

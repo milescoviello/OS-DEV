@@ -284,6 +284,14 @@ void isr_dispatch(struct registers *r) {
              * after reports the handler's own entry point, which is the same
              * address every time and tells you nothing. */
             uint64_t frip = r->rip;
+            /* THE WHOLE FRAME, not just rip (M2078). app_signal_deliver
+             * rewrites this frame to enter the handler -- rip becomes the
+             * handler, rdi the signal number, rsi and rdx the siginfo and
+             * ucontext pointers -- so dumping `r` after the call reports the
+             * handler's entry state and nothing about the fault. I read
+             * "rdi=0xb" as a corrupt pointer for three runs before noticing it
+             * was SIGSEGV's number. Snapshot first, report the snapshot. */
+            struct registers fregs = *r;
             /* SEGV_MAPERR(1) = not mapped, SEGV_ACCERR(2) = mapped and refused.
              * Bit 0 of a page-fault error code is "the page WAS present". */
             if (r->int_no == 14) app_set_fault_siginfo(cr2, (r->err_code & 1) ? 2 : 1);
@@ -296,13 +304,21 @@ void isr_dispatch(struct registers *r) {
                             exception_names[r->int_no], r->int_no, r->err_code,
                             (void *)frip, (void *)cr2, task_current_id(), task_name_of(task_self()));
                     app_describe_addr(frip);
+                    /* AND WHAT THE FAULTING PAGE IS. "present and not
+                     * writable" and "present, not writable and COW" are
+                     * completely different bugs -- the second is a copy-on-
+                     * write break the handler should have taken, the first is
+                     * a protection the program asked for -- and the error code
+                     * alone cannot tell them apart. The terminate path has
+                     * printed this since M2005; the caught path had nothing. */
+                    if (r->int_no == 14) app_describe_fault_addr();
                     /* AND THE REGISTERS. A caught fault on `mov (%rax),%edx`
                      * says nothing without rax: a #GP there means the address
                      * is NON-CANONICAL, which is a different bug from a page
                      * that is merely absent, and the two are indistinguishable
                      * from the instruction alone. The terminate path below has
                      * dumped them since M1945; the caught path had nothing. */
-                    dump_registers(r);
+                    dump_registers(&fregs);
                     /* AND WHAT IT WAS DOING. lx_trace_dump_fault runs on the
                      * terminate path only, so a caught fault left no history
                      * at all -- the one case where the program's own message

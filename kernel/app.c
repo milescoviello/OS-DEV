@@ -2934,6 +2934,7 @@ void app_net_stall_watch(void) {
  * runtime's own behaviour from outside it. (M2073) */
 const char *g_lx_env_cmdline[LX_ENV_CMDLINE];
 
+int g_lx_keytrace;  /* -append lxkeys: print each byte a Linux process reads from the console (M2078) */
 int g_lx_syshist;   /* -append lxhist: sample every live Linux process every 15 s (M2066) */
 
 void app_stall_watchdog(void) {
@@ -5780,6 +5781,46 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
         a->majflt++;                                /* swapped in from disk => major fault (M1150) */
         return 1;
     }
+    /* A STALE TLB ENTRY IS NOT A VMA QUESTION (M2078).
+     *
+     * M2005 added this check and put it INSIDE the branch that has found a
+     * VMA, where it has sat ever since -- so the one repair for a
+     * hardware/page-table disagreement was conditional on our own bookkeeping
+     * describing the address. It is not: when a PTE is made more permissive,
+     * x86 does not require the TLB to be updated, and a stale entry may fault
+     * on an access the table now allows. The table is authoritative, and
+     * whether a VMA happens to cover the page has nothing to do with it.
+     *
+     * JavaScriptCore's JIT region is mapped and has no VMA, so every such
+     * fault in it fell through to the bottom and killed the process:
+     *
+     *   err=0x7 at rip=b000b918 (CR2=b0038798) [tid 133 'HeapHelper']
+     *   the faulting page b0038000: pte=800000001f4b2067
+     *                               (present=1 write=1 user=1 cow=0)
+     *     in NO VMA of this process (74 vmas)
+     *
+     * A WRITE fault on a page the table reports present, writable and user.
+     * There is no other way to reach that state, and the process was told it
+     * had segfaulted -- which is how the interactive TUI died about fifty
+     * seconds in, having already painted.
+     *
+     * Retrying is safe and cannot loop: an invlpg'd entry is reloaded from the
+     * table that already permits the access, and app_fault_handle's recursion
+     * guard bounds it either way. */
+    {
+        uint64_t cpte0 = vmm_pte_raw(fpage);
+        int wants_write0 = (err & 2) != 0, wants_exec0 = (err & 0x10) != 0;
+        if ((cpte0 & PTE_PRESENT) && (cpte0 & PTE_USER) &&
+            (!wants_write0 || (cpte0 & PTE_WRITABLE)) &&
+            (!wants_exec0  || !(cpte0 & PTE_NX))) {
+            vmm_invlpg_one(fpage);
+            if (!g_spurious_faults)
+                kprintf("[fault] SPURIOUS fault at %lx: err=%lx but pte=%lx already permits it "
+                        "-- stale TLB entry, invalidated and retried (M2005/M2078)\n", fpage, err, cpte0);
+            g_spurious_faults++;
+            return 1;
+        }
+    }
     /* FIND THE VMA IN ONE LOCKED SCAN, then work from a COPY (M1987).
      *
      * The scan must not drop the lock between iterations, and the first
@@ -8341,6 +8382,18 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
                  * and a program that cleared ICRNL is asking for the CR a
                  * real terminal would have delivered. */
                 if (c == '\n' && tio_wants_cr(a)) c = '\r';
+                /* -append lxkeys: THE BYTES, AS DELIVERED (M2078).
+                 *
+                 * Claude Code's input box accepted every typed character and
+                 * ignored Return, and from the outside there is no way to tell
+                 * "the key never arrived" from "it arrived as the wrong byte"
+                 * -- which is the same ambiguity M2014 and M2024 both turned
+                 * out to be. One hex byte per key answers it. */
+                { extern int g_lx_keytrace; static int shown;
+                  if (g_lx_keytrace && shown < 64) {
+                      shown++;
+                      kprintf("[keys] pid %d reads 0x%02x%s\n", a->pid, (unsigned char)c,
+                              (c == '\r') ? " (CR)" : (c == '\n') ? " (LF)" : ""); } }
                 ((char *)buf)[0] = (char)c;
                 /* ECHO, when the program asked for it (M2014). A cooked-mode
                  * Linux program expects the TERMINAL to show what was typed;

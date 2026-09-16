@@ -241,16 +241,37 @@ void vmm_destroy_address_space(uint64_t cr3) {
     uint64_t *pml4  = phys_to_table(cr3);
     uint64_t *bpml4 = phys_to_table(kernel_pml4);
 
-    /* The user/private region lives only under PML4[0]; [1..255] are zero and
-     * [256..511] are the shared higher half — never touched. */
-    uint64_t pml4e = pml4[0];
-    if ((pml4e & PTE_PRESENT) && (pml4e & ADDR_MASK) != (bpml4[0] & ADDR_MASK)) {
+    /* EVERY USER PML4 SLOT, NOT JUST THE FIRST (M2078).
+     *
+     * The comment this replaced said "the user/private region lives only under
+     * PML4[0]; [1..255] are zero" -- which stopped being true at M1962, when
+     * MMAP_TOP became 32 TiB and mmap started handing out addresses across
+     * PML4 slots 0..63. M2031 fixed fork() for exactly that reason, and its
+     * own note says so; the teardown was never brought along.
+     *
+     * So fork() took a reference on every shared frame across the whole
+     * address space, and exit/exec dropped only the ones below half a
+     * terabyte. Bun's heap sits around 5 TiB. Every subprocess Claude Code
+     * spawned permanently leaked the parent's references AND the child's
+     * entire page-table hierarchy above PML4[0] -- a PDPT, a PD and a PT per
+     * populated region, per spawn, never freed. The refcounts left behind also
+     * make pmm_refcount() lie about which frames are shared, which is the
+     * input the COW break and MADV_DONTNEED both make their decisions from.
+     *
+     * Mirrors vmm_fork_cow's walk exactly, including its two "shared with the
+     * kernel" guards -- a slot or a PD that IS the master table's must never
+     * be freed. */
+    for (int top = 0; top < 256; top++) {                /* user half only */
+        uint64_t pml4e = pml4[top];
+        if (!(pml4e & PTE_PRESENT)) continue;
+        if ((bpml4[top] & PTE_PRESENT) && (pml4e & ADDR_MASK) == (bpml4[top] & ADDR_MASK)) continue;  /* shared with the kernel */
         uint64_t pdpt_phys = pml4e & ADDR_MASK;
         uint64_t *pdpt  = phys_to_table(pdpt_phys);
-        uint64_t *bpdpt = phys_to_table(bpml4[0] & ADDR_MASK);
+        uint64_t *bpdpt = (bpml4[top] & PTE_PRESENT) ? phys_to_table(bpml4[top] & ADDR_MASK) : 0;
         for (int i = 0; i < 512; i++) {
             if (!(pdpt[i] & PTE_PRESENT)) continue;
-            if ((pdpt[i] & ADDR_MASK) == (bpdpt[i] & ADDR_MASK)) continue;  /* shared boot PD */
+            if (bpdpt && (bpdpt[i] & PTE_PRESENT) &&
+                (pdpt[i] & ADDR_MASK) == (bpdpt[i] & ADDR_MASK)) continue;  /* shared boot PD */
             if (pdpt[i] & PTE_HUGE) continue;                              /* 1 GiB page (n/a for user) */
             uint64_t *pd = phys_to_table(pdpt[i] & ADDR_MASK);
             for (int j = 0; j < 512; j++) {
