@@ -1033,6 +1033,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the signal-disposition probe...\n");
         int sgrc = app_run_linux_sync("/disk2/lxsig", 0, 0, 90000);
         kprintf("[lxabi] LXSIG exit -> %d\n", sgrc);
+        /* The futex key was a PHYSICAL address, so fork -- which makes every
+         * page COW -- silently disconnected wakers from waiters. (M2073) */
+        kprintf("[lxabi] launching the futex-across-a-COW-break probe...\n");
+        int furc = app_run_linux_sync("/disk2/lxfutex", 0, 0, 120000);
+        kprintf("[lxabi] LXFUTEX exit -> %d\n", furc);
         kprintf("[lxabi] launching the absolute-deadline probe...\n");
         int trc = app_run_linux_sync("/disk2/lxtime", 0, 0, 90000);
         kprintf("[lxabi] LXTIME exit -> %d\n", trc);

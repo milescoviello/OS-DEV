@@ -5188,7 +5188,68 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
 int g_futex_trace;              /* -append futextrace (M1997) */
 static int g_futex_traced;
 #define FUTEX_NWAIT 256
-static struct { uint64_t key; void *task; int used; } g_futex[FUTEX_NWAIT];
+/* `uaddr` and `val` are carried purely so the dump can ANSWER THE QUESTION
+ * rather than pose it (M2073). A slot that says only "task 14 is parked on
+ * key 10b32620" leaves the two possibilities that matter indistinguishable:
+ * the waker never signalled, or it signalled a key we no longer answer to.
+ * The word's own physical address is the key, so its CURRENT value can be
+ * read through the HHDM from any address space, and re-translating `uaddr`
+ * in the owner's CR3 says whether a WAKE issued now would still find us. */
+static struct { uint64_t key; void *as; void *task; int used; uint64_t uaddr; int val; } g_futex[FUTEX_NWAIT];
+
+/* WHAT A FUTEX IS NAMED BY (M2073) -- the bug that stopped Claude Code.
+ *
+ * The key was the word's PHYSICAL address. For memory shared between
+ * processes that is the only key that can work, and for everything else it
+ * is a lie that holds right up until the page moves. Ours move: fork marks
+ * every page COW, so the parent's next write to a page allocates a FRESH
+ * frame, and madvise(MADV_DONTNEED) plus a refault does the same. A thread
+ * parked before that point keeps the old frame's key; every WAKE afterwards
+ * computes the new one, matches nothing, and reports success.
+ *
+ * Nothing fails. FUTEX_WAKE's contract is 'wake up to N waiters and tell me
+ * how many' -- zero is a perfectly ordinary answer, returned by every
+ * uncontended unlock -- so a lost wakeup and an idle lock are the same
+ * syscall return. This is the fourteenth thing granted in name only, and
+ * the worst placed: a futex is what every other synchronisation primitive
+ * in a threaded program is built out of. Claude Code forks to run `git`
+ * during startup, and from that fork onward its threads could no longer
+ * wake each other: the main thread parked on a condition variable, a worker
+ * parked on the mutex it was waiting to hand over, and the machine went
+ * completely idle with the TUI never painted.
+ *
+ * Linux does not key on physical addresses for this reason. get_futex_key
+ * uses (mm, virtual address) whenever the mapping is private -- which is
+ * stable across COW by construction, because the identity of the mapping is
+ * what the waiters agree on, not the frame currently behind it -- and only
+ * uses (inode, page index) for a genuinely shared one. FUTEX_PRIVATE_FLAG
+ * is an optimisation hint, not the decision: the VMA is.
+ *
+ * So: a shared VMA keeps the physical key, everything else is named by
+ * (address space, virtual address). An address with no VMA at all -- a main
+ * thread's stack, the brk heap -- is private by default, which is both true
+ * and the safe way to be wrong, since the physical key is the one that
+ * silently breaks. */
+static void futex_key_of(uint64_t uaddr, uint64_t *key, void **as) {
+    struct app *a = cur();
+    int shared = 0;
+    if (a) {
+        uint64_t f = vma_alloc_lock(a);
+        for (int i = 0; i < a->nvma; i++)
+            if (uaddr >= a->vma[i].start && uaddr < a->vma[i].start + a->vma[i].len) {
+                shared = a->vma[i].shared; break;
+            }
+        vma_alloc_unlock(a, f);
+    }
+    if (shared) {
+        uint64_t phys = vmm_translate(uaddr & ~(uint64_t)(PAGE_SIZE - 1));
+        *key = phys | (uaddr & (PAGE_SIZE - 1));
+        *as  = 0;                       /* the frame IS the identity; no address space qualifies it */
+    } else {
+        *key = uaddr;
+        *as  = a;                       /* two processes' private words at the same VA are different futexes */
+    }
+}
 
 /* Release our futex slot after waking, and report whether we were STILL
  * registered (i.e. nobody woke us -- a timeout).
@@ -5265,10 +5326,20 @@ static void futex_note(int wake, uint64_t uaddr, uint64_t key, int woke) {
 }
 
 void app_futex_dump(void) {
-    for (int i = 0; i < FUTEX_NWAIT; i++)
-        if (g_futex[i].used)
-            kprintf("[futex] slot %d key=%lx task=%d\n", i, g_futex[i].key,
-                    g_futex[i].task ? ((task_t *)g_futex[i].task)->id : -1);
+    for (int i = 0; i < FUTEX_NWAIT; i++) {
+        if (!g_futex[i].used) continue;
+        task_t *wt = (task_t *)g_futex[i].task;
+        uint64_t va = g_futex[i].uaddr;
+        /* Re-translate in the WAITER's address space, not ours: this runs from
+         * the desktop task and `vmm_translate` would answer about the wrong
+         * CR3 -- an instrument that reads the wrong memory is worse than none. */
+        uint64_t nowp = (wt && wt->cr3) ? vmm_translate_in(wt->cr3, va & ~(uint64_t)(PAGE_SIZE - 1)) : 0;
+        int cur = nowp ? *(volatile int *)hhdm(nowp | (va & (PAGE_SIZE - 1))) : 0;
+        kprintf("[futex] slot %d key=%lx as=%lx uaddr=%lx task=%d parked because *uaddr==%d; it is %d now%s\n",
+                i, g_futex[i].key, (unsigned long)(uintptr_t)g_futex[i].as, va,
+                wt ? wt->id : -1, g_futex[i].val, cur,
+                nowp ? "" : " -- ITS PAGE IS NOT MAPPED ANY MORE");
+    }
     /* ...and the last operations, with a verdict per line: a WAKE for a key
      * nobody is parked on is ordinary (an uncontended unlock does it every
      * time); a key that is STILL PARKED and was never woken is the hang. */
@@ -5290,9 +5361,10 @@ void app_futex_dump(void) {
 
 long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
     if (!vmm_user_ok(uaddr, 4)) return -1;
-    uint64_t phys = vmm_translate(uaddr & ~(uint64_t)(PAGE_SIZE - 1));
-    if (!phys) return -1;
-    uint64_t key = phys | (uaddr & (PAGE_SIZE - 1));        /* per-physical-word key */
+    if (!vmm_translate(uaddr & ~(uint64_t)(PAGE_SIZE - 1))) return -1;   /* must be mapped to be read */
+    uint64_t key; void *as;
+    futex_key_of(uaddr, &key, &as);
+    if (!key) return -1;
 
     if (op == FUTEX_WAIT) {
         uint64_t f = irq_save();
@@ -5300,7 +5372,9 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         int slot = -1;
         for (int i = 0; i < FUTEX_NWAIT; i++) if (!g_futex[i].used) { slot = i; break; }
         if (slot < 0) { irq_restore(f); return -1; }        /* too many waiters */
-        g_futex[slot].key = key; g_futex[slot].task = task_self(); g_futex[slot].used = 1;
+        g_futex[slot].key = key; g_futex[slot].as = as; g_futex[slot].task = task_self();
+        g_futex[slot].uaddr = uaddr; g_futex[slot].val = val;
+        g_futex[slot].used = 1;
         futex_note(0, uaddr, key, 0);
         if (g_futex_trace && g_futex_traced < 240) {
             g_futex_traced++;
@@ -5320,7 +5394,7 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         uint64_t f = irq_save();
         int woke = 0;
         for (int i = 0; i < FUTEX_NWAIT && woke < val; i++)
-            if (g_futex[i].used && g_futex[i].key == key) {
+            if (g_futex[i].used && g_futex[i].key == key && g_futex[i].as == as) {
                 task_t *wt = (task_t *)g_futex[i].task;
                 g_futex[i].used = 0;
                 /* A DEAD task must never go back on the run queue. The slots
@@ -5335,6 +5409,27 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
          * does not match ours -- which is a lost wakeup and a hang. Printing
          * the address lets the two be told apart against the WAIT lines.
          * (M1997) */
+        /* ...and now SAY WHICH (M2073). The two cases above are not equally
+         * likely and are not equally harmless, and for four milestones I have
+         * been reading "woke NOBODY" lines unable to tell them apart. The key
+         * is a PHYSICAL address; a waiter parked on the same VIRTUAL address in
+         * the same address space, whose key no longer matches ours, is a lost
+         * wakeup already in progress -- it will never be woken again. That is
+         * not a diagnosis to be inferred later from a ring, it is an invariant
+         * this function can check while it still has both halves in hand. */
+        if (!woke) {
+            uint64_t g = irq_save();
+            for (int i = 0; i < FUTEX_NWAIT; i++)
+                if (g_futex[i].used && g_futex[i].uaddr == uaddr &&
+                    (g_futex[i].key != key || g_futex[i].as != as)) {
+                    kprintf("[futex] LOST WAKEUP: tid %d woke uaddr %lx (key %lx) and task %d is "
+                            "parked on the SAME uaddr under key %lx -- the page moved under it\n",
+                            task_current_id(), uaddr, key,
+                            g_futex[i].task ? ((task_t *)g_futex[i].task)->id : -1, g_futex[i].key);
+                    break;
+                }
+            irq_restore(g);
+        }
         futex_note(1, uaddr, key, woke);
         if (g_futex_trace && g_futex_traced < 240) {
             g_futex_traced++;
