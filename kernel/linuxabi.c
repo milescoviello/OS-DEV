@@ -255,6 +255,7 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_unlink_       87
 #define LXS_unlinkat_    263
 #define LXS_pread64_      17
+#define LXS_pwrite64_     18
 #define LXS_access_       21
 #define LXS_faccessat_   269
 #define LXS_clone_        56
@@ -995,6 +996,7 @@ const char *lx_syscall_name(unsigned long nr) {
     case 285: return "fallocate";
     case 288: return "accept4";
     case 290: return "eventfd2";
+    case 18: return "pwrite64";
     case 283: return "timerfd_create";
     case 286: return "timerfd_settime";
     case 287: return "timerfd_gettime";
@@ -3980,6 +3982,40 @@ void linux_syscall_dispatch(struct registers *r) {
         }
         long got = vfs_pread(fp, (void *)r->rsi, (unsigned long)n, off);
         r->rax = (got < 0) ? (uint64_t)-(long)LX_EIO : (uint64_t)got;
+        break;
+    }
+    case LXS_pwrite64_: {                   /* (fd, buf, count, offset) */
+        /* THE WRITE HALF, WHICH WAS SIMPLY ABSENT (M2079).
+         *
+         * pread64 has been here since the dynamic loader needed it; pwrite64
+         * returned ENOSYS. Claude Code swaps every tool's output through a
+         * temp file and writes it with pwrite64, so its Bash tool failed on a
+         * missing syscall -- after the missing /tmp, and with the same
+         * symptom, which is why the second cause only became visible once the
+         * first was fixed. */
+        long n = (long)r->rdx; uint64_t off = r->r10;
+        if (n < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (n && !vmm_user_ok(r->rsi, (uint64_t)n)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const char *wp = app_fd_path((int)a1);
+        if (!wp) {
+            if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            /* A memfd is seekable and pathless, exactly as in pread64: save
+             * the cursor, seek, write, restore. */
+            if (app_fd_type((int)a1) == 3) {
+                long save = app_lseek((int)a1, 0, 1 /*SEEK_CUR*/);
+                if (app_lseek((int)a1, (long)off, 0 /*SEEK_SET*/) < 0) {
+                    r->rax = (uint64_t)-(long)LX_EINVAL; break;
+                }
+                long put = app_fd_write((int)a1, (const void *)r->rsi, (unsigned long)n);
+                if (save >= 0) app_lseek((int)a1, save, 0);
+                r->rax = (put < 0) ? (uint64_t)lx_fd_err(put) : (uint64_t)put;
+                break;
+            }
+            r->rax = (uint64_t)-(long)LX_ESPIPE;   /* a pipe, a socket, a terminal */
+            break;
+        }
+        long put = vfs_pwrite(wp, (const void *)r->rsi, (unsigned long)n, off);
+        r->rax = (put < 0) ? (uint64_t)-(long)LX_EIO : (uint64_t)put;
         break;
     }
     case LXS_access_:

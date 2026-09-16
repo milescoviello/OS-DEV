@@ -7718,7 +7718,15 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
         /* One extra entry, one-shot, for a caller that needs to hand a specific
          * program something the whole system should NOT have -- see
          * app_set_next_env. (M1999) */
-        int en = 32;
+        /* TMPDIR, because a tool that cannot write a temp file cannot run
+         * (M2079). Claude Code swaps each tool's output through a file under
+         * $TMPDIR and refuses the tool if the directory is not there; the
+         * guest had no /tmp at all, so every Bash tool call failed for a
+         * reason that had nothing to do with the command. Named explicitly
+         * rather than left to the default so it is visible here next to the
+         * directory the image now creates. */
+        envp0[32] = "TMPDIR=/tmp";
+        int en = 33;
         /* ...and entries set from the KERNEL COMMAND LINE, which unlike the
          * one-shot slot above persist for every program in the boot (M2073).
          * A JIT and a concurrent collector can each be turned off by a JSC

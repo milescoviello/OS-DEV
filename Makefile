@@ -512,6 +512,16 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile
 	@# /bin/cc1 -- so the Phase 5 in-guest compile could never start.
 	@gv=15; gt=x86_64-pc-linux-gnu; 	 mkdir -p $(LXROOT)/libexec/gcc/$$gt/$$gv; 	 for p in cc1 collect2; do 	   src="$$(gcc -print-prog-name=$$p 2>/dev/null)"; 	   if [ -f "$$src" ]; then cp -f "$$src" $(LXROOT)/libexec/gcc/$$gt/$$gv/$$p; fi; 	 done; 	 echo "  STAGE   cc1 + collect2 (also at /libexec/gcc/$$gt/$$gv, where the driver looks)"
 	@for t in mkdir rm cp touch printf nm; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
+	@# A WRITABLE /tmp, WHICH THE GUEST DID NOT HAVE AT ALL (M2079).
+	@# Claude Code diagnosed this itself, from inside OS-DEV, when asked to run
+	@# a command: "the Bash tool is currently broken in this session -- every
+	@# command fails with: task output swap refused (tasks dir moved or
+	@# linked): /tmp/claude-0/~src/.../tasks/". It swaps each tool's output
+	@# through a file under $$TMPDIR, and $$TMPDIR did not exist, so every Bash
+	@# tool call failed for a reason that had nothing to do with the command.
+	@# mke2fs -d preserves the mode, so 1777 is what lands on the volume.
+	@mkdir -p $(LXROOT)/tmp $(LXROOT)/var/tmp && chmod 1777 $(LXROOT)/tmp $(LXROOT)/var/tmp
+	@echo "  STAGE   /tmp and /var/tmp (mode 1777) -- a tool that cannot write a temp file cannot run"
 	@mkdir -p $(LXROOT)/bin && for t in mkdir rm cp touch printf; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@tools/stage-linux-tool.sh $(LXROOT) bash
 	@# PHASE 6: Node. 102 MB and 21 shared libraries (libuv, c-ares, OpenSSL,
