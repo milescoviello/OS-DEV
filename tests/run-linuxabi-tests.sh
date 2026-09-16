@@ -199,6 +199,8 @@ LXTLS: OK
 LXLOCK: OK
 LXNREAD: OK
 LXSOCKOPT: OK
+LXMSG: OK
+LXTLSMANY: OK
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -400,6 +402,36 @@ LXWAIT: reaped 40/40 children
         echo "  ok: socket options report real values -- a nonzero send buffer a write can actually fill, SO_TYPE/SO_DOMAIN/SO_ACCEPTCONN, SO_PEERCRED's full ucred, booleans that round-trip, and ENOPROTOOPT for what is not implemented (M2088, 24 checks)"
     else
         echo "  FAIL: getsockopt is still answering fiction:"; grep -a "LXSOCKOPT" "$SLOG3" | grep -a FAIL | head -6; f3=1
+    fi
+    # M2090 -- sendmsg REPORTED ONE ERRNO FOR SIX FAILURES, AND IT WAS IMPOSSIBLE.
+    # Every path out of the handler that sent nothing fell through to
+    #   if (done == 0) r->rax = -ENETUNREACH;
+    # and ENETUNREACH on an AF_UNIX socket cannot happen -- there is no network
+    # between two ends of a socketpair. It cost Firefox's FORK SERVER, which is
+    # how every content process is created: it recvmsg'd a request, forked the
+    # child successfully, and then could not report it --
+    #   56(1200011, 0, 0)  = ec    clone -- forked pid 236
+    #   46(3, 50fff200, 0) = -101  sendmsg = ENETUNREACH
+    # A caller told ENETUNREACH tears the channel down; one told EAGAIN polls
+    # and retries. Every content process died this way.
+    # Underneath it, unix_send returned whatever fitted -- INCLUDING ZERO when
+    # the ring was full -- and nothing ever waited, so a writer looped for ever
+    # making no progress. A write of 0 is worse than either correct answer.
+    # Reverting gives "errno 101 Network is unreachable" for an unreadable
+    # iovec, and then HANGS at the full-socket check.
+    if grep -aq "LXMSG: OK" "$SLOG3"; then
+        echo "  ok: sendmsg/recvmsg report the errno that happened -- EFAULT, EAGAIN, EPIPE, EBADF, EMSGSIZE -- a full non-blocking socket blocks or says EAGAIN rather than returning 0, and MSG_CMSG_CLOEXEC is honoured (M2090, 14 checks)"
+    else
+        echo "  FAIL: a socket message failure is still misreported:"; grep -a "LXMSG" "$SLOG3" | grep -a FAIL | head -6; f3=1
+    fi
+    # M2089's companion: the same per-thread TLS invariant lxtls asserts with 8
+    # threads, at the ~140 threads Firefox actually runs. A thread found with
+    # FS_BASE live=0 while its saved base was good is a restore that did not
+    # happen, and 8 threads never reproduced it.
+    if grep -aq "LXTLSMANY: OK" "$SLOG3"; then
+        echo "  ok: $(grep -ao 'LXTLSMANY: [0-9]* checks across [0-9]* threads, [0-9]* wrong' "$SLOG3" | tail -1) (M2089)"
+    else
+        echo "  FAIL: per-thread TLS does not survive Firefox's thread count:"; grep -a "LXTLSMANY" "$SLOG3" | tail -3; f3=1
     fi
     # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
     # Every listing in the kernel came through one struct whose name field was

@@ -420,6 +420,15 @@ static int g_lx_statfail;     /* rate-limit the failed-path report (M1992) */   
  * "write EBADF" on a socket whose fd was perfectly valid, because the byte
  * path for that fd type did not exist. EBADF sends you looking at descriptor
  * bookkeeping; EPIPE/EAGAIN name what actually happened. */
+/* NAMED AFTER WHAT THEY MUST HOLD, not after round numbers (M2090).
+ *
+ * The staging buffer was 2048 bytes against libwayland's 4096-byte connection
+ * ring, and a message that did not fit was quietly TRUNCATED and reported as a
+ * success -- so a caller believed it had sent bytes that were never copied.
+ * The iovec limit was 16, and exceeding it abandoned the message with
+ * ENETUNREACH, which on a Unix socket is not a thing that can happen. */
+#define LX_MSG_STAGE 8192
+#define LX_MSG_IOV   64
 static long lx_fd_err(long rc) {
     if (rc == APP_FD_EAGAIN) return -(long)LX_EAGAIN;
     if (rc == APP_FD_EPIPE)  return -(long)LX_EPIPE;
@@ -1800,6 +1809,21 @@ void linux_syscall_dispatch(struct registers *r) {
          * dangerous failure is not refusing the request, it is granting it
          * silently in name only. */
         int sp_ty = (int)r->rsi;
+        /* SOCK_DGRAM IS SERVED BY A STREAM RING, AND SAYING SO IS THE POINT
+         * (M2090). unixsock.c has one transport -- a byte ring per direction --
+         * so an AF_UNIX datagram pair preserves no message boundaries: two
+         * sends of 10 bytes can be read as one 20-byte recv. Nothing has asked
+         * for it yet, and the honest thing while that is true is to serve it
+         * and NAME the limitation, rather than either refusing a call that
+         * mostly works or pretending the boundaries are there. Found by a test
+         * that asserted EMSGSIZE against it and was asserting the wrong thing.
+         */
+        if ((sp_ty & 0xF) == 2 /*SOCK_DGRAM*/) {
+            static int told;
+            if (!told) { told = 1;
+                kprintf("[sock] socketpair(AF_UNIX, SOCK_DGRAM): served by the stream ring, so "
+                        "MESSAGE BOUNDARIES ARE NOT PRESERVED. No caller has needed them yet.\n"); }
+        }
         if (sp_ty & 0x800)   { app_fd_set_nonblock(sv[0], 1); app_fd_set_nonblock(sv[1], 1); }   /* SOCK_NONBLOCK */
         if (sp_ty & 0x80000) { app_fd_set_cloexec(sv[0], 1);  app_fd_set_cloexec(sv[1], 1);  }   /* SOCK_CLOEXEC */
         ((int *)r->r10)[0] = sv[0]; ((int *)r->r10)[1] = sv[1];
@@ -2021,41 +2045,90 @@ void linux_syscall_dispatch(struct registers *r) {
     }
     case LXS_sendmsg_:
     case LXS_sendmmsg_: {                   /* (fd, msg[vec], vlen, flags) */
+        /* SIX FAILURE CAUSES SHARED ONE NONSENSICAL ERRNO (M2090).
+         *
+         * Every path out of this handler that sent nothing fell through to
+         *     if (done == 0) r->rax = -ENETUNREACH;
+         * and ENETUNREACH on an AF_UNIX socket is not a thing that can happen:
+         * there is no network between two ends of a socketpair. The six were
+         * "too many iovecs", "an unreadable iovec array", "an unreadable
+         * iovec", "the underlying write failed", "out of memory", and -- worst
+         * -- a silent 2048-byte TRUNCATION that was reported as SUCCESS.
+         *
+         * What it cost: Firefox's fork server, which is how every content
+         * process is created. Its last four calls before aborting are
+         *
+         *   47(3, 50fff388, 0) = 40      recvmsg  -- a 64-byte request
+         *   14(0, ...)         = 0       rt_sigprocmask(SIG_BLOCK)
+         *   56(1200011, 0, 0)  = ec      clone    -- forked child pid 236
+         *   14(2, ...)         = 0       rt_sigprocmask(SIG_SETMASK)
+         *   46(3, 50fff200, 0) = ffffffffffffff9b   sendmsg = -101
+         *
+         * It had done the work and could not report it. A caller told
+         * ENETUNREACH tears the channel down; one told EAGAIN polls and
+         * retries, which is what a non-blocking socket with a briefly full
+         * ring is asking for. Every content process died this way.
+         *
+         * The staging buffer is also sized by what it must HOLD rather than by
+         * a round number: libwayland's connection ring is 4096, and a message
+         * bigger than the buffer is now EMSGSIZE rather than a quietly short
+         * one. */
         int is_mm = (r->rax == LXS_sendmmsg_);
         unsigned long vlen = is_mm ? (unsigned long)r->rdx : 1;
         if (vlen > 64) vlen = 64;
         unsigned long stride = is_mm ? 64 : 56;
         if (!vlen || !vmm_user_ok(r->rsi, vlen * stride)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        long done = 0, first = -1;
+        long done = 0, first = -1, err = 0;
         for (unsigned long m = 0; m < vlen; m++) {
             const uint8_t *h = (const uint8_t *)(r->rsi + m * stride);
             uint64_t nameptr = *(const uint64_t *)(h + 0);
             uint32_t namelen = *(const uint32_t *)(h + 8);
             uint64_t iovptr  = *(const uint64_t *)(h + 16);
             uint64_t iovlen  = *(const uint64_t *)(h + 24);
-            if (iovlen > 16) break;
-            if (iovlen && !vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) break;
+            if (iovlen > LX_MSG_IOV) { err = -(long)LX_EMSGSIZE; break; }
+            if (iovlen && !vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) { err = -(long)LX_EFAULT; break; }
             /* Gather the iovecs. A datagram is ONE packet, so they have to be
              * concatenated before it goes out -- sending them separately would
-             * turn one query into several. */
-            /* PER CALL, NOT static -- see the note on recvmsg's sbuf below.
+             * turn one query into several.
+             *
+             * PER CALL, NOT static -- see the note on recvmsg's sbuf below.
              * Two tasks gathering into one shared buffer splice one client's
              * outgoing message into another's. (M2000) */
-            uint8_t *gbuf = kmalloc(2048);
-            if (!gbuf) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+            uint8_t *gbuf = kmalloc(LX_MSG_STAGE);
+            if (!gbuf) { err = -(long)LX_ENOMEM; break; }
             unsigned long tot = 0;
+            int clamped = 0;
+            /* A DATAGRAM SOCKET IS THE ONE THAT CANNOT BE SHORT-WRITTEN. Told
+             * apart by the descriptor's own type and by whether a destination
+             * address came with the message, which is the only way a caller
+             * can send a datagram through this entry point. */
+            int is_dgram = (app_fd_type((int)a1) == 9) || (nameptr && namelen >= 8);
             const struct lx_iovec *v = (const struct lx_iovec *)iovptr;
-            int bad = 0;
             for (uint64_t i = 0; i < iovlen; i++) {
                 unsigned long n = v[i].iov_len;
                 if (!n) continue;
-                if (!v[i].iov_base || !vmm_user_ok((uint64_t)v[i].iov_base, n)) { bad = 1; break; }
-                if (tot + n > 2048) n = 2048 - tot;
+                if (!v[i].iov_base || !vmm_user_ok((uint64_t)v[i].iov_base, n)) { err = -(long)LX_EFAULT; break; }
+                /* THE CLAMP IS ONLY HONEST FOR A STREAM. Being precise about
+                 * this, because my first reading of the old code was wrong: it
+                 * copied what fitted and returned that count, and for a STREAM
+                 * socket a short write is legal -- the caller sends the rest.
+                 * For a DATAGRAM it is silent truncation, because a datagram is
+                 * one packet and there is no "rest": the peer receives a
+                 * shortened message and nobody is told. Linux answers EMSGSIZE.
+                 *
+                 * So: clamp for a stream (and let the return value say how
+                 * much), refuse for a datagram. */
+                if (tot + n > LX_MSG_STAGE) {
+                    if (is_dgram) { err = -(long)LX_EMSGSIZE; break; }
+                    n = LX_MSG_STAGE - tot;
+                    clamped = 1;
+                    if (!n) break;
+                }
                 for (unsigned long k = 0; k < n; k++) gbuf[tot + k] = ((const uint8_t *)v[i].iov_base)[k];
                 tot += n;
-                if (tot >= 2048) break;
+                if (clamped) break;
             }
-            if (bad) { kfree(gbuf); break; }
+            if (err) { kfree(gbuf); break; }
             /* SCM_RIGHTS: hand any descriptors in msg_control to the peer
              * BEFORE the bytes, so they are already queued when it reads.
              *
@@ -2089,16 +2162,28 @@ void linux_syscall_dispatch(struct registers *r) {
                 uint16_t dport = (uint16_t)((sa[2] << 8) | sa[3]);
                 uint8_t dip[4] = { sa[4], sa[5], sa[6], sa[7] };
                 sn = app_sendto((int)a1, dip, dport, gbuf, (int)tot);
+                if (sn < 0) err = -(long)LX_ENETUNREACH;   /* here it IS a network error */
             } else {
                 sn = app_fd_write((int)a1, gbuf, tot);   /* connected socket */
+                if (sn < 0) err = lx_fd_err(sn);         /* EAGAIN / EPIPE / EBADF, as it really was */
             }
             kfree(gbuf);
-            if (sn < 0) break;
+            if (err) break;
+            /* A ONE-SHOT LINE WHEN THE CLAMP ACTUALLY FIRES, so "we silently
+             * shorten large writes" stops being invisible. A legal short write
+             * is still a cost: the caller comes back through poll for the
+             * remainder every time. */
+            if (clamped) { static int told; if (!told) { told = 1;
+                kprintf("[sock] sendmsg: a message longer than %d bytes was short-written "
+                        "(legal for a stream; the caller will send the rest)\n", LX_MSG_STAGE); } }
             if (first < 0) first = sn;
             if (is_mm) *(uint32_t *)(h + 56) = (uint32_t)sn;   /* msg_len, per message */
             done++;
         }
-        if (done == 0) { r->rax = (uint64_t)-(long)LX_ENETUNREACH; break; }
+        /* A PARTIAL sendmmsg is a success for the messages that went (that is
+         * the contract); only a first-message failure is an error. */
+        if (done == 0 && err) { r->rax = (uint64_t)err; break; }
+        if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }   /* nothing sent, no cause: not yet */
         r->rax = is_mm ? (uint64_t)done : (uint64_t)first;
         break;
     }
@@ -2110,14 +2195,20 @@ void linux_syscall_dispatch(struct registers *r) {
         if (vlen > 64) vlen = 64;
         unsigned long stride = is_mm ? 64 : 56;
         if (!vlen || !vmm_user_ok(r->rsi, vlen * stride)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        long done = 0, first = -1;
+        /* THE SAME ERRNO COLLAPSE AS THE SEND SIDE (M2090). Every failure here
+         * fell through to `break` and then to `if (done == 0) -EAGAIN`, so
+         * "too many iovecs", "an unreadable iovec array", "the peer hung up"
+         * and "nothing has arrived yet" were one answer. EAGAIN means "try
+         * again", so a caller told it for a dead socket retries for ever. */
+        long done = 0, first = -1, rerr = 0;
         for (unsigned long m = 0; m < vlen; m++) {
             uint8_t *h = (uint8_t *)(r->rsi + m * stride);
             uint64_t nameptr = *(const uint64_t *)(h + 0);
             uint64_t iovptr  = *(const uint64_t *)(h + 16);
             uint64_t iovlen  = *(const uint64_t *)(h + 24);
-            if (!iovlen || iovlen > 16) break;
-            if (!vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) break;
+            if (!iovlen) { rerr = -(long)LX_EINVAL; break; }
+            if (iovlen > LX_MSG_IOV) { rerr = -(long)LX_EMSGSIZE; break; }
+            if (!vmm_user_ok(iovptr, iovlen * sizeof(struct lx_iovec))) { rerr = -(long)LX_EFAULT; break; }
             const struct lx_iovec *v = (const struct lx_iovec *)iovptr;
             /* Receive into a staging buffer and SCATTER: a datagram arrives
              * whole and then fills the iovecs in order.
@@ -2141,7 +2232,7 @@ void linux_syscall_dispatch(struct registers *r) {
              * is why the test suite never saw it.
              *
              * The send side had the identical bug with gbuf. */
-            uint8_t *sbuf = kmalloc(2048);
+            uint8_t *sbuf = kmalloc(LX_MSG_STAGE);
             if (!sbuf) { r->rax = (uint64_t)-(long)LX_ENOMEM; goto msgdone; }
             #define sbuf_free() kfree(sbuf)
             /* NEVER read more than the caller can take. Reading into a staging
@@ -2151,10 +2242,11 @@ void linux_syscall_dispatch(struct registers *r) {
              * 94 bytes of a 148-byte burst of registry events and waited
              * forever for the other 54, which had been thrown away here.
              * (M1978) */
-            unsigned long want = 0;
-            for (uint64_t i = 0; i < iovlen; i++) want += v[i].iov_len;
-            if (want > 2048) want = 2048;
-            if (!want) { sbuf_free(); break; }
+            unsigned long want = 0, asked = 0;
+            for (uint64_t i = 0; i < iovlen; i++) asked += v[i].iov_len;
+            want = asked;
+            if (want > LX_MSG_STAGE) want = LX_MSG_STAGE;
+            if (!want) { sbuf_free(); rerr = -(long)LX_EINVAL; break; }
             uint8_t sip[4] = {0,0,0,0}; uint16_t sp = 0;
             long gn;
             /* MSG_DONTWAIT (0x40) makes THIS CALL non-blocking regardless of
@@ -2170,7 +2262,7 @@ void linux_syscall_dispatch(struct registers *r) {
             if (rflags & 0x40) app_fd_set_nonblock((int)a1, nb_save);
             if (g_wl_verbose) kprintf("[sock] recvmsg(fd %ld) want=%lu -> %ld\n", a1, want, gn);
             if (gn == APP_FD_EAGAIN) { sbuf_free(); if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; goto msgdone; } break; }
-            if (gn < 0) { sbuf_free(); break; }
+            if (gn < 0) { sbuf_free(); rerr = lx_fd_err(gn); break; }   /* EPIPE/EBADF, as it really was */
             unsigned long off = 0;
             for (uint64_t i = 0; i < iovlen && off < (unsigned long)gn; i++) {
                 unsigned long n = v[i].iov_len;
@@ -2191,6 +2283,11 @@ void linux_syscall_dispatch(struct registers *r) {
             /* SCM_RIGHTS the other way: install any descriptors the peer passed
              * and describe them in msg_control. A receiver that asked for no
              * control space gets none, which is what Linux does. (M1977) */
+            uint32_t mflags = 0;
+            /* MSG_TRUNC: a DATAGRAM longer than the caller's buffers has lost
+             * its tail, and that is not the same as a short stream read. It
+             * was hardcoded to 0 below, so it could never be reported. */
+            if (app_fd_type((int)a1) == 9 && (unsigned long)gn > asked) mflags |= 0x20;
             {
                 uint64_t ctl = *(const uint64_t *)(h + 32);
                 uint64_t ctllen = *(const uint64_t *)(h + 40);
@@ -2203,9 +2300,24 @@ void linux_syscall_dispatch(struct registers *r) {
                     while (nfd < cap) {
                         int nf2 = app_unix_recv_fd((int)a1);
                         if (nf2 < 0) break;
+                        /* MSG_CMSG_CLOEXEC, WHICH LIBWAYLAND ALWAYS PASSES
+                         * (M2090). Ignored until now, so every descriptor a
+                         * client received leaked across its next execve -- and
+                         * Firefox execve's a content process for every tab,
+                         * each inheriting a memfd it can never close and
+                         * pinning the object against NMEMFD. The flag is the
+                         * caller saying "this descriptor is mine, not my
+                         * children's"; granting the receive and dropping the
+                         * condition is granting it in name only. */
+                        if (rflags & 0x40000000) app_fd_set_cloexec(nf2, 1);
                         outfds[nfd++] = nf2;
                         if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: received fd %d\n", nf2);
                     }
+                    /* IF MORE WERE QUEUED THAN FITTED, SAY SO. Linux sets
+                     * MSG_CTRUNC, and a receiver that checks it knows to come
+                     * back with a bigger control buffer; one that is told
+                     * nothing believes it got everything. */
+                    if (nfd == cap && app_unix_peek_fd((int)a1) >= 0) mflags |= 0x8;   /* MSG_CTRUNC */
                     if (nfd > 0) {
                         wrote = 16 + (uint64_t)nfd * sizeof(int);
                         *(uint64_t *)(cm + 0) = wrote;
@@ -2215,13 +2327,14 @@ void linux_syscall_dispatch(struct registers *r) {
                 }
                 *(uint64_t *)(h + 40) = wrote;            /* msg_controllen: what we actually filled */
             }
-            *(uint32_t *)(h + 48) = 0;                    /* msg_flags: nothing truncated */
+            *(uint32_t *)(h + 48) = mflags;               /* msg_flags: honestly, now (M2090) */
             sbuf_free();
             if (first < 0) first = (long)off;
             if (is_mm) *(uint32_t *)(h + 56) = (uint32_t)off;
             done++;
         }
         #undef sbuf_free
+        if (done == 0 && rerr) { r->rax = (uint64_t)rerr; break; }
         if (done == 0) { r->rax = (uint64_t)-(long)LX_EAGAIN; break; }
         r->rax = is_mm ? (uint64_t)done : (uint64_t)first;
         msgdone: break;

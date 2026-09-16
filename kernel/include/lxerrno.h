@@ -39,6 +39,9 @@
 #define LX_ENOTDIR  20
 #define LX_EISDIR   21
 #define LX_EINVAL   22
+#define LX_EMSGSIZE 90   /* a message too big for the socket -- NOT a silent truncation (M2090) */
+#define LX_ENOPROTOOPT 92 /* an unimplemented socket option -- NOT a confident zero (M2088) */
+#define LX_ENOTSOCK 88   /* a socket call on a descriptor that is not one (M2088) */
 #define LX_ENFILE   23
 #define LX_EMFILE   24
 #define LX_ENOTTY   25

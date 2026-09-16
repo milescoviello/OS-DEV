@@ -27,6 +27,8 @@ int  unix_readable(int ep);      /* non-blocking: is there data (or a closed pee
 long unix_nread(int ep);         /* FIONREAD: bytes queued on this endpoint's RX ring; -1 bad ep (M2086) */
 int  unix_peer_pid(int ep);      /* SO_PEERCRED: the pid on the far end, 0 = not accepted yet (M2088) */
 int  unix_ring_bytes(void);      /* SO_SNDBUF/SO_RCVBUF: the real usable capacity per direction (M2088) */
+#define UNIX_EAGAIN (-11)        /* unix_send_ex(nb): the ring is full and nothing moved (M2090) */
+long unix_send_ex(int ep, const void *buf, unsigned long len, int nb);   /* O_NONBLOCK-aware send; blocks for space otherwise (M2090) */
 int  unix_pending(int lid);      /* non-blocking: would accept() succeed? (M1965) */
 int  unix_accept_nb(int lid);    /* accept without blocking; -1 if nothing pending (M1965) */
 int  unix_unlisten(int lid);     /* release a listener's name on close(); 0/-1 (M1965) */

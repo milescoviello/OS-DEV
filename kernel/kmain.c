@@ -812,6 +812,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the readable-byte-count probe...\n");
         {   int nrrc = app_run_linux_sync("/disk2/lxnread", 0, 0, 120000);
             kprintf("[lxabi] LXNREAD exit -> %d\n", nrrc); }
+        /* sendmsg answered ENETUNREACH -- impossible on a Unix socket -- for
+         * six different failures, and Firefox's FORK SERVER got it after
+         * successfully forking a content process. Every content process died
+         * that way. (M2090) */
+        kprintf("[lxabi] launching the sendmsg/recvmsg errno probe...\n");
+        {   int mgrc = app_run_linux_sync("/disk2/lxmsg", 0, 0, 120000);
+            kprintf("[lxabi] LXMSG exit -> %d\n", mgrc); }
         /* ...and the same invariant at FIREFOX'S SCALE. Eight threads never
          * reproduced the FS_BASE loss; a hundred and twenty might. (M2089) */
         kprintf("[lxabi] launching the 120-thread TLS probe...\n");

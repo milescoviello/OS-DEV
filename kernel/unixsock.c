@@ -97,6 +97,17 @@ struct uconn {
      * later lookup cannot tell which of several descriptors is asking. */
     int a_pid, b_pid;
     task_t *a_waiter, *b_waiter;  /* side A blocked reading b2a; side B blocked reading a2b */
+    /* A WRITER HAS TO BE ABLE TO WAIT TOO (M2090).
+     *
+     * unix_send did `rput()` and returned whatever fitted -- including ZERO
+     * when the ring was full -- and nothing ever waited. A write that returns
+     * 0 is the worst of the three possible answers: a blocking socket must
+     * wait for space, a non-blocking one must say EAGAIN, and 0 makes every
+     * caller loop for ever making no progress while believing it is working.
+     * That is the same shape as the EAGAIN spin M2087's detector found.
+     *
+     * Woken by unix_recv, which is the only thing that creates space. */
+    task_t *a_wwaiter, *b_wwaiter;
 };
 static struct uconn conns[U_CONN];
 
@@ -125,6 +136,20 @@ static struct ulisten lis[U_LISTEN];
  * subsystem that stores a waiter needed the same one. */
 void unix_forget_task(void *t) {
     for (int i = 0; i < U_LISTEN; i++) if ((void *)lis[i].waiter == t) lis[i].waiter = 0;
+    /* AND THE PER-CONNECTION SLOTS, which this never cleared (M2090).
+     * M2053 added this function for exactly the hazard it left half-open: a
+     * freed task_t parked in a waiter slot gets task_wake()'d later, which
+     * sets a state field on reclaimed memory and puts it back on the run
+     * queue -- and then a freed task is SCHEDULED. The listener slots were
+     * cleared; the reader and (new) writer slots on every connection were
+     * not, and those are the ones a busy socket actually uses. */
+    for (int i = 0; i < U_CONN; i++) {
+        if (!conns[i].used) continue;
+        if ((void *)conns[i].a_waiter  == t) conns[i].a_waiter  = 0;
+        if ((void *)conns[i].b_waiter  == t) conns[i].b_waiter  = 0;
+        if ((void *)conns[i].a_wwaiter == t) conns[i].a_wwaiter = 0;
+        if ((void *)conns[i].b_wwaiter == t) conns[i].b_wwaiter = 0;
+    }
 }
 
 
@@ -180,6 +205,7 @@ int unix_connect(const char *path) {
     struct uconn *c = &conns[ci];
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
     c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
+    c->a_wwaiter = c->b_wwaiter = 0;            /* a reused slot must not inherit a stale writer (M2090) */
     c->a_refs = c->b_refs = 1;                     /* one descriptor per end to begin with (M2002) */
     c->a_pid = app_current_pid();                  /* the connector (M2088) */
     c->b_pid = 0;                                  /* ...the server's pid is set by accept */
@@ -219,18 +245,42 @@ static struct uconn *ep_conn(int ep, int *side) {
     return &conns[ci];
 }
 
-long unix_send(int ep, const void *buf, unsigned long len) {
+long unix_send(int ep, const void *buf, unsigned long len) { return unix_send_ex(ep, buf, len, 0); }
+
+/* `nb` = the caller's O_NONBLOCK. Returns bytes written (a SHORT count is
+ * legal and real), UNIX_EAGAIN when nothing at all fitted on a non-blocking
+ * socket, or -1 for a dead peer. Never 0 for a non-empty write. (M2090) */
+long unix_send_ex(int ep, const void *buf, unsigned long len, int nb) {
+    if (!len) return 0;
     uint64_t fl = usock_irq_save();
     int s; struct uconn *c = ep_conn(ep, &s); if (!c) { usock_irq_restore(fl); return -1; }
-    int peer_closed = s ? c->a_closed : c->b_closed;
-    int self_wr = s ? c->b_wr_closed : c->a_wr_closed;
-    if (peer_closed || self_wr) { usock_irq_restore(fl); return -1; }   /* peer is gone, or we shut our write side */
-    struct uring *tx = s ? &c->b2a : &c->a2b;                    /* B writes b2a, A writes a2b */
-    int n = rput(tx, (const unsigned char *)buf, (int)len);
-    task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer's blocked reader */
-    if (n > 0 && *pw) { task_wake(*pw); *pw = 0; }
-    usock_irq_restore(fl);
-    return n;
+    for (;;) {
+        int peer_closed = s ? c->a_closed : c->b_closed;
+        int self_wr = s ? c->b_wr_closed : c->a_wr_closed;
+        if (peer_closed || self_wr) { usock_irq_restore(fl); return -1; }   /* peer gone, or we shut our write side */
+        struct uring *tx = s ? &c->b2a : &c->a2b;                /* B writes b2a, A writes a2b */
+        int n = rput(tx, (const unsigned char *)buf, (int)len);
+        if (n > 0) {
+            task_t **pw = s ? &c->a_waiter : &c->b_waiter;       /* wake the peer's blocked reader */
+            if (*pw) { task_wake(*pw); *pw = 0; }
+            usock_irq_restore(fl);
+            return n;
+        }
+        /* The ring is full and not one byte moved. */
+        if (nb) { usock_irq_restore(fl); return UNIX_EAGAIN; }
+        /* Block once, registered so the draining reader can wake us. Same
+         * check-set-block sequence under the same lock as unix_recv, which is
+         * what makes it lost-wakeup-free across cores (M1609). */
+        task_t **ww = s ? &c->b_wwaiter : &c->a_wwaiter;
+        *ww = task_self();
+        usock_irq_restore(fl);
+        task_block();
+        fl = usock_irq_save();
+        c = ep_conn(ep, &s);
+        if (!c) { usock_irq_restore(fl); return -1; }            /* the connection went away while we slept */
+        ww = s ? &c->b_wwaiter : &c->a_wwaiter;
+        *ww = 0;
+    }
 }
 
 long unix_recv(int ep, void *buf, unsigned long max) {
@@ -266,6 +316,14 @@ long unix_recv(int ep, void *buf, unsigned long max) {
         *mw = 0;
     }
     int got = rget(rx, (unsigned char *)buf, (int)max);
+    /* DRAINING IS WHAT CREATES SPACE, so this is where a blocked writer gets
+     * woken (M2090). Without it unix_send_ex's wait never ends and a full ring
+     * is a permanent hang rather than momentary backpressure. The writer on
+     * OUR rx ring is the peer: side B reads a2b, which side A writes. */
+    if (got > 0) {
+        task_t **pw = s ? &c->a_wwaiter : &c->b_wwaiter;
+        if (*pw) { task_wake(*pw); *pw = 0; }
+    }
     usock_irq_restore(fl);
     return got;
 }
@@ -280,6 +338,12 @@ int unix_shutdown(int ep, int how) {
     if (s) c->b_wr_closed = 1; else c->a_wr_closed = 1;
     task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer so its recv returns EOF */
     if (*pw) { task_wake(*pw); *pw = 0; }
+    /* ...AND ANY WRITER WAITING FOR SPACE (M2090). It is waiting for a reader
+     * that is never coming back; leaving it parked is a hang, and its retry
+     * will now see the closed flag and return -1 (EPIPE) as it must. Both
+     * sides, because either could be blocked on this connection. */
+    if (c->a_wwaiter) { task_wake(c->a_wwaiter); c->a_wwaiter = 0; }
+    if (c->b_wwaiter) { task_wake(c->b_wwaiter); c->b_wwaiter = 0; }
     usock_irq_restore(fl);
     return 0;
 }
@@ -305,6 +369,10 @@ int unix_close(int ep) {
     if (s) c->b_closed = 1; else c->a_closed = 1;
     task_t **pw = s ? &c->a_waiter : &c->b_waiter;               /* wake the peer so its recv returns EOF */
     if (*pw) { task_wake(*pw); *pw = 0; }
+    /* ...and any writer blocked for space, which will now see the close and
+     * return EPIPE instead of waiting for a reader that has gone (M2090). */
+    if (c->a_wwaiter) { task_wake(c->a_wwaiter); c->a_wwaiter = 0; }
+    if (c->b_wwaiter) { task_wake(c->b_wwaiter); c->b_wwaiter = 0; }
     if (c->a_closed && c->b_closed) c->used = 0;                 /* both ends gone -> free the slot */
     usock_irq_restore(fl);
     return 0;
@@ -431,6 +499,7 @@ int unix_socketpair(int *a, int *b) {
     struct uconn *c = &conns[ci];
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
     c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
+    c->a_wwaiter = c->b_wwaiter = 0;            /* a reused slot must not inherit a stale writer (M2090) */
     c->a_refs = c->b_refs = 1;                     /* one descriptor per end to begin with (M2002) */
     c->a_pid = c->b_pid = app_current_pid();       /* both ends are this process's (M2088) */
     *a = (ci << 1) | 0;                             /* side A */

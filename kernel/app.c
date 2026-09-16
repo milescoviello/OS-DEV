@@ -1278,6 +1278,14 @@ int app_scm_recv(int ep) {
     return fd;
 }
 
+/* IS THERE STILL A DESCRIPTOR QUEUED? (M2090) Non-consuming, because the
+ * caller is asking in order to set MSG_CTRUNC -- "there were more than fitted"
+ * -- and consuming one to find out would be the opposite of the answer. */
+int app_scm_peek(int ep) {
+    struct scmq *q = scm_in(ep); if (!q) return -1;
+    return scmq_empty(q) ? -1 : 0;
+}
+
 /* getcwd (M1248): canonicalize an absolute-ish path (resolve "."/".."/"//") into
  * out. Component-stack: push names, pop on "..". Pure string work — the cwd_path
  * is cosmetic-for-getcwd (the real cwd is the component state above), so a bad
@@ -8941,13 +8949,20 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 12) {  /* AF_UNIX endpoint: send (M1965) */
         if (a->fd[fd].obj < 0) return -1;
-        long w = unix_send(a->fd[fd].obj, buf, len);
+        /* O_NONBLOCK IS THE CALLER'S, AND A FULL RING IS NOT A SUCCESS (M2090).
+         * unix_send returned whatever fitted -- including ZERO -- and nothing
+         * ever waited. A write of 0 makes a caller loop for ever making no
+         * progress while believing it is working; Firefox's fork server hit
+         * the ENETUNREACH this got turned into and tore its channel down. */
+        long w = unix_send_ex(a->fd[fd].obj, buf, len, app_fd_nonblock(fd));
+        if (w == UNIX_EAGAIN) return APP_FD_EAGAIN;
         /* A dead peer is EPIPE, not EBADF. Node reported "write EBADF" on a
          * connection that was fine, because this whole case was MISSING and
          * the write fell through to fd_pipe_idx() -- which of course found no
          * pipe behind a socket fd and returned -1. Every socket call in the
          * trace had succeeded; the byte path simply did not exist. */
-        return (w < 0) ? APP_FD_EPIPE : w;
+        if (w < 0) { app_request_signal(a, SIGPIPE); return APP_FD_EPIPE; }
+        return w;
     }
     int idx = fd_pipe_idx(a, fd, 1); if (idx < 0) return -1;
     /* ...and the write side, for the same reason (M2009): the thread POSTING a
@@ -9592,6 +9607,14 @@ int app_unix_recv_fd(int sockfd) {
     if (sockfd < 0 || sockfd >= APP_NFD || !a->fd[sockfd].used || a->fd[sockfd].type != 12) return -1;
     if (a->fd[sockfd].obj < 0) return -1;
     return app_scm_recv(a->fd[sockfd].obj);
+}
+
+/* Are there MORE descriptors queued than the receiver took? For MSG_CTRUNC. */
+int app_unix_peek_fd(int sockfd) {
+    struct app *a = cur(); if (!a) return -1;
+    if (sockfd < 0 || sockfd >= APP_NFD || !a->fd[sockfd].used || a->fd[sockfd].type != 12) return -1;
+    if (a->fd[sockfd].obj < 0) return -1;
+    return app_scm_peek(a->fd[sockfd].obj);
 }
 
 /* shutdown(2) on an AF_UNIX fd (M1965): end this side's write direction so the
