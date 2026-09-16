@@ -318,6 +318,24 @@ void isr_dispatch(struct registers *r) {
                             exception_names[r->int_no], r->int_no, r->err_code,
                             (void *)frip, (void *)cr2, task_current_id(), task_name_of(task_self()));
                     app_describe_addr(frip);
+                    /* NAME THE CANARY READ HERE TOO (M2083). The diagnostic
+                     * below is on the TERMINATE path only, and a runtime that
+                     * installs a SIGSEGV handler -- Bun, Firefox, anything
+                     * with a crash reporter -- never reaches it. So the one
+                     * fault whose report points at the wrong subsystem by
+                     * default was invisible in exactly the processes that
+                     * matter: CR2=0x28 reads as a generic null dereference in
+                     * libc, and the cause is always the FS base, never the
+                     * reported address. */
+                    if (r->int_no == 14 && cr2 == 0x28) {
+                        uint64_t live = 0, cached = 0; int core = -1;
+                        task_fs_base_live(&live, &cached, &core);
+                        kprintf("[fault] CR2=0x28 is the `mov %%fs:0x28` stack canary: FS BASE is "
+                                "saved=%p live=%p cached=%p core=%d -- if those are 0 this thread "
+                                "is running with NO TLS, and the bug is in clone/CLONE_SETTLS or "
+                                "the context switch's FS_BASE restore\n",
+                                (void *)task_fs_base(), (void *)live, (void *)cached, core);
+                    }
                     /* AND WHAT THE FAULTING PAGE IS. "present and not
                      * writable" and "present, not writable and COW" are
                      * completely different bugs -- the second is a copy-on-

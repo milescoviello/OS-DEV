@@ -195,6 +195,7 @@ LXTHREAD: 4 threads
 LXEPOLL: ALL PASSED
 LXLONG: ALL PASSED
 LXSIG: ALL PASSED
+LXTLS: OK
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -333,6 +334,19 @@ LXWAIT: reaped 40/40 children
         echo "  ok: rt_sigaction/rt_sigprocmask/kill are honoured -- a handler runs, a block blocks, SIG_IGN discards"
     else
         echo "  FAIL: signal dispositions are not honoured:"; grep -a "LXSIG" "$SLOG3" | grep -a FAIL | head -4; f3=1
+    fi
+    # M2083 -- TLS IS PER-THREAD, AND SO IS A WAIT.
+    # Firefox died reading the stack canary at %fs:0x28, which means a thread
+    # with NO TLS. Two defects behind it, each of which this probe fails on
+    # alone: fork copied the TLS base from the process's MAIN task rather than
+    # from the thread that called fork (so a child forked off a worker aliased
+    # a thread that was not its parent), and a child's exit woke only the main
+    # task (so wait4 from any other thread blocked for ever -- reverting that
+    # one does not fail the assertion, it never returns at all).
+    if grep -aq "LXTLS: OK" "$SLOG3"; then
+        echo "  ok: every thread sees its own TLS across 1600 checks, and a child forked from a NON-MAIN thread keeps that thread's TLS (M2083)"
+    else
+        echo "  FAIL: per-thread TLS or a non-main-thread fork is broken:"; grep -a "LXTLS" "$SLOG3" | tail -4; f3=1
     fi
     # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
     # Every listing in the kernel came through one struct whose name field was

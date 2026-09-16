@@ -1931,7 +1931,24 @@ static int app_pid_alive(int pid) {            /* a live (un-exited) process wit
 }
 static void app_wake_waiter(int pid) {         /* wake a parent blocked in waitpid() */
     struct app *a = app_by_pid(pid);
-    if (a && a->waiting && a->task) task_wake(a->task);
+    if (!a || !a->waiting) return;
+    /* EVERY THREAD, NOT JUST THE MAIN ONE (M2083).
+     *
+     * wait4 may be called from any thread, and this woke only a->task. A
+     * worker thread that forked and then waited blocked for ever: the child
+     * exited, exit_group ran, this fired -- and the one task it woke was not
+     * the one waiting. Same shape as M2075's app_request_signal, which woke
+     * only the main thread for a process-directed signal, and for the same
+     * reason: "the process" is not a single task and has not been since
+     * threads arrived.
+     *
+     * Waking a thread that is not in wait4 is harmless -- it re-checks its own
+     * condition and blocks again -- so there is nothing to be clever about
+     * here. Guessing which thread is the one costs a wrong answer; waking all
+     * of them costs a re-check. */
+    if (a->task) task_wake((task_t *)a->task);
+    for (int k = 0; k < APP_MAXTHREAD; k++)
+        if (a->thr[k] && a->thr[k]->state != TASK_DEAD) task_wake(a->thr[k]);
 }
 static void app_free_zombie_children(int ppid) {  /* a dying parent orphans its uncollected zombies */
     for (int i = 0; i < MAX_APPS; i++)
@@ -10428,7 +10445,21 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
     }
     /* copy the parent's live FP/SSE state so a child mid-float-computation is correct */
     task_copy_fpu(a->task, p->task);
-    task_copy_tls(a->task, p->task);   /* the child must see the parent's %fs base (M1949) */
+    /* THE FORKING THREAD'S TLS, NOT THE PROCESS'S MAIN ONE (M2083).
+     *
+     * M1949 got the direction right and the source wrong: it copies from
+     * p->task, which is the parent process's MAIN task. fork() from any other
+     * thread therefore handed the child the main thread's thread-control-block
+     * address, so every __thread variable in the child aliased a thread that
+     * is not the one that called fork -- and the child is the only thread it
+     * has, so nothing else could ever correct it.
+     *
+     * Measured: a child forked from a worker thread read its own __thread
+     * variable as someone else's and exited 3. glibc's own pthread bookkeeping
+     * lives in that block, which is why the failure presents as a canary read
+     * at %fs:0x28 rather than as a wrong value. */
+    { task_t *forker = task_self();
+      task_copy_tls(a->task, forker ? forker : p->task); }
     task_cont(a->task);                /* context complete: now it may run */
 
     /* give the child its own window (the WM consumes the pending queue) */

@@ -792,6 +792,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the per-thread signal probe...\n");
         {   int tsrc = app_run_linux_sync("/disk2/lxtsig", 0, 0, 180000);
             kprintf("[lxabi] LXTSIG exit -> %d\n", tsrc); }
+        /* Firefox died reading the stack canary at %fs:0x28 -- a thread with
+         * NO TLS. Nothing asserted that a thread's own __thread storage is
+         * its own, nor that a child forked from a non-main thread keeps the
+         * FORKING thread's TLS rather than the process's main one. (M2083) */
+        kprintf("[lxabi] launching the per-thread TLS probe...\n");
+        {   int tlrc = app_run_linux_sync("/disk2/lxtls", 0, 0, 180000);
+            kprintf("[lxabi] LXTLS exit -> %d\n", tlrc); }
         /* ...and whether a COW break loses a write when several threads take
          * one at the same moment, which is what fork() in a threaded process
          * makes happen. (M2076) */

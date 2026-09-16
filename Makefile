@@ -285,6 +285,11 @@ $(LXROOT)/lxtsig: tools/lx/lxtsig.c
 	$(CC) -static-pie -O2 -o $@ $< -lpthread
 	@echo "  HOSTCC  $@ (a signal sent to a thread must arrive at THAT thread)"
 
+$(LXROOT)/lxtls: tools/lx/lxtls.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $< -lpthread
+	@echo "  HOSTCC  $@ (every thread must see its own TLS, and a forked child must keep it)"
+
 $(LXROOT)/lxcow: tools/lx/lxcow.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $< -lpthread
@@ -384,7 +389,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
