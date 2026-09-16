@@ -863,6 +863,25 @@ int net_udp_readable(uint16_t sport) {
     return 0;
 }
 
+/* FIONREAD on a datagram socket (M2086): the length of the datagram the NEXT
+ * recvfrom would return, which is what Linux reports here -- not the total of
+ * everything queued. It must therefore walk the queue in exactly udpq_take's
+ * order, including its TTL test, or the number describes a different datagram
+ * from the one that arrives. Returns 0 when nothing is waiting. */
+long net_udp_nread(uint16_t sport) {
+    uint64_t now = timer_ticks();
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < UDPQ_N; i++) {
+            if (!g_udpq[i].len) continue;
+            if (now - g_udpq[i].at > UDPQ_TTL + (uint64_t)pass) continue;
+            if (g_udpq[i].dport != sport) continue;
+            return (long)g_udpq[i].len;
+        }
+        if (pass == 0) udp_pump_once(sport);
+    }
+    return 0;
+}
+
 /* ===================================================================== *
  *  Raw packet sockets (M1259): AF_PACKET/SOCK_RAW — ring 3 gets the WHOLE
  *  Ethernet frame (dst+src MAC + ethertype + payload). Lets userspace build
@@ -976,6 +995,16 @@ int net_tcp_sock_readable(int idx) {
     if (rxcount(idx) > 0) return 1;
     tcpsock_pump(idx);
     return rxcount(idx) > 0 || g_tcpsock[idx].eof || !g_tcpsock[idx].c.up;
+}
+/* FIONREAD on a connected socket (M2086): how many bytes the receive ring
+ * holds, pumping the NIC first for the same reason net_tcp_sock_readable does
+ * -- the bytes may still be on the wire, and a count that reads zero while a
+ * segment is queued in the driver is the same lie as POLLNVAL was. A pending
+ * EOF counts as zero bytes, which is exactly right: read() will return 0. */
+long net_tcp_sock_nread(int idx) {
+    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return -1;
+    if (rxcount(idx) == 0) tcpsock_pump(idx);
+    return rxcount(idx);
 }
 /* A connected socket is always writable here: tcp_write sends immediately. */
 int net_tcp_sock_writable(int idx) {

@@ -120,6 +120,17 @@ void inotify_feed(char op, const char *path) {
     }
 }
 
+/* FIONREAD on an inotify fd (M2086): Linux reports the byte total of the
+ * queued events, and our records are a fixed 48 bytes, so the count is exact
+ * rather than an estimate -- which matters, because the documented idiom is to
+ * size a buffer from this number and then read it in one call. */
+long inotify_nread(int idx) {
+    if (idx < 0 || idx >= INOT_MAX || !g_inot[idx].used) return -1;
+    struct inot *n = &g_inot[idx];
+    int q = (n->qhead - n->qtail + INOT_QUEUE) % INOT_QUEUE;
+    return (long)q * 48;
+}
+
 /* Drain queued events into buf as fixed 48-byte records:
  *   wd(4) | mask(4) | cookie(4)=0 | len(4)=32 | name[32]
  * Returns bytes written (0 if no events — a non-blocking read). */

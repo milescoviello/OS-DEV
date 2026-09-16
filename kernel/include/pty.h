@@ -17,5 +17,6 @@ long pty_write(int id, const void *buf, unsigned long len);/* bytes; -1 bad id *
 int  pty_close(int id);                                    /* close one end (wakes the peer); 0/-1 */
 int  pty_ctl(int id, int cmd, int arg);                    /* cmd 0=set lflag (ICANON|ECHO|ISIG); 1=set fg pgid; 0/-1 */
 int  pty_ready(int id);                                    /* fswait peek: would pty_read NOT block? */
+long pty_nread(int id);                                    /* FIONREAD: bytes queued on this side; -1 bad id (M2086) */
 int  pty_pts_valid(int n);                                 /* is pair n a live pty whose slave /dev/pts/n is openable? (M1274) */
 void pty_release_pid(int pid);                             /* close every pty owned by a dead pid (app_reap) */

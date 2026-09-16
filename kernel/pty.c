@@ -209,6 +209,14 @@ int pty_ready(int id) {                                      /* fswait peek */
     return pr_cnt(&p->out) > 0 || !p->s_open;
 }
 
+/* FIONREAD on a pty (M2086): bytes queued on whichever side this id names --
+ * the slave reads the input ring, the master reads the output ring. A pending
+ * EOF/hangup is readiness, not a byte count, so it reports 0. */
+long pty_nread(int id) {
+    int slave; struct pty *p = resolve(id, &slave); if (!p) return -1;
+    return (long)pr_cnt(slave ? &p->in : &p->out);
+}
+
 void pty_release_pid(int pid) {
     for (int i = 0; i < NPTY; i++)
         if (ptys[i].used && ptys[i].owner == pid) {

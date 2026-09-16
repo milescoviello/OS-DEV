@@ -319,6 +319,28 @@ int unix_readable(int ep) {
     usock_irq_restore(fl);
     return r;
 }
+/* HOW MANY BYTES ARE WAITING, not merely "are there any" (M2086).
+ *
+ * ep_readable answers a yes/no question, and FIONREAD asks a numeric one --
+ * so there was nothing here that could answer it, and the ioctl handler
+ * answered ENOTTY instead. A socket is not a terminal, but "not a terminal"
+ * is not the same statement as "that question is meaningless": the caller
+ * asked how much it may read, 142 bytes were sitting in the ring, and it was
+ * told the descriptor does not support the concept.
+ *
+ * Note this deliberately does NOT count a pending EOF as a byte. ep_readable
+ * must (a poller has to learn of the hangup), but a count is a count: a
+ * caller that sizes a buffer from it and then reads that many bytes would
+ * block for ever on the phantom one. */
+long unix_nread(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    long n = -1;
+    if (c) { struct uring *rx = s ? &c->a2b : &c->b2a; n = rcount(rx); }
+    usock_irq_restore(fl);
+    return n;
+}
+
 /* Does this listener have a connection waiting? POLLIN on a listening socket
  * means "accept would not block", which is what a server's event loop polls. */
 int unix_pending(int lid) {

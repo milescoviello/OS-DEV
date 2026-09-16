@@ -300,6 +300,10 @@ void app_describe_fault_addr(void);                             /* describe the 
 void app_describe_addr(uint64_t addr);                          /* print the file+offset an address maps to, for a fault report (M2003) */
 void app_epoll_dump(int epfd);                                 /* print an epoll instance's registered fds + readiness (M1998) */                                      /* fd-table type, or -1 if not open (M1965) */
 int  app_fd_set_cloexec(int fd, int on);                       /* FD_CLOEXEC, for MFD_CLOEXEC/SOCK_CLOEXEC (M1977) */
+#define APP_NREAD_ENOTTY (-1)   /* this kind of descriptor keeps no byte count at all (M2086) */
+#define APP_NREAD_EINVAL (-2)   /* a socket with no byte stream to count -- a listener (M2086) */
+int  app_fd_nread(int fd, long *out);                          /* FIONREAD: bytes readable without blocking; 0/APP_NREAD_* (M2086) */
+long app_console_nread(void);                                  /* FIONREAD on fd 0/1/2 with no table entry: queued keys (M2086) */
 long app_pread(int fd, void *buf, unsigned long max, long off);        /* read a FILE fd without moving its cursor; bytes/0 EOF/-1 (M1572) */
 long app_pwrite(int fd, const void *buf, unsigned long len, long off); /* write a FILE fd without moving its cursor; bytes/-1 (M1572) */
 int  app_fd_close(int fd);             /* close an fd; 0/-1 (M1187) */

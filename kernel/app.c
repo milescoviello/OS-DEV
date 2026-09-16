@@ -2463,6 +2463,15 @@ void app_key(app_t *a, char c) {
 static int iq_has(struct app *a) {
     return a && (a->paste_pos < a->paste_len || a->ih != a->it);
 }
+/* How many bytes iq_get would hand over before blocking (M2086). A paste is
+ * not capped by IQ_SIZE, so it is counted separately and first -- the same
+ * order iq_get drains them in. */
+static int iq_count(struct app *a) {
+    if (!a) return 0;
+    int paste = (a->paste_pos < a->paste_len) ? (a->paste_len - a->paste_pos) : 0;
+    int ring  = (a->ih - a->it + IQ_SIZE) % IQ_SIZE;
+    return paste + ring;
+}
 static int iq_get(struct app *a) {
     if (a->paste_pos < a->paste_len)            /* drain a pending paste first (not capped by IQ_SIZE) */
         return (unsigned char)a->pastebuf[a->paste_pos++];
@@ -3217,6 +3226,16 @@ int app_console_size(int *cols, int *rows) {
     if (cols) *cols = t->cols;
     if (rows) *rows = t->rows;
     return 1;
+}
+
+/* FIONREAD on the console (M2086): how many keystrokes are already queued for
+ * whichever window this process reads from. Same source app_fd_ready's type-14
+ * arm polls, so a program told "readable" and then asking "how much" gets two
+ * answers that agree. */
+long app_console_nread(void) {
+    struct app *a = cur(); if (!a) return 0;
+    struct app *src = a->out_to ? a->out_to : a;
+    return (long)iq_count(src);
 }
 
 /* Write bytes into an app's terminal grid, interpreting escape sequences.
@@ -10103,6 +10122,100 @@ int app_fd_ready(app_t *ap, int fd, int events) {
     }
     return re;
 }
+/* FIONREAD: HOW MANY BYTES CAN BE READ WITHOUT BLOCKING (M2086).
+ *
+ * The bug this exists to fix: the Linux ioctl handler computes "is this fd a
+ * terminal", and answers ENOTTY to everything that is not. FIONREAD is not a
+ * terminal ioctl -- it is valid on sockets, pipes, ptys and regular files, and
+ * on Linux it is one of the few ioctls a portable program may assume. So
+ * Firefox's IPC channel asked how many bytes were waiting on its socket, was
+ * told "that descriptor is not a terminal", and aborted -- while 142 bytes sat
+ * in the ring, which the very next recvfrom on the same fd collected.
+ *
+ * EVERY ANSWER HERE WAS CHECKED AGAINST A REAL LINUX KERNEL, and three of my
+ * first guesses were wrong in the way that matters -- a plausible number where
+ * Linux fails, which is this project's dominant bug class:
+ *
+ *   - a pipe's WRITE end reports the ring contents too, not 0. FIONREAD on a
+ *     pipe is a property of the pipe, not of the end you hold.
+ *   - an eventfd, a timerfd, a signalfd, a DIRECTORY fd and a character device
+ *     all answer ENOTTY. Reporting 8 for an eventfd (one u64 waiting) is a
+ *     tidy-looking fabrication.
+ *   - a LISTENING socket answers EINVAL, not 0. There is no byte stream to
+ *     count, and "0" would tell a caller the stream is merely drained.
+ *
+ * The other rule followed throughout: a pending EOF or hangup is READINESS,
+ * not a byte count. app_fd_ready must report it (a poller learns of a hangup
+ * no other way); a count must not, because a caller that sizes a read from
+ * this number and then reads that many bytes would block for ever on the
+ * phantom byte. Every ...nread primitive therefore reports 0, not 1, at EOF.
+ *
+ * Returns 0 with *out set, or APP_NREAD_ENOTTY / APP_NREAD_EINVAL -- never a
+ * plausible zero, which a caller cannot tell from "drained". The ENOTTY types
+ * log themselves once each, so "we cannot answer this" is not invisible. */
+int app_fd_nread(int fd, long *out) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || !out) return APP_NREAD_ENOTTY;
+    long n = -1;
+    int ty = a->fd[fd].type;
+    switch (ty) {
+    case 1: {                                               /* pipe: either end, same answer */
+        int q = -1;
+        pipe_state(a->fd[fd].obj, 0, 0, &q, 0);
+        n = q;
+        break;
+    }
+    case 2: {                                               /* regular file: size - offset */
+        struct statx st;
+        if (vfs_stat(a->fd[fd].path, &st) != 0) return APP_NREAD_ENOTTY;
+        if ((st.stx_mode & 0xF000) == 0x4000) return APP_NREAD_ENOTTY;   /* a DIRECTORY is not a byte stream */
+        long sz = (long)st.stx_size, off = a->fd[fd].off;
+        n = sz > off ? sz - off : 0;
+        break;
+    }
+    case 3: {                                               /* memfd: a shmem file, same rule */
+        long sz = (long)memfds[a->fd[fd].obj].size, off = a->fd[fd].off;
+        n = sz > off ? sz - off : 0;
+        break;
+    }
+    case 8:                                                 /* inotify: 48 bytes per queued event */
+        n = inotify_nread(a->fd[fd].obj);
+        break;
+    case 9:                                                 /* AF_INET datagram: the NEXT datagram's length */
+        n = a->fd[fd].off ? net_udp_nread((uint16_t)a->fd[fd].off) : 0;
+        break;
+    case 10:                                                /* AF_INET stream */
+        n = net_tcp_sock_nread(a->fd[fd].obj);
+        if (n < 0) return APP_NREAD_EINVAL;                 /* a socket in no state to have a stream */
+        break;
+    case 11:                                                /* pty */
+        n = pty_nread(a->fd[fd].obj);
+        break;
+    case 12:                                                /* AF_UNIX endpoint */
+        n = unix_nread(a->fd[fd].obj);
+        if (n < 0) return APP_NREAD_EINVAL;
+        break;
+    case 13: case 15:                                       /* listeners: no byte stream exists yet */
+        return APP_NREAD_EINVAL;
+    case 14: {                                              /* console alias */
+        struct app *src = a->out_to ? a->out_to : a;
+        n = iq_count(src);
+        break;
+    }
+    default: {
+        static uint32_t moaned;
+        if (ty < 32 && !(moaned & (1u << ty))) {
+            moaned |= (1u << ty);
+            kprintf("[linuxabi] FIONREAD: fd type %d keeps no byte count; answering ENOTTY\n", ty);
+        }
+        return APP_NREAD_ENOTTY;
+    }
+    }
+    if (n < 0) return APP_NREAD_ENOTTY;
+    *out = n;
+    return 0;
+}
+
 /* pidfd (M1222): a pid-reuse-aware-ish process handle as an fd. It stores the
  * target pid (a plain value — no shared object, so fork/dup2 just copy it and
  * close needs no teardown). poll/epoll report POLLIN once the process has

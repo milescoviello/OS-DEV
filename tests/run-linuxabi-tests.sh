@@ -197,6 +197,7 @@ LXLONG: ALL PASSED
 LXSIG: ALL PASSED
 LXTLS: OK
 LXLOCK: OK
+LXNREAD: OK
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -360,6 +361,24 @@ LXWAIT: reaped 40/40 children
         echo "  ok: fcntl F_GETLK/F_SETLK/F_UNLCK with l_whence, cross-process conflict reported as EAGAIN, flock(2), and EINVAL rather than EBADF for an unknown command (M2085, 11 checks)"
     else
         echo "  FAIL: record locks are not honoured:"; grep -a "LXLOCK" "$SLOG3" | grep -a FAIL | head -4; f3=1
+    fi
+    # M2086 -- "HOW MANY BYTES MAY I READ?" ANSWERED "THAT IS NOT A TERMINAL".
+    # The ioctl handler decided one thing -- is this fd a console? -- and
+    # answered ENOTTY to every request on every fd for which it was not. That
+    # is right for TCGETS. FIONREAD is not a terminal ioctl: it is defined on
+    # sockets, pipes, ptys and files, and Firefox's IPC channel asked it on a
+    # healthy socketpair, was refused, and aborted -- while the very next
+    # syscall on that same descriptor read 142 bytes off it:
+    #     t293 16(2f, 541b, ...)      = -25   ioctl(FIONREAD) ENOTTY
+    #     t293 45(2f, ..., 10000)     = 8e    recvfrom(same fd) 142 bytes
+    # Every number this probe asserts was first checked against a real Linux
+    # kernel, which corrected three of my guesses -- a pipe's WRITE end reports
+    # the ring contents too, an eventfd/timerfd/directory must REFUSE rather
+    # than report a tidy-looking 8, and a LISTENING socket is EINVAL not 0.
+    if grep -aq "LXNREAD: OK" "$SLOG3"; then
+        echo "  ok: FIONREAD reports real byte counts on sockets/pipes/files/ptys/inotify, refuses the types Linux refuses, and FIONBIO/FIOCLEX/FIONCLEX reach the fcntl state they name (M2086, 32 checks)"
+    else
+        echo "  FAIL: FIONREAD or the FIO* family is wrong:"; grep -a "LXNREAD" "$SLOG3" | grep -a FAIL | head -6; f3=1
     fi
     # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
     # Every listing in the kernel came through one struct whose name field was

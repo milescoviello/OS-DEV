@@ -83,6 +83,7 @@ int  net_sntp(void);                /* SNTP: set the RTC from pool.ntp.org; 0/-1
 /* Userspace UDP sockets (M1258): connectionless datagram send/recv for ring 3. */
 int  net_udp_send(const uint8_t dstip[4], uint16_t dport, uint16_t sport, const void *payload, int plen);   /* 0/-1 */
 int  net_udp_recv(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport, int timeout_ms);  /* bytes/-1 */
+long net_udp_nread(uint16_t sport);                         /* FIONREAD: length of the next datagram, 0 if none (M2086) */
 /* Raw packet sockets (M1259): whole-Ethernet-frame send/recv for ring 3. */
 int  net_raw_send(const void *frame, int len);              /* send a complete L2 frame; 0/-1 */
 int  net_raw_recv(void *buf, int max, int timeout_ms);      /* next L2 frame; length/-1 */
@@ -93,6 +94,7 @@ int  net_raw_recv(void *buf, int max, int timeout_ms);      /* next L2 frame; le
 #define NET_SOCK_EAGAIN (-11)
 int  net_tcp_sock_open(void);                               /* alloc a TCB slot; idx/-1 */
 int  net_tcp_sock_readable(int idx);                        /* poll: would recv return now? (M1967) */
+long net_tcp_sock_nread(int idx);                           /* FIONREAD: bytes in the receive ring; -1 bad idx (M2086) */
 int  net_tcp_sock_writable(int idx);                        /* poll: is it connected? (M1967) */
 int  net_tcp_sock_set_nonblock(int idx, int on);            /* O_NONBLOCK -> EAGAIN instead of waiting (M1967) */
 int  net_udp_readable(uint16_t sport);                      /* poll: is a datagram queued for this port? (M1967) */

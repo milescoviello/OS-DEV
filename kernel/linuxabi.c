@@ -688,6 +688,30 @@ void lx_trace_dump_last(const char *why, unsigned long want) { lx_trace_dump_pid
 /* `only_pid` != 0 restricts the dump to one process and SCANS THE WHOLE RING
  * for its entries, rather than taking the last `want` slots -- otherwise a
  * chatty child still crowds the parent out of the window. (M2069) */
+/* Same scan as the pid filter, keyed on the THREAD. (M2086) */
+void lx_trace_dump_tid(const char *why, unsigned long want, int only_tid) {
+    unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
+    unsigned long start = have, found = 0;
+    kprintf("[linuxabi] last syscalls by TID %d before %s (oldest first):\n", only_tid, why);
+    for (unsigned long k = 0; k < have && found < (want ? want : have); k++) {
+        struct lxring_ent *e = &g_lxring[(g_lxring_i - 1 - k) & (LXRING_N - 1)];
+        if (e->tid == only_tid) { found++; start = have - 1 - k; }
+    }
+    if (!found) { kprintf("   (this thread made no syscall in the last %lu)\n", have); return; }
+    for (unsigned long k = start; k < have; k++) {
+        struct lxring_ent *e = &g_lxring[(g_lxring_i - have + k) & (LXRING_N - 1)];
+        if (e->tid != only_tid) continue;
+        if (e->ret == LX_INFLIGHT)
+            kprintf("   %lu(%lx, %lx, %lx) = <still blocked in this call>%s%s\n",
+                    (unsigned long)e->nr, e->a1, e->a2, e->a3,
+                    e->path[0] ? "  " : "", e->path);
+        else
+            kprintf("   %lu(%lx, %lx, %lx) = %lx%s%s\n",
+                    (unsigned long)e->nr, e->a1, e->a2, e->a3, e->ret,
+                    e->path[0] ? "  " : "", e->path);
+    }
+}
+
 void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid) {
     unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
     unsigned long n = have;
@@ -737,8 +761,22 @@ void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }
  * console-lock regression boot past its budget. Deep on demand, modest by
  * default: the flag that asks for syscall tracing is asking for exactly this.
  * (M2003) */
+/* THE FAULTING THREAD'S OWN HISTORY (M2086).
+ *
+ * The ring is global -- it has to be, a process's threads interleave and the
+ * interleaving is often the point -- and on a fault that is exactly wrong. Three
+ * times now I have read a fault dump showing another thread's clock_gettime
+ * loop while the thread that actually died made none of those calls. M2069 made
+ * the ring filterable by PID for the same reason and stopped one level short:
+ * a process with sixty threads has the same problem a machine with two
+ * processes had.
+ *
+ * Both are printed. The tid-filtered view answers "what did the thread that
+ * died just do", and the unfiltered tail answers "what else was going on",
+ * which is the question when the cause is another thread. */
 void lx_trace_dump_fault(void) {
-    lx_trace_dump_last("a ring-3 fault", g_lx_systrace ? 64 : 20);
+    lx_trace_dump_tid("this fault", 24, task_current_id());
+    lx_trace_dump_last("a ring-3 fault (every thread)", g_lx_systrace ? 64 : 12);
 }
 
 /* DUMP THE HISTORY WHEN A PROGRAM SAYS IT IS GIVING UP (M1992).
@@ -2685,6 +2723,65 @@ void linux_syscall_dispatch(struct registers *r) {
                 if (g_lx_systrace)
                     kprintf("[linuxabi] ioctl(fd %ld, 0x%lx) type=%d\n", a1, req, app_fd_type((int)a1));
             }
+        }
+        /* THE GENERIC DESCRIPTOR IOCTLS COME FIRST, BECAUSE THEY ARE NOT
+         * TERMINAL IOCTLS (M2086).
+         *
+         * Everything below this point decides "is this fd a terminal?" and
+         * answers ENOTTY if not -- correct for TCGETS and TIOCGWINSZ, and
+         * wrong for the four ioctls in the FIO* family, which are defined on
+         * any descriptor. Firefox's IPC channel asked FIONREAD on a healthy
+         * socketpair and was told the descriptor is not a terminal:
+         *
+         *     t293 16(2f, 541b, ...) = -25          ioctl(FIONREAD) = ENOTTY
+         *     t293 45(2f, ...,  10000) = 8e         recvfrom(same fd) = 142
+         *
+         * The next syscall on the same descriptor read 142 bytes. Answering
+         * "not a terminal" to "how much may I read" is the error this ordering
+         * removes.
+         *
+         * FIONBIO/FIOCLEX/FIONCLEX are here for the same reason: they are the
+         * ioctl spellings of fcntl(F_SETFL, O_NONBLOCK) and F_SETFD, and both
+         * capabilities already exist -- they were simply unreachable through
+         * this door. */
+        if (req == 0x541b /*FIONREAD*/) {
+            if (!app_fd_is_open((int)a1) && !(a1 >= 0 && a1 <= 2)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            if (!vmm_user_ok(r->rdx, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            long nr = 0;
+            if (!app_fd_is_open((int)a1)) {
+                /* fd 0/1/2 with nothing in the table IS the console (the same
+                 * aliasing the terminal test below relies on). */
+                int cc = 0, rr = 0;
+                if (!app_console_size(&cc, &rr)) { r->rax = (uint64_t)-(long)LX_ENOTTY; break; }
+                nr = app_console_nread();
+            } else {
+                int nrc = app_fd_nread((int)a1, &nr);
+                if (nrc != 0) {
+                    /* Two DIFFERENT refusals, because Linux gives two: a
+                     * listening socket is EINVAL (the question is meaningless
+                     * in that state) and a timerfd/eventfd/directory is ENOTTY
+                     * (the object has no byte count at all). Collapsing them
+                     * into one errno is the same mistake as AF_NETLINK's four
+                     * causes sharing one EAFNOSUPPORT. */
+                    r->rax = (uint64_t)-(long)(nrc == APP_NREAD_EINVAL ? LX_EINVAL : LX_ENOTTY);
+                    break;
+                }
+            }
+            if (nr > 0x7fffffffL) nr = 0x7fffffffL;          /* the argument is an int */
+            *(int32_t *)r->rdx = (int32_t)nr;
+            r->rax = 0; break;
+        }
+        if (req == 0x5421 /*FIONBIO*/) {
+            if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            if (!vmm_user_ok(r->rdx, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            int on = *(const int32_t *)r->rdx ? 1 : 0;
+            r->rax = (app_fd_set_nonblock((int)a1, on) == 0) ? 0 : (uint64_t)-(long)LX_EBADF;
+            break;
+        }
+        if (req == 0x5451 /*FIOCLEX*/ || req == 0x5450 /*FIONCLEX*/) {
+            if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            r->rax = (app_fd_set_cloexec((int)a1, req == 0x5451) == 0) ? 0 : (uint64_t)-(long)LX_EBADF;
+            break;
         }
         /* A DESCRIPTOR IS A TERMINAL BECAUSE OF WHAT IT REFERS TO, not because
          * of its number (M2004). Checking `fd <= 2` looks right and is wrong

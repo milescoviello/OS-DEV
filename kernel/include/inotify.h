@@ -27,5 +27,6 @@ int  inotify_rm(int idx, int wd);                        /* unregister a watch b
 void inotify_ref(int idx);                               /* a dup()/fork() alias of an existing fd (M1603) */
 void inotify_free(int idx);                              /* drop a reference; frees the instance at 0 (M1603) */
 int  inotify_ready(int idx);                             /* are events queued? (epoll/poll) */
+long inotify_nread(int idx);                             /* FIONREAD: queued bytes (48 per event); -1 bad idx (M2086) */
 long inotify_read(int idx, void *buf, unsigned long max);/* drain queued events; bytes written (0 = none) */
 void inotify_feed(char op, const char *path);            /* called from fsevents_record on every VFS mutation */

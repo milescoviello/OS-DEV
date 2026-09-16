@@ -805,6 +805,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the record-lock probe...\n");
         {   int lkrc = app_run_linux_sync("/disk2/lxlock", 0, 0, 120000);
             kprintf("[lxabi] LXLOCK exit -> %d\n", lkrc); }
+        /* FIONREAD -- not a terminal ioctl, and answered by the "not a
+         * terminal" branch anyway, so a socket with 142 bytes waiting was told
+         * the question did not apply to it. Firefox's IPC channel asked and
+         * then aborted. (M2086) */
+        kprintf("[lxabi] launching the readable-byte-count probe...\n");
+        {   int nrrc = app_run_linux_sync("/disk2/lxnread", 0, 0, 120000);
+            kprintf("[lxabi] LXNREAD exit -> %d\n", nrrc); }
         /* ...and whether a COW break loses a write when several threads take
          * one at the same moment, which is what fork() in a threaded process
          * makes happen. (M2076) */
