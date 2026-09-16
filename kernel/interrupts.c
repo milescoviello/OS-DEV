@@ -272,7 +272,27 @@ void isr_dispatch(struct registers *r) {
             uint64_t cr2 = 0;
             if (r->int_no == 14) {                 /* page fault: maybe a demand-paged mmap region */
                 __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-                if (app_fault_handle(cr2, r->err_code)) return;  /* COW copy / swap-in / mapped a reserved page -> retry */
+                /* HOW MANY FAULTS, AND WHAT THEY COST (M2091). The boot budget
+                 * put 78% of a Firefox startup in an UNATTRIBUTED residual --
+                 * "guest code under TCG, page faults, the scheduler, idle" --
+                 * and the only way to narrow that is to take one of those
+                 * three out of it and name it. Demand-paging an 83-library
+                 * closure is hundreds of thousands of faults, each a ring
+                 * transition plus this handler, so it is the first candidate
+                 * and this is the number that says whether it is the answer.
+                 *
+                 * Counted around app_fault_handle only: a fault it does NOT
+                 * repair goes on to be reported or delivered, and that cost
+                 * belongs to the crash, not to demand paging. */
+                extern uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
+                uint32_t plo, phi;
+                __asm__ volatile("rdtsc" : "=a"(plo), "=d"(phi));
+                uint64_t pt0 = ((uint64_t)phi << 32) | plo;
+                int fixed = app_fault_handle(cr2, r->err_code);
+                __asm__ volatile("rdtsc" : "=a"(plo), "=d"(phi));
+                g_pf_cycles += (((uint64_t)phi << 32) | plo) - pt0;
+                g_pf_count++;
+                if (fixed) { g_pf_repaired++; return; }  /* COW copy / swap-in / mapped a reserved page -> retry */
             }
             /* An Invalid Opcode may be an instruction the CPU under us simply
              * does not implement -- every binary on this host is built for a

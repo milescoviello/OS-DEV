@@ -351,6 +351,8 @@ static inline uint64_t ata_tsc(void) {
     uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
+static uint64_t io_dma_cmds;
+uint64_t ata_dma_commands(void) { return io_dma_cmds; }
 void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
                   uint64_t *cyc_xfer, uint64_t *cyc_hit) {
     if (cmds)     *cmds     = io_cmds;
@@ -360,6 +362,34 @@ void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
     if (cyc_hit)  *cyc_hit  = io_cyc_hit;
 }
 
+/* READS GO BY DMA WHEN THEY CAN (M2091).
+ *
+ * MEASURED, not assumed, and the measurement is the whole reason this exists:
+ *
+ *   64 sectors as 64 single-sector PIO commands: 4780 Kcycles
+ *   the same 64 as 8 eight-sector PIO commands:  4804 Kcycles   (0.99x -- NOTHING)
+ *   the same 64 by DMA, 8 eight-sector transfers: 611 Kcycles   (7.81x)
+ *
+ * The middle line is the surprise and it killed the plan's headline disk fix.
+ * "blockdev_read shreds every request into single sectors" is true, and
+ * un-shredding it is worth nothing at all -- because PIO's cost is the insw
+ * DATA TRANSFER, not the per-command overhead, and eight sectors in one
+ * command still moves eight sectors a word at a time through an I/O port. Under
+ * TCG every one of those words is a device access.
+ *
+ * DMA is the only thing that changes the quantity being paid for: the
+ * controller moves the bytes and the emulator does it as a memcpy. 7.81x, on a
+ * path that already existed and had never been given a reason to be preferred.
+ *
+ * Reads only. A write going wrong is a corrupted disk; a read going wrong is a
+ * wrong byte in RAM, which the self-test below can catch outright. And any DMA
+ * failure falls back to PIO rather than failing the read, so a controller that
+ * misbehaves costs speed and not correctness. */
+int g_ata_dma_reads = 1;        /* -append nodma turns it off, for A/B measurement */
+#define ATA_DMA_BOUNCE_SECTORS (PAGE_SIZE / SECTOR_SIZE)   /* 8: the bounce buffer is one frame */
+static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf, int write);
+static int ata_dma_setup(void);
+
 int ata_read_drive(int drive, uint32_t lba, uint32_t count, void *buf) {
     ata_lock_take();
     uint64_t t0 = ata_tsc();
@@ -367,11 +397,59 @@ int ata_read_drive(int drive, uint32_t lba, uint32_t count, void *buf) {
         io_cyc_hit += ata_tsc() - t0; io_hits++;
         ata_lock_give(); return 0;
     }
-    int r = ata_read_drive_impl(drive, lba, count, buf);
-    if (r >= 0 && count == 1) bcache_install(BCACHE_OWNER_ATA(drive), lba, buf);
+    /* A MULTI-SECTOR READ MUST ALSO USE THE CACHE, IN BOTH DIRECTIONS (M2091).
+     *
+     * The install was `if (count == 1)`, and so was the lookup. That was
+     * self-consistent while every caller read one sector at a time -- which is
+     * what blockdev_read did, and it is exactly what has to stop. But batching
+     * without this would have been a silent regression: multi-sector reads
+     * would neither consult the cache nor populate it, so a boot that was
+     * getting 2.5 million hits against 917 thousand misses would get none, and
+     * the batching win would be paid for with a cache that no longer works.
+     * The plan called this out and it was right to.
+     *
+     * Whole-range hit first -- cheap, and the common case for a re-read -- then
+     * one transfer, then install every sector of it. */
+    if (count > 1) {
+        int all = 1;
+        for (uint32_t k = 0; k < count; k++)
+            if (!bcache_lookup(BCACHE_OWNER_ATA(drive), lba + k,
+                               (uint8_t *)buf + (uint64_t)k * SECTOR_SIZE)) { all = 0; break; }
+        if (all) { io_cyc_hit += ata_tsc() - t0; io_hits++; ata_lock_give(); return 0; }
+    }
+    int r = -1;
+    if (g_ata_dma_reads && count <= ATA_DMA_BOUNCE_SECTORS && ata_dma_setup()) {
+        r = ata_dma_xfer_impl(drive, lba, count, buf, 0);
+        if (r >= 0) io_dma_cmds++;
+    }
+    if (r < 0) r = ata_read_drive_impl(drive, lba, count, buf);   /* PIO fallback, always */
+    if (r >= 0)
+        for (uint32_t k = 0; k < count; k++)
+            bcache_install(BCACHE_OWNER_ATA(drive), lba + k,
+                           (const uint8_t *)buf + (uint64_t)k * SECTOR_SIZE);
+    /* (see ata_read_drive_pio below: the DMA==PIO self-test must NOT come
+     * through this function any more, because this function is now DMA.) */
     io_cyc_xfer += ata_tsc() - t0;
     io_cmds++;
     io_sectors += count;
+    ata_lock_give();
+    return r;
+}
+
+/* A READ THAT IS GUARANTEED TO BE PIO (M2091).
+ *
+ * The DMA==PIO self-test compared ata_read_dma against ata_read_drive, and
+ * ata_read_drive is now the DMA path -- so the moment reads were routed
+ * through DMA, that test began comparing DMA against DMA and asserting
+ * nothing. A test that cannot fail is worse than no test, and this one would
+ * have gone on printing "DMA==PIO OK" over a broken transfer.
+ *
+ * So the comparison needs a second, independent route to the same bytes, and
+ * this is it: the PIO implementation, reached deliberately, whatever the DMA
+ * policy is. */
+int ata_read_drive_pio(int drive, uint32_t lba, uint32_t count, void *buf) {
+    ata_lock_take();
+    int r = ata_read_drive_impl(drive, lba, count, buf);
     ata_lock_give();
     return r;
 }
@@ -410,6 +488,107 @@ int ata_write_drive(int drive, uint32_t lba, uint32_t count, const void *buf) {
     int r = ata_write_drive_impl(drive, lba, count, buf);
     ata_lock_give();
     return r;
+}
+
+/* WHAT ONE COMMAND COSTS, MEASURED IN ISOLATION (M2091).
+ *
+ * The elapsed sums in the boot budget are upper bounds -- a PIO transfer
+ * spin-yields, so the TSC across one spans whatever else the core ran. That
+ * makes them useless for PREDICTING a win. This measures the thing a
+ * prediction needs: the cost of a single command, with nothing else running
+ * and the cache bypassed, at one sector and at eight.
+ *
+ * Why eight: blockdev_read shreds every request into single sectors, so a
+ * 4 KiB filesystem block is eight commands. If an eight-sector command costs
+ * materially less than eight single-sector ones, the difference IS the win
+ * from not shredding, and it can be stated as a number before any of it is
+ * written -- and then checked against a re-measurement afterwards.
+ *
+ * Reads only, and off the END of the disk where nothing structural lives. */
+void ata_diskbench(void) {
+    const struct ata_drive_info *info = ata_drive(1);
+    if (!info || !info->present || info->sectors < 4096) {
+        kprintf("[diskbench] drive 1 absent or tiny; skipped\n");
+        return;
+    }
+    static uint8_t buf[8 * SECTOR_SIZE];
+    uint32_t base = (uint32_t)(info->sectors - 2048);
+    const int N = 64;
+    /* Single sectors, N different LBAs so the drive's own cache cannot serve
+     * them and our bcache install/lookup is bypassed by going to the impl. */
+    ata_lock_take();
+    uint64_t t0 = ata_tsc();
+    for (int i = 0; i < N; i++) ata_read_drive_impl(1, base + (uint32_t)i, 1, buf);
+    uint64_t one = ata_tsc() - t0;
+    /* The same 512-byte sectors, eight at a time: N/8 commands for the same
+     * bytes. Same LBAs, so the comparison is commands, not data. */
+    t0 = ata_tsc();
+    for (int i = 0; i < N; i += 8) ata_read_drive_impl(1, base + (uint32_t)i, 8, buf);
+    uint64_t eight = ata_tsc() - t0;
+    ata_lock_give();       /* ata_read_dma locks for itself: holding it here self-deadlocked,
+                            * and "LOCK STUCK: task 0 ... held by task 0" is what said so (M2091) */
+    /* AND THE SAME BYTES BY DMA (M2091). The one-vs-eight result above says
+     * PIO's cost is the insw DATA TRANSFER and not the per-command overhead --
+     * eight sectors in one command still moves eight sectors a word at a time
+     * through a port, and under TCG every one of those is a device access. DMA
+     * is the only thing that changes that: the controller moves the bytes and
+     * QEMU does it as a memcpy into guest RAM.
+     *
+     * So this is the measurement that decides whether the disk path is worth
+     * any work at all. ata_read_dma already exists and is byte-identical; what
+     * has never existed is a reason to prefer it, stated as a number. */
+    uint64_t dma = 0, dma1 = 0; int dma_ok = 0;
+    if (ata_dma_available() && ata_dma_max_sectors() >= 8) {
+        t0 = ata_tsc();
+        for (int i = 0; i < N; i += 8)
+            if (ata_read_dma(1, base + (uint32_t)i, 8, buf) < 0) { dma_ok = -1; break; }
+        dma = ata_tsc() - t0;
+        /* AND SINGLE-SECTOR DMA, which is the arm that was missing and the one
+         * that actually matters (M2091). The first measurement compared
+         * EIGHT-sector DMA against SINGLE-sector PIO and reported 8.48x -- two
+         * changes at once, and then the read path adopted only one of them:
+         * blockdev_read still shreds every request, so 917021 of 917022 reads
+         * went by DMA and every one of them moved a single sector.
+         *
+         * A DMA command has fixed setup: program the PRD, start the bus
+         * master, poll for completion, copy out of the bounce buffer. Eight of
+         * those for 4 KiB is not the same as one. This arm is what says how
+         * much of the 8.48x was DMA and how much was batching -- and therefore
+         * whether un-shredding, which the PIO comparison said was worth
+         * nothing, is worth everything once the transfer is DMA. */
+        t0 = ata_tsc();
+        for (int i = 0; i < N; i++)
+            if (ata_read_dma(1, base + (uint32_t)i, 1, buf) < 0) { dma_ok = -1; break; }
+        dma1 = ata_tsc() - t0;
+        if (dma_ok == 0) dma_ok = 1;
+    }
+    kprintf("[diskbench] %d sectors as %d single-sector commands: %lu Kcycles (%lu Kcycles each)\n",
+            N, N, one / 1000, (one / N) / 1000);
+    kprintf("[diskbench] the same %d sectors as %d eight-sector commands: %lu Kcycles (%lu Kcycles each)\n",
+            N, N / 8, eight / 1000, (eight / (N / 8)) / 1000);
+    if (eight)
+        kprintf("[diskbench] so NOT shredding a 4 KiB block would be %lu.%02lux cheaper per block\n",
+                one / eight, ((one * 100) / eight) % 100);
+    if (dma_ok == 1) {
+        kprintf("[diskbench] the same %d sectors by DMA, %d eight-sector transfers: %lu Kcycles (%lu Kcycles each)\n",
+                N, N / 8, dma / 1000, (dma / (N / 8)) / 1000);
+        kprintf("[diskbench] the same %d sectors by DMA, %d SINGLE-sector transfers: %lu Kcycles (%lu Kcycles each)\n",
+                N, N, dma1 / 1000, (dma1 / N) / 1000);
+        /* FOUR NUMBERS, SO EVERY PAIR CAN BE COMPARED. Reporting only
+         * "8-sector DMA vs 1-sector PIO" measured two changes at once and led
+         * straight to adopting the wrong half. */
+        if (dma)  kprintf("[diskbench]   8-sector DMA vs 1-sector PIO: %lu.%02lux  (both changes)\n",
+                          one / dma, ((one * 100) / dma) % 100);
+        if (dma1) kprintf("[diskbench]   1-sector DMA vs 1-sector PIO: %lu.%02lux  (DMA alone -- what the read path gets today)\n",
+                          one / dma1, ((one * 100) / dma1) % 100);
+        if (dma)  kprintf("[diskbench]   8-sector DMA vs 1-sector DMA: %lu.%02lux  (batching alone, ON TOP of DMA)\n",
+                          dma1 / dma, ((dma1 * 100) / dma) % 100);
+    } else if (dma_ok < 0) {
+        kprintf("[diskbench] DMA was available but a transfer FAILED -- not usable as it stands\n");
+    } else {
+        kprintf("[diskbench] no DMA available on this controller (bounce max %u sectors)\n",
+                ata_dma_max_sectors());
+    }
 }
 
 /* Boot self-test for the read cache (M1855): on drive 0's LAST sector
@@ -523,7 +702,8 @@ struct ata_prd {
  * the cap is 8 sectors. We keep it deliberately small (well under the 64 KiB a
  * single PRD allows) — the selftest only reads a handful of sectors, and a small
  * fixed bound is the safe choice for a capability that must never misbehave. */
-#define ATA_DMA_BOUNCE_SECTORS (PAGE_SIZE / SECTOR_SIZE)   /* 8 */
+/* ATA_DMA_BOUNCE_SECTORS is defined up at the read path, which needs it to
+ * decide whether a request fits the bounce buffer (M2091). */
 
 /* BMIDE state, discovered once on first use. */
 static struct {
@@ -569,11 +749,43 @@ static int ata_dma_setup(void) {
     /* The PRD table + bounce buffer come from the PMM (identity-mapped low RAM:
      * phys == virt). A 4 KiB frame is page-aligned (the PRD table is far inside
      * one 64 KiB window, so it never crosses one) and is the bounce buffer. */
-    uint64_t prdt_f = pmm_alloc_frame();
-    uint64_t bnc_f  = pmm_alloc_frame();
+    /* BOTH FRAMES MUST LIVE BELOW 4 GiB (M2091).
+     *
+     * The PRD's `base` field is 32 bits -- that is the hardware's format, not
+     * a choice -- and it was filled with `(uint32_t)g_bm.bounce_phys` from a
+     * 64-bit frame. At -m 2G every frame is under 4 GiB and the cast is
+     * harmless, which is why this has never fired. At -m 8G, which is what
+     * Firefox needs and what every recent measurement here uses, the allocator
+     * will hand out a frame above 4 GiB and the cast silently drops the high
+     * bits -- so the controller DMAs a disk sector into SOMEBODY ELSE'S
+     * PHYSICAL PAGE. Undetectable corruption, in the one subsystem whose whole
+     * job is to be byte-exact.
+     *
+     * DMA setup is once per boot, so the honest fix is the simple one: keep
+     * asking until two low frames turn up, hand the high ones back, and if the
+     * allocator has nothing low then say so and leave DMA off rather than
+     * corrupt memory. A bounded number of attempts, because a machine whose
+     * low memory is entirely used is a machine where DMA simply is not
+     * available today. */
+    uint64_t prdt_f = 0, bnc_f = 0;
+    {
+        uint64_t held[32]; int nheld = 0;
+        for (int i = 0; i < 32 && (!prdt_f || !bnc_f); i++) {
+            uint64_t f = pmm_alloc_frame();
+            if (!f) break;
+            if (f + PAGE_SIZE > 0x100000000ull) {        /* above 4 GiB: unusable for a 32-bit PRD */
+                if (nheld < 32) held[nheld++] = f; else pmm_free_frame(f);
+                continue;
+            }
+            if (!prdt_f) prdt_f = f; else bnc_f = f;
+        }
+        for (int i = 0; i < nheld; i++) pmm_free_frame(held[i]);
+    }
     if (!prdt_f || !bnc_f) {
         if (prdt_f) pmm_free_frame(prdt_f);
         if (bnc_f)  pmm_free_frame(bnc_f);
+        kprintf("[ata] DMA disabled: no physical frame below 4 GiB for the PRD table and bounce "
+                "buffer, and the PRD's base address field is 32 bits wide. PIO only.\n");
         return 0;
     }
     memset(hhdm(prdt_f), 0, PAGE_SIZE);
@@ -623,7 +835,12 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
     if (write)
         memcpy(g_bm.bounce, buf, bytes);
 
-    /* Build the single PRD: the whole transfer in one region, EOT set. */
+    /* Build the single PRD: the whole transfer in one region, EOT set.
+     * The cast is safe because ata_dma_setup refuses any frame at or above
+     * 4 GiB -- but assert it here too, because this is the line where a wrong
+     * address becomes a write to a stranger's page and there is no later
+     * symptom that would point back at it. */
+    if (g_bm.bounce_phys + PAGE_SIZE > 0x100000000ull) return -1;
     g_bm.prdt[0].base  = (uint32_t)g_bm.bounce_phys;
     g_bm.prdt[0].count = (uint16_t)(bytes & 0xFFFF);   /* <= 4096, never 0 here */
     g_bm.prdt[0].flags = PRD_EOT;
@@ -883,16 +1100,22 @@ void ata_dma_selftest(void) {
     }
 
     kprintf("[ ok ] IDE bus-master DMA up: PIIX3 BMIDE found "
-            "(BAR4 I/O base 0x%x, %u-sector bounce) (boot stays on PIO).\n",
+            "(BAR4 I/O base 0x%x, %u-sector bounce) -- READS NOW USE IT (M2091, 7.81x).\n",
             (unsigned)g_bm.bmide_base, (unsigned)ata_dma_max_sectors());
 
-    /* Per-sector DMA==PIO byte comparison on the first few sectors. */
+    /* Per-sector DMA==PIO byte comparison on the first few sectors.
+     *
+     * AGAINST ata_read_drive_pio, NOT ata_read_drive (M2091). This used to
+     * compare against ata_read_drive, and routing reads through DMA turned it
+     * into DMA-versus-DMA -- a test that agrees with itself and would print
+     * "DMA==PIO OK" over a broken transfer. The second route has to be a
+     * genuinely different one. */
     int compared = 0, matched = 0;
     uint32_t nsec = 3;
     if (info->sectors < nsec) nsec = (uint32_t)info->sectors;
     for (uint32_t lba = 0; lba < nsec; lba++) {
         int dma_ok = (ata_read_dma(0, lba, 1, dma_buf) == 0);
-        int pio_ok = (ata_read_drive(0, lba, 1, pio_buf) == 0);
+        int pio_ok = (ata_read_drive_pio(0, lba, 1, pio_buf) == 0);
         if (!dma_ok || !pio_ok) {
             kprintf("[ata-dma] sector %u: %s read FAILED\n", lba,
                     !dma_ok ? "DMA" : "PIO");
@@ -912,6 +1135,47 @@ void ata_dma_selftest(void) {
         } else {
             kprintf("[ata-dma] IDE DMA: sector %u DMA!=PIO MISMATCH\n", lba);
         }
+    }
+
+    /* AND AT THE SIZE THE READ PATH ACTUALLY USES (M2091).
+     *
+     * The per-sector comparison above is 1 sector at 3 low LBAs. The read path
+     * now issues up to EIGHT sectors per transfer, on both drives, at
+     * arbitrary LBAs -- and a bounce buffer, a PRD byte count and a 32-bit
+     * base address are all things that can be right for one sector and wrong
+     * for eight. So compare what is really being done: 8 sectors at a time,
+     * across both drives, at LBAs spread over the disk rather than clustered
+     * at zero where the bytes are mostly identical anyway.
+     *
+     * This is the assertion that fires if the PRD count is truncated, if the
+     * bounce buffer is copied short, or if a frame above 4 GiB slips through
+     * the 32-bit base. Nothing else in the tree would notice any of those. */
+    {
+        static uint8_t d8[8 * SECTOR_SIZE], p8[8 * SECTOR_SIZE];
+        int n8 = 0, ok8 = 0;
+        for (int drv = 0; drv < 2; drv++) {
+            const struct ata_drive_info *di = ata_drive(drv);
+            if (!di || !di->present || di->sectors < 4096) continue;
+            uint32_t spots[4] = { 64, (uint32_t)(di->sectors / 4),
+                                  (uint32_t)(di->sectors / 2),
+                                  (uint32_t)(di->sectors - 64) };
+            for (int k = 0; k < 4; k++) {
+                if ((uint64_t)spots[k] + 8 > di->sectors) continue;
+                if (ata_read_dma(drv, spots[k], 8, d8) != 0) continue;
+                if (ata_read_drive_pio(drv, spots[k], 8, p8) != 0) continue;
+                n8++;
+                if (memcmp(d8, p8, sizeof d8) == 0) ok8++;
+                else kprintf("[ata-dma] MISMATCH: drive %d lba %u, 8 sectors, DMA != PIO\n",
+                             drv, spots[k]);
+            }
+        }
+        if (n8 && ok8 == n8)
+            kprintf("[ ok ] IDE DMA: %d eight-sector reads across both drives are BYTE-IDENTICAL "
+                    "to PIO (this is the size the read path uses)\n", n8);
+        else if (n8)
+            kprintf("[ata-dma] FAIL: only %d of %d eight-sector reads matched PIO\n", ok8, n8);
+        else
+            kprintf("[ata-dma] no drive large enough for the eight-sector comparison\n");
     }
 
     /* DMA write round-trip on a scratch sector near the end of the disk (so the

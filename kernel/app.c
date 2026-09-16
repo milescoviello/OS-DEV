@@ -3079,6 +3079,11 @@ int app_last_spawn_pid(void) { return g_last_spawn_pid; }
  * read-only, and a page present in the tables with no VMA at all. The bare
  * address cannot tell them apart and the existing report only dumps the VMA
  * table for NOT-PRESENT faults. (M2005) */
+/* RING-3 PAGE FAULTS: how many, how many were repaired, and what they cost
+ * (M2091). Defined here rather than in interrupts.c so app_fault_handle's
+ * caller and the budget printer share one definition. */
+uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
+
 void app_describe_fault_addr(void) {
     struct app *a = cur();
     uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));

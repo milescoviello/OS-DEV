@@ -374,9 +374,32 @@ static void thread_trampoline(void) {
     task_exit();                /* if the entry function returns, end cleanly */
 }
 
+/* IDLE CYCLES, BECAUSE A WALL-CLOCK DENOMINATOR IS A LYING ONE (M2091).
+ *
+ * The first boot budget reported "UNATTRIBUTED 91%" and I nearly believed it.
+ * The denominator was cycles from the kernel's first instruction, and the TSC
+ * keeps counting through `hlt` -- so a boot that spends six minutes asleep in
+ * a 15-second heartbeat loop attributes all of that to "guest code under TCG".
+ * The instrument was measuring the clock on the wall, not the work.
+ *
+ * Counted here and in the AP idle loop, and subtracted from the denominator so
+ * every share below is a share of BUSY time. Same lesson as every other
+ * instrument this session: the one that describes the wrong quantity costs
+ * more than no instrument at all. */
+uint64_t g_idle_cycles;
+static inline uint64_t idle_tsc(void) {
+    uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 /* The idle task: a guaranteed-runnable floor. Halts with interrupts on so the
  * timer can preempt it the instant any real task becomes runnable. */
-static void idle_loop(void) { for (;;) __asm__ volatile("sti; hlt"); }
+static void idle_loop(void) {
+    for (;;) {
+        uint64_t t0 = idle_tsc();
+        __asm__ volatile("sti; hlt");
+        g_idle_cycles += idle_tsc() - t0;
+    }
+}
 
 void sched_init(void) {
     task_t *t = kzalloc(sizeof(task_t));
@@ -891,7 +914,11 @@ void task_wake(task_t *t) {
 void task_sleep_ms(uint64_t ms) {
     if (!current || current->pin_core >= 0) {       /* no scheduler / this core's own floor: busy-wait */
         uint64_t target = timer_ms() + ms;
-        while (timer_ms() < target) __asm__ volatile("sti; hlt");
+        while (timer_ms() < target) {
+            uint64_t t0 = idle_tsc();
+            __asm__ volatile("sti; hlt");
+            g_idle_cycles += idle_tsc() - t0;     /* a pinned core's busy-wait is still idle (M2091) */
+        }
         return;
     }
     uint64_t f = irq_save();

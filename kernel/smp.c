@@ -289,7 +289,14 @@ void ap_main(void) {
         schedule();                      /* let the general scheduler run something else here too (M1531) */
         __asm__ volatile("cli");         /* re-check with interrupts off (no lost wakeup) */
         if (__atomic_load_n(&sj_next, __ATOMIC_SEQ_CST) >= __atomic_load_n(&sj_n, __ATOMIC_SEQ_CST))
-            __asm__ volatile("sti; hlt");   /* sleep until an IPI; sti;hlt is atomic */
+            {   extern uint64_t g_idle_cycles;
+                uint32_t ilo, ihi;
+                __asm__ volatile("rdtsc" : "=a"(ilo), "=d"(ihi));
+                uint64_t it0 = ((uint64_t)ihi << 32) | ilo;
+                __asm__ volatile("sti; hlt");   /* sleep until an IPI; sti;hlt is atomic */
+                __asm__ volatile("rdtsc" : "=a"(ilo), "=d"(ihi));
+                g_idle_cycles += (((uint64_t)ihi << 32) | ilo) - it0;   /* an AP asleep is idle (M2091) */
+            }
         else
             __asm__ volatile("sti");
     }

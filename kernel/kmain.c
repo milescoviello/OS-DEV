@@ -279,6 +279,7 @@ static volatile int g_lxbuild_test;           /* -append lxbuildtest: build OS-D
 static volatile int g_lxgcc_test;             /* -append lxgcctest: compile OS-DEV's OWN source in-guest, on its own boot (M1960) */
 static volatile int g_lxtrace_make;           /* -append lxsystrace: syscall-trace the make run only -- tracing the whole boot is unreadable */
 static volatile int g_lxfault_test;           /* -append lxfaulttest: also launch a binary that faults, proving a ring-3 fault mid-print is REPORTED and never deadlocks the console lock (M1941) */
+static volatile int g_diskbench;               /* -append diskbench: measure one ATA command's cost in isolation (M2091) */
 static volatile int g_lxabi_test;             /* -append lxabitest: launch a real Linux static-PIE binary off the ext2 volume (M1939) */
 static volatile int g_netcon;                 /* -append netcon: start the network debug console on TCP 2323 (M1870, real-HW bring-up) */
 static volatile int g_nodisk;                 /* -append nodisk: skip ALL disk-WRITE self-tests + FS mount (M1872) — safe to boot on a machine with real disks; the bring-up image sets this */
@@ -500,26 +501,63 @@ static inline uint64_t km_tsc(void) {
  * matter: when a client has painted (what the user waits for) and when the
  * desktop takes over (the end of the scrolling wall of text). */
 void kmain_budget(const char *when) {
-    uint64_t total = km_tsc() - g_boot_tsc0;
+    extern uint64_t g_idle_cycles;
+    extern uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
+    uint64_t wall = km_tsc() - g_boot_tsc0;
+    int nc = smp_cpu_count > 0 ? smp_cpu_count : 1;
+    /* THE DENOMINATOR IS CORE-CYCLES, NOT WALL-CYCLES (M2091).
+     *
+     * Two mistakes in a row here, both worth writing down because both made
+     * the instrument confidently wrong:
+     *
+     *  1. Dividing by wall time. The TSC runs through `hlt`, so a boot that
+     *     sleeps six minutes in a heartbeat loop credited all of it to "guest
+     *     code under TCG" and the budget read 91% UNATTRIBUTED.
+     *  2. Subtracting a per-core idle SUM from a single-core wall time. Four
+     *     cores idling for the whole boot produce four times the wall in idle
+     *     cycles, so the subtraction went negative and every share came out
+     *     over 100% -- disk 109%, faults 253%.
+     *
+     * The available budget is wall x cores; idle is already a sum over cores;
+     * busy is the difference. */
+    uint64_t avail = wall * (uint64_t)nc;
+    uint64_t idle = g_idle_cycles;
+    uint64_t busy = avail > idle ? avail - idle : 0;
+
     uint64_t cmds = 0, sect = 0, hits = 0, cx = 0, chh = 0;
     ata_io_stats(&cmds, &sect, &hits, &cx, &chh);
     uint64_t ch = 0, ln = 0, sc = 0, cg = 0, cs = 0;
     fbcon_stats(&ch, &ln, &sc, &cg, &cs);
-    uint64_t io = cx + chh, con = cg + cs;
-    uint64_t resid = total > io + con ? total - io - con : 0;
-    kprintf("\n[budget] %s -- %lu Mcycles since the kernel started\n", when, total / 1000000);
-    kprintf("[budget]   disk    %6lu Mcycles (%lu%%)  %lu commands, %lu sectors, %lu cache hits\n",
-            io / 1000000, total ? io * 100 / total : 0, cmds, sect, hits);
-    kprintf("[budget]   console %6lu Mcycles (%lu%%)  %lu lines, %lu full-screen scrolls\n",
-            con / 1000000, total ? con * 100 / total : 0, ln, sc);
-    kprintf("[budget]   %s %6lu Mcycles (%lu%%)  everything else: guest code under TCG,\n",
-            (total && resid * 100 / total > 25) ? "UNATTRIBUTED" : "other       ",
-            resid / 1000000, total ? resid * 100 / total : 0);
-    kprintf("[budget]                                  page faults, the scheduler, idle\n");
-    if (total && resid * 100 / total > 25)
-        kprintf("[budget]   ^ over 25%% is UNATTRIBUTED on purpose: this budget measures two\n"
-                "[budget]     subsystems, not the whole machine, and a residual that large means\n"
-                "[budget]     the answer is NOT in either of them.\n");
+    uint64_t io = cx + chh, con = cg + cs, pf = g_pf_cycles;
+
+    kprintf("\n[budget] %s\n", when);
+    kprintf("[budget]   %lu Mcycles wall x %d cores = %lu Mcycles available, %lu idle, %lu BUSY\n",
+            wall / 1000000, nc, avail / 1000000, idle / 1000000, busy / 1000000);
+    /* AND THESE ARE ELAPSED SUMS, NOT CPU TIME. The third instrument mistake,
+     * and the one that matters most: a disk read spin-yields and a fault
+     * handler can block, so the TSC delta across either spans whatever else
+     * this core ran in the meantime. They are UPPER BOUNDS. A figure over
+     * 100% is not a bug in the arithmetic -- it is this overlap being visible,
+     * and it is why the counts below are the numbers to reason from. */
+    kprintf("[budget]   these are ELAPSED sums and overlap each other and idle -- upper bounds,\n");
+    kprintf("[budget]   not shares. The COUNTS are exact; reason from those.\n");
+    kprintf("[budget]   disk     %7lu Mcycles elapsed   %lu commands (%lu by DMA), %lu sectors (%lu KiB), %lu cache hits\n",
+            io / 1000000, cmds, ata_dma_commands(), sect, sect / 2, hits);
+    if (cmds) kprintf("[budget]                                 %lu sectors per command -- 1 means every "
+                      "multi-sector request is being shredded\n", sect / cmds);
+    kprintf("[budget]   faults   %7lu Mcycles elapsed   %lu ring-3 faults, %lu repaired by demand paging\n",
+            pf / 1000000, g_pf_count, g_pf_repaired);
+    kprintf("[budget]   console  %7lu Mcycles elapsed   %lu lines, %lu full-screen scrolls\n",
+            con / 1000000, ln, sc);
+    if (busy) {
+        uint64_t named = io > pf ? io : pf;          /* the fault bucket contains the disk one */
+        named += con;
+        kprintf("[budget]   the largest NAMED cost is %lu Mcycles against %lu Mcycles busy: at most %lu%%\n",
+                named / 1000000, busy / 1000000, named * 100 / busy);
+        if (named * 100 / busy < 50)
+            kprintf("[budget]   so MOST OF THE BOOT IS GUEST CODE UNDER TCG, and no amount of work on\n"
+                    "[budget]   the disk, the faults or the console will change how long it takes.\n");
+    }
 }
 
 void kmain(uint64_t mb_info, uint64_t magic) {
@@ -548,6 +586,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "smpschedtest"))  g_smpsched_test = 1;       /* general-scheduler cross-core migration test (M1862) */
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
+        if (cmdline_has(cl, "nodma")) { extern int g_ata_dma_reads; g_ata_dma_reads = 0; }   /* A/B the DMA read path (M2091) */
+        if (cmdline_has(cl, "diskbench")) g_diskbench = 1;                /* per-command disk cost (M2091) */
         if (cmdline_has(cl, "lxabitest"))  g_lxabi_test = 1;              /* run a host-built static-PIE LINUX binary (M1939) */
         if (cmdline_has(cl, "lxfaulttest")) { g_lxabi_test = 1; g_lxfault_test = 1; }   /* + ONE binary that FAULTS, to prove the fault is reported and does not wedge (M1941) */
         /* The full demo set (M1954). Separate from lxfaulttest on purpose: those
@@ -1850,6 +1890,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     ata_dma_selftest();
     ata_lba48_selftest();   /* M1721: high-LBA round-trip if a >128 GiB ATA disk is attached (else no-op) */
     ata_cache_selftest();   /* M1855: single-sector read cache fill+hit+write-invalidate coherence */
+    /* AND WHAT ONE COMMAND COSTS (M2091). The boot budget's elapsed sums are
+     * upper bounds -- a PIO transfer spin-yields, so the TSC across one spans
+     * whatever else the core ran -- which makes them useless for PREDICTING a
+     * win. This measures the number a prediction needs, in isolation, and it
+     * is the difference between "not shredding requests should help" and a
+     * figure that can be checked afterwards. */
+    if (g_diskbench) ata_diskbench();
     }
 
     /* Bring up AHCI/SATA as an ADDITIONAL storage driver (the boot disk above

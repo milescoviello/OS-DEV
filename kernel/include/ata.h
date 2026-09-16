@@ -104,3 +104,7 @@ void ata_lba48_selftest(void);
  * disk is or is not the bottleneck is a reading rather than an opinion. */
 void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
                   uint64_t *cyc_xfer, uint64_t *cyc_hit);
+void ata_diskbench(void);   /* one command's cost at 1 and 8 sectors, measured in isolation (M2091) */
+uint64_t ata_dma_commands(void);   /* how many reads the DMA path served (M2091) */
+extern int g_ata_dma_reads;        /* 0 = PIO only, for an A/B measurement (M2091) */
+int ata_read_drive_pio(int drive, uint32_t lba, uint32_t count, void *buf);   /* guaranteed PIO, so DMA has something independent to be compared against (M2091) */
