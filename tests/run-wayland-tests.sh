@@ -134,6 +134,23 @@ if grep -aqE "\[wl\] surface [0-9]+ created \(client ep [0-9]+" "$SLOG"; then
 else
     echo "  FAIL: no surface-creation line from a real client:"; grep -a "\[wl\] surface" "$SLOG" | tail -4; f=1
 fi
+# M2087 -- A DESTROYED POOL KEPT ITS SHARED-MEMORY OBJECT FOR EVER.
+# wl_shm_pool holds a reference on the memfd object behind it, taken by the
+# kernel when the descriptor arrives over SCM_RIGHTS, and there was no call to
+# hand one back -- the source said so outright and deliberately leaked, because
+# freeing on the pool's destroy would pull the memory out from under buffers
+# the protocol guarantees outlive their pool. So the fix was never the unref:
+# it was giving the other holders references of their own. A buffer and a
+# surface's committed frame each take one now.
+# 300 cycles is chosen so the failure is unambiguous rather than statistical:
+# NMEMFD is 256, so a leak of one per cycle exhausts the table and the client's
+# own memfd_create starts failing. Reverting the unrefs fails at cycle 255 with
+# "[memfd] TABLE FULL", and the high-water mark prints the whole staircase.
+if grep -aq "LXWL-POOLCYCLE: 300 pools created and destroyed, none leaked" "$SLOG"; then
+    echo "  ok: 300 wl_shm_pool create/destroy cycles leak nothing -- peak was $(grep -ao '\[memfd\] [0-9]* of [0-9]* shared' "$SLOG" | tail -1 | grep -oE '^\[memfd\] [0-9]+' | grep -oE '[0-9]+') live object(s) (M2087)"
+else
+    echo "  FAIL: a destroyed shm pool is still holding its memory:"; grep -a "LXWL-POOLCYCLE\|TABLE FULL" "$SLOG" | tail -3; f=1
+fi
 # PIXELS. The client wrote 0xFF3366CC into a memfd, passed the DESCRIPTOR over
 # the protocol socket, and committed a surface. The compositor reading that
 # exact value back proves the whole zero-copy path: SCM_RIGHTS carried the

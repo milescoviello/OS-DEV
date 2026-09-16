@@ -238,6 +238,52 @@ int main(void) {
     }
 
 
+    /* THE POOL-DESTROY LEAK DEMO (M2087).
+     *
+     * A wl_shm_pool holds a reference on the memfd object behind it, taken by
+     * the kernel when the descriptor arrives over SCM_RIGHTS. There was no way
+     * to hand one back, so every pool the compositor was ever given leaked its
+     * object -- and NMEMFD is 256. Firefox recreates its pool on every window
+     * resize, and each of its content processes opens its own connection, so
+     * this is not a slow leak.
+     *
+     * 300 cycles is the number on purpose: past 256 the global memfd table is
+     * exhausted, so on the unfixed kernel memfd_create itself starts failing
+     * and this loop reports exactly where. On the fixed kernel it is flat --
+     * no cycle allocates anything the previous one did not give back.
+     *
+     * Each cycle is the client's whole lifecycle for a pool, in the order the
+     * protocol allows and a toolkit uses: create the object, hand it over,
+     * cut a buffer, drop OUR references (close+munmap) while the compositor
+     * still holds its own, then destroy the buffer and the pool. */
+    {
+        int made = 0, failed_at = -1;
+        for (int i = 0; i < 300; i++) {
+            int cfd = memfd_create("lxwl-cycle", 0);
+            if (cfd < 0 || ftruncate(cfd, 4096) != 0) { failed_at = i; if (cfd >= 0) close(cfd); break; }
+            void *cm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+            if (cm == MAP_FAILED) { failed_at = i; close(cfd); break; }
+            struct wl_shm_pool *cp = wl_shm_create_pool(shm, cfd, 4096);
+            if (!cp) { failed_at = i; munmap(cm, 4096); close(cfd); break; }
+            struct wl_buffer *cb = wl_shm_pool_create_buffer(cp, 0, 8, 8, 32, WL_SHM_FORMAT_ARGB8888);
+            /* OUR references go first, deliberately: from here the object is
+             * alive only because the compositor holds it, which is the exact
+             * state the leak lived in. */
+            munmap(cm, 4096);
+            close(cfd);
+            if (cb) wl_buffer_destroy(cb);
+            wl_shm_pool_destroy(cp);
+            if (wl_display_roundtrip(dpy) < 0) { failed_at = i; break; }
+            made++;
+        }
+        if (failed_at >= 0)
+            printf("LXWL-POOLCYCLE: FAILED at cycle %d of 300 (%d completed) -- "
+                   "the shared-memory object table is exhausted\n", failed_at, made);
+        else
+            printf("LXWL-POOLCYCLE: 300 pools created and destroyed, none leaked\n");
+        fflush(stdout);
+    }
+
     const int W = 64, H = 32, STRIDE = W * 4;
     const int SZ = STRIDE * H;
     int fd = memfd_create("lxwl-pool", 0);

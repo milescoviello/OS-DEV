@@ -581,7 +581,16 @@ static int64_t lx_realtime_sec(void) {
 
 /* The last LXRING_N Linux syscalls, for post-mortem on a process that dies
  * without saying anything. (M1970) */
-#define LXRING_N 256
+/* 256 WAS NOT ENOUGH TO SEE ONE THREAD (M2087).
+ *
+ * M2086 made the ring filterable by tid, and the very first fault it was
+ * pointed at answered "no entries for this thread at all" -- because Firefox
+ * runs ~140 threads and 256 entries is under two calls each. A filter over a
+ * window that short cannot see the thread that died, which makes the filter
+ * itself a decoration. 4096 entries is ~29 per thread at that population and
+ * 460 KB of BSS, which is nothing next to the 8 GiB these runs use and next to
+ * the cost of one more debugging session spent reading a stranger's history. */
+#define LXRING_N 4096
 /* WHICH THREAD MADE THE CALL (M2003). The ring is global -- it has to be, a
  * process's threads interleave and the interleaving is often the point -- but
  * that makes the history of the thread that actually FAULTED unreadable when
@@ -712,10 +721,20 @@ void lx_trace_dump_tid(const char *why, unsigned long want, int only_tid) {
     }
 }
 
+/* HOW DEEP THE RING IS AND HOW DEEP A DUMP PRINTS ARE TWO DIFFERENT NUMBERS,
+ * and M2087 conflated them for one run. Raising LXRING_N to 4096 so a tid
+ * filter could find a quiet thread also made `want == 0` -- "print everything"
+ * -- mean 4096 lines of byte-at-a-time serial output, which took minutes and
+ * buried the thing it was printed to show. The ring stays deep; an unfiltered
+ * dump gets a readable tail, and a caller that really wants more asks. */
+#define LXRING_DUMP_DEFAULT 96
 void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid) {
     unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
     unsigned long n = have;
-    if (!only_pid && want && n > want) n = want;
+    if (!only_pid) {
+        if (!want) want = LXRING_DUMP_DEFAULT;
+        if (n > want) n = want;
+    }
     if (only_pid) {
         unsigned long shown = 0;
         kprintf("[linuxabi] last syscalls by pid %d before %s (oldest first):\n", only_pid, why);
@@ -4284,6 +4303,45 @@ void linux_syscall_dispatch(struct registers *r) {
      * than at entry because the whole value of the record is the RESULT. */
     { struct lxring_ent *re = &g_lxring[ring_slot & (LXRING_N - 1)];
       if (re->seq == ring_slot) re->ret = r->rax;   /* still ours: see `seq` */ }
+    /* A THREAD THAT SPINS ON EAGAIN IS NOT MAKING PROGRESS, AND NOTHING SAID SO
+     * (M2087).
+     *
+     * EAGAIN is deliberately excluded from the failure histogram above, and
+     * correctly: a non-blocking fd answering "not yet" is the normal vocabulary
+     * of every event loop, and logging each one drowns the log by three orders
+     * of magnitude. But the SAME thread asking the SAME question about the SAME
+     * descriptor thousands of times in a row is a different statement
+     * altogether -- it is a busy-wait, it burns a core under TCG, and it floods
+     * this very ring so that no other thread's history survives to be read.
+     * Found exactly that way: 4096 ring entries turned out to be one thread
+     * alternating read(fd 14) = -EAGAIN with clock_gettime, forever, and the
+     * instrument could show the loop while being unable to name the fd.
+     *
+     * One line per run of spins, at powers-of-ten thresholds, naming the fd's
+     * TYPE and what the poll ladder thinks of it -- because the interesting
+     * case is a descriptor poll calls ready and read calls empty, and that
+     * disagreement is invisible from either side alone. */
+    if ((long)r->rax == -(long)LX_EAGAIN) {
+        static struct { int tid; uint32_t nr; uint64_t fd; unsigned long n; } spin;
+        uint32_t nr_s = g_lxring[ring_slot & (LXRING_N - 1)].seq == ring_slot
+                      ? g_lxring[ring_slot & (LXRING_N - 1)].nr : 0xffffffffu;
+        int tid_s = task_current_id();
+        if (spin.tid == tid_s && spin.nr == nr_s && spin.fd == a1) {
+            spin.n++;
+            if (spin.n == 1000 || spin.n == 10000 || spin.n == 100000) {
+                long nrd = -1; int rdy = app_fd_ready((app_t *)app_current(), (int)a1, POLLIN);
+                int ty = app_fd_type((int)a1);
+                (void)app_fd_nread((int)a1, &nrd);
+                kprintf("[linuxabi] SPINNING: pid %d tid %d has had EAGAIN from %s(fd %lu) "
+                        "%lu times in a row -- poll says %s, FIONREAD says %ld, and the fd is: ",
+                        app_current_pid(), tid_s, lx_syscall_name(nr_s), (unsigned long)a1, spin.n,
+                        (rdy & POLLIN) ? "READABLE" : "not readable", nrd);
+                (void)ty;
+                app_fd_print((int)a1);
+                kprintf("\n");
+            }
+        } else { spin.tid = tid_s; spin.nr = nr_s; spin.fd = a1; spin.n = 1; }
+    }
     /* EVERY SYSCALL THAT FAILED, EXCEPT THE ONES THAT FAIL BY DESIGN (M2070).
      *
      * A histogram says what a program is doing a lot of; it cannot show the

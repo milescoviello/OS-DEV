@@ -132,6 +132,10 @@ int    app_scm_take_memfd_idx(int ep, void **base, unsigned long *size, int *idx
  * CAPACITY is what the object can be resized to without reallocating, which is
  * the only bound a compositor may safely hand a client. 0/-1. (M2058) */
 int    app_memfd_obj_info(int idx, void **base, unsigned long *size, unsigned long *cap);
+void   app_memfd_obj_ref(int idx);        /* the compositor takes another reference (pool/buffer/frame) (M2087) */
+void   app_memfd_obj_unref(int idx);      /* ...and gives one back; the object dies at zero (M2087) */
+int    app_memfd_inuse(void);             /* live memfd objects, for a leak assertion (M2087) */
+void   app_fd_print(int fd);               /* kprintf an fd's kind AND state, for a diagnostic (M2087) */
 int    app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsigned long len);  /* the kernel hands a client a readable memfd: wl_keyboard.keymap (M1984) */
 int    app_eventfd_create(unsigned int initval, int flags);  /* pollable u64-counter fd (M1242) */
 int    app_inotify_init(void);                       /* a pollable filesystem-watch fd (M1266) */

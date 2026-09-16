@@ -7976,7 +7976,23 @@ static struct memfd { int used, refs; unsigned seals; unsigned long size, cap;
                        * with them. */
                       int named; } memfds[NMEMFD];
 
+static inline uint64_t memfd_lock_take(void);
+static inline void memfd_lock_give(uint64_t f);
+/* CLAIMING A SLOT IS A SCAN-AND-CLAIM AND THEREFORE NEEDS THE LOCK (M2087).
+ *
+ * `if (!memfds[i].used) { m->used = 1; ... }` unlocked is the same shape as
+ * unixsock.c's table claim before M1609 and pmm.c's before M1912: two cores
+ * both see slot i free, both claim it, and one of them silently gets a handle
+ * to an object the other is initialising. Every other access to this table has
+ * been under g_memfd_lock since M2043; this one was missed because it reads
+ * like an allocator rather than like shared state.
+ *
+ * The count is taken here too, under the same lock, so it cannot report a
+ * half-initialised slot. */
 static int memfd_alloc(const char *name) {
+    int got = -1, live = 0;
+    char nm[32]; nm[0] = 0;
+    uint64_t f = memfd_lock_take();
     for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used) {
         struct memfd *m = &memfds[i];
         m->used = 1; m->refs = 1; m->seals = 0; m->size = 0; m->cap = 0;
@@ -7985,9 +8001,39 @@ static int memfd_alloc(const char *name) {
         for (int k = 0; k < MEMFD_RETIRED_N; k++) m->retired[k] = 0;
         int j = 0; if (name) while (name[j] && j < (int)sizeof m->name - 1) { m->name[j] = name[j]; j++; }
         m->name[j] = 0;
-        return i;
+        for (j = 0; m->name[j] && j < (int)sizeof nm - 1; j++) nm[j] = m->name[j];
+        nm[j] = 0;
+        got = i;
+        break;
     }
-    return -1;
+    if (got >= 0) for (int k = 0; k < NMEMFD; k++) if (memfds[k].used) live++;
+    memfd_lock_give(f);
+    if (got < 0) {
+        /* THE TABLE IS FULL, AND SAYING SO IS THE WHOLE POINT. Every caller
+         * turns this -1 into an errno of its own and none of them can say
+         * which of NMEMFD's several exhaustion causes it was. (M2087) */
+        static int moaned;
+        if (!moaned) { moaned = 1;
+            kprintf("[memfd] TABLE FULL: all %d shared-memory objects are in use, "
+                    "refusing to create '%s'. Something is not giving references back.\n",
+                    NMEMFD, name ? name : "(anon)");
+        }
+        return -1;
+    }
+    /* A HIGH-WATER MARK, NOT A PER-CALL LINE (M2087). A leak of one object per
+     * operation is invisible in a per-operation log -- the lines all look the
+     * same -- and unmistakable in this one: the mark climbs monotonically to
+     * NMEMFD and the table is then exhausted for the rest of the boot. A
+     * correct create/destroy cycle never moves it at all, so a healthy boot
+     * prints a handful of lines and a leaking one prints a staircase. */
+    {   static int peak;
+        if (live > peak) {
+            peak = live;
+            kprintf("[memfd] %d of %d shared-memory objects live (new peak) -- '%s'\n",
+                    live, NMEMFD, nm);
+        }
+    }
+    return got;
 }
 /* THE memfd REFCOUNT IS SHARED ACROSS PROCESSES, so it needs a lock (M2043).
  *
@@ -8356,6 +8402,33 @@ int app_memfd_obj_info(int idx, void **base, unsigned long *size, unsigned long 
     }
     memfd_lock_give(f);
     return ok ? 0 : -1;
+}
+
+/* THE COMPOSITOR IS A REFERENCE HOLDER LIKE ANY OTHER (M2087).
+ *
+ * app_scm_take_memfd_idx hands the compositor one reference and there was no
+ * way to give it back, nor to take a second. So the compositor leaked the
+ * object on every wl_shm_pool.destroy -- which Firefox does on every window
+ * resize -- and, worse, leaked one per POOL of every client that merely
+ * disconnected, which each of its content processes does. NMEMFD is 256.
+ *
+ * Giving it back needs the ability to take more than one first: a pool, every
+ * buffer cut from it, and a surface's committed frame all read through the
+ * same memory and outlive each other in an order the CLIENT chooses. The
+ * protocol says so explicitly -- destroying a pool does not invalidate its
+ * buffers, and a buffer may be destroyed the moment it is committed. Freeing
+ * on the pool's destroy would hand the heap a buffer the window manager is
+ * still blitting from. */
+void app_memfd_obj_ref(int idx)   { memfd_ref(idx); }
+void app_memfd_obj_unref(int idx) { memfd_unref(idx); }
+/* How many memfd objects are alive, for a leak assertion: a create/destroy
+ * loop must return to the number it started at (M2087). */
+int app_memfd_inuse(void) {
+    int n = 0;
+    uint64_t f = memfd_lock_take();
+    for (int i = 0; i < NMEMFD; i++) if (memfds[i].used) n++;
+    memfd_lock_give(f);
+    return n;
 }
 
 /* The OTHER direction: the KERNEL hands a client a descriptor (M1984).
@@ -10214,6 +10287,44 @@ int app_fd_nread(int fd, long *out) {
     if (n < 0) return APP_NREAD_ENOTTY;
     *out = n;
     return 0;
+}
+
+/* WHAT IS THIS DESCRIPTOR, AND WHAT STATE IS IT IN? (M2087)
+ *
+ * Written for the EAGAIN spin detector, which found a thread reading an empty
+ * non-blocking pipe a hundred thousand times in a row and could say only
+ * "fd type 1". The question that decides whether that is our bug or the
+ * program's is a different one: is a writer still open on the other end, has
+ * one ever been, and did the program ask for non-blocking at all? Those facts
+ * exist in three different modules and none of them was reachable from the
+ * place that needed to print them.
+ *
+ * It PRINTS rather than formatting into a buffer because this kernel has no
+ * sprintf -- kprintf is the only formatter -- and one printer per fd type here
+ * is one fewer place for a caller to print a field that means something else
+ * for the type it actually got. */
+void app_fd_print(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) { kprintf("fd %d: not open", fd); return; }
+    int ty = a->fd[fd].type, obj = a->fd[fd].obj;
+    int nb = a->fd[fd].nonblock, cx = a->fd[fd].cloexec;
+    switch (ty) {
+    case 1: {
+        int ro = -1, wo = -1, q = -1, hw = -1;
+        pipe_state(obj, &ro, &wo, &q, &hw);
+        kprintf("pipe %d %s-end readers=%d writers=%d queued=%d ever_had_writer=%d nonblock=%d cloexec=%d",
+                obj, a->fd[fd].write_end ? "write" : "read", ro, wo, q, hw, nb, cx);
+        break;
+    }
+    case 2: kprintf("file '%s' off=%ld nonblock=%d cloexec=%d", a->fd[fd].path, a->fd[fd].off, nb, cx); break;
+    case 3: kprintf("memfd obj %d off=%ld nonblock=%d cloexec=%d", obj, a->fd[fd].off, nb, cx); break;
+    case 12: kprintf("AF_UNIX ep %d queued=%ld readable=%d nonblock=%d cloexec=%d",
+                     obj, unix_nread(obj), unix_readable(obj), nb, cx); break;
+    case 10: kprintf("AF_INET stream sock %d queued=%ld nonblock=%d cloexec=%d",
+                     obj, net_tcp_sock_nread(obj), nb, cx); break;
+    case 14: kprintf("console alias, %d key(s) queued, nonblock=%d", iq_count(a->out_to ? a->out_to : a), nb); break;
+    default: kprintf("fd type %d obj %d nonblock=%d cloexec=%d", ty, obj, nb, cx); break;
+    }
 }
 
 /* pidfd (M1222): a pid-reuse-aware-ish process handle as an fd. It stores the

@@ -639,6 +639,12 @@ static const char *wl_role_name(int r) {
 static void wl_surface_unmap(struct wl_object *sf) {
     sf->base = 0; sf->size = 0;
     sf->off = sf->width = sf->height = sf->stride = sf->format = 0;
+    /* ...AND GIVE BACK THE FRAME'S REFERENCE (M2087). An unmap is the one
+     * place a surface stops reading its pixels while remaining alive, so it is
+     * the one place the frame's hold must end without the object being
+     * destroyed. A toolkit unmaps and remaps a window (a tooltip, a menu) many
+     * times per session. */
+    if (sf->mfd >= 0) { app_memfd_obj_unref(sf->mfd); sf->mfd = -1; }
 }
 
 /* From a ROLE object back to the wl_surface it speaks for. The links are the
@@ -735,6 +741,7 @@ static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
          * clearing ptr_in/kbd_in makes the next enter() be sent for whatever
          * surface replaces it. */
         if (c->surface == id) { c->surface = 0; c->ptr_in = c->kbd_in = 0; }
+        if (o->mfd >= 0) { app_memfd_obj_unref(o->mfd); o->mfd = -1; }   /* the committed frame (M2087) */
         break;
     case WLK_BUFFER:
         /* The COMMITTED frame stays: a wl_surface owns its content and the
@@ -746,6 +753,7 @@ static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
         for (int i = 0; i < c->nobj; i++)
             if (c->obj[i].id && c->obj[i].kind == WLK_SURFACE && c->obj[i].attached == id)
                 { c->obj[i].attached = 0; c->obj[i].attach_set = 0; }
+        if (o->mfd >= 0) { app_memfd_obj_unref(o->mfd); o->mfd = -1; }   /* the buffer's own hold (M2087) */
         break;
     case WLK_SHM_POOL:
         /* Buffers cut from this pool stay valid -- the protocol is explicit
@@ -753,10 +761,15 @@ static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
          * base and size they copied. They only lose the BACKLINK, so a reused
          * pool id cannot be mistaken for their pool.
          *
-         * NOT RELEASED HERE: the memfd reference app_scm_take_memfd took. There
-         * is no call to hand one back, and dropping it while buffers still read
-         * through the memory would be far worse than leaking it -- doing this
-         * properly needs the pool refcounted by its buffers. */
+         * RELEASED HERE NOW (M2087): the memfd reference app_scm_take_memfd
+         * took. This used to be left deliberately leaked, and the reasoning in
+         * this comment was right -- dropping it while buffers still read
+         * through the memory would be far worse -- so the fix was never the
+         * unref, it was giving the other holders references of their own.
+         * Every buffer cut from this pool, and every surface showing a frame
+         * out of it, now holds one. So this drops only the POOL's hold, and
+         * the object survives exactly as long as something still reads it. */
+        if (o->mfd >= 0) { app_memfd_obj_unref(o->mfd); o->mfd = -1; }
         break;
     case WLK_XDG_SURFACE:
     case WLK_XDG_TOPLEVEL:
@@ -784,6 +797,35 @@ static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
     uint8_t d[4]; wr32(d, id);
     wl_send(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, d, 4);
     if (g_wl_verbose) kprintf("[wl] destroyed %s@%u\n", wl_kind_name(kind), id);
+}
+
+/* A DISCONNECTING CLIENT MUST HAND BACK WHAT IT WAS HOLDING (M2087).
+ *
+ * `c->used = 0` was the whole of the teardown, which is a leak of every memfd
+ * object the client's pools, buffers and committed frames held -- and unlike
+ * wl_shm_pool.destroy, this one fires for a client that did everything right
+ * and simply exited. Firefox's content processes each open a connection, so a
+ * single startup burns several, against NMEMFD 256.
+ *
+ * Not routed through wl_destroy_obj on purpose: that sends wl_display.delete_id
+ * for each object, and there is nobody to send it to -- the socket is already
+ * closed, so every one of those would queue into an output buffer that is
+ * about to be discarded. What is needed here is the RELEASE, not the protocol
+ * courtesy. */
+static void wl_client_release(struct wl_client *c) {
+    int freed = 0;
+    for (int i = 0; i < c->nobj; i++) {
+        if (!c->obj[i].id) continue;
+        if (c->obj[i].mfd >= 0) { app_memfd_obj_unref(c->obj[i].mfd); c->obj[i].mfd = -1; freed++; }
+        c->obj[i].id = 0;
+    }
+    c->nobj = 0; c->inlen = 0; c->outlen = 0; c->registry = 0;
+    c->surface = 0; c->pointer = 0; c->keyboard = 0; c->ptr_in = 0; c->kbd_in = 0;
+    if (freed)
+        kprintf("[wl] client ep %d released %d shared-memory reference(s) on disconnect\n", c->ep, freed);
+    unix_close(c->ep);
+    c->ep = -1;
+    c->used = 0;
 }
 
 /* Handle one complete message. Returns 0 always (an unknown object or opcode is
@@ -1013,6 +1055,13 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         if (!bo) return;
         bo->base   = o->base; bo->size = o->size;
         bo->link   = o->id;                          /* its pool, so a resize can refresh it */
+        /* AND A REFERENCE OF ITS OWN (M2087). The protocol is explicit that
+         * destroying a pool does not invalidate the buffers cut from it, so a
+         * buffer outlives its pool by the client's choice -- and a buffer that
+         * merely copied `base` would be reading freed heap the moment the pool
+         * released the object. */
+        bo->mfd = o->mfd;
+        if (bo->mfd >= 0) app_memfd_obj_ref(bo->mfd);
         bo->off    = rd32(args + 4);
         bo->width  = rd32(args + 8);
         bo->height = rd32(args + 12);
@@ -1233,6 +1282,19 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                 /* THE COMMITTED FRAME BELONGS TO THE SURFACE (M2058). This used
                  * to be four file-scope globals, so the last surface to commit
                  * anything became the window's contents. */
+                /* AND THE FRAME TAKES A REFERENCE TOO (M2087), because a
+                 * client may destroy the buffer as soon as it has committed
+                 * it -- libwayland's own double-buffering does exactly that --
+                 * and the window manager blits from this base on every redraw
+                 * long afterwards. The frame being REPLACED gives its
+                 * reference back, so a client drawing 60 frames a second does
+                 * not accumulate them. */
+                if (o->mfd != b->mfd) {
+                    if (o->mfd >= 0) app_memfd_obj_unref(o->mfd);
+                    o->mfd = b->mfd;
+                    if (o->mfd >= 0) app_memfd_obj_ref(o->mfd);
+                }   /* same object as last frame: no net change, so redrawing
+                     * at 60 Hz touches the refcount not at all */
                 o->base   = b->base + b->off;
                 o->size   = b->size - b->off;
                 o->off    = 0;
@@ -1668,7 +1730,7 @@ int wl_compositor_poll(void) {
         int room = WL_INBUF - c->inlen;
         if (room <= 0) {
             kprintf("[wl] input buffer full (%d bytes) with no complete message: dropping client\n", c->inlen);
-            unix_close(c->ep); c->used = 0;
+            wl_client_release(c);
             continue;
         }
         long n = unix_recv(c->ep, c->in + c->inlen, (unsigned long)room);
@@ -1678,7 +1740,7 @@ int wl_compositor_poll(void) {
              * receive that errored, and those need different fixes. (M2002) */
             kprintf("[wl] client disconnected (ep %d, recv -> %ld, %d byte(s) still queued to send)\n",
                     c->ep, n, c->outlen);
-            unix_close(c->ep); c->used = 0;
+            wl_client_release(c);
             continue;
         }
         c->inlen += (int)n;
