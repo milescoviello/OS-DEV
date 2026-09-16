@@ -107,8 +107,28 @@ return_to_kernel:
     mov ax, 0x10                     ; back to KERNEL_DS
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
+    ; FS AND GS ARE DELIBERATELY NOT RELOADED (M2084), for exactly the reasons
+    ; iret_to_user and enter_user above already document -- this sibling path
+    ; never got the same treatment, and it is the one taken when a ring-3 app
+    ; EXITS, so it fires on every process teardown.
+    ;
+    ; Loading any selector into FS or GS ZEROES the corresponding BASE MSR. In
+    ; long mode DS/ES/FS/GS selectors are not used for access checks; only the
+    ; bases matter. So these two instructions bought nothing and cost:
+    ;
+    ;   - FS_BASE, which is the TLS pointer of whatever thread next runs on
+    ;     this core before a context switch rewrites it. Firefox died at
+    ;     CR2=0x28 -- the `mov %fs:0x28` stack canary -- with the fault report
+    ;     saying saved=0x1271c46c0 live=0x0 cached=0x0: the task's recorded
+    ;     base was perfectly good and the register was empty.
+    ;   - GS_BASE, which linux_entry.asm relies on PERMANENTLY holding this
+    ;     core's per-CPU block, and which nothing restores on a context switch
+    ;     because it is per-core rather than per-task. Zeroing it here left
+    ;     that core's Linux-ABI per-CPU pointer null for the rest of the boot.
+    ;
+    ; load_fs_base() on every context switch stays the single authority for FS,
+    ; and the per-core GS_BASE set at bring-up stays the single authority for
+    ; GS. Neither wants help from a segment load.
 
     mov rsp, [kernel_resume_rsp]     ; restore the saved kernel stack
     pop r15
