@@ -5382,7 +5382,11 @@ void app_futex_forget(void *t) {
  * one right BEFORE everything went quiet, so keep the last few and print them
  * when something asks why nothing is moving. The question a lost wakeup poses
  * is precise: was a WAKE issued for the key a thread is still parked on? */
-#define FUTEX_RING_N 96
+/* 96 -> 384 (M2081). Firefox parks sixty-odd threads at once, and each one
+ * makes several futex calls on its way down; 96 entries is a fraction of a
+ * single quiesce, so the WAKE being hunted had already been overwritten by the
+ * WAITs that followed it. The ring only has to outlast one stall. */
+#define FUTEX_RING_N 384
 struct futex_note { int tid, wake, woke; uint64_t uaddr, key; };
 static struct futex_note g_futex_ring[FUTEX_RING_N];
 static unsigned long g_futex_ring_i;
@@ -5438,7 +5442,19 @@ long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
         if (*(volatile int *)uaddr != val) { irq_restore(f); return -1; }   /* value changed -> EAGAIN, don't block */
         int slot = -1;
         for (int i = 0; i < FUTEX_NWAIT; i++) if (!g_futex[i].used) { slot = i; break; }
-        if (slot < 0) { irq_restore(f); return -1; }        /* too many waiters */
+        if (slot < 0) {                                     /* too many waiters */
+            /* AND SAY SO (M2081). A full table makes FUTEX_WAIT return the
+             * same -1 as a timeout, so the caller is told its wait EXPIRED
+             * when in fact it never happened -- the "answers with a plausible
+             * wrong value instead of failing" shape this campaign keeps
+             * finding. Whether it ever actually fills is a question nobody
+             * could answer from the log, because nothing said. */
+            static int moaned;
+            if (!moaned) { moaned = 1;
+                kprintf("[futex] the wait table is FULL (%d slots) -- a wait is being "
+                        "reported as a timeout that never waited\n", FUTEX_NWAIT); }
+            irq_restore(f); return -1;
+        }
         g_futex[slot].key = key; g_futex[slot].as = as; g_futex[slot].task = task_self();
         g_futex[slot].uaddr = uaddr; g_futex[slot].val = val;
         g_futex[slot].used = 1;

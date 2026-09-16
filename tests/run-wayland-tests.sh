@@ -111,6 +111,18 @@ if grep -aq "LXWL: connected, 7 globals, wl_compositor bound, 2 roundtrips OK" "
 else
     echo "  FAIL: the client did not complete:"; grep -aE "LXWL|roundtrip" "$SLOG" | tail -4; f=1
 fi
+# M2081: the compositor never SAID a surface had been created. obj_add is
+# silent, and the exported counters covered commits, destroys, protocol errors,
+# clients, messages and globals -- everything except the one object whose
+# existence separates a client that is starting up from a client that is never
+# going to draw. Firefox's whole symptom is "never creates a wl_surface", and
+# the only way to observe that was -append wlverbose, which dumps every message
+# and, before M2080, was the flag most likely to wedge the machine.
+if grep -aqE "\[wl\] surface [0-9]+ created \(client ep [0-9]+" "$SLOG"; then
+    echo "  ok: the compositor NAMES each surface as it is created ($(grep -ac "\[wl\] surface .* created" "$SLOG") seen, incl. one from the real client) (M2081)"
+else
+    echo "  FAIL: no surface-creation line from a real client:"; grep -a "\[wl\] surface" "$SLOG" | tail -4; f=1
+fi
 # PIXELS. The client wrote 0xFF3366CC into a memfd, passed the DESCRIPTOR over
 # the protocol socket, and committed a surface. The compositor reading that
 # exact value back proves the whole zero-copy path: SCM_RIGHTS carried the

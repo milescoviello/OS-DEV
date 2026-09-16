@@ -4120,10 +4120,26 @@ void linux_syscall_dispatch(struct registers *r) {
             int e = (int)-rv;
             if (e != LX_ENOENT && e != LX_EAGAIN && e != LX_EINTR) {
                 static int shown;
+                /* THE NUMBER, ALWAYS, BESIDE THE NAME, AND ALL SIX ARGUMENTS
+                 * (M2081).
+                 *
+                 * `lx_syscall_name` answers "?" for anything the table has no
+                 * entry for, and a line reading `?(c, 0, 0) = -28` names
+                 * nothing at all -- which is this instrument repeating the
+                 * mistake M2070's own comment records it already made once.
+                 * The name is the convenience; the NUMBER is the fact, and it
+                 * is never unavailable.
+                 *
+                 * Six arguments rather than three for the same reason: the
+                 * x86-64 Linux ABI puts the fourth in r10, and that is where
+                 * fallocate keeps its length, pwrite its offset and futex its
+                 * timeout -- so three arguments cannot tell apart precisely
+                 * the calls whose failure most needs explaining. */
                 if (++shown <= 200)
-                    kprintf("[syserr] pid %d t%d %s(%lx, %lx, %lx) = -%d\n",
+                    kprintf("[syserr] pid %d t%d %lu/%s(%lx, %lx, %lx, %lx, %lx, %lx) = -%d\n",
                             app_current_pid(), task_current_id(),
-                            lx_syscall_name(nr_), r->rdi, r->rsi, r->rdx, e);
+                            (unsigned long)nr_, lx_syscall_name(nr_),
+                            r->rdi, r->rsi, r->rdx, r->r10, r->r8, r->r9, e);
                 /* EBADF is the one errno where the ANSWER is about a
                  * descriptor, so say what that descriptor actually is: "not
                  * open" and "open, but this call does not handle its type"

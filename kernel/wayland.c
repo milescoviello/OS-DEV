@@ -308,6 +308,16 @@ static struct wl_client g_cl[WL_MAXCLIENT];
 static int g_listener = -1;
 int g_wl_verbose;                 /* -append wlverbose: log every message both ways */
 static unsigned g_nconn, g_nmsg, g_nglobal, g_ncommit;
+/* SURFACES AND ROLES (M2081). The headline question about a stalled toolkit is
+ * "did it ever create a wl_surface", and nothing here could answer it: obj_add
+ * is silent, and the exported counters covered commits, destroys, protocol
+ * errors, clients, messages and globals -- everything except the one object
+ * whose existence is the difference between a client that is starting up and a
+ * client that is never going to draw. The only way to see it was -append
+ * wlverbose, which dumps every message and, before M2080, was the flag most
+ * likely to wedge the machine. */
+static unsigned g_nsurface;       /* wl_compositor.create_surface, ever */
+static unsigned g_nrole;          /* surfaces that were given a role (toplevel/popup/subsurface/cursor) */
 static unsigned g_ndestroy;       /* objects released back to the table (M2058) */
 static unsigned g_nprotoerr;      /* wl_display.error events we had to post (M2058) */
 
@@ -423,6 +433,8 @@ const char *wl_surface_title(void) {
 }
 
 unsigned wl_commits(void)      { return g_ncommit; }
+unsigned wl_surfaces(void)     { return g_nsurface; }
+unsigned wl_roles(void)        { return g_nrole; }
 unsigned wl_destroys(void)     { return g_ndestroy; }
 unsigned wl_proto_errors(void) { return g_nprotoerr; }
 uint32_t wl_last_pixel(void) {
@@ -657,6 +669,7 @@ static void wl_give_role(struct wl_client *c, uint32_t sid, int role, uint32_t r
                 sid, wl_role_name(sf->role), wl_role_name(role));
         return;
     }
+    if (sf->role == WLR_NONE) g_nrole++;        /* a surface that can now be shown (M2081) */
     sf->role = role; sf->role_id = role_id;
     kprintf("[wl] surface %u is a %s (role object %u)\n", sid, wl_role_name(role), role_id);
 }
@@ -899,6 +912,8 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         uint32_t sid = rd32(args);
         obj_add(c, sid, WLK_SURFACE);
         if (!c->surface) c->surface = sid;      /* input goes to the first surface, until a toplevel appears */
+        g_nsurface++;
+        kprintf("[wl] surface %u created (client ep %d, %u so far)\n", sid, c->ep, g_nsurface);
         return;
     }
     /* wl_region: a shape, used for the opaque and input regions. We model the

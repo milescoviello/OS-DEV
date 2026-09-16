@@ -1249,8 +1249,28 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                              * combining two different runs is how I convinced
                              * myself of something that was not true. (M1998) */
                             app_dump_threads(fpid);
-                            if (t == 7 || t == 15 || t == 23)
+                            if (t == 7 || t == 15 || t == 23) {
                                 lx_trace_dump_last("the Firefox heartbeat", 24);
+                                /* ...AND THE FUTEX LEDGER (M2081).
+                                 *
+                                 * Every thread in the dump above is parked in
+                                 * app_futex, and "blocked on a futex" is the
+                                 * answer for a healthy idle browser as much as
+                                 * a hung one -- the thread dump cannot tell
+                                 * them apart. The question that can is
+                                 * narrower, and app_futex_dump has answered it
+                                 * since M1959: was a WAKE ever issued for a
+                                 * key somebody is STILL parked on? That is a
+                                 * lost wakeup, and it is the only reading here
+                                 * that separates "waiting for work" from
+                                 * "waiting for a signal that already came and
+                                 * went". It was wired into the synchronous-run
+                                 * timeout only, and Firefox is spawned
+                                 * ASYNCHRONOUSLY -- so the one path that most
+                                 * needed it was the one path that never
+                                 * called it. */
+                                app_futex_dump();
+                            }
                         }
                     }
                 }
