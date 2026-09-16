@@ -268,7 +268,42 @@ void isr_dispatch(struct registers *r) {
                 extern int vexemu_try(struct registers *r);
                 if (vexemu_try(r)) return;
             }
-            if (app_signal_deliver(r, 11)) return;  /* SIGSEGV: a registered handler catches the fault */
+            /* SAY SO WHEN A PROCESS CATCHES ITS OWN FAULT (M2073).
+             *
+             * A delivered SIGSEGV used to leave nothing in the log but the
+             * one line app_fault_handle prints on its way out -- no rip, no
+             * library, no thread. So Bun printing "Segmentation fault at
+             * address 0x0" was the ONLY record of a null dereference, and it
+             * gives an address that is null by definition and nothing about
+             * where the code was. The handler runs instead of the report, so
+             * the report has to happen here or not at all. Bounded, because a
+             * program can fault in a loop and a flood would push the history
+             * that explains it out of the log. */
+            /* app_signal_deliver REWRITES the frame to enter the handler, so
+             * the faulting rip has to be taken before the call -- reading it
+             * after reports the handler's own entry point, which is the same
+             * address every time and tells you nothing. */
+            uint64_t frip = r->rip;
+            /* SEGV_MAPERR(1) = not mapped, SEGV_ACCERR(2) = mapped and refused.
+             * Bit 0 of a page-fault error code is "the page WAS present". */
+            if (r->int_no == 14) app_set_fault_siginfo(cr2, (r->err_code & 1) ? 2 : 1);
+            if (app_signal_deliver(r, 11)) {       /* SIGSEGV: a registered handler catches the fault */
+                static int told;
+                if (told < 8) {
+                    told++;
+                    kprintf("[fault] %s (vector %lu) err=0x%lx at rip=%p (CR2=%p) [tid %d '%s'] "
+                            "-- DELIVERED to the process's own handler\n",
+                            exception_names[r->int_no], r->int_no, r->err_code,
+                            (void *)frip, (void *)cr2, task_current_id(), task_name_of(task_self()));
+                    app_describe_addr(frip);
+                    /* AND WHAT IT WAS DOING. lx_trace_dump_fault runs on the
+                     * terminate path only, so a caught fault left no history
+                     * at all -- the one case where the program's own message
+                     * is written by someone else's crash handler. */
+                    if (lx_syscalls_made()) lx_trace_dump_fault();
+                }
+                return;
+            }
             /* REPORT FS_BASE (M2054). A ring-3 fault at CR2=0x28 is almost
              * always `mov %fs:0x28,%rax` -- glibc's stack canary -- read with
              * a ZERO thread pointer, and the dump could not distinguish "the

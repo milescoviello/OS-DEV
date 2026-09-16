@@ -25,6 +25,9 @@ int         app_state_of(int pid);
 void        app_dump_threads(int pid);                                /* where every thread of a pid is parked (M1996) */                                     /* task state of a live pid, -1 if gone (M1996) */                                  /* pid of the last successful spawn (M1988) */
 void        app_count_lx_syscall(unsigned long nr);                    /* one more Linux syscall by the caller, counted BY NUMBER (M2004/M2066) */
 int         app_reap_selftest(void);                                   /* -append selftest: only ONE reaper may tear a process down (M2072) */
+#define LX_ENV_CMDLINE 4
+extern const char *g_lx_env_cmdline[LX_ENV_CMDLINE];   /* extra environment for every Linux program, from -append (M2073) */
+void        app_set_fault_siginfo(uint64_t addr, int code);       /* si_addr/si_code for the NEXT fault signal delivered (M2073) */
 void        app_lx_syshist_dump(app_t *a, int want);                   /* the top `want` syscall numbers since the last sample -- what a stuck program is actually doing (M2066) */
 void        app_stall_watchdog(void);                                  /* WM: report any Linux process that has stopped making syscalls (M2004) */
 int         app_open_console_alias(void);                              /* a new fd for the controlling terminal: open("/dev/tty") (M2004) */
@@ -310,7 +313,9 @@ long app_fsync(int fd);                                     /* fsync/fdatasync: 
 long app_sync_file_range(int fd, uint64_t offset, uint64_t nbytes, unsigned flags);  /* same as app_fsync; range/flags unused (M1566) */
 void app_sync(void);                                        /* whole-system flush, no fd, never fails (M1588) */
 int  app_timerfd_create(void);                             /* a pollable one-shot timer fd (>=3); -1 (M1217) */
-long app_timerfd_settime(int fd, long delay_ms, long interval_ms);  /* arm a timerfd: initial delay + periodic interval (ms; interval 0 = one-shot, delay <=0 disarms); 0/-1 (M1217, periodic M1302) */
+long app_timerfd_settime(int fd, long delay_ms, long interval_ms);
+long app_timerfd_remaining_ms(int fd);                     /* ms until it fires, 0 = disarmed/expired, -1 = not a timerfd (M2073) */
+long app_timerfd_interval_ms(int fd);                      /* its periodic interval in ms, 0 = one-shot (M2073) */  /* arm a timerfd: initial delay + periodic interval (ms; interval 0 = one-shot, delay <=0 disarms); 0/-1 (M1217, periodic M1302) */
 long app_fcntl(int fd, int cmd, long arg);                 /* F_GETFD/SETFD/DUPFD/DUPFD_CLOEXEC (M1218) */
 int  app_dup3(int oldfd, int newfd, int flags);            /* dup w/ O_CLOEXEC; -1 if old==new (M1218) */
 long app_close_range(unsigned lo, unsigned hi, int flags); /* close fds in [lo,hi]; 0/-1 (M1218) */

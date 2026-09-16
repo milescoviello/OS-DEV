@@ -80,7 +80,7 @@ MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
 CLAUDE_BIN ?= $(shell readlink -f "$$(command -v claude 2>/dev/null)" 2>/dev/null)
 # Firefox's install directory. Staged whole -- see the rule below for why.
 FIREFOX_DIR ?= $(firstword $(wildcard /usr/lib64/firefox /usr/lib/firefox))
-EXT2SIZE  := 2200M   # 512M -> 1500M (M1964): Node is 102 MB plus 21 shared libraries, on top of the 195 MB toolchain+source tree
+EXT2SIZE := 3200M   # 512M -> 1500M -> 2200M -> 3200M: Node (102 MB + 21 libs), the 195 MB toolchain+source tree, and Bun (93 MB + 36 libs, M2073)
 ifneq ($(MKE2FS),)
 EXT2IMG   := $(BUILD)/ext2.img
 EXT2FLAGS := -drive file=$(BUILD)/ext2.img,format=raw,if=ide
@@ -270,6 +270,16 @@ $(LXROOT)/lxfutex: tools/lx/lxfutex.c
 	$(CC) -static-pie -O2 -o $@ $< -lpthread
 	@echo "  HOSTCC  $@ (a futex keyed by its PAGE stops working when fork moves the page)"
 
+$(LXROOT)/lxzero: tools/lx/lxzero.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (anonymous memory must be zero every time it is handed over)"
+
+$(LXROOT)/lxstack: tools/lx/lxstack.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $< -lpthread
+	@echo "  HOSTCC  $@ (a thread must be able to find its own stack: GC roots depend on it)"
+
 $(LXROOT)/lxlongname: tools/lx/lxlongname.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -350,7 +360,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
@@ -484,6 +494,11 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile
 	@# ICU, nghttp2, simdjson) -- staged whole and unmodified, exactly like the
 	@# toolchain. We do not port Node; we run it.
 	@tools/stage-linux-tool.sh $(LXROOT) node
+	@# ...and BUN, which is the runtime Claude Code actually embeds (it is a Bun
+	@# standalone executable, so JavaScriptCore rather than V8). A 230 MB TUI is
+	@# a terrible reproducer for a heap-corruption bug; the same runtime with a
+	@# thirty-line script is a good one, and the two differ only in the JS.
+	@tools/stage-linux-tool.sh $(LXROOT) bun
 	@# PHASE 8: libwayland-client and its closure, so a real Wayland client can
 	@# run in-guest. Staged from the lxwl binary we just built against it.
 	@# ABSPATH, not a relative one: the staging script only accepts an absolute

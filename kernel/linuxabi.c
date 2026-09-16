@@ -331,6 +331,10 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_epoll_pwait_ 281
 #define LXS_eventfd_     284   /* the flagless original; glibc still emits it (M2017) */
 #define LXS_eventfd2_    290
+#define LXS_timerfd_create_  283
+#define LXS_timerfd_settime_ 286
+#define LXS_timerfd_gettime_ 287
+#define LXS_msync_            26
 #define LXS_poll_          7
 #define LXS_ppoll_       271
 #define LXS_chdir_        80
@@ -991,6 +995,10 @@ const char *lx_syscall_name(unsigned long nr) {
     case 285: return "fallocate";
     case 288: return "accept4";
     case 290: return "eventfd2";
+    case 283: return "timerfd_create";
+    case 286: return "timerfd_settime";
+    case 287: return "timerfd_gettime";
+    case 26: return "msync";
     case 291: return "epoll_create1";
     case 293: return "pipe2";
     case 294: return "inotify_init1";
@@ -2231,6 +2239,73 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;
         break;
     }
+    /* TIMERFD, WHICH AN EVENT LOOP CANNOT DO WITHOUT (M2073).
+     *
+     * ENOSYS here is not a missing convenience. uSockets says so and stops:
+     * "panic(main thread): us_create_timer: returned null: 38" -- errno 38,
+     * ENOSYS, surfaced as a null pointer three layers up. Everything else
+     * that reaches for a timer and gets nothing falls back to POLLING, which
+     * is how a program ends up making nine hundred clock_gettime calls every
+     * fifteen seconds and looking busy while waiting.
+     *
+     * The native timerfd has existed since M1217 and is already pollable; all
+     * that was missing is the translation. Linux's interface is absolute-or-
+     * relative itimerspec in NANOSECONDS, ours is a relative millisecond
+     * delay plus an interval, so the conversion is the work -- and TFD_ABSTIME
+     * matters: reading an absolute deadline as a relative one is the same
+     * mistake M2010 fixed in FUTEX_WAIT_BITSET. */
+    case LXS_timerfd_create_: {             /* (clockid, flags) */
+        int tfd = app_timerfd_create();
+        if (tfd < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        if (r->rsi & 0x800)   app_fd_set_nonblock(tfd, 1);   /* TFD_NONBLOCK */
+        if (r->rsi & 0x80000) app_fd_set_cloexec(tfd, 1);    /* TFD_CLOEXEC  */
+        r->rax = (uint64_t)tfd;
+        break;
+    }
+    case LXS_timerfd_settime_: {            /* (fd, flags, new*, old*) */
+        if (!r->rdx) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!vmm_user_ok(r->rdx, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        const int64_t *it = (const int64_t *)r->rdx;      /* {interval.sec,nsec, value.sec,nsec} */
+        /* Round the nanoseconds UP, for the same reason the futex path does:
+         * a sub-millisecond timer must not become a zero-millisecond one,
+         * which reads as "disarm" and stops the loop it was driving. */
+        int64_t ival = it[0] * 1000 + (it[1] + 999999) / 1000000;
+        int64_t want = it[2] * 1000 + (it[3] + 999999) / 1000000;
+        int64_t delay = want;
+        if ((it[2] || it[3]) && (r->rsi & 1)) {           /* TFD_TIMER_ABSTIME */
+            int64_t now = (int64_t)timer_ms();
+            delay = want - now;
+            if (delay <= 0) delay = 1;                    /* already due: fire at once, not never */
+        }
+        if (!it[2] && !it[3]) delay = 0;                  /* value 0 = disarm, exactly as Linux */
+        if (r->r10) {                                     /* old_value, if asked for */
+            if (!vmm_user_ok(r->r10, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            int64_t *ov = (int64_t *)r->r10;
+            long rem = app_timerfd_remaining_ms((int)a1), iv = app_timerfd_interval_ms((int)a1);
+            ov[0] = iv / 1000; ov[1] = (iv % 1000) * 1000000;
+            ov[2] = rem / 1000; ov[3] = (rem % 1000) * 1000000;
+        }
+        long rc3 = app_timerfd_settime((int)a1, (long)delay, (long)ival);
+        r->rax = (rc3 < 0) ? (uint64_t)-(long)LX_EINVAL : 0;
+        break;
+    }
+    case LXS_timerfd_gettime_: {            /* (fd, old*) */
+        if (!vmm_user_ok(r->rsi, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        long rem = app_timerfd_remaining_ms((int)a1), iv = app_timerfd_interval_ms((int)a1);
+        if (rem < 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        int64_t *ov = (int64_t *)r->rsi;
+        ov[0] = iv / 1000; ov[1] = (iv % 1000) * 1000000;
+        ov[2] = rem / 1000; ov[3] = (rem % 1000) * 1000000;
+        r->rax = 0;
+        break;
+    }
+    case LXS_msync_:                        /* (addr, len, flags) */
+        /* A MAP_SHARED writer that cannot flush has no way to make its writes
+         * durable, and the honest failure is not ENOSYS -- app_msync exists
+         * and does exactly this. MS_INVALIDATE has nothing to drop here (our
+         * page cache IS the mapping), so it is a successful no-op. */
+        r->rax = (uint64_t)(app_msync(r->rdi, r->rsi) < 0 ? -(long)LX_EINVAL : 0);
+        break;
     case LXS_epoll_create1_: {              /* (flags) */
         int efd = app_epoll_create();
         r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;

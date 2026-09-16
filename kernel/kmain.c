@@ -539,7 +539,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
         if (cmdline_has(cl, "lxclaudetest")) { g_lxabi_test = 1; g_lxclaude_test = 1; }  /* Claude Code ALONE: the Node suite ahead of it costs 20 minutes per attempt (M1970) */
         if (cmdline_has(cl, "termtest")) g_termtest = 1;                               /* assert on the terminal's CELLS (M2057) */
-        if (cmdline_has(cl, "lxhist")) { g_lxhist = 1; extern int g_lx_syshist; g_lx_syshist = 1; }   /* what each Linux process is actually doing (M2066) */
+        if (cmdline_has(cl, "lxhist")) { g_lxhist = 1; extern int g_lx_syshist; g_lx_syshist = 1; }
+        /* BISECT SWITCHES FOR A FOREIGN RUNTIME (M2073). JSC reads its options
+         * from the environment, so turning its JIT or its concurrent collector
+         * off is the cheapest way to ask which of them is involved in a heap
+         * corruption -- and the answer is one bit, where the fault address has
+         * so far given none. */
+        if (cmdline_has(cl, "lxnojit"))  g_lx_env_cmdline[0] = "BUN_JSC_useJIT=0";
+        if (cmdline_has(cl, "lxnogc"))   g_lx_env_cmdline[1] = "BUN_JSC_useConcurrentGC=0";
+        if (cmdline_has(cl, "lxnogen"))  g_lx_env_cmdline[2] = "BUN_JSC_useGenerationalGC=0";   /* what each Linux process is actually doing (M2066) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
@@ -761,6 +769,23 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * Linux write(2) lands on the kernel console, which is mirrored to serial,
      * unlike ring-3 print() from our own apps. */
     if (g_lxabi_test) {
+        /* FIRST, because every other probe in this block -- and every program
+         * the kernel will ever run -- depends on it, and because the suite
+         * below it intermittently wedges. JSC's parallel marker crashed on a
+         * JSValue of 0x9000900090: a repeating 16-bit pattern, which is what
+         * recycled memory looks like and what zeroed memory does not. A
+         * garbage collector reads every word it ever allocated, so it is the
+         * most sensitive consumer of "anonymous memory arrives zero" in the
+         * system and the least able to name the page that was wrong. */
+        kprintf("[lxabi] launching the zero-fill/COW probe...\n");
+        {   int zrc = app_run_linux_sync("/disk2/lxzero", 0, 0, 180000);
+            kprintf("[lxabi] LXZERO exit -> %d\n", zrc); }
+        /* ...and whether a thread can find its own stack, for the same
+         * reason: a conservative collector scans between the stack pointer
+         * and the base it was told, so the bounds are a correctness input. */
+        kprintf("[lxabi] launching the stack-bounds probe...\n");
+        {   int strc2 = app_run_linux_sync("/disk2/lxstack", 0, 0, 120000);
+            kprintf("[lxabi] LXSTACK exit -> %d\n", strc2); }
         /* HOME, and the XDG directories under it (M1985). A GTK program writes
          * before it draws -- a profile, a font cache, a dconf directory -- and
          * glib treats a config directory it cannot create as fatal rather than

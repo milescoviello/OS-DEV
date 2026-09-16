@@ -295,6 +295,17 @@ struct app {
     int      sigq_n;                     /* # valid queued payloads, [0..sigq_n) in arrival (FIFO) order */
     uint64_t sig_q_value;                /* scratch: si_value for the signal currently being delivered */
     int      sig_q_code;                 /* scratch: si_code  for the signal currently being delivered */
+    /* WHERE THE FAULT WAS (M2073). si_addr was hardcoded to 0 for every
+     * signal, and the comment said "0 for a raised/queued signal" -- true
+     * of kill() and sigqueue(), and wrong for exactly the signals whose
+     * whole point is an address. A SIGSEGV handler reads si_addr to decide
+     * whether the fault is one it can handle, so answering 0 turns every
+     * recoverable fault into an unrecognised one. Bun printed
+     * "Segmentation fault at address 0x0" while CR2 was 0x500000020 -- our
+     * number, not its bug. Set by the fault handler immediately before it
+     * delivers, and consumed once. */
+    uint64_t sig_fault_addr;
+    int      sig_fault_code, sig_fault_valid;
     uint64_t sig_alt_base, sig_alt_size; /* sigaltstack: alternate signal-handler stack; 0 size = none (M1276) */
     uint64_t alarm_interval, alarm_next; /* SIGALRM (M1102): periodic timer; 0 interval = disarmed */
 #define APP_NPTIMER 8
@@ -2867,6 +2878,10 @@ void app_net_stall_watch(void) {
         return;
     }
 }
+
+/* Environment entries added by the kernel command line, for bisecting a
+ * runtime's own behaviour from outside it. (M2073) */
+const char *g_lx_env_cmdline[LX_ENV_CMDLINE];
 
 int g_lx_syshist;   /* -append lxhist: sample every live Linux process every 15 s (M2066) */
 
@@ -6103,6 +6118,16 @@ void app_sigaction_full(int signo, uint64_t handler, uint64_t restorer, uint32_t
 
 #define APP_SA_SIGINFO 4u
 #define APP_SA_ONSTACK 0x08000000u
+/* Tell the next signal delivery WHERE the fault was (M2073). Called from the
+ * fault handler just before app_signal_deliver, because that is the only place
+ * that knows CR2 and the error code; `code` is SEGV_MAPERR(1) when the page was
+ * not present and SEGV_ACCERR(2) when it was there and the access was not
+ * allowed -- a distinction a handler acts on differently. */
+void app_set_fault_siginfo(uint64_t addr, int code) {
+    struct app *a = cur(); if (!a) return;
+    a->sig_fault_addr = addr; a->sig_fault_code = code; a->sig_fault_valid = 1;
+}
+
 int app_signal_deliver(struct registers *r, int signo) {
     struct app *a = cur();
     if (!a || signo <= 0 || signo >= APP_NSIG) return 0;
@@ -6128,8 +6153,12 @@ int app_signal_deliver(struct registers *r, int signo) {
             || !vmm_user_ok(si_addr, 32)) return 0;
         *(struct registers *)mctx_addr = *r;              /* the interrupted context = the ucontext */
         ((int *)si_addr)[0] = signo;                      /* si_signo @0  */
-        ((int *)si_addr)[1] = a->sig_q_code;              /* si_code  @4  (SI_QUEUE=-1 from sigqueue, else SI_USER=0) */
-        ((uint64_t *)si_addr)[1] = 0;                     /* si_addr  @8  (0 for a raised/queued signal) */
+        /* A FAULT SIGNAL CARRIES ITS ADDRESS (M2073); a raised or queued one
+         * genuinely has none. sig_fault_valid distinguishes them, so kill()
+         * still reports SI_USER with a zero address as it always did. */
+        ((int *)si_addr)[1] = a->sig_fault_valid ? a->sig_fault_code : a->sig_q_code;   /* si_code @4 */
+        ((uint64_t *)si_addr)[1] = a->sig_fault_valid ? a->sig_fault_addr : 0;          /* si_addr @8 */
+        a->sig_fault_valid = 0;                           /* consumed: one delivery, one fault */
         ((uint64_t *)si_addr)[2] = a->sig_q_value;        /* si_value @16 (the sigqueue sigval payload, M1271) */
         *(volatile uint64_t *)ret = a->sig_restorer;
         a->sig_saved = *r;                                /* safe baseline: cs/ss/rflags for sigreturn */
@@ -7306,7 +7335,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
           if (!pre[k] && (g_pend_lxcwd[k] == 0 || g_pend_lxcwd[k] == '/')) startcwd = g_pend_lxcwd; }
         vfs_cwd_set_for(a, startcwd);
         { int k = 0; while (startcwd[k] && k < (int)sizeof a->cwd_path - 1) { a->cwd_path[k] = startcwd[k]; k++; } a->cwd_path[k] = 0; }
-        static const char *argv0[2 + LX_PEND_ARGS], *envp0[40];
+        static const char *argv0[2 + LX_PEND_ARGS], *envp0[48];
         /* argv[0] is what the PROGRAM sees, so strip the /disk2 mount prefix:
          * inside a Linux process that volume IS the root, and a program that
          * re-execs itself by argv[0] (lxbox does) would otherwise ask for
@@ -7445,6 +7474,15 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * program something the whole system should NOT have -- see
          * app_set_next_env. (M1999) */
         int en = 32;
+        /* ...and entries set from the KERNEL COMMAND LINE, which unlike the
+         * one-shot slot above persist for every program in the boot (M2073).
+         * A JIT and a concurrent collector can each be turned off by a JSC
+         * option, and "does it still corrupt its heap with the JIT off" is a
+         * one-bit answer that no amount of reading the fault address gives. A
+         * bisect switch belongs in the kernel here because the environment is
+         * built here and nothing else can reach it. */
+        for (int k = 0; k < LX_ENV_CMDLINE && en < 44; k++)
+            if (g_lx_env_cmdline[k]) envp0[en++] = g_lx_env_cmdline[k];
         for (int k = 0; k < LX_PEND_ENV; k++)
             if (g_pend_env_extra[k]) { envp0[en++] = g_pend_env_extra[k]; g_pend_env_extra[k] = 0; }
         envp0[en] = 0;
@@ -8696,6 +8734,23 @@ int app_timerfd_create(void) {
     a->fd[fd] = (struct fdent){ 1, 4, 0, 0, {0}, 0 };       /* used, type=timerfd, off=0 disarmed, obj=0 one-shot */
     return fd;
 }
+/* What timerfd_gettime has to answer, and what timerfd_settime's `old_value`
+ * has to report: the time left and the period. Both live in the fd entry
+ * already; nothing could read them out before, so the Linux side had to either
+ * fake them or refuse. (M2073) */
+long app_timerfd_remaining_ms(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return -1;
+    if (!a->fd[fd].off) return 0;                       /* disarmed */
+    uint64_t now = timer_ms(), due = (uint64_t)a->fd[fd].off;
+    return (due > now) ? (long)(due - now) : 0;         /* already expired reads as 0, as on Linux */
+}
+long app_timerfd_interval_ms(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return 0;
+    return (long)a->fd[fd].obj;
+}
+
 long app_timerfd_settime(int fd, long delay_ms, long interval_ms) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return -1;
