@@ -487,7 +487,12 @@ struct app {
      * send()/recv()s on it, so a connect that only understood TCP made every
      * getaddrinfo fail with EAI_AGAIN, an error meaning "try later" about a
      * lookup that was never going to happen. */
-    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; uint8_t peer_ip[4]; uint16_t peer_port; uint8_t epwatch; } fd[APP_NFD];   /* cloexec/nonblock/peer at END to keep the positional initializers valid (M1218/M1965/M1967) */
+    /* `sndbuf`/`rcvbuf`/`sockflags` are the socket options a program SET and
+     * may read back (M2088). 0 in the size fields means "never set", which is
+     * how a get reports the real capacity rather than a stored fiction. At the
+     * END, like every field added since M1218, so the positional initializers
+     * scattered through this file stay valid. */
+    struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; uint8_t peer_ip[4]; uint16_t peer_port; uint8_t epwatch; int sndbuf, rcvbuf; uint32_t sockflags; } fd[APP_NFD];   /* cloexec/nonblock/peer at END to keep the positional initializers valid (M1218/M1965/M1967) */
     /* seccomp-BPF self-filter (M1190): a process installs a bpf.c program that
      * vets its own syscalls. Zero on spawn/fork; inherited across fork; once set
      * it's permanent (privilege drop is one-way). Empty => no filtering overhead. */
@@ -10287,6 +10292,189 @@ int app_fd_nread(int fd, long *out) {
     if (n < 0) return APP_NREAD_ENOTTY;
     *out = n;
     return 0;
+}
+
+/* ======================= SOCKET OPTIONS (M2088) =========================
+ *
+ * WHAT WAS HERE: getsockopt wrote a 4-byte ZERO into the caller's buffer and
+ * returned success, for every option, at every level, without reading optname
+ * at all. The comment explained the one case it was written for -- SO_ERROR,
+ * where 0 means "the connection is fine" -- and that case is right. Every
+ * other option got the same answer.
+ *
+ * WHAT IT COST: Firefox's IPC I/O thread creates its channel with
+ * socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK) and then asks
+ * how big the send buffer is. It was told ZERO BYTES, and aborted:
+ *
+ *     t219 53(1, 80801, 0) = 0     socketpair(AF_UNIX, ...|CLOEXEC|NONBLOCK)
+ *     t219 55(3d, 1, 7)    = 0     getsockopt(fd 61, SOL_SOCKET, SO_SNDBUF)
+ *     t219 39(...)         = df    getpid()  -- formatting the message
+ *     t219 1(2, ..., 78)   = 78    "###!!! ABORT: ... ipc_channel_posix.cc:128"
+ *
+ * A socket you cannot send one byte through is not a socket, and it is the
+ * project's dominant bug shape in one line: a plausible wrong value where the
+ * honest answers were either the real number or ENOPROTOOPT.
+ *
+ * EVERY VALUE AND EVERY ERRNO BELOW WAS MEASURED ON A REAL LINUX KERNEL, and
+ * three of them are not what I would have written: setting SO_SNDBUF makes a
+ * later get report DOUBLE what you asked for, an unknown option is
+ * ENOPROTOOPT (92) rather than EINVAL, and any of these on a non-socket fd is
+ * ENOTSOCK (88) rather than ENOTTY.
+ *
+ * The sizes reported are OURS, not Linux's 212992 -- our AF_UNIX ring really
+ * is 16 KiB per direction, and a program that sizes a write from this number
+ * must get the number that is there. */
+#define SOCKF_REUSEADDR  (1u << 0)
+#define SOCKF_KEEPALIVE  (1u << 1)
+#define SOCKF_BROADCAST  (1u << 2)
+#define SOCKF_PASSCRED   (1u << 3)
+#define SOCKF_NODELAY    (1u << 4)
+#define SOCKF_OOBINLINE  (1u << 5)
+#define SOCKF_DONTROUTE  (1u << 6)
+#define SOCKF_REUSEPORT  (1u << 7)
+
+/* Is this descriptor a socket at all, and of what shape? */
+static int fd_is_sock(int ty) {
+    return ty == 9 || ty == 10 || ty == 12 || ty == 13 || ty == 15 || ty == 16;
+}
+static int fd_sock_type(int ty)   { return ty == 9 ? 2 /*SOCK_DGRAM*/ : 1 /*SOCK_STREAM*/; }
+static int fd_sock_domain(int ty) { return (ty == 12 || ty == 13) ? 1 /*AF_UNIX*/ : 2 /*AF_INET*/; }
+static int fd_sock_listening(int ty) { return ty == 13 || ty == 15; }
+/* The capacity that is really behind this descriptor, per direction. */
+static int fd_sock_capacity(int ty) {
+    if (ty == 12 || ty == 13) return unix_ring_bytes();
+    if (ty == 10 || ty == 15 || ty == 16) return net_tcp_sock_bufbytes();
+    return 8192;                                   /* AF_INET datagram: one queued datagram */
+}
+
+/* Which flag bit an option name maps to, or 0 if it is not a simple boolean. */
+static uint32_t sockopt_flagbit(int opt) {
+    switch (opt) {
+    case 2:  return SOCKF_REUSEADDR;
+    case 5:  return SOCKF_DONTROUTE;
+    case 6:  return SOCKF_BROADCAST;
+    case 9:  return SOCKF_KEEPALIVE;
+    case 10: return SOCKF_OOBINLINE;
+    case 15: return SOCKF_REUSEPORT;
+    case 16: return SOCKF_PASSCRED;
+    default: return 0;
+    }
+}
+
+/* getsockopt(2). Returns the number of bytes written to `out`, or a negative
+ * Linux errno. `max` is what the caller said it had room for. */
+int app_sock_getopt(int fd, int level, int opt, void *out, int max) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -9;    /* EBADF */
+    int ty = a->fd[fd].type;
+    if (!fd_is_sock(ty)) return -88;                                   /* ENOTSOCK */
+    if (!out || max < 4) return -14;                                   /* EFAULT */
+    int32_t v;
+    if (level == 6 /*SOL_TCP*/) {
+        if (opt == 1 /*TCP_NODELAY*/) { v = (a->fd[fd].sockflags & SOCKF_NODELAY) ? 1 : 0; goto give4; }
+        return -92;                                                    /* ENOPROTOOPT */
+    }
+    if (level != 1 /*SOL_SOCKET*/) return -92;
+    switch (opt) {
+    case 3:  v = fd_sock_type(ty); break;                              /* SO_TYPE */
+    case 4:  v = 0; break;                                             /* SO_ERROR: no pending error */
+    case 7:  v = a->fd[fd].sndbuf ? a->fd[fd].sndbuf : fd_sock_capacity(ty); break;   /* SO_SNDBUF */
+    case 8:  v = a->fd[fd].rcvbuf ? a->fd[fd].rcvbuf : fd_sock_capacity(ty); break;   /* SO_RCVBUF */
+    case 17: {                                                         /* SO_PEERCRED: struct ucred */
+        if (max < 12) return -14;
+        int pid = (ty == 12) ? unix_peer_pid(a->fd[fd].obj) : 0;
+        if (pid < 0) pid = 0;
+        int32_t *u = (int32_t *)out;
+        u[0] = pid; u[1] = 0; u[2] = 0;                                /* pid, uid 0, gid 0: single-user */
+        return 12;
+    }
+    case 18: case 19: v = 1; break;                                    /* SO_RCVLOWAT / SO_SNDLOWAT */
+    case 20: case 21: {                                                /* SO_RCVTIMEO / SO_SNDTIMEO: struct timeval */
+        if (max < 16) return -14;
+        int64_t *t = (int64_t *)out;
+        t[0] = 0; t[1] = 0;                                            /* no timeout set */
+        return 16;
+    }
+    case 13: {                                                         /* SO_LINGER: struct linger */
+        if (max < 8) return -14;
+        int32_t *l = (int32_t *)out;
+        l[0] = 0; l[1] = 0;
+        return 8;
+    }
+    case 30: v = fd_sock_listening(ty) ? 1 : 0; break;                 /* SO_ACCEPTCONN */
+    case 38: v = 0; break;                                             /* SO_PROTOCOL */
+    case 39: v = fd_sock_domain(ty); break;                            /* SO_DOMAIN */
+    default: {
+        uint32_t bit = sockopt_flagbit(opt);
+        if (!bit) {
+            /* UNKNOWN MEANS UNKNOWN. This is the line that used to answer 0.
+             * Named once per option so the next program to want one says so
+             * instead of silently believing a zero. */
+            static uint32_t moaned[8];
+            if (opt >= 0 && opt < 256 && !(moaned[opt >> 5] & (1u << (opt & 31)))) {
+                moaned[opt >> 5] |= 1u << (opt & 31);
+                kprintf("[sock] getsockopt(level %d, option %d) is not implemented -- "
+                        "answering ENOPROTOOPT rather than 0\n", level, opt);
+            }
+            return -92;                                                /* ENOPROTOOPT */
+        }
+        v = (a->fd[fd].sockflags & bit) ? 1 : 0;
+        break;
+    }
+    }
+give4:
+    *(int32_t *)out = v;
+    return 4;
+}
+
+/* setsockopt(2). 0, or a negative Linux errno. */
+int app_sock_setopt(int fd, int level, int opt, const void *in, int len) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -9;    /* EBADF */
+    int ty = a->fd[fd].type;
+    if (!fd_is_sock(ty)) return -88;                                   /* ENOTSOCK */
+    int32_t v = 0;
+    if (in && len >= 4) v = *(const int32_t *)in;
+    if (level == 6 /*SOL_TCP*/) {
+        if (opt == 1) { if (v) a->fd[fd].sockflags |= SOCKF_NODELAY; else a->fd[fd].sockflags &= ~SOCKF_NODELAY; return 0; }
+        return -92;
+    }
+    if (level != 1 /*SOL_SOCKET*/) return -92;
+    switch (opt) {
+    case 7: case 8: {                                                  /* SO_SNDBUF / SO_RCVBUF */
+        /* LINUX DOUBLES IT, and then clamps to the system maximum. Both halves
+         * matter: a program that sets N and reads back N/2 concludes the set
+         * failed, and one that sets a gigabyte must be told a real number
+         * rather than the gigabyte. Ours is clamped to what is actually there,
+         * which is exactly what Linux does at wmem_max. */
+        if (len < 4) return -14;
+        if (v < 0) return -22;                                         /* EINVAL */
+        int cap = fd_sock_capacity(ty);
+        int got = v * 2;
+        if (got < 2048) got = 2048;                                    /* SOCK_MIN_SNDBUF-ish floor */
+        if (got > cap) got = cap;
+        if (opt == 7) a->fd[fd].sndbuf = got; else a->fd[fd].rcvbuf = got;
+        return 0;
+    }
+    case 13: case 20: case 21:                                         /* SO_LINGER / timeouts: accepted, nothing to store */
+        return 0;
+    case 4: return -92;                                                /* SO_ERROR is read-only */
+    case 3: case 30: case 38: case 39: return -92;                     /* SO_TYPE/ACCEPTCONN/PROTOCOL/DOMAIN are read-only */
+    default: {
+        uint32_t bit = sockopt_flagbit(opt);
+        if (!bit) {
+            static uint32_t moaned[8];
+            if (opt >= 0 && opt < 256 && !(moaned[opt >> 5] & (1u << (opt & 31)))) {
+                moaned[opt >> 5] |= 1u << (opt & 31);
+                kprintf("[sock] setsockopt(level %d, option %d) is not implemented -- "
+                        "answering ENOPROTOOPT rather than pretending it took\n", level, opt);
+            }
+            return -92;
+        }
+        if (v) a->fd[fd].sockflags |= bit; else a->fd[fd].sockflags &= ~bit;
+        return 0;
+    }
+    }
 }
 
 /* WHAT IS THIS DESCRIPTOR, AND WHAT STATE IS IT IN? (M2087)

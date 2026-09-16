@@ -23,6 +23,7 @@
 #include "unixsock.h"
 #include "task.h"
 #include "console.h"   /* kprintf for the close/EOF trace (M1978) */
+#include "app.h"       /* app_current_pid, for SO_PEERCRED (M2088) */
 
 static volatile int usock_lock;
 static inline uint64_t usock_irq_save(void) {
@@ -88,6 +89,13 @@ struct uconn {
      * TCP sockets already had in app_fd_fork -- AF_UNIX was the one type never
      * added to that list. */
     int a_refs, b_refs;
+    /* WHO IS ON EACH END (M2088). SO_PEERCRED is the only way a program can
+     * learn the pid on the far side of a Unix socket, and it is not a nicety:
+     * GDBus uses it to authenticate, and Firefox's IPC channel reads it to
+     * confirm it is talking to the process it launched. Recorded at the moment
+     * the end is created, because that is the only moment it is known -- a
+     * later lookup cannot tell which of several descriptors is asking. */
+    int a_pid, b_pid;
     task_t *a_waiter, *b_waiter;  /* side A blocked reading b2a; side B blocked reading a2b */
 };
 static struct uconn conns[U_CONN];
@@ -173,6 +181,8 @@ int unix_connect(const char *path) {
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
     c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
     c->a_refs = c->b_refs = 1;                     /* one descriptor per end to begin with (M2002) */
+    c->a_pid = app_current_pid();                  /* the connector (M2088) */
+    c->b_pid = 0;                                  /* ...the server's pid is set by accept */
     lis[li].pend[lis[li].np++] = ci;               /* enqueue for the server to accept */
     if (lis[li].waiter) { task_wake(lis[li].waiter); lis[li].waiter = 0; }
     usock_irq_restore(fl);
@@ -195,6 +205,7 @@ int unix_accept(int lid) {
     int ci = l->pend[0];                           /* FIFO dequeue */
     for (int i = 1; i < l->np; i++) l->pend[i - 1] = l->pend[i];
     l->np--;
+    conns[ci].b_pid = app_current_pid();           /* the server, for SO_PEERCRED (M2088) */
     usock_irq_restore(fl);
     return (ci << 1) | 1;                          /* server gets side B */
 }
@@ -319,6 +330,21 @@ int unix_readable(int ep) {
     usock_irq_restore(fl);
     return r;
 }
+/* THE PID ON THE OTHER END, for SO_PEERCRED (M2088). 0 when nothing has
+ * accepted yet -- a pending connection has no server. */
+int unix_peer_pid(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    int pid = c ? (s ? c->a_pid : c->b_pid) : -1;
+    usock_irq_restore(fl);
+    return pid;
+}
+/* THE REAL SIZE OF ONE DIRECTION'S RING, for SO_SNDBUF/SO_RCVBUF (M2088).
+ * One slot is always kept empty to tell full from empty, so the usable
+ * capacity is one less than the array -- and reporting the array size would be
+ * a number no write can ever reach. */
+int unix_ring_bytes(void) { return U_RING - 1; }
+
 /* HOW MANY BYTES ARE WAITING, not merely "are there any" (M2086).
  *
  * ep_readable answers a yes/no question, and FIONREAD asks a numeric one --
@@ -406,6 +432,7 @@ int unix_socketpair(int *a, int *b) {
     c->used = 1; c->a2b.head = c->a2b.tail = 0; c->b2a.head = c->b2a.tail = 0;
     c->a_closed = c->b_closed = 0; c->a_wr_closed = c->b_wr_closed = 0; c->a_waiter = c->b_waiter = 0;
     c->a_refs = c->b_refs = 1;                     /* one descriptor per end to begin with (M2002) */
+    c->a_pid = c->b_pid = app_current_pid();       /* both ends are this process's (M2088) */
     *a = (ci << 1) | 0;                             /* side A */
     *b = (ci << 1) | 1;                             /* side B */
     usock_irq_restore(fl);

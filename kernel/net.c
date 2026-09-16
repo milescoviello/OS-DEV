@@ -1001,6 +1001,10 @@ int net_tcp_sock_readable(int idx) {
  * -- the bytes may still be on the wire, and a count that reads zero while a
  * segment is queued in the driver is the same lie as POLLNVAL was. A pending
  * EOF counts as zero bytes, which is exactly right: read() will return 0. */
+/* THE REAL RECEIVE-RING SIZE, for SO_RCVBUF (M2088). A socket option that
+ * reports a number a program then sizes its logic from must be the number that
+ * is actually there. */
+int net_tcp_sock_bufbytes(void) { return TCPSOCK_RX; }
 long net_tcp_sock_nread(int idx) {
     if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return -1;
     if (rxcount(idx) == 0) tcpsock_pump(idx);

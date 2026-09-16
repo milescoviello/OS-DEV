@@ -95,6 +95,7 @@ int  net_raw_recv(void *buf, int max, int timeout_ms);      /* next L2 frame; le
 int  net_tcp_sock_open(void);                               /* alloc a TCB slot; idx/-1 */
 int  net_tcp_sock_readable(int idx);                        /* poll: would recv return now? (M1967) */
 long net_tcp_sock_nread(int idx);                           /* FIONREAD: bytes in the receive ring; -1 bad idx (M2086) */
+int  net_tcp_sock_bufbytes(void);                           /* SO_RCVBUF/SO_SNDBUF: the real ring size (M2088) */
 int  net_tcp_sock_writable(int idx);                        /* poll: is it connected? (M1967) */
 int  net_tcp_sock_set_nonblock(int idx, int on);            /* O_NONBLOCK -> EAGAIN instead of waiting (M1967) */
 int  net_udp_readable(uint16_t sport);                      /* poll: is a datagram queued for this port? (M1967) */

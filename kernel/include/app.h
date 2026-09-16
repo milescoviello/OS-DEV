@@ -136,6 +136,8 @@ void   app_memfd_obj_ref(int idx);        /* the compositor takes another refere
 void   app_memfd_obj_unref(int idx);      /* ...and gives one back; the object dies at zero (M2087) */
 int    app_memfd_inuse(void);             /* live memfd objects, for a leak assertion (M2087) */
 void   app_fd_print(int fd);               /* kprintf an fd's kind AND state, for a diagnostic (M2087) */
+int  app_sock_getopt(int fd, int level, int opt, void *out, int max);        /* bytes written, or -errno (M2088) */
+int  app_sock_setopt(int fd, int level, int opt, const void *in, int len);   /* 0, or -errno (M2088) */
 int    app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsigned long len);  /* the kernel hands a client a readable memfd: wl_keyboard.keymap (M1984) */
 int    app_eventfd_create(unsigned int initval, int flags);  /* pollable u64-counter fd (M1242) */
 int    app_inotify_init(void);                       /* a pollable filesystem-watch fd (M1266) */

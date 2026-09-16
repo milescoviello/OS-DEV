@@ -198,6 +198,7 @@ LXSIG: ALL PASSED
 LXTLS: OK
 LXLOCK: OK
 LXNREAD: OK
+LXSOCKOPT: OK
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
@@ -379,6 +380,26 @@ LXWAIT: reaped 40/40 children
         echo "  ok: FIONREAD reports real byte counts on sockets/pipes/files/ptys/inotify, refuses the types Linux refuses, and FIONBIO/FIOCLEX/FIONCLEX reach the fcntl state they name (M2086, 32 checks)"
     else
         echo "  FAIL: FIONREAD or the FIO* family is wrong:"; grep -a "LXNREAD" "$SLOG3" | grep -a FAIL | head -6; f3=1
+    fi
+    # M2088 -- getsockopt ANSWERED A CONFIDENT ZERO TO EVERY OPTION EVER ASKED.
+    # It wrote a 4-byte zero into the caller's buffer and returned success
+    # without reading optname at all. Written for SO_ERROR, where zero means
+    # "this connection is fine"; every other option inherited it. So a socket's
+    # send buffer was nought bytes, its SO_TYPE was neither STREAM nor DGRAM,
+    # and an unimplemented option reported a clean zero. Firefox's IPC I/O
+    # thread built its channel and asked how much it could send:
+    #   t219 53(1, 80801, 0) = 0   socketpair(AF_UNIX, STREAM|CLOEXEC|NONBLOCK)
+    #   t219 55(3d, 1, 7)    = 0   getsockopt(fd 61, SOL_SOCKET, SO_SNDBUF)
+    #   t219 1(2, ..., 78)   = 78  "ABORT: ... ipc_channel_posix.cc:128"
+    # Removing that abort is what let the startup reach its next blocker.
+    # Every number this probe asserts was checked against a real Linux kernel
+    # first, which corrected three guesses: a set SO_SNDBUF reads back DOUBLE,
+    # an unknown option is ENOPROTOOPT not EINVAL, and any of it on a
+    # non-socket is ENOTSOCK not ENOTTY.
+    if grep -aq "LXSOCKOPT: OK" "$SLOG3"; then
+        echo "  ok: socket options report real values -- a nonzero send buffer a write can actually fill, SO_TYPE/SO_DOMAIN/SO_ACCEPTCONN, SO_PEERCRED's full ucred, booleans that round-trip, and ENOPROTOOPT for what is not implemented (M2088, 24 checks)"
+    else
+        echo "  FAIL: getsockopt is still answering fiction:"; grep -a "LXSOCKOPT" "$SLOG3" | grep -a FAIL | head -6; f3=1
     fi
     # M2062 -- A DIRECTORY LISTING MUST GIVE BACK THE NAME THAT IS THERE.
     # Every listing in the kernel came through one struct whose name field was

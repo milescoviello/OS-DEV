@@ -793,6 +793,57 @@ void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }
  * Both are printed. The tid-filtered view answers "what did the thread that
  * died just do", and the unfiltered tail answers "what else was going on",
  * which is the question when the cause is another thread. */
+/* WHAT DID THIS PROGRAM DO TO *THIS ADDRESS*? (M2088)
+ *
+ * The question a "no VMA of this process" fault actually raises. The tid
+ * filter answers "what was this thread doing", which for a memory fault is
+ * usually a read/lseek loop three layers above the bug -- the interesting call
+ * was the mmap or munmap that decided this page's fate, and it can be thousands
+ * of syscalls back. Firefox's own allocator commits and decommits memory with
+ * mmap(MAP_FIXED) over existing mappings, so on a fault into a hole the
+ * relevant history is precisely the VM operations that overlapped it.
+ *
+ * Scans the whole ring, not a tail: an operation from startup is exactly the
+ * one worth finding, and there is no reason to print the ninety calls between.
+ * Prints nothing if nothing overlapped, which is itself an answer -- it means
+ * the program was handed this pointer without ever mapping it. */
+const char *lx_syscall_name(unsigned long nr);
+void lx_trace_dump_addr(const char *why, unsigned long addr) {
+    unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
+    int shown = 0;
+    for (unsigned long k = 0; k < have; k++) {
+        struct lxring_ent *e = &g_lxring[(g_lxring_i - have + k) & (LXRING_N - 1)];
+        if (!e->seq && !e->nr) continue;
+        unsigned long base = 0, len = 0;
+        switch (e->nr) {
+        case 9:  base = e->a1; len = e->a2; break;          /* mmap(addr, len, ...) */
+        case 10: base = e->a1; len = e->a2; break;          /* mprotect */
+        case 11: base = e->a1; len = e->a2; break;          /* munmap */
+        case 25: base = e->a1; len = e->a2; break;          /* mremap(old, oldlen, ...) */
+        case 28: base = e->a1; len = e->a2; break;          /* madvise */
+        default: continue;
+        }
+        /* An mmap with addr==0 named no address, so it cannot have decided
+         * this one -- except through its RETURN, which is the one case where
+         * the answer is in `ret` rather than the arguments. */
+        int hit = (base && addr >= base && addr < base + len) ||
+                  (e->ret != LX_INFLIGHT && (long)e->ret > 0 &&
+                   addr >= e->ret && addr < e->ret + e->a2);
+        if (!hit) continue;
+        if (!shown)
+            kprintf("[linuxabi] every VM operation this process aimed at %lx, oldest first:\n", addr);
+        shown++;
+        if (shown > 24) continue;                            /* a runaway loop must not bury the log */
+        kprintf("   t%d %s(%lx, %lx, %lx) = %lx\n", e->tid, lx_syscall_name(e->nr),
+                e->a1, e->a2, e->a3, e->ret);
+    }
+    if (!shown)
+        kprintf("[linuxabi] NOTHING this process asked for ever covered %lx -- it was handed a "
+                "pointer into memory it never mapped (%s)\n", addr, why);
+    else if (shown > 24)
+        kprintf("   ... and %d more\n", shown - 24);
+}
+
 void lx_trace_dump_fault(void) {
     lx_trace_dump_tid("this fault", 24, task_current_id());
     lx_trace_dump_last("a ring-3 fault (every thread)", g_lx_systrace ? 64 : 12);
@@ -1789,23 +1840,38 @@ void linux_syscall_dispatch(struct registers *r) {
         r->rax = 0;
         break;
     }
-    case LXS_setsockopt_:
-        r->rax = 0;                          /* accepted; no option changes local-socket behaviour */
+    case LXS_setsockopt_: {                 /* (fd, level, optname, optval, optlen) */
+        /* THIS USED TO BE `r->rax = 0` AND NOTHING ELSE, with the comment "no
+         * option changes local-socket behaviour". Some of them do; more
+         * importantly its partner below then answered every GET with a zero,
+         * and a stored value is what makes the round trip honest. (M2088) */
+        int slen = (int)r->r8;
+        if (r->r10 && slen > 0 && !vmm_user_ok(r->r10, (uint64_t)slen)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int src = app_sock_setopt((int)a1, (int)r->rsi, (int)r->rdx, (const void *)r->r10, slen);
+        r->rax = (src < 0) ? (uint64_t)(long)src : 0;
         break;
-    case LXS_getsockopt_:
-        /* SO_ERROR (4) in particular: an event loop reads it after connect to
-         * decide whether the connection succeeded, and a nonzero answer would
-         * make it give up on a socket that is fine. */
-        /* ARGUMENT ORDER: getsockopt(fd, level, optname, optval, optlen) --
-         * optval is r10 and optlen is r8. Having them the other way round
+    }
+    case LXS_getsockopt_: {                 /* (fd, level, optname, optval, optlen *) */
+        /* ARGUMENT ORDER: optval is r10 and optlen is r8, and r8 is a POINTER
+         * to the length -- in and out. Having them the other way round once
          * wrote the LENGTH (4) into the value buffer, so libuv read
          * SO_ERROR == 4 and reported "connect EINTR" on a connection that had
-         * succeeded: socket, bind, listen, connect and accept had all
-         * returned cleanly. Nothing in the error named the real call. */
-        if (r->r10 && vmm_user_ok(r->r10, 4)) *(uint32_t *)r->r10 = 0;   /* optval: no error */
-        if (r->r8  && vmm_user_ok(r->r8, 4))  *(uint32_t *)r->r8  = 4;   /* optlen: bytes written */
+         * succeeded (M1967). Nothing in that error named the real call.
+         *
+         * AND IT ANSWERED ZERO TO EVERY OPTION EVER ASKED (M2088). SO_ERROR is
+         * the one option for which that is right, and it was the only one this
+         * was written for; the rest inherited it. Firefox asked how big its
+         * IPC send buffer was, was told nought bytes, and aborted. */
+        if (!r->r8 || !vmm_user_ok(r->r8, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int room = (int)*(const uint32_t *)r->r8;
+        if (room < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        if (!r->r10 || !vmm_user_ok(r->r10, (uint64_t)(room > 0 ? room : 4))) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        int grc = app_sock_getopt((int)a1, (int)r->rsi, (int)r->rdx, (void *)r->r10, room);
+        if (grc < 0) { r->rax = (uint64_t)(long)grc; break; }
+        *(uint32_t *)r->r8 = (uint32_t)grc;      /* how many bytes we really wrote */
         r->rax = 0;
         break;
+    }
     case LXS_sendto_: {                     /* (fd, buf, len, flags, dest_addr, addrlen) */
         long slen = (long)r->rdx;
         if (slen < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
@@ -4339,6 +4405,15 @@ void linux_syscall_dispatch(struct registers *r) {
                 (void)ty;
                 app_fd_print((int)a1);
                 kprintf("\n");
+                /* AND WHOSE LOOP IT IS (M2087). The fd's state says the pipe
+                 * is genuinely empty and the poll agrees, so the remaining
+                 * question is entirely about the CALLER: a thread that wants
+                 * to wait on a descriptor and spins on read+clock_gettime
+                 * instead of poll is either retrying something it was told to
+                 * retry, or waiting for a wakeup nobody is going to send. One
+                 * backtrace names the library and the offset, which is the
+                 * difference between "something spins" and knowing what. */
+                if (spin.n == 1000) lx_user_backtrace(r);
             }
         } else { spin.tid = tid_s; spin.nr = nr_s; spin.fd = a1; spin.n = 1; }
     }

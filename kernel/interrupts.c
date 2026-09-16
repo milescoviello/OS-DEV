@@ -355,7 +355,15 @@ void isr_dispatch(struct registers *r) {
                      * terminate path only, so a caught fault left no history
                      * at all -- the one case where the program's own message
                      * is written by someone else's crash handler. */
-                    if (lx_syscalls_made()) lx_trace_dump_fault();
+                    if (lx_syscalls_made()) {
+                        lx_trace_dump_fault();
+                        /* ...and the address's own history (M2088). Both fault
+                         * paths need it, and adding it to one of them is how a
+                         * diagnostic ends up missing from exactly the case
+                         * that fires: MOZ_CRASH writes to null and is CAUGHT,
+                         * so the terminate path never sees a Firefox abort. */
+                        if (r->int_no == 14) lx_trace_dump_addr("this caught fault", (unsigned long)cr2);
+                    }
                 }
                 return;
             }
@@ -443,7 +451,17 @@ void isr_dispatch(struct registers *r) {
             /* The last few syscalls, not the last 256: on a fault the tail is
              * what matters, and the full ring is hundreds of console-locked
              * lines. abort() still dumps the whole thing. */
-            if (lx_syscalls_made()) { lx_trace_dump_fault(); lx_user_backtrace(r); }
+            if (lx_syscalls_made()) {
+                lx_trace_dump_fault();
+                /* ...AND WHAT DECIDED THE FAULTING PAGE'S FATE (M2088). For a
+                 * memory fault the thread's own recent history is usually
+                 * three layers above the cause; the call that matters is the
+                 * mmap or munmap that made this address what it is, and that
+                 * can be thousands of syscalls back. Only for vector 14 --
+                 * there is no faulting address to trace for anything else. */
+                if (r->int_no == 14) lx_trace_dump_addr("this fault", (unsigned long)cr2);
+                lx_user_backtrace(r);
+            }
             app_fault_current(r);  /* dump a core, mark the app exited + task_exit(); does not return */
         }
 

@@ -812,6 +812,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the readable-byte-count probe...\n");
         {   int nrrc = app_run_linux_sync("/disk2/lxnread", 0, 0, 120000);
             kprintf("[lxabi] LXNREAD exit -> %d\n", nrrc); }
+        /* getsockopt answered a confident ZERO to every option ever asked, so
+         * Firefox's IPC channel was told its send buffer was nought bytes and
+         * aborted at ipc_channel_posix.cc:128. (M2088) */
+        kprintf("[lxabi] launching the socket-option probe...\n");
+        {   int sorc = app_run_linux_sync("/disk2/lxsockopt", 0, 0, 120000);
+            kprintf("[lxabi] LXSOCKOPT exit -> %d\n", sorc); }
         /* ...and whether a COW break loses a write when several threads take
          * one at the same moment, which is what fork() in a threaded process
          * makes happen. (M2076) */
