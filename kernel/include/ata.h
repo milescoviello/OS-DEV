@@ -96,3 +96,11 @@ void ata_dma_selftest(void);
  * ceiling is present, write+read-back a sector past the 2^28 boundary to prove
  * the LBA48 path. A clean no-op with no such disk (the default). */
 void ata_lba48_selftest(void);
+
+/* WHAT THE DISK ACTUALLY COST (M2091): commands, sectors, cache hits, and the
+ * cycles spent inside the driver -- transfers and hits counted apart, because
+ * a cache that is working shows up as the second number growing while the
+ * first does not. Measured before any block-cache work, so the claim that the
+ * disk is or is not the bottleneck is a reading rather than an opinion. */
+void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
+                  uint64_t *cyc_xfer, uint64_t *cyc_hit);

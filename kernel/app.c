@@ -3094,9 +3094,17 @@ void app_describe_fault_addr(void) {
     for (int i = 0; i < a->nvma; i++) {
         if (!a->vma[i].len) continue;
         if (page < a->vma[i].start || page >= a->vma[i].start + a->vma[i].len) continue;
-        kprintf("[fault]   inside vma[%d] %lx-%lx prot=%d%s%s\n", i, a->vma[i].start,
-                a->vma[i].start + a->vma[i].len, a->vma[i].prot,
-                a->vma[i].file_backed ? " file" : "", a->vma[i].shared ? " shared" : "");
+        /* NAME THE FILE (M2091). "inside a file-backed vma with prot=1" is one
+         * fact short of a diagnosis: a read-only mapping of libxul's .rodata
+         * is correct and a read-only mapping of something the program asked to
+         * write is a bug in us, and the only thing that tells them apart is
+         * WHICH file. Firefox faulted writing into a prot=1 file mapping three
+         * runs in a row and this line could not say what it was. */
+        kprintf("[fault]   inside vma[%d] %lx-%lx prot=%d%s%s '%s' +%lx (%lu file bytes valid)\n",
+                i, a->vma[i].start, a->vma[i].start + a->vma[i].len, a->vma[i].prot,
+                a->vma[i].file_backed ? " file" : "", a->vma[i].shared ? " shared" : "",
+                a->vma[i].file_backed ? vma_path(a, i) : "anon",
+                a->vma[i].foff, a->vma[i].fvalid);
         found = 1; break;
     }
     vma_unlock(a, fl);
@@ -10536,6 +10544,31 @@ void app_fd_print(int fd) {
     case 14: kprintf("console alias, %d key(s) queued, nonblock=%d", iq_count(a->out_to ? a->out_to : a), nb); break;
     default: kprintf("fd type %d obj %d nonblock=%d cloexec=%d", ty, obj, nb, cx); break;
     }
+}
+
+/* WHAT IS ACTUALLY OPEN IN THIS PROCESS? (M2091)
+ *
+ * The question an EBADF raises, and nothing could answer it. A Firefox content
+ * process starts, does set_robust_list / rt_sigaction / close(4), then
+ * recvmsg(fd 12) = -EBADF and aborts -- and "fd 12 is not open" is only half a
+ * finding. Which descriptors ARE open, and what are they, decides whether the
+ * fork lost one, the dup2 went somewhere else, or the number was never right.
+ *
+ * One line per open descriptor, printed through app_fd_print so each type
+ * describes itself rather than being guessed at from a number. */
+void app_fd_dump(const char *why) {
+    struct app *a = cur(); if (!a) return;
+    int n = 0;
+    kprintf("[fd] pid %d open descriptors (%s):\n", a->pid, why ? why : "");
+    for (int i = 0; i < APP_NFD; i++) {
+        if (!a->fd[i].used) continue;
+        kprintf("[fd]   %d = ", i);
+        app_fd_print(i);
+        kprintf("\n");
+        n++;
+        if (n >= 48) { kprintf("[fd]   ... (stopping at 48)\n"); break; }
+    }
+    if (!n) kprintf("[fd]   NONE -- not one descriptor is open, so 0/1/2 are the console alias\n");
 }
 
 /* pidfd (M1222): a pid-reuse-aware-ish process handle as an fd. It stores the

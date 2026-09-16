@@ -4509,6 +4509,23 @@ void linux_syscall_dispatch(struct registers *r) {
      * TYPE and what the poll ladder thinks of it -- because the interesting
      * case is a descriptor poll calls ready and read calls empty, and that
      * disagreement is invisible from either side alone. */
+    /* AN EBADF IS WORTH ONE FD TABLE DUMP (M2091). "fd 12 is not open" is half
+     * a finding: which descriptors ARE open decides whether a fork lost one, a
+     * dup2 landed elsewhere, or the number was never right. Once per process,
+     * because a program that has lost a descriptor asks about it in a loop. */
+    if ((long)r->rax == -(long)LX_EBADF) {
+        static int dumped_pid[8]; static int ndumped;
+        int pid_e = app_current_pid(), seen_e = 0;
+        for (int i = 0; i < ndumped; i++) if (dumped_pid[i] == pid_e) { seen_e = 1; break; }
+        if (!seen_e && ndumped < 8) {
+            dumped_pid[ndumped++] = pid_e;
+            uint32_t nr_e = g_lxring[ring_slot & (LXRING_N - 1)].seq == ring_slot
+                          ? g_lxring[ring_slot & (LXRING_N - 1)].nr : 0xffffffffu;
+            kprintf("[linuxabi] EBADF from %s(fd %lu) in pid %d tid %d -- so:\n",
+                    lx_syscall_name(nr_e), (unsigned long)a1, pid_e, task_current_id());
+            app_fd_dump("after an EBADF");
+        }
+    }
     if ((long)r->rax == -(long)LX_EAGAIN) {
         static struct { int tid; uint32_t nr; uint64_t fd; unsigned long n; } spin;
         uint32_t nr_s = g_lxring[ring_slot & (LXRING_N - 1)].seq == ring_slot

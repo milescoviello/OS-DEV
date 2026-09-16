@@ -486,7 +486,44 @@ static void journal_guest_test(void) {
             rc, c0, c1, clean, crc, pre_old, rep, r0, r1, idem, ok ? "OK" : "FAIL");
 }
 
+/* THE DENOMINATOR (M2091). Every "the disk is N% of the boot" claim needs one
+ * number that cannot be argued with: the cycles from the kernel's first
+ * instruction to the moment being measured. Same counter the per-subsystem
+ * budgets use, so a share can never exceed 100% without the instrument itself
+ * being wrong -- which is the property that makes it worth printing. */
+static uint64_t g_boot_tsc0;
+static inline uint64_t km_tsc(void) {
+    uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+/* Print every budget against that denominator. Called at the two moments that
+ * matter: when a client has painted (what the user waits for) and when the
+ * desktop takes over (the end of the scrolling wall of text). */
+void kmain_budget(const char *when) {
+    uint64_t total = km_tsc() - g_boot_tsc0;
+    uint64_t cmds = 0, sect = 0, hits = 0, cx = 0, chh = 0;
+    ata_io_stats(&cmds, &sect, &hits, &cx, &chh);
+    uint64_t ch = 0, ln = 0, sc = 0, cg = 0, cs = 0;
+    fbcon_stats(&ch, &ln, &sc, &cg, &cs);
+    uint64_t io = cx + chh, con = cg + cs;
+    uint64_t resid = total > io + con ? total - io - con : 0;
+    kprintf("\n[budget] %s -- %lu Mcycles since the kernel started\n", when, total / 1000000);
+    kprintf("[budget]   disk    %6lu Mcycles (%lu%%)  %lu commands, %lu sectors, %lu cache hits\n",
+            io / 1000000, total ? io * 100 / total : 0, cmds, sect, hits);
+    kprintf("[budget]   console %6lu Mcycles (%lu%%)  %lu lines, %lu full-screen scrolls\n",
+            con / 1000000, total ? con * 100 / total : 0, ln, sc);
+    kprintf("[budget]   %s %6lu Mcycles (%lu%%)  everything else: guest code under TCG,\n",
+            (total && resid * 100 / total > 25) ? "UNATTRIBUTED" : "other       ",
+            resid / 1000000, total ? resid * 100 / total : 0);
+    kprintf("[budget]                                  page faults, the scheduler, idle\n");
+    if (total && resid * 100 / total > 25)
+        kprintf("[budget]   ^ over 25%% is UNATTRIBUTED on purpose: this budget measures two\n"
+                "[budget]     subsystems, not the whole machine, and a residual that large means\n"
+                "[budget]     the answer is NOT in either of them.\n");
+}
+
 void kmain(uint64_t mb_info, uint64_t magic) {
+    g_boot_tsc0 = km_tsc();
     console_init();
 
     /* GRUB `multiboot2` hands a tag list, not the Multiboot1 struct; convert it
@@ -1291,6 +1328,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                 if (pw >= 640 && ph >= 480) {
                                     kprintf("[ff] it has PAINTED: a %ux%u window is ready -- "
                                             "handing over to the desktop now rather than at t=360s\n", pw, ph);
+                                    kmain_budget("Firefox has painted its first frame");
                                     break;
                                 }
                             }
@@ -1983,6 +2021,17 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * Opt-in for the same reason as the block above: boot-to-desktop under a
      * second is a number this project keeps deliberately low. */
     if (g_termtest) app_term_selftest();
+
+    /* WHAT THE BOOT LOG COST TO DRAW (M2091). Printed here, at the end of the
+     * scrolling wall of text and before the desktop replaces it, because this
+     * is the moment whose length the user actually experiences: "took like
+     * forever for the scrolling wall of text to go away".
+     *
+     * A per-pixel glyph write and a 4.9 MB full-screen memmove per line are
+     * both MMIO under TCG, where a store is a device access rather than a
+     * store. Whether that is the boot's cost or a rounding error is a
+     * measurement, not a hunch -- and this is the measurement. */
+    kmain_budget("the desktop is taking over");
 
     kprintf("[main] launching the desktop environment...\n");
     speaker_chime();              /* a little startup arpeggio */

@@ -330,11 +330,48 @@ static int ata_read_drive_impl(int drive, uint32_t lba, uint32_t count, void *bu
  * and the journal's flush hook). */
 void ata_cache_flush(void) { bcache_flush(); }
 
+/* WHAT THE DISK ACTUALLY COSTS (M2091).
+ *
+ * The question the whole optimisation phase turns on, and nothing could answer
+ * it: is a two-and-a-half-minute Firefox startup disk-bound, or is it TCG
+ * executing Firefox's own code? Those need completely different work, and
+ * guessing which costs a week.
+ *
+ * So: count the commands, the sectors, and the CYCLES SPENT INSIDE THE DRIVER,
+ * separately for cache hits and real transfers. Cycles rather than
+ * milliseconds because a single PIO sector is far below the 10 ms PIT tick,
+ * and rdtsc is the only clock here with the resolution to see one.
+ *
+ * The number that makes this unfalsifiable is the ratio printed at the end:
+ * driver cycles against the whole boot's cycles. If the disk is 5% of the
+ * boot, no amount of block-cache work will make the boot feel different, and
+ * that is worth knowing BEFORE writing any of it. */
+static uint64_t io_cmds, io_sectors, io_hits, io_cyc_xfer, io_cyc_hit;
+static inline uint64_t ata_tsc(void) {
+    uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
+                  uint64_t *cyc_xfer, uint64_t *cyc_hit) {
+    if (cmds)     *cmds     = io_cmds;
+    if (sectors)  *sectors  = io_sectors;
+    if (hits)     *hits     = io_hits;
+    if (cyc_xfer) *cyc_xfer = io_cyc_xfer;
+    if (cyc_hit)  *cyc_hit  = io_cyc_hit;
+}
+
 int ata_read_drive(int drive, uint32_t lba, uint32_t count, void *buf) {
     ata_lock_take();
-    if (count == 1 && bcache_lookup(BCACHE_OWNER_ATA(drive), lba, buf)) { ata_lock_give(); return 0; }
+    uint64_t t0 = ata_tsc();
+    if (count == 1 && bcache_lookup(BCACHE_OWNER_ATA(drive), lba, buf)) {
+        io_cyc_hit += ata_tsc() - t0; io_hits++;
+        ata_lock_give(); return 0;
+    }
     int r = ata_read_drive_impl(drive, lba, count, buf);
     if (r >= 0 && count == 1) bcache_install(BCACHE_OWNER_ATA(drive), lba, buf);
+    io_cyc_xfer += ata_tsc() - t0;
+    io_cmds++;
+    io_sectors += count;
     ata_lock_give();
     return r;
 }
