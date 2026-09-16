@@ -145,6 +145,22 @@ require "concurrent CMOS reads from 2 tasks"  "RTC CMOS index/data pair is atomi
 require "still owe a flush after the timeout"  "a TLB shootdown that times out KEEPS the flush obligation (M2065)"
 require "shootdown nobody answered reports failure"  "...and reports failure rather than success, so a caller does not free a frame another core still maps (M2065)"
 require "TLBSELFTEST PASSED"                   "the TLB shootdown self-test (M2065)"
+# M2072: app_reap frees the address space, every memfd mapping, the main task
+# and every thread -- with no serialisation, while being called from four
+# places including the window manager's loop AND a parent inside wait4. Two
+# cores tore the same process down and kfree was handed the heap's own poison:
+#   [0] kfree+0x40 [1] task_free+0x2c [2] app_reap+0x602 [3] app_reap_children_of
+# Claude Code spawns git children and wait4()s them while the WM sweeps the
+# same slots, so it hit this constantly. Remove the one-line atomic claim and
+# the first two checks below fail.
+require "a second reaper is turned away"       "only ONE reaper may tear a process down (M2072)"
+require "the slot is still allocated"          "...and a turned-away reaper changes nothing (M2072)"
+require "REAPSELFTEST PASSED"                  "the one-reaper self-test (M2072)"
+if grep -aq "^\[reaptest\] FAIL" "$LOG"; then
+    echo "  FAIL: the one-reaper self-test reported a failing check"
+    grep -a "^\[reaptest\] FAIL" "$LOG" | head -3 | sed 's/^/           /'
+    fail=1
+fi
 if grep -aq "^\[tlbtest\] FAIL" "$LOG"; then
     echo "  FAIL: the TLB shootdown self-test reported a failing check"
     grep -a "^\[tlbtest\] FAIL" "$LOG" | head -3 | sed 's/^/           /'

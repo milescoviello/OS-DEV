@@ -395,6 +395,7 @@ struct app {
 #define APP_NUNVEIL 8
     struct { char path[48]; uint8_t perms; } uv[APP_NUNVEIL];  /* unveil() allowed path prefixes */
     int      nuv;                        /* number of unveil entries */
+    volatile int reaping;                /* one reaper only: see app_reap (M2072) */
 #define LX_SYSHIST_N 460                 /* Linux x86-64 numbers we could plausibly see; 460 covers every one staged here */
     unsigned int syshist[LX_SYSHIST_N];      /* per-syscall-number call counts (M2066) */
     unsigned int syshist_seen[LX_SYSHIST_N]; /* ...as of the previous sample, so a dump shows a DELTA */
@@ -2046,6 +2047,35 @@ int app_reap(app_t *a) {
      * process stayed un-reaped and un-zombified for ever and its parent hung in
      * wait4(). See task_off_stack for why STOPPED needs its own proof. */
     if (a->used && a->exited && (!a->task || app_task_reapable(a->task))) {
+        /* ONE REAPER, ATOMICALLY (M2072).
+         *
+         * This function frees the address space, every memfd mapping, the
+         * graphics canvas, the alternate screen, the main task and every
+         * thread -- and it had NO serialisation of any kind while being called
+         * from four independent places: the window manager's loop, a parent
+         * inside wait4 (app_reap_children_of), app_run_linux_sync's own loop,
+         * and desktop.c's windowless sweep. Two cores entering together both
+         * see a child that is not yet a zombie, both run the whole teardown,
+         * and both free the same task_t.
+         *
+         * The kernel said so exactly:
+         *
+         *   *** KERNEL PANIC: General Protection Fault
+         *     rbx=dededededededede  rdi=dededededededede
+         *     [0] kfree+0x40  [1] task_free+0x2c  [2] app_reap+0x602
+         *     [3] app_reap_children_of+0x5e  [4] app_wait4+0x38
+         *
+         * -- kfree handed the heap's own poison, because the second reaper
+         * read a pointer out of a struct the first had already freed. Claude
+         * Code spawns `git` children and wait4()s them while the window
+         * manager is sweeping the same slots, so it hit this constantly: the
+         * TUI never appeared because the MACHINE died.
+         *
+         * Both exits from the body below are terminal -- the slot becomes a
+         * zombie or is freed outright, and either makes a later reap a no-op --
+         * so the claim is never released. A loser returns 0, "not reaped yet",
+         * and its caller simply looks again. */
+        if (__atomic_exchange_n(&a->reaping, 1, __ATOMIC_ACQ_REL)) return 0;
         {
             uint64_t uf = irq_save();      /* pairs with app_uffd_read/app_fault_handle's own lock (M1612) */
             if (g_uffd.active && g_uffd.owner == a) {     /* uffd owner gone: tear down, free any blocked monitor (M1134) */
@@ -2143,6 +2173,57 @@ int app_reap(app_t *a) {
         a->used = 0;
     }
     return !a->used;
+}
+
+/* ONE-REAPER SELF-TEST (M2072).
+ *
+ * The bug is a RACE -- two cores inside app_reap for the same process -- and a
+ * race cannot be reproduced by calling the function twice in a row: the first
+ * call finishes and leaves a terminal state the second correctly ignores. What
+ * CAN be tested directly is the invariant the fix installs: a reaper that
+ * arrives while another is mid-teardown must be turned away and must change
+ * nothing.
+ *
+ * So set the claim by hand -- exactly the state another core leaves while it is
+ * inside the body -- and assert the second entry does nothing. Without the
+ * claim, app_reap runs the whole teardown and frees the slot, which is the
+ * double free the kernel died on.
+ *
+ * Uses a REAL apps[] slot with no task, no threads, no VMAs, and the caller's
+ * own CR3 (so the msync context switch is a no-op and nothing is destroyed). */
+int app_reap_selftest(void) {
+    int fails = 0, slot = -1;
+    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { slot = i; break; }
+    if (slot < 0) { kprintf("[reaptest] no free app slot (skipped)\n"); return 0; }
+    struct app *a = &apps[slot];
+    memset(a, 0, sizeof *a);
+    a->used = 1; a->exited = 1; a->task = 0; a->parent = 0;
+    a->pid = 0x7000 + slot;                     /* not a real pid: nothing else refers to it */
+    a->nvma = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(a->cr3));
+    a->cr3_borrowed = 1;                        /* never destroy the caller's own address space */
+
+    /* 1. A second reaper, arriving while the first is inside the body, must be
+     *    turned away and must not touch the slot. */
+    a->reaping = 1;
+    int rc = app_reap((app_t *)a);
+    if (rc != 0)   { kprintf("[reaptest] FAIL a second reaper reported success (%d)\n", rc); fails++; }
+    else             kprintf("[reaptest] ok   a second reaper is turned away\n");
+    if (!a->used)  { kprintf("[reaptest] FAIL a second reaper FREED the slot -- this is the double free\n"); fails++; }
+    else             kprintf("[reaptest] ok   ...and changed nothing: the slot is still allocated\n");
+
+    /* 2. Once the claim is clear, a reaper does its job. */
+    a->reaping = 0;
+    rc = app_reap((app_t *)a);
+    if (!rc)       { kprintf("[reaptest] FAIL an unclaimed reap did not complete\n"); fails++; }
+    else             kprintf("[reaptest] ok   an unclaimed reap completes normally\n");
+    if (a->used)   { kprintf("[reaptest] FAIL the slot was not released\n"); fails++; }
+    else             kprintf("[reaptest] ok   ...and releases the slot\n");
+
+    a->used = 0;
+    if (fails) kprintf("[reaptest] REAPSELFTEST FAILED (%d)\n", fails);
+    else       kprintf("[reaptest] REAPSELFTEST PASSED (4 checks)\n");
+    return fails;
 }
 
 /* Ask a running app to close (e.g. the user clicked the window's X or pressed

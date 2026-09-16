@@ -24,6 +24,7 @@ int         app_last_spawn_pid(void);
 int         app_state_of(int pid);
 void        app_dump_threads(int pid);                                /* where every thread of a pid is parked (M1996) */                                     /* task state of a live pid, -1 if gone (M1996) */                                  /* pid of the last successful spawn (M1988) */
 void        app_count_lx_syscall(unsigned long nr);                    /* one more Linux syscall by the caller, counted BY NUMBER (M2004/M2066) */
+int         app_reap_selftest(void);                                   /* -append selftest: only ONE reaper may tear a process down (M2072) */
 void        app_lx_syshist_dump(app_t *a, int want);                   /* the top `want` syscall numbers since the last sample -- what a stuck program is actually doing (M2066) */
 void        app_stall_watchdog(void);                                  /* WM: report any Linux process that has stopped making syscalls (M2004) */
 int         app_open_console_alias(void);                              /* a new fd for the controlling terminal: open("/dev/tty") (M2004) */

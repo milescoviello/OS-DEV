@@ -1849,6 +1849,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         pci_selftest();     /* M1914: PCI config address/data pair is indivisible */
         console_selftest(); /* M1915: concurrent kprintf lines are never spliced */
         vmm_tlb_selftest(); /* M2065: a shootdown that times out must KEEP the flush obligation */
+        app_reap_selftest();/* M2072: two cores must not tear the same process down */
     }
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).
