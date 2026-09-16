@@ -7767,8 +7767,30 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned read (M1193/M1196) */
         long off = a->fd[fd].off;
         if (off < 0) return -1;
+        /* A DIRECTORY IS NOT AN UNREADABLE FILE (M2071). ext2_pread refuses a
+         * directory with a bare -1, which the Linux layer turns into EBADF --
+         * the least informative answer available for a descriptor the kernel
+         * itself reports as open and regular. Linux says EISDIR, and programs
+         * depend on it: Claude Code opens `/src/.git` and reads it to learn
+         * whether it is a real repository (a directory -> EISDIR) or a
+         * worktree pointer (a file holding `gitdir: ...`). Told EBADF it
+         * learns neither. */
+        { struct statx st;
+          if (vfs_stat(a->fd[fd].path, &st) == 0 && (st.stx_mode & S_IFMT) == S_IFDIR)
+              return APP_FD_EISDIR; }
         long n = vfs_pread(a->fd[fd].path, buf, max, (uint64_t)off);   /* native positioned read (tmpfs/ext2); uncapped */
         if (n > 0) a->fd[fd].off = off + n;
+        /* A READ OF AN OPEN FILE THAT FAILS SAYS WHICH FILE (M2071). The Linux
+         * ABI turns a bare -1 into EBADF, and "bad file descriptor" on a
+         * descriptor the kernel itself reports as open and regular is the most
+         * misleading answer available -- it sends you to the fd table, which
+         * is fine. The path and offset are the whole question. */
+        if (n < 0) {
+            static int told;
+            if (++told <= 12)
+                kprintf("[app] read(fd %d) FAILED on an open regular file: \"%s\" off=%ld max=%lu\n",
+                        fd, a->fd[fd].path, off, max);
+        }
         return n;                                             /* 0 => EOF (offset at/after end) */
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 3) {   /* memfd: positioned read (M1212) */

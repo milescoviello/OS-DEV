@@ -416,6 +416,7 @@ static int g_lx_statfail;     /* rate-limit the failed-path report (M1992) */   
 static long lx_fd_err(long rc) {
     if (rc == APP_FD_EAGAIN) return -(long)LX_EAGAIN;
     if (rc == APP_FD_EPIPE)  return -(long)LX_EPIPE;
+    if (rc == APP_FD_EISDIR) return -(long)LX_EISDIR;   /* M2071 */
     return -(long)LX_EBADF;
 }
 static long g_epoll_lastk = -1;   /* what the last epoll_wait answered, for the spin detector (M2016) */
@@ -3953,6 +3954,12 @@ void linux_syscall_dispatch(struct registers *r) {
     { extern int g_lx_syshist;
       if (g_lx_syshist) {
         long rv = (long)r->rax;
+        /* `r->rax` is the RETURN VALUE by now -- the number lives in the ring
+         * entry we just patched. Reading rax for the name printed "?" for
+         * every line, which is the instrument making the same mistake the code
+         * it watches keeps making. (M2070) */
+        unsigned long nr_ = g_lxring[ring_slot & (LXRING_N - 1)].seq == ring_slot
+                          ? g_lxring[ring_slot & (LXRING_N - 1)].nr : 0;
         if (rv < 0 && rv > -4096) {
             int e = (int)-rv;
             if (e != LX_ENOENT && e != LX_EAGAIN && e != LX_EINTR) {
@@ -3960,7 +3967,14 @@ void linux_syscall_dispatch(struct registers *r) {
                 if (++shown <= 200)
                     kprintf("[syserr] pid %d t%d %s(%lx, %lx, %lx) = -%d\n",
                             app_current_pid(), task_current_id(),
-                            lx_syscall_name(r->rax), r->rdi, r->rsi, r->rdx, e);
+                            lx_syscall_name(nr_), r->rdi, r->rsi, r->rdx, e);
+                /* EBADF is the one errno where the ANSWER is about a
+                 * descriptor, so say what that descriptor actually is: "not
+                 * open" and "open, but this call does not handle its type"
+                 * are completely different bugs and read identically as -9. */
+                if (e == LX_EBADF && (long)r->rdi >= 0 && (long)r->rdi < 4096)
+                    kprintf("[syserr]   ...fd %ld is type %d (open=%d)\n",
+                            (long)r->rdi, app_fd_type((int)r->rdi), app_fd_is_open((int)r->rdi));
             }
         }
       }

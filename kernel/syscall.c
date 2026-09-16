@@ -8,6 +8,7 @@
  */
 #define __KERNEL__
 #include "syscall.h"
+#include "lxargsplit.h"   /* split a shell arg string into argv, sentinel and all (M2071) */
 #include "interrupts.h"
 #include "console.h"
 #include "app.h"
@@ -772,25 +773,22 @@ void syscall_dispatch(struct registers *r) {
                                             * user types `linux /usr/bin/claude --version` in OS-DEV's own
                                             * shell and the ABI does the rest.
                                             *
-                                            * argstr is split on spaces into argv[1..]; quoting belongs to
-                                            * the shell and is not reinvented here. */
+                                            * argstr is split on spaces into argv[1..] by
+                                            * lx_split_args, which also strips the shell's
+                                            * quoting sentinel -- see lxargsplit.h for why
+                                            * that cannot be left to the shell (M2071). */
         if (!ustr(r->rdi)) { r->rax = (uint64_t)-1; break; }
         const char *lp = (const char *)r->rdi;
-        static char abuf[512];
-        static char *av[16];
+        /* NOT static (M2071). These were `static char abuf[512]` and
+         * `static char *av[16]` -- a shared buffer in a syscall, which is the
+         * bug class M2001 already cost a day to: two processes launching a
+         * Linux program at once on two cores overwrite each other's argv.
+         * 640 bytes on a 16 KB kernel stack is the obvious price. */
+        char abuf[512];
+        char *av[16];
         int nav = 0;
-        if (r->rsi && ustr(r->rsi)) {
-            const char *src = (const char *)r->rsi;
-            int k = 0;
-            while (*src && k < (int)sizeof abuf - 1) {
-                while (*src == ' ') src++;
-                if (!*src) break;
-                if (nav >= 16) break;
-                av[nav++] = &abuf[k];
-                while (*src && *src != ' ' && k < (int)sizeof abuf - 1) abuf[k++] = *src++;
-                abuf[k++] = 0;
-            }
-        }
+        if (r->rsi && ustr(r->rsi))
+            nav = lx_split_args((const char *)r->rsi, abuf, (int)sizeof abuf, av, 16);
         /* The path is given in the LINUX process's world (/usr/bin/claude);
          * the loader wants it in ours, under the ext2 mount. */
         static char full[VFS_PATH_MAX];

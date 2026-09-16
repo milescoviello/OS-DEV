@@ -259,6 +259,14 @@ int  app_pipe(int *out);               /* pipe(): out[0]=read fd, out[1]=write f
  * a bad fd: "nothing right now" and "the peer is gone". (M1965) */
 #define APP_FD_EAGAIN (-11)   /* would block; the value is Linux's EAGAIN */
 #define APP_FD_EPIPE  (-32)   /* peer closed;  the value is Linux's EPIPE  */
+/* READ ON A DIRECTORY IS EISDIR, NOT EBADF (M2071). The value is Linux's
+ * EISDIR, so the ABI layer needs no translation table -- and the distinction
+ * is load-bearing: opening `.git` and reading it is how every git client asks
+ * "is this a normal repository or a worktree pointer file?". EISDIR means
+ * directory, success means it is a file holding `gitdir: ...`. Answered EBADF,
+ * the caller learns neither, and cannot tell a directory from a broken
+ * descriptor. */
+#define APP_FD_EISDIR (-21)   /* the fd names a directory; the value is Linux's EISDIR */
 long app_fd_read(int fd, void *buf, unsigned long max);        /* read a pipe fd; bytes/0 EOF/-1 (M1187) */
 long app_fd_write(int fd, const void *buf, unsigned long len); /* write a pipe fd; bytes/-1 EPIPE (M1187) */
 int  app_termios_get(uint32_t *ifl, uint32_t *ofl, uint32_t *cfl, uint32_t *lfl, uint8_t *cc);  /* the terminal settings this app asked for (M2014) */
