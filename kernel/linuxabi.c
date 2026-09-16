@@ -3942,7 +3942,42 @@ void linux_syscall_dispatch(struct registers *r) {
          * seek+read, precisely so it does not disturb the fd's cursor -- so
          * this must NOT go through app_fd_read. */
         const char *fp = app_fd_path((int)a1);
-        if (!fp) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        if (!fp) {
+            /* ESPIPE, NOT EBADF, FOR A PIPE (M2077). An fd with no path is
+             * usually not a closed fd -- it is a pipe, a socket or a terminal,
+             * i.e. something that cannot seek. EBADF says "that descriptor
+             * does not exist", which is a different fact and one the caller
+             * cannot recover from: Bun.spawnSync pread()s the child's output
+             * pipe, expects ESPIPE, and falls back to read(). It got EBADF and
+             * threw instead --
+             *
+             *   GC2: spawn threw Error: EBADF: bad file descriptor, pread
+             *
+             * -- so every subprocess Claude Code runs through spawnSync failed
+             * for a reason that had nothing to do with the subprocess. Third
+             * time in this campaign that an error naming the wrong thing sent
+             * the diagnosis somewhere else. */
+            if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            /* A MEMFD IS SEEKABLE AND HAS NO PATH (M2077). Bun.spawnSync
+             * collects a child's output in one and pread()s it back, so
+             * answering ESPIPE here failed every subprocess Claude Code runs
+             * through spawnSync -- which is how it runs a Bash tool. pread
+             * must not move the cursor, so save it, seek, read, restore;
+             * pread(2)'s contract is about the fd's offset, not about being a
+             * single operation against other threads sharing that fd. */
+            if (app_fd_type((int)a1) == 3) {
+                long save = app_lseek((int)a1, 0, 1 /*SEEK_CUR*/);
+                if (app_lseek((int)a1, (long)off, 0 /*SEEK_SET*/) < 0) {
+                    r->rax = (uint64_t)-(long)LX_EINVAL; break;
+                }
+                long got2 = app_fd_read((int)a1, (void *)r->rsi, (unsigned long)n);
+                if (save >= 0) app_lseek((int)a1, save, 0);
+                r->rax = (got2 < 0) ? (uint64_t)lx_fd_err(got2) : (uint64_t)got2;
+                break;
+            }
+            r->rax = (uint64_t)-(long)LX_ESPIPE;   /* a pipe, a socket, a terminal */
+            break;
+        }
         long got = vfs_pread(fp, (void *)r->rsi, (unsigned long)n, off);
         r->rax = (got < 0) ? (uint64_t)-(long)LX_EIO : (uint64_t)got;
         break;

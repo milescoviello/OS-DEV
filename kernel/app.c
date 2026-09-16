@@ -5684,7 +5684,51 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
             if (!nf) return 0;                      /* OOM -> let it fault/die */
             uint8_t *s = (uint8_t *)hhdm(old), *d = (uint8_t *)hhdm(nf);
             for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
-            vmm_set_raw(fpage, nf | PTE_PRESENT | (pte & (PTE_USER | PTE_NX)) | PTE_WRITABLE);
+            /* ONE BREAK PER PAGE (M2077).
+             *
+             * M1995 gave the demand-zero path a locked re-check for exactly
+             * this reason and the COW path kept none, so two threads of one
+             * process on two cores could both break the SAME page:
+             *
+             *   both read the PTE as present+COW, both allocate, both copy,
+             *   A installs its frame and its instruction writes a word, then
+             *   B installs ITS frame over A's mapping -- and A's word is gone.
+             *   Worse, both then pmm_free_frame(old), so the shared frame's
+             *   count is decremented twice for one reference and it is handed
+             *   to the next allocation on any core while a FORKED CHILD still
+             *   maps it.
+             *
+             * The shape matched what Claude Code did: nothing on -smp 1, and
+             * on -smp 4 a different garbage pointer every run -- a JSValue of
+             * 0x300000000, a non-canonical address out of a call, a null field
+             * in a JIT worker, and once a cell pointer that was ASCII text.
+             * Only a process that forks has COW pages at all, which is why a
+             * pure allocation workload never reproduced it and the same
+             * workload with one Bun.spawnSync per round did.
+             *
+             * The lock covers the re-check and the install and nothing else.
+             * It must NOT cover app_tlb_sync below: that sends IPIs and waits
+             * for acknowledgements, and a core spinning on this lock with
+             * interrupts off cannot answer one. That is the deadlock the
+             * earlier whole-operation VMA lock died of. */
+            int won;
+            {
+                uint64_t cfl = vma_alloc_lock(a);
+                uint64_t now = vmm_pte_raw(fpage);
+                won = (now & PTE_PRESENT) && (now & PTE_COW) && ((now & PTE_ADDR_MASK) == old);
+                if (won)
+                    vmm_set_raw(fpage, nf | PTE_PRESENT | (now & (PTE_USER | PTE_NX)) | PTE_WRITABLE);
+                vma_alloc_unlock(a, cfl);
+            }
+            if (!won) {
+                /* Somebody else broke it. Their page is the real one; drop ours
+                 * and let the instruction re-execute against theirs. Crucially
+                 * we do NOT free `old`: our reference to it was consumed by
+                 * the winner's free, and freeing it again is the corruption. */
+                pmm_free_frame(nf);
+                a->minflt++;
+                return 1;
+            }
             /* SHOOT THE OTHER CORES DOWN BEFORE DROPPING THE FRAME (M2034).
              *
              * vmm_set_raw invlpg's THIS core only. A sibling thread -- same

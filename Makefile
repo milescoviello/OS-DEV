@@ -290,6 +290,20 @@ $(LXROOT)/lxcow: tools/lx/lxcow.c
 	$(CC) -static-pie -O2 -o $@ $< -lpthread
 	@echo "  HOSTCC  $@ (concurrent COW breaks after fork must not lose writes)"
 
+# The JavaScriptCore reproducers. Claude Code is a Bun standalone executable, so
+# the runtime that crashes in it is JSC; a 230 MB TUI driven through a terminal
+# is a poor reproducer for heap corruption and a thirty-line script that WALKS
+# AND VERIFIES a live object graph is a good one. Staged as data, not built.
+$(LXROOT)/gcstress.js: tools/lx/gcstress.js
+	@mkdir -p $(LXROOT)
+	@cp -f $< $@
+	@echo "  STAGE   $@ (JSC heap integrity: a verified object graph across 40 collections)"
+
+$(LXROOT)/gcstress2.js: tools/lx/gcstress2.js
+	@mkdir -p $(LXROOT)
+	@cp -f $< $@
+	@echo "  STAGE   $@ (...the same, plus fork+exec of a real subprocess each round)"
+
 $(LXROOT)/lxlongname: tools/lx/lxlongname.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -370,7 +384,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxcow $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
