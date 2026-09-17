@@ -852,9 +852,19 @@ static void syscall_dispatch_body(struct registers *r) {
     case SYS_inotify_rm_watch:             /* (fd, wd) -> unregister a watch; 0/-1 (M1568) */
         r->rax = (uint64_t)(int64_t)app_inotify_rm((int)r->rdi, (int)r->rsi);
         break;
-    case SYS_socket:                       /* (domain, type) -> AF_INET datagram socket fd (M1267) */
-        r->rax = (uint64_t)(int64_t)app_socket((int)r->rdi, (int)r->rsi);
+    case SYS_socket: {                     /* (domain, type) -> AF_INET datagram socket fd (M1267) */
+        /* THE NATIVE ABI PROMISED -1 (M2133). app_socket now distinguishes its
+         * five failure causes so the Linux layer can map each to the right
+         * errno (M2128), and those extra codes must not leak out here: this
+         * side is documented "fd, or -1", and a native program written against
+         * that would read -3 as a valid descriptor if it tested `== -1`.
+         * Splitting an errno for one caller must not change the contract of
+         * another -- which is the whole reason the two syscall worlds are
+         * separate. */
+        int sfd = app_socket((int)r->rdi, (int)r->rsi);
+        r->rax = (uint64_t)(int64_t)(sfd < 0 ? -1 : sfd);
         break;
+    }
     case SYS_sock_bind:                    /* (fd, port) -> bind a datagram socket (M1267) */
         r->rax = (uint64_t)(int64_t)app_sock_bind((int)r->rdi, (int)r->rsi);
         break;
