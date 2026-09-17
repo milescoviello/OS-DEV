@@ -42,19 +42,39 @@
  * and timed out with every one of its checks passing. A test that is killed
  * for being slow reports a failure it did not find. 40 rounds is still 9600
  * checks across 120 threads, with two deschedules each. */
-#define ROUNDS 40
+#define ROUNDS 100000   /* an upper bound only: BUDGET_MS is what actually stops it (M2100) */
 
 static __thread uint64_t mine;
 static __thread char     scratch[192];   /* guarantees a canary read in this frame */
 static volatile long checks, wrong;
 static volatile int  started;
+/* SELF-PACING, SO IT CAN NEVER BE KILLED FOR BEING SLOW (M2100).
+ *
+ * The property under test is thread COUNT and migration: does a thread's own
+ * TLS survive being descheduled among 119 others. The ROUND count does not
+ * establish it -- and twice now a fixed round count has had this probe killed
+ * by a timeout with every one of its checks passing, once at 150 rounds and
+ * again at 40 under `make check`'s six-way parallel TCG at -cpu max. A test
+ * killed for being slow reports a failure it did not find.
+ *
+ * So: run rounds until the budget is spent, and report how many checks that
+ * bought. The assertion is "N checks, 0 wrong, at least 64 threads" with N
+ * measured rather than assumed -- which is a stronger claim than a fixed N
+ * that only holds on an idle host. */
+#define BUDGET_MS 20000
+static volatile int g_stop;
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 static void *body(void *arg) {
     long id = (long)arg;
     uint64_t tag = 0xA5A5000000000000ull | (uint64_t)id;
     mine = tag;
     __atomic_add_fetch(&started, 1, __ATOMIC_RELAXED);
-    for (int r = 0; r < ROUNDS; r++) {
+    for (int r = 0; r < ROUNDS && !g_stop; r++) {
         /* A libc call with a local buffer: the canary read that faults. */
         int n = snprintf(scratch, sizeof scratch, "thread %ld round %d tag %llx",
                          id, r, (unsigned long long)mine);
@@ -82,6 +102,18 @@ int main(void) {
     }
     printf("LXTLSMANY: %d of %d threads created\n", made, NT);
     fflush(stdout);
+    /* Stop the workers once the budget is spent; they check g_stop each round,
+     * so they wind down at a round boundary with their invariant intact. */
+    {   long t0 = now_ms();
+        while (now_ms() - t0 < BUDGET_MS) {
+            if (__atomic_load_n(&started, __ATOMIC_RELAXED) < made) { usleep(2000); continue; }
+            /* Every thread is up; give them the rest of the budget. */
+            long spent = now_ms() - t0;
+            if (BUDGET_MS > spent) usleep((unsigned)((BUDGET_MS - spent) * 1000));
+            break;
+        }
+        g_stop = 1;
+    }
     for (int i = 0; i < made; i++) pthread_join(th[i], 0);
 
     /* The main thread's own TLS must still be its own after all that. */
@@ -90,13 +122,17 @@ int main(void) {
     snprintf(b, sizeof b, "main %llx", (unsigned long long)mine);
     int mainok = (mine == 0xDEADBEEFCAFEull);
 
-    printf("LXTLSMANY: %ld checks across %d threads, %ld wrong\n", checks, made, wrong);
+    printf("LXTLSMANY: %ld checks across %d threads, %ld wrong (%d ms budget)\n",
+           checks, made, wrong, BUDGET_MS);
+    if (checks < 2000)
+        printf("LXTLSMANY: FAIL only %ld checks fitted in the budget -- too few to mean anything\n", checks);
     if (made < 64)
         printf("LXTLSMANY: FAIL only %d threads could be created -- the scale this tests is the point\n", made);
     if (!mainok)
         printf("LXTLSMANY: FAIL the MAIN thread's own TLS was corrupted\n");
     if (wrong)
         printf("LXTLSMANY: FAIL %ld reads saw a TLS value that was not this thread's\n", wrong);
-    printf((wrong || !mainok || made < 64) ? "LXTLSMANY: FAILED\n" : "LXTLSMANY: OK\n");
-    return (wrong || !mainok || made < 64) ? 1 : 0;
+    int bad = (wrong || !mainok || made < 64 || checks < 2000);
+    printf(bad ? "LXTLSMANY: FAILED\n" : "LXTLSMANY: OK\n");
+    return bad ? 1 : 0;
 }

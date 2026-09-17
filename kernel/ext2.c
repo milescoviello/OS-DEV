@@ -43,6 +43,27 @@ static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     return v->read(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
 }
+/* `n` PHYSICALLY CONSECUTIVE blocks in one request (M2101).
+ *
+ * Measured under KVM, so this is about the kernel and not about emulation:
+ * Firefox's first paint issued 128750 block-device commands to move 998396
+ * sectors -- 7.8 sectors each, which is one 4 KiB ext2 block. The driver can
+ * do 128 sectors per DMA transfer since this milestone, and blockdev_read
+ * stopped shredding in M2092, so the remaining 4 KiB granularity was entirely
+ * ext2_pread asking for one block at a time.
+ *
+ * Every one of those commands takes the GLOBAL ata_lock, which is why 8 fast
+ * KVM cores did not help: the disk work cannot overlap, so the boot serialises
+ * on a lock held 128750 times. Coalescing a run is worth a factor on the lock
+ * traffic as much as on the transfers. */
+static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
+    uint32_t spb = v->block_size / SECSZ;
+    return v->read(v->ctx, v->start + (uint64_t)blk * spb, n * spb, buf);
+}
+/* How many blocks a single request may cover: the block device's own transfer
+ * ceiling, in blocks. Asking for more than it can do in one go makes it split
+ * the request anyway -- or, worse, fall back off its fast path. */
+#define EXT2_MAX_RUN 16u
 
 /* parse + validate the superblock; 0 on a supported ext2, -1 otherwise */
 static int ext2_open(blk_read_fn read, void *ctx, uint64_t start, ext2_t *v) {
@@ -236,10 +257,33 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
     uint8_t blk[4096]; unsigned long done = 0;
     while (done < want) {
         unsigned long pos = offset + done;
-        uint32_t db = map_block(&v, inode, (uint32_t)(pos / v.block_size));
+        uint32_t lb = (uint32_t)(pos / v.block_size);
+        uint32_t db = map_block(&v, inode, lb);
         uint32_t bo = (uint32_t)(pos % v.block_size);      /* byte offset within the block */
         uint32_t chunk = v.block_size - bo;                /* to the block's end */
         if (chunk > want - done) chunk = (uint32_t)(want - done);
+        /* WHOLE, ALIGNED, CONTIGUOUS BLOCKS GO STRAIGHT INTO THE CALLER'S
+         * BUFFER, AS MANY AS FOLLOW EACH OTHER (M2101).
+         *
+         * The old loop did one block per iteration and bounced every one
+         * through `blk[]` even when the whole block was wanted -- so a 64 KiB
+         * readahead of a contiguous file was sixteen device commands and
+         * sixteen redundant 4 KiB memcpys. A run of physically consecutive
+         * blocks is one command and no copy at all.
+         *
+         * The partial-block path below is unchanged and still bounces, because
+         * it must: the caller's buffer has no room for the bytes either side
+         * of the piece it asked for. */
+        if (db && bo == 0 && want - done >= v.block_size) {
+            uint32_t run = 1;
+            while (run < EXT2_MAX_RUN && (done + (unsigned long)(run + 1) * v.block_size) <= want) {
+                if (map_block(&v, inode, lb + run) != db + run) break;   /* not contiguous: stop the run */
+                run++;
+            }
+            if (rdblks(&v, db, run, (uint8_t *)buf + done) < 0) break;
+            done += (unsigned long)run * v.block_size;
+            continue;
+        }
         if (!db) { memset((uint8_t *)buf + done, 0, chunk); }   /* hole */
         else { if (rdblk(&v, db, blk) < 0) break; memcpy((uint8_t *)buf + done, blk + bo, chunk); }
         done += chunk;

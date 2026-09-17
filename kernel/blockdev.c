@@ -287,11 +287,13 @@ static int raw_write(int i, uint64_t lba, uint32_t count, const void *buf) {
  * double-cache coherence gap the bcache.h note wrongly claimed was already gone). */
 static int is_ata_backed(int i) { return g_dev[i].read == ata_bd_read; }
 
-/* The largest run handed to the ATA driver in one call. Eight because the DMA
- * bounce buffer is one 4 KiB frame, and a call bigger than that would fall
- * back to PIO for the whole thing -- which is slower than eight DMA
- * transfers. (M2091) */
-#define BLOCKDEV_MAX_BATCH 8
+/* The largest run handed to the ATA driver in one call. It must match the
+ * driver's DMA transfer ceiling exactly: a call bigger than that falls back to
+ * PIO for the WHOLE request, which is slower than splitting it. M2091 set this
+ * to 8 because the bounce buffer was one 4 KiB frame; M2101 made it sixteen
+ * frames of scatter-gather PRD, so 128. Named from the driver's own constant
+ * rather than copied, so the two cannot drift apart again. */
+#define BLOCKDEV_MAX_BATCH ((uint32_t)ata_dma_max_sectors())
 
 /* Read one sector (dev i, lba) into dst, via the cache. The per-device lock spans
  * lookup->read->install so a concurrent write's invalidation can't race between

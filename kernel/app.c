@@ -492,6 +492,11 @@ struct app {
      * how a get reports the real capacity rather than a stored fiction. At the
      * END, like every field added since M1218, so the positional initializers
      * scattered through this file stay valid. */
+    /* COW FRAMES AWAITING ONE SHARED TLB SHOOTDOWN (M2102). See
+     * cow_quarantine(). 64 frames = 256 KiB held briefly, against 381271 IPI
+     * broadcasts per Firefox startup. */
+    uint64_t cowq[64];
+    int      ncowq;
     struct fdent { uint8_t used, type, write_end; int obj; char path[256]; long off; uint8_t cloexec; uint8_t nonblock; uint8_t peer_ip[4]; uint16_t peer_port; uint8_t epwatch; int sndbuf, rcvbuf; uint32_t sockflags; } fd[APP_NFD];   /* cloexec/nonblock/peer at END to keep the positional initializers valid (M1218/M1965/M1967) */
     /* seccomp-BPF self-filter (M1190): a process installs a bpf.c program that
      * vets its own syscalls. Zero on spawn/fork; inherited across fork; once set
@@ -507,6 +512,7 @@ unsigned long g_readahead_pages;   /* pages filled by readahead rather than by a
 int g_net_trace;
 static unsigned long g_net_calls;   /* socket reads+writes, to notice a connection going quiet (M2016) */
 static struct app apps[MAX_APPS];
+void app_cow_quarantine_flush(struct app *a);   /* drain the batched COW frees (M2102) */
 
 /* SELF-AUDIT (-append vmaaudit, M1988). Two VMAs must never describe the same
  * address: that is the invariant every "no VMA" fault suggests is broken, and
@@ -2257,6 +2263,11 @@ int app_reap(app_t *a) {
          * still mapped is kept alive precisely by this reference. (M1985) */
         for (int vi = 0; vi < a->nvma; vi++)
             if (a->vma[vi].mfd >= 0) { memfd_unref(a->vma[vi].mfd); a->vma[vi].mfd = -1; }
+        /* ...AND WHATEVER THE COW BATCH IS STILL HOLDING (M2102). Frames sit
+         * in that queue with OUR reference still on them, which is exactly
+         * what makes batching safe -- and exactly what leaks them if nobody
+         * drains it. This is the last moment anything knows the queue exists. */
+        app_cow_quarantine_flush(a);
         /* A vfork child that never exec'd still BORROWS its parent's address
          * space; freeing it here would free the parent's memory. (M2006) */
         if (!a->cr3_borrowed) vmm_destroy_address_space(a->cr3);
@@ -4476,6 +4487,80 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
  *
  * Called AFTER the mapping change and OUTSIDE the vmm lock: a core spinning
  * for that lock with interrupts off could never ack. */
+/* ONE SHOOTDOWN PER SIXTY-FOUR COW BREAKS, NOT ONE PER BREAK (M2102).
+ *
+ * MEASURED UNDER KVM, which is what makes this the right target: Firefox's
+ * first paint takes 517476 ring-3 faults of which 381271 are copy-on-write
+ * breaks, and every one of those ended in a TLB shootdown -- an IPI broadcast
+ * to every other core plus a wait for all their acknowledgements. Eight fast
+ * cores did not make the boot faster, and this is a large part of why: the
+ * work does not parallelise, it synchronises.
+ *
+ * WHY BATCHING IS CORRECT, and it turns on what the stale entry actually is.
+ * The sibling core's cached translation for `old` is READ-ONLY and COW-marked
+ * -- that is precisely why this fault happened. So:
+ *
+ *   - a sibling WRITING through it takes its own fault. It cannot lose a write.
+ *   - a sibling READING through it reads `old`, whose contents are byte-
+ *     identical to the copy just made. It reads correct data.
+ *   - the only real hazard is `old` being FREED and handed to another
+ *     allocation while that stale read-only entry still points at it. Then a
+ *     sibling could read a stranger's page.
+ *
+ * So the shootdown is not needed to make the MAPPING correct -- it is needed
+ * only to make the FREE safe. Hold the frames instead: our reference is not
+ * dropped while a frame sits here, so it stays allocated and every other
+ * mapping of it stays valid. When the batch fills, one shootdown covers all
+ * sixty-four.
+ *
+ * This is Linux's tlb_gather_mmu, for the same reason and with the same
+ * bound. Flushed at process teardown so nothing leaks, and a single-threaded
+ * process still pays nothing at all -- app_tlb_sync already returns without an
+ * IPI when there are no siblings to shoot down. */
+static int app_tlb_sync(struct app *a);
+static void cow_quarantine(struct app *a, uint64_t frame) {
+    uint64_t batch[64]; int n = 0;
+    uint64_t fl = vma_alloc_lock(a);
+    if (a->ncowq < (int)(sizeof a->cowq / sizeof a->cowq[0])) {
+        a->cowq[a->ncowq++] = frame;
+        frame = 0;                                  /* queued: not ours to free here */
+    }
+    if (a->ncowq >= (int)(sizeof a->cowq / sizeof a->cowq[0])) {
+        for (int i = 0; i < a->ncowq; i++) batch[n++] = a->cowq[i];
+        a->ncowq = 0;
+    }
+    vma_alloc_unlock(a, fl);
+    /* Outside the lock: app_tlb_sync sends IPIs and waits for acks, and a core
+     * spinning for this lock with interrupts off could never answer one. That
+     * is the deadlock the whole-operation VMA lock died of. */
+    if (n) {
+        if (app_tlb_sync(a)) {
+            for (int i = 0; i < n; i++) pmm_free_frame(batch[i]);
+        } else {
+            static int told;
+            if (!told) { told = 1;
+                kprintf("[vmm] %d COW frames LEAKED rather than freed: the shootdown did not "
+                        "complete, so another core may still map them\n", n); }
+        }
+    }
+    if (frame) {                                    /* queue was full and stayed full: old path */
+        if (app_tlb_sync(a)) pmm_free_frame(frame);
+    }
+}
+/* Release whatever is still quarantined. Called at teardown, where the address
+ * space is about to go away entirely -- so the shootdown is unconditional and
+ * a failure to ack still means the frames must not be reused. */
+void app_cow_quarantine_flush(struct app *a) {
+    if (!a) return;
+    uint64_t batch[64]; int n = 0;
+    uint64_t fl = vma_alloc_lock(a);
+    for (int i = 0; i < a->ncowq; i++) batch[n++] = a->cowq[i];
+    a->ncowq = 0;
+    vma_alloc_unlock(a, fl);
+    if (!n) return;
+    if (app_tlb_sync(a)) for (int i = 0; i < n; i++) pmm_free_frame(batch[i]);
+}
+
 static int app_tlb_sync(struct app *a) {
     if (!a) return 1;
     for (int i = 0; i < APP_MAXTHREAD; i++)
@@ -5939,14 +6024,16 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
              * any core. Freeing anyway turns a missed IPI into a
              * use-after-free. Leaking one 4 KiB frame is the strictly better
              * failure: bounded, harmless, and reported. */
-            if (app_tlb_sync(a)) {
-                pmm_free_frame(old);                /* decrements the shared frame's refcount */
-            } else {
-                static int told;
-                if (!told) { told = 1;
-                    kprintf("[vmm] a COW frame was LEAKED rather than freed: the shootdown "
-                            "did not complete, so another core may still be using it\n"); }
-            }
+            /* BATCHED (M2102): the frame is queued and freed with up to 63
+             * others behind a single shootdown. The old per-break path is
+             * still below and still correct; it is what the queue falls back
+             * to when it cannot absorb one. */
+            /* BATCHED (M2102). cow_quarantine holds our reference on `old` --
+             * so it stays allocated and every other mapping of it stays valid
+             * -- and drops sixty-four of them behind ONE shootdown. It also
+             * owns the "shootdown did not ack, so leak rather than reuse"
+             * decision, which used to live here. */
+            cow_quarantine(a, old);
         }
         a->minflt++;                                /* COW resolve: no disk I/O => minor fault (M1150) */
         return 1;

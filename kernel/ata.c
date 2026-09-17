@@ -386,7 +386,15 @@ void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
  * failure falls back to PIO rather than failing the read, so a controller that
  * misbehaves costs speed and not correctness. */
 int g_ata_dma_reads = 1;        /* -append nodma turns it off, for A/B measurement */
-#define ATA_DMA_BOUNCE_SECTORS (PAGE_SIZE / SECTOR_SIZE)   /* 8: the bounce buffer is one frame */
+/* 16 FRAMES = 64 KiB = 128 SECTORS PER TRANSFER (M2101).
+ *
+ * Was one frame, so eight sectors, so a Firefox first paint needed 206704
+ * commands to move 1607420 sectors -- measured under KVM, where emulation is
+ * not in the way and the number is therefore about this kernel rather than
+ * about TCG. 64 KiB is also exactly FAULT_READAHEAD_PAGES, so a readahead
+ * window becomes ONE command instead of sixteen. */
+#define ATA_DMA_FRAMES 16
+#define ATA_DMA_BOUNCE_SECTORS (ATA_DMA_FRAMES * (PAGE_SIZE / SECTOR_SIZE))   /* 128 */
 static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf, int write);
 static int ata_dma_setup(void);
 
@@ -713,6 +721,12 @@ static struct {
 
     struct ata_prd *prdt;  /* PRD table (its own pmm frame) */
     uint64_t prdt_phys;    /* physical address of the PRD table */
+    /* The bounce buffer is ATA_DMA_FRAMES separate frames, described by one PRD
+     * entry each -- scatter-gather is what a PRD list is FOR, so the buffer
+     * need not be contiguous and the allocator is never asked for a run it
+     * cannot give. (M2101) */
+    uint64_t bounce_phys_n[ATA_DMA_FRAMES];
+    int      nbounce;
 
     uint8_t *bounce;       /* page-aligned DMA bounce buffer (pmm frame) */
     uint64_t bounce_phys;  /* physical address of the bounce buffer */
@@ -767,27 +781,57 @@ static int ata_dma_setup(void) {
      * corrupt memory. A bounded number of attempts, because a machine whose
      * low memory is entirely used is a machine where DMA simply is not
      * available today. */
-    uint64_t prdt_f = 0, bnc_f = 0;
+    /* ONE FRAME OF BOUNCE BUFFER CAPPED EVERY TRANSFER AT 8 SECTORS (M2101).
+     *
+     * Measured under KVM on pve-ultra -- which is the measurement that matters,
+     * because it removes emulation from the question entirely: Firefox's first
+     * paint reads 1607420 sectors (803 MB) in 206704 commands. That is 7.8
+     * sectors each, and it is 7.8 because the bounce buffer is a single 4 KiB
+     * frame and nothing can ask for more than fits in it.
+     *
+     * A PRD table is a SCATTER-GATHER list -- that is its entire purpose -- so
+     * the buffer does not have to be one contiguous region. ATA_DMA_FRAMES
+     * separate frames, one PRD entry each, gives a 64 KiB transfer out of
+     * frames the allocator can actually produce. 206704 commands becomes
+     * roughly 13000.
+     *
+     * All of them below 4 GiB, because the PRD's `base` field is 32 bits --
+     * that is the hardware's format, not a choice. A frame above 4 GiB
+     * truncates and the controller DMAs a disk sector into somebody else's
+     * physical page, which is undetectable corruption in the one subsystem
+     * whose whole job is to be byte-exact. At -m 2G every frame is low and the
+     * cast was harmless; at the 8 GiB Firefox needs it is not. */
+    uint64_t prdt_f = 0;
     {
-        uint64_t held[32]; int nheld = 0;
-        for (int i = 0; i < 32 && (!prdt_f || !bnc_f); i++) {
+        uint64_t held[64]; int nheld = 0;
+        int got = 0;
+        for (int i = 0; i < 256 && (!prdt_f || got < ATA_DMA_FRAMES); i++) {
             uint64_t f = pmm_alloc_frame();
             if (!f) break;
             if (f + PAGE_SIZE > 0x100000000ull) {        /* above 4 GiB: unusable for a 32-bit PRD */
-                if (nheld < 32) held[nheld++] = f; else pmm_free_frame(f);
+                if (nheld < 64) held[nheld++] = f; else pmm_free_frame(f);
                 continue;
             }
-            if (!prdt_f) prdt_f = f; else bnc_f = f;
+            if (!prdt_f) prdt_f = f;
+            else g_bm.bounce_phys_n[got++] = f;
         }
+        g_bm.nbounce = got;
         for (int i = 0; i < nheld; i++) pmm_free_frame(held[i]);
     }
-    if (!prdt_f || !bnc_f) {
+    if (!prdt_f || g_bm.nbounce < 1) {
         if (prdt_f) pmm_free_frame(prdt_f);
-        if (bnc_f)  pmm_free_frame(bnc_f);
+        for (int i = 0; i < g_bm.nbounce; i++) pmm_free_frame(g_bm.bounce_phys_n[i]);
+        g_bm.nbounce = 0;
         kprintf("[ata] DMA disabled: no physical frame below 4 GiB for the PRD table and bounce "
                 "buffer, and the PRD's base address field is 32 bits wide. PIO only.\n");
         return 0;
     }
+    uint64_t bnc_f = g_bm.bounce_phys_n[0];
+    for (int i = 0; i < g_bm.nbounce; i++) memset(hhdm(g_bm.bounce_phys_n[i]), 0, PAGE_SIZE);
+    if (g_bm.nbounce < ATA_DMA_FRAMES)
+        kprintf("[ata] DMA bounce buffer is %d of %d frames (low memory is tight): transfers "
+                "cap at %d sectors\n", g_bm.nbounce, ATA_DMA_FRAMES,
+                g_bm.nbounce * (int)(PAGE_SIZE / SECTOR_SIZE));
     memset(hhdm(prdt_f), 0, PAGE_SIZE);
     memset(hhdm(bnc_f),  0, PAGE_SIZE);
 
@@ -832,18 +876,37 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
     uint16_t ch   = bmide_channel(drive);
     uint32_t bytes = count * SECTOR_SIZE;
 
-    if (write)
-        memcpy(g_bm.bounce, buf, bytes);
+    /* Scatter the write across the bounce frames, and gather the read back out
+     * of them afterwards. Both loops walk the SAME frame order the PRD list
+     * below is built in, which is what makes the transfer byte-exact. (M2101) */
+    if (write) {
+        uint32_t left = bytes, off = 0;
+        for (int i = 0; i < g_bm.nbounce && left; i++) {
+            uint32_t n = left > PAGE_SIZE ? PAGE_SIZE : left;
+            memcpy(hhdm(g_bm.bounce_phys_n[i]), (const uint8_t *)buf + off, n);
+            off += n; left -= n;
+        }
+    }
 
     /* Build the single PRD: the whole transfer in one region, EOT set.
      * The cast is safe because ata_dma_setup refuses any frame at or above
      * 4 GiB -- but assert it here too, because this is the line where a wrong
      * address becomes a write to a stranger's page and there is no later
      * symptom that would point back at it. */
-    if (g_bm.bounce_phys + PAGE_SIZE > 0x100000000ull) return -1;
-    g_bm.prdt[0].base  = (uint32_t)g_bm.bounce_phys;
-    g_bm.prdt[0].count = (uint16_t)(bytes & 0xFFFF);   /* <= 4096, never 0 here */
-    g_bm.prdt[0].flags = PRD_EOT;
+    {   uint32_t left = bytes;
+        int n = 0;
+        for (int i = 0; i < g_bm.nbounce && left; i++) {
+            uint64_t ph = g_bm.bounce_phys_n[i];
+            if (ph + PAGE_SIZE > 0x100000000ull) return -1;   /* 32-bit PRD base: never truncate */
+            uint32_t c = left > PAGE_SIZE ? PAGE_SIZE : left;
+            g_bm.prdt[n].base  = (uint32_t)ph;
+            g_bm.prdt[n].count = (uint16_t)(c & 0xFFFF);      /* 4096 fits; 0 would mean 64 KiB */
+            g_bm.prdt[n].flags = 0;
+            left -= c; n++;
+        }
+        if (left || !n) return -1;                            /* asked for more than the buffer holds */
+        g_bm.prdt[n - 1].flags = PRD_EOT;                     /* only the LAST entry ends the list */
+    }
 
     /* Make sure the bus master is stopped before we reprogram it, then point it
      * at our PRD table and clear any latched error/IRQ status (write-1-to-clear). */
@@ -905,7 +968,13 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
         return -1;                      /* DMA error or timed out: clean failure */
 
     if (!write)
-        memcpy(buf, g_bm.bounce, bytes);
+        {   uint32_t left = bytes, off = 0;
+            for (int i = 0; i < g_bm.nbounce && left; i++) {
+                uint32_t n = left > PAGE_SIZE ? PAGE_SIZE : left;
+                memcpy((uint8_t *)buf + off, hhdm(g_bm.bounce_phys_n[i]), n);
+                off += n; left -= n;
+            }
+        }
     return 0;
 }
 
@@ -934,6 +1003,16 @@ int ata_dma_available(void) {
 }
 
 uint32_t ata_dma_max_sectors(void) {
+    /* WHAT THE BUFFER REALLY IS, NOT WHAT IT WAS ASKED TO BE (M2101). The
+     * bounce buffer is ATA_DMA_FRAMES frames if the allocator could produce
+     * that many below 4 GiB, and fewer if it could not. blockdev_read sizes
+     * its batches from this, and a batch larger than the buffer falls back to
+     * PIO for the whole request -- so reporting the constant instead of the
+     * actual count would silently turn DMA off on a machine with tight low
+     * memory. Before setup has run there is nothing yet, so report the
+     * intended size: the caller will find out when it tries. */
+    if (g_bm.probed && g_bm.present)
+        return (uint32_t)g_bm.nbounce * (PAGE_SIZE / SECTOR_SIZE);
     return ATA_DMA_BOUNCE_SECTORS;
 }
 
