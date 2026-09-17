@@ -125,22 +125,53 @@ uint64_t timer_ms(void) {
 
 /* NANOSECONDS since boot. Whole ticks from the PIT, the remainder from the TSC.
  * (M2114) */
+static volatile uint64_t g_ns_floor;      /* the highest value ever returned (M2119) */
 uint64_t timer_ns(void) {
-    uint64_t t = ticks, anchor = g_tick_tsc, per = g_tsc_per_tick;
-    uint64_t base = t * (1000000000ull / (tick_hz ? tick_hz : 100));
-    if (!per) return base;
-    uint64_t d = rdtsc_now() - anchor;
-    if (d >= per) d = per - 1;            /* never reach the next tick: stays monotonic */
-    /* FIXED POINT, NOT A DIVIDED-DOWN DELTA. The first version computed
-     * `(d / 1024) * ns_per_tick / (per / 1024)`, which keeps the product inside
-     * 64 bits by throwing away the bottom ten bits of the delta -- so the real
-     * resolution was 1024 cycles, about 333 ns at 3 GHz, while timer_res_ns
-     * went on reporting 1 ns. An instrument describing a resolution it does not
-     * have is the defect this whole block is about, so: 16.16 fixed point,
-     * which holds the full delta for any TSC between 1 MHz and 100 GHz without
-     * overflowing and is accurate to well under a nanosecond. */
-    return base + ((d * g_ns_per_cycle_q16) >> 16);
+    /* THREE WAYS THIS WENT BACKWARDS, and the test caught it: "the monotonic
+     * clock went BACKWARDS by 4872123ns" (M2119).
+     *
+     * 1. `ticks` and `g_tick_tsc` were read as separate loads. A tick landing
+     *    between them pairs the OLD tick count with the NEW tick's anchor, so
+     *    the TSC delta is ~0 against a base one tick too low -- a jump back of
+     *    very nearly one tick, which is exactly the 4.87 ms observed. Read the
+     *    tick count on both sides and retry if it moved.
+     * 2. `rdtsc_now() - anchor` is unsigned. On more than one core the anchor
+     *    may have been taken on a CPU whose TSC runs ahead of this one -- under
+     *    TCG they are barely related -- and the subtraction underflows to an
+     *    enormous number, which the clamp then turns into a full tick forward,
+     *    and the next call comes back down. Guard the underflow.
+     * 3. Even with both fixed, two cores with skewed TSCs disagree about the
+     *    sub-tick fraction. So monotonicity is not argued, it is ENFORCED: the
+     *    highest value ever returned is remembered and never gone below. That
+     *    is the property callers actually depend on, and a clock that
+     *    guarantees it by construction cannot be wrong about it. */
+    uint64_t per = g_tsc_per_tick;
+    uint64_t ns_per_tick = 1000000000ull / (tick_hz ? tick_hz : 100);
+    uint64_t val = 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        uint64_t t1 = ticks;
+        uint64_t anchor = g_tick_tsc;
+        uint64_t now = rdtsc_now();
+        if (ticks != t1) continue;        /* a tick landed mid-read: the pair is inconsistent */
+        uint64_t base = t1 * ns_per_tick;
+        if (!per) { val = base; break; }
+        uint64_t d = (now > anchor) ? (now - anchor) : 0;
+        if (d >= per) d = per - 1;        /* never reach the next tick */
+        val = base + ((d * g_ns_per_cycle_q16) >> 16);
+        break;
+    }
+    if (!val) val = ticks * ns_per_tick;  /* four retries lost: whole ticks is still correct */
+    /* The floor, published with a compare-exchange so a racing core cannot
+     * lower it. */
+    for (;;) {
+        uint64_t f = g_ns_floor;
+        if (val <= f) return f;
+        if (__atomic_compare_exchange_n((uint64_t *)&g_ns_floor, &f, val, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return val;
+    }
 }
+
 
 /* The real resolution, so clock_getres can stop claiming one it does not have.
  * Nanoseconds per TSC cycle, rounded up, or a whole tick if uncalibrated. */

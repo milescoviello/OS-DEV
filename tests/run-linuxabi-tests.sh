@@ -197,7 +197,14 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # Keep the early break for a panic or a #UD: those mean the remaining
     # markers are never coming, and waiting the full timeout for them wastes
     # five minutes per run.
-    lxfull_markers="XSAVE+AVX enabled
+    # "XSAVE+AVX enabled" WAS NEVER PRINTED (M2119). M2007 reworded the boot
+    # log and fixed the ASSERTION below to read the XCR0 value instead of
+    # grepping a sentence -- and left the old sentence here, in the list of
+    # markers this suite WAITS FOR. So every run since has waited out the full
+    # 1700-iteration timeout for a line nothing emits, and any assertion whose
+    # evidence had not arrived by then failed as collateral. Fixed in one place
+    # and not the other, which is this project's most repeated mistake.
+    lxfull_markers="fpu: XSAVE enabled, XCR0=
 static-PIE LIBC binary: argc=1 argv0=/hellolibc
 LXIO: wrote+read 200 lines
 LXBOX: pipeline wc=4 writer=0
@@ -867,7 +874,12 @@ LXWAIT: reaped 40/40 children
         cp "$SLOG3" /tmp/osdev-linuxabi-FAIL.log 2>/dev/null && \
             echo "  (the failing boot's serial log is at /tmp/osdev-linuxabi-FAIL.log)"
     fi
-    [ $f3 -eq 0 ] || { echo "FAIL: XSAVE/AVX test"; exit 1; }
+    # NAME THE BLOCK, NOT ITS FIRST CHECK (M2119). This said "FAIL: XSAVE/AVX
+    # test" for any failure anywhere in a block that also covers threads,
+    # sockets, madvise, dup3, timers, statx and twenty probes -- so a monotonic
+    # clock going backwards was reported as an XSAVE fault, and I went looking
+    # at the FPU.
+    [ $f3 -eq 0 ] || { echo "FAIL: the full Linux-ABI probe suite (see the ok/FAIL lines above for which check)"; exit 1; }
     echo "PASS: a real GLIBC static-PIE binary runs under OS-DEV (AVX via XSAVE, SysV auxv stack, clean exit)"
 
     # --- M1955: PHASE 4 -- the BORROWED toolchain, running in-guest ----------
