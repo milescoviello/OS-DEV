@@ -9,6 +9,7 @@
  * fault-in), so the zram tier is invisible to that ABI. Because the primary
  * tier is RAM, swap is ALWAYS active — no disk required (M1156).
  */
+#include "string.h"   /* memcpy/memset: a page moves word-at-a-time (M2094) */
 #include "swap.h"
 #include "blockdev.h"
 #include "vmm.h"        /* hhdm() */
@@ -116,7 +117,7 @@ int swap_out(uint64_t phys) {
     }
     uint8_t *b = kmalloc(PAGE_SIZE);                          /* no disk: hold it raw in RAM */
     if (!b) { irq_restore(fl); return -1; }
-    for (int i = 0; i < PAGE_SIZE; i++) b[i] = src[i];
+    memcpy(b, src, PAGE_SIZE);   /* word-at-a-time (M2094) */
     zbuf[s] = b; zsz[s] = (uint16_t)PAGE_SIZE; zk[s] = 1;
     g_out++; g_cur++; g_ramcur++; g_zbytes += PAGE_SIZE;
     irq_restore(fl);
@@ -128,12 +129,12 @@ int swap_in(int slot, uint64_t phys) {
     uint64_t fl = irq_save();
     if (slot < 0 || slot >= SWAP_SLOTS || !zk[slot]) { irq_restore(fl); return -1; }
     uint8_t *dst = (uint8_t *)hhdm(phys);
-    if (zk[slot] == 2) { for (int i = 0; i < PAGE_SIZE; i++) dst[i] = 0; g_in++; irq_restore(fl); return 0; }   /* zero page */
+    if (zk[slot] == 2) { memset(dst, 0, PAGE_SIZE); g_in++; irq_restore(fl); return 0; }   /* zero page */
     if (zk[slot] == 1) {
         if (zsz[slot] < PAGE_SIZE) {                          /* compressed */
             if (inflate(zbuf[slot], zsz[slot], dst, PAGE_SIZE) != PAGE_SIZE) { irq_restore(fl); return -1; }   /* corrupt */
         } else {
-            for (int i = 0; i < PAGE_SIZE; i++) dst[i] = zbuf[slot][i];   /* raw */
+            memcpy(dst, zbuf[slot], PAGE_SIZE);   /* raw, word-at-a-time (M2094) */
         }
         g_in++; irq_restore(fl); return 0;
     }

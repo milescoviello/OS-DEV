@@ -1812,7 +1812,7 @@ long app_process_vm_write(int pid, uint64_t raddr, const void *local, uint64_t l
             uint64_t nf = pmm_alloc_frame();
             if (!nf) break;
             uint8_t *s = (uint8_t *)hhdm(frame), *d = (uint8_t *)hhdm(nf);
-            for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
+            memcpy(d, s, PAGE_SIZE);   /* word-at-a-time (M2094) */
             vmm_set_pte_in(t->cr3, vpage, nf | PTE_PRESENT | PTE_USER | PTE_WRITABLE | (pte & PTE_NX));
             pmm_free_frame(frame);                        /* drop the old shared reference */
             frame = nf;
@@ -3910,7 +3910,7 @@ uint64_t app_sbrk(long inc) {
          *    -- i.e. a previous process's INSTRUCTIONS, used as a pointer.
          *    It presented as cc1 either faulting or looping forever, and only
          *    on inputs big enough to reach recycled frames. */
-        { uint8_t *z = (uint8_t *)hhdm(frame); for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0; }
+        { uint8_t *z = (uint8_t *)hhdm(frame); memset(z, 0, PAGE_SIZE); }   /* (M2094) */
         vmm_map(v, frame, PTE_WRITABLE | PTE_USER | PTE_NX);   /* heap: data, never code (W^X) */
     }
     a->heap_end = newend;
@@ -4734,7 +4734,7 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
             return (uint64_t)-1;
         }
         uint8_t *s = (uint8_t *)hhdm(ph), *d = (uint8_t *)hhdm(nf);
-        for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
+        memcpy(d, s, PAGE_SIZE);   /* word-at-a-time (M2094) */
         vmm_map(nbase + off, nf, PTE_WRITABLE | PTE_USER | PTE_NX);
     }
     int vs5; VMA_NEW(a, vs5);
@@ -5269,7 +5269,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
             return 0;
         }
         uint8_t *z = (uint8_t *)hhdm(frame);
-        for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0;
+        memset(z, 0, PAGE_SIZE);   /* word-at-a-time (M2094) */
         /* The ring's DOUBLE mapping needs a real second reference; above
          * PMM_MAXREFS pmm_addref is a no-op, so unmapping the mirror would
          * free the frame the primary still uses. (M1985) */
@@ -5813,7 +5813,16 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
             uint64_t nf = pmm_alloc_frame();
             if (!nf) return 0;                      /* OOM -> let it fault/die */
             uint8_t *s = (uint8_t *)hhdm(old), *d = (uint8_t *)hhdm(nf);
-            for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
+            /* memcpy, NOT A BYTE LOOP (M2094). This is the copy-on-write
+             * break, and the boot budget says it is 79% of every page fault in
+             * a Firefox startup -- 377883 of them, which at 4 KiB each is
+             * 1.5 GB copied one byte per iteration. lib/string.c's memcpy goes
+             * eight bytes at a time when source and destination share their
+             * low alignment bits, and two page frames always do. The same
+             * lesson was learned for the filesystem copy loops in M1513-1516
+             * and this one was simply missed -- it is in the fault path, which
+             * is the last place a byte loop belongs. */
+            memcpy(d, s, PAGE_SIZE);
             /* ONE BREAK PER PAGE (M2077).
              *
              * M1995 gave the demand-zero path a locked re-check for exactly
@@ -6155,7 +6164,8 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                 return 0;
             }
             uint8_t *z = (uint8_t *)hhdm(frame);
-            for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0; /* never leak stale RAM to userspace */
+            memset(z, 0, PAGE_SIZE);   /* never leak stale RAM to userspace -- memset, not a
+                                        * byte loop: this runs on every demand-zero fault (M2094) */
             if (v.file_backed) {                /* fill the page from the backing file (M1136) */
                 uint64_t voff = page - v.start;
                 uint64_t fileoff = v.foff + voff;

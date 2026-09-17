@@ -5,6 +5,7 @@
  * frames outlive any single mapper and are genuinely shared. Built on the
  * M1089 per-frame refcount.
  */
+#include "string.h"   /* memset: a page is zeroed word-at-a-time, not byte-at-a-time (M2094) */
 #include "shm.h"
 #include "pmm.h"
 #include "vmm.h"   /* hhdm() */
@@ -55,7 +56,7 @@ int shm_get(const char *name, uint64_t size, uint64_t **frames, int *npages) {
             uint64_t f = pmm_alloc_frame();
             if (!f) { for (int u = 0; u < p; u++) pmm_free_frame(tab[i].frames[u]); sh_irq_restore(f0); return -1; }  /* OOM: unwind */
             uint8_t *z = (uint8_t *)hhdm(f);
-            for (int b = 0; b < PAGE_SIZE; b++) z[b] = 0;
+            memset(z, 0, PAGE_SIZE);   /* word-at-a-time (M2094) */
             tab[i].frames[p] = f;
         }
         int j = 0; while (name[j] && j < 31) { tab[i].name[j] = name[j]; j++; } tab[i].name[j] = 0;

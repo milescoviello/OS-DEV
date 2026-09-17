@@ -356,7 +356,8 @@ int vmm_fork_cow(uint64_t child_cr3) {
                     uint64_t nf = pmm_alloc_frame();
                     if (!nf) { rc = -1; break; }
                     uint8_t *s = hhdm(phys), *d = hhdm(nf);
-                    for (int b = 0; b < PAGE_SIZE; b++) d[b] = s[b];
+                    memcpy(d, s, PAGE_SIZE);   /* word-at-a-time: this is fork's eager copy for
+                                                * pages the pmm cannot refcount (M2094) */
                     if (vmm_map_to(child_cr3, va, nf, e & (PTE_WRITABLE | PTE_USER | PTE_NX)) != 0) { pmm_free_frame(nf); rc = -1; break; }
                     continue;
                 }
