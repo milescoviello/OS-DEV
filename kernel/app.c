@@ -9147,6 +9147,7 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max);
 static void epoll_note_drain(struct app *a, int fd);
 static void epoll_note_post(struct app *a, int fd);
 static void epoll_note_peer_ready(int fdtype, int obj);   /* re-arm the PEER's edge, in its own process (M2131) */
+void app_wake_pollers(struct app *a);                    /* wake its poll/epoll nappers (M2138) */
 long app_fd_read(int fd, void *buf, unsigned long max) {
     long n = app_fd_read_inner(fd, buf, max);
     if (g_net_trace) { struct app *a = cur(); if (a) eof_spin_watch(a, fd, n); }
@@ -10712,11 +10713,28 @@ static void epoll_note_peer_ready(int fdtype, int obj) {
     for (int k = 0; k < MAX_APPS; k++) {
         struct app *pa = &apps[k];
         if (!pa->used || pa->exited) continue;
+        int holds = 0;
         for (int f = 0; f < APP_NFD; f++) {
             if (!pa->fd[f].used || pa->fd[f].type != fdtype) continue;
-            if (pa->fd[f].obj != obj || !pa->fd[f].epwatch) continue;
-            epoll_rearm_edge(pa, f);
+            if (pa->fd[f].obj != obj) continue;
+            holds = 1;
+            if (pa->fd[f].epwatch) epoll_rearm_edge(pa, f);
         }
+        /* AND WAKE IT, IF IT IS ASLEEP IN A POLL (M2138).
+         *
+         * Re-arming an edge is no use to a process that will not look for
+         * another 5 ms. This kernel's poll is a nap loop with no wait queue, so
+         * a receiver parked in poll()/epoll_wait() sleeps out its full nap even
+         * though its data arrived at once -- and a round-trip therefore costs
+         * one timer tick. Firefox's pre-page plateau runs at almost exactly 100
+         * round-trips a second, which is 10 ms each, which is the tick: the
+         * latency IS the nap. Wake the sleeper and the round-trip costs what
+         * the work costs.
+         *
+         * Only tasks flagged as napping inside poll/epoll are woken --
+         * task_sleep_ms is also how nanosleep is implemented, and cutting one
+         * of those short would be a correctness bug, not an optimisation. */
+        if (holds) app_wake_pollers(pa);
     }
 }
 
@@ -11284,6 +11302,20 @@ int app_thread_count(int pid) {
         if (tk && task_state_of(tk) != TASK_DEAD) n++;
     }
     return n;
+}
+
+/* Wake every thread of `a` that is asleep inside a poll/epoll nap. See
+ * epoll_note_peer_ready and lx_poll_nap_sleep (M2138). */
+void app_wake_pollers(struct app *a) {
+    extern volatile unsigned char g_lx_pollnap[64];
+    if (!a) return;
+    for (int t = 0; t <= APP_MAXTHREAD; t++) {
+        task_t *tk = (t == APP_MAXTHREAD) ? a->task : a->thr[t];
+        if (!tk) continue;
+        if (task_state_of(tk) != TASK_BLOCKED) continue;
+        if (!g_lx_pollnap[tk->id & 63]) continue;
+        task_wake(tk);
+    }
 }
 
 /* EVERY AF_UNIX DESCRIPTOR A GIVEN PROCESS HOLDS, AND THE STATE OF BOTH ITS

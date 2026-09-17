@@ -1260,6 +1260,37 @@ unsigned long g_poll_naps, g_poll_nap_ms, g_poll_yields;
  * the millisecond total would inflate a number the budget reports as a share
  * of the wall clock. That is the mistake this project keeps making with
  * instruments, and it is cheaper to keep two counters. */
+/* WHO IS ASLEEP IN A POLL, SO A SENDER CAN WAKE THEM (M2138).
+ *
+ * THE BUG THIS EXISTS FOR. The plateau before Firefox's page runs at almost
+ * exactly 100 IPC round-trips a second -- recvmsg=1512 and sendmsg=1510 per 15
+ * seconds, matched pairs -- which is one round-trip per 10 ms, and 10 ms is
+ * this kernel's timer tick. That is not a coincidence and it is not Firefox
+ * pacing itself: it is the cost of a round-trip when the receiver is asleep in
+ * a poll nap and nothing wakes it.
+ *
+ * unix_send_ex wakes a peer parked in a BLOCKING unix_recv. It cannot wake a
+ * peer parked in poll()/epoll_wait(), because this kernel's poll is a
+ * re-checking nap loop with no wait queue -- so the receiver sleeps out its
+ * full 1-5 ms even though its data arrived immediately. A startup sequence
+ * that needs thousands of sequential round-trips pays that every time, and the
+ * total is the hundred seconds.
+ *
+ * The flag cannot live on the task, because task.c knows nothing about the
+ * Linux ABI; a small id-keyed array is enough, and a collision only costs a
+ * spurious wake of another poller, which the loop handles by re-checking. It
+ * must be set ONLY around a poll/epoll nap: task_sleep_ms is also how
+ * nanosleep is implemented, and waking a sleeper early there would be a real
+ * correctness bug rather than a latency win. */
+#define LX_NAPPERS 64
+volatile unsigned char g_lx_pollnap[LX_NAPPERS];
+void lx_poll_nap_sleep(int ms) {
+    int slot = (int)(task_current_id() & (LX_NAPPERS - 1));
+    g_lx_pollnap[slot] = 1;
+    task_sleep_ms((uint64_t)ms);
+    g_lx_pollnap[slot] = 0;
+}
+
 static int lx_poll_nap(int spins) {
     /* EIGHT YIELDS, NOT SIXTY-FOUR (M2122).
      *
@@ -3101,7 +3132,7 @@ static void lx_dispatch_body(struct registers *r) {
                         app_current_pid(), task_current_id(), (int)a1, timeout);
                 app_epoll_dump((int)a1);
             }
-            { int nms = lx_poll_nap(espins); if (nms) task_sleep_ms(nms); }
+            { int nms = lx_poll_nap(espins); if (nms) lx_poll_nap_sleep(nms); }
         }
         __asm__ volatile("cli");
         if (k < 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
@@ -3170,7 +3201,7 @@ static void lx_dispatch_body(struct registers *r) {
                     }
                 }
             }
-            { int nms = lx_poll_nap(spins); if (nms) task_sleep_ms(nms); }
+            { int nms = lx_poll_nap(spins); if (nms) lx_poll_nap_sleep(nms); }
         }
         __asm__ volatile("cli");
         r->rax = (uint64_t)ready;
