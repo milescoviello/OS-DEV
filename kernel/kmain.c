@@ -1459,10 +1459,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * I/O is responsible and the renderer itself is blocked. If
                      * it DOES paint, those are exactly where to look.
                      * `-append ffdata` picks it. */
+                    /* The URL is positional AND the homepage is set in the
+                     * staged prefs (M2110). Belt and braces deliberately: the
+                     * command line is what a desktop launcher uses, and the
+                     * homepage pref is what the initial tab loads with no
+                     * handler, remote-command path or process-assignment step
+                     * in between. The document was opened on some runs and not
+                     * others with the command line alone. */
                     static const char *av_fw[] = { "--no-remote", "--new-instance",
-                                                   "--new-window", "file:///ffpage.html" };
+                                                   "file:///ffpage.html" };
                     static const char *av_fd[] = { "--no-remote", "--new-instance",
-                                                   "--new-window",
                                                    "data:text/html,<body%20style%3D%22background%3A%23101820%22>"
                                                    "<h1%20style%3D%22color%3A%234fd1c5%22>OS-DEV</h1>" };
                     const char **av_use = g_ffdata ? av_fd : av_fw;
@@ -1498,7 +1504,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     app_set_next_env("MOZ_DISABLE_CONTENT_SANDBOX=1");
                     kprintf("[ff] spawning FIREFOX against our compositor "
                             "(content in the PARENT process: MOZ_FORCE_DISABLE_E10S)...\n");
-                    int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 4);
+                    int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
                     /* A HEARTBEAT, because silence is ambiguous (M1996).
                      * Firefox spends minutes relocating an 83-library closure
@@ -1618,8 +1624,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                                 int pids[16];
                                                 int np = app_live_pids(pids, 16);
                                                 for (int j = 0; j < np; j++)
-                                                    if (app_thread_count(pids[j]) > 2)
+                                                    if (app_thread_count(pids[j]) > 2) {
                                                         app_wait_summary(pids[j]);
+                                                        /* ...and WHAT IT LAST
+                                                         * ASKED FOR. A wchan
+                                                         * says where a thread
+                                                         * parked; the ring says
+                                                         * what the process was
+                                                         * doing before it did.
+                                                         * "Waiting for a
+                                                         * message that never
+                                                         * comes" and "never
+                                                         * asked for one" are
+                                                         * the same wchan. */
+                                                        lx_trace_dump_pid("this process", 8, pids[j]);
+                                                    }
                                             }
                                             {   int cp2 = 0, cs2 = lx_fatal_signal(&cp2);
                                                 if (cs2) { kprintf("[page] pid %d CRASHED with signal %d "

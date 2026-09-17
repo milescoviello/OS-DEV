@@ -40,10 +40,39 @@ pref("dom.ipc.processCount",         1);
 // layer (M2083, M2084, M2104 were all in it). One way for a child to start is
 // enough while children are still dying silently.
 pref("dom.ipc.forkserver.enable",    false);
+// NO PRELAUNCHED CONTENT PROCESS. Firefox starts a spare content process
+// early and parks it so that opening a tab feels instant. Two of them turned
+// up here -- pids 166 and 167, seventeen threads each, every thread BLOCKED,
+// nothing running -- which is exactly what a process with no document assigned
+// to it looks like, and it made "the content process is alive but idle" read
+// as a bug when it is the design. Worse, it puts a process-assignment step
+// between the URL and the renderer, and that step is what has to work for a
+// page to appear at all. On demand is one less moving part.
+pref("dom.ipc.processPrelaunch.enabled", false);
 // NOTE: `browser.tabs.remote.autostart` is NOT a pref in this build -- the
 // string does not appear in libxul at all, so setting it did nothing. Checked
 // rather than assumed, because a pref that does not exist fails silently and
 // looks exactly like a pref that did not help.
+
+// THE FIRST TAB LOADS OUR PAGE, AND NOT BECAUSE OF argv (M2110).
+//
+// The content area has been 84% #f9f9fb through this entire campaign, and that
+// colour is not "blank" -- it is the background of about:home. Firefox's
+// packaged prefs say so outright:
+//
+//     pref("browser.startup.page",     1);            // 1 = load the homepage
+//     pref("browser.startup.homepage", "about:home");
+//
+// So the browser was loading its home page, correctly, and every conclusion
+// drawn from "the content area is blank" was drawn about a page that had
+// rendered exactly as configured. A URL on the command line is supposed to
+// override this, and it did not do so reliably -- the document was opened on
+// some runs and not on others. Setting the homepage removes argv from the
+// question entirely: the initial tab loads this and there is no handler,
+// no remote-command path and no process-assignment step in between.
+pref("browser.startup.page",         1);
+pref("browser.startup.homepage",     "file:///ffpage.html");
+pref("browser.newtabpage.enabled",   false);
 
 // Nothing may open a second tab, phone home, or replace the URL we asked for.
 pref("browser.shell.checkDefaultBrowser", false);
