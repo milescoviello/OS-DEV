@@ -1,6 +1,6 @@
 # What's next
 
-> **(M2128-M2130) CLAUDE CODE RUNS A SHELL COMMAND INSIDE OS-DEV AND READS THE
+> **(M2128-M2131) CLAUDE CODE RUNS A SHELL COMMAND INSIDE OS-DEV AND READS THE
 > RESULT BACK.**
 >
 > This is the Phase 7 north star's last step, and it is met:
@@ -96,6 +96,42 @@
 > expires; when it does, the demo skips rather than fails. Firefox's on-screen
 > content area is still blank, and the multi-core guest-memory corruption is
 > still open -- both are the remaining work on the standing goal.
+>
+> **(M2131) And on Firefox: three premises this campaign had been carrying
+> turned out to be false, and three instruments were the reason.** Each one had
+> a budget or a filter shared between a healthy majority and the single
+> interesting process, and spent itself on the majority: the page sampler
+> skipped any process with two threads or fewer -- when "the content process
+> has two threads" would itself have been the answer; the stalled-poll and
+> stalled-epoll reports shared one global budget of 24, which the browser
+> parent consumes permanently; and the stalled-epoll dump only fires after a
+> single `epoll_wait` call has waited three seconds, which a content process's
+> IPC pump never does because it polls with a short timeout in a loop. That
+> last one is worth naming precisely: it was not an absence of evidence about
+> the child, it was an instrument whose trigger the child cannot satisfy.
+>
+> With those fixed, the census says the content processes are **alive and fully
+> populated** (17 and 19 threads), `MOZ_FORCE_DISABLE_E10S` is **not** honoured
+> by this build -- the old note inferred that it was from the string being
+> present in libxul -- and the long-standing "seven child processes exit with
+> status 1 per startup" claim is simply wrong: after Firefox starts there are
+> zero non-zero exits, and the status-7 exits in the log belong to a probe that
+> runs before Firefox is spawned.
+>
+> One real latent bug came out of it. epoll's edge re-arm was being applied in
+> the *posting* process's own descriptor table, which was right for M2062's
+> eventfd waker (same process both sides) and wrong in general: a write to one
+> end of an AF_UNIX socketpair makes the other end readable in a *different*
+> process, whose epoll instance nothing re-armed. An `EPOLLET` registration on
+> a cross-process channel was therefore told "readable" exactly once. Same
+> shape as M2126 -- a rule applied at one of the places that needed it.
+>
+> **It did not fix Firefox**, and one apparent smoking gun disproved itself:
+> `readable=1 rx_queued=280` on a content process's channel beside
+> `app_fd_ready -> 0` for the same descriptor looked like a readiness function
+> lying, but the two lines print microseconds apart and the syscall ring shows
+> that channel being drained in a loop. The page stays blank for both `file://`
+> and `data:` URLs, with the window title never leaving "Mozilla Firefox".
 
 > **(M2121-M2127) THIS MACHINE NEVER ANSWERED ARP, SO THE LAN FORGOT IT EXISTED.**
 >
