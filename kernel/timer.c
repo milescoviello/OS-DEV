@@ -20,6 +20,7 @@
 #include "profile.h"
 #include "app.h"
 #include "vdso.h"
+#include "console.h"   /* kprintf, for the one calibration line (M2114) */
 
 #define PIT_CH0_DATA 0x40
 #define PIT_COMMAND  0x43
@@ -29,6 +30,32 @@ static volatile uint64_t ticks;
 static uint32_t          tick_hz = 100;   /* IRQ0 frequency, set by timer_init */
 static uint32_t          tick_ms = 10;    /* ms per tick (1000/hz), for CPU-time accounting (M1150) */
 
+/* A MONOTONIC CLOCK THAT MOVES IN 10 ms STEPS IS NOT A CLOCK A BROWSER CAN USE
+ * (M2114).
+ *
+ * The PIT runs at 100 Hz, so timer_ms() -- which is what clock_gettime(2)
+ * answers from -- advanced in TEN MILLISECOND JUMPS, while clock_getres(2)
+ * claimed one millisecond. Ten milliseconds is coarser than a 60 Hz frame
+ * interval (16.7 ms), so every duration Gecko measures quantises to 0 or 10,
+ * and a refresh driver that asks "has enough time passed to draw" gets an
+ * answer with no information in it.
+ *
+ * The TSC has the resolution; what it lacks is a known frequency and a
+ * guarantee of not drifting. So do not build a clock out of it -- ANCHOR it.
+ * The PIT tick count stays the authority for whole ticks and the TSC only
+ * fills in the fraction SINCE the last tick, clamped so it can never reach the
+ * next one. That is monotonic by construction, cannot drift however wrong the
+ * calibration is, and degrades to exactly the old behaviour if the TSC is
+ * unusable. */
+static uint64_t g_tsc_per_tick;           /* 0 = not calibrated: fall back to whole ticks */
+static volatile uint64_t g_tick_tsc;      /* TSC at the last PIT tick */
+
+static inline uint64_t rdtsc_now(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static void timer_handler(struct registers *r) {
     /* PAY ANY TLB DEBT FIRST (M2065). A shootdown whose IPI this core missed
      * leaves a per-core flag set rather than cancelling it, and this tick --
@@ -37,6 +64,7 @@ static void timer_handler(struct registers *r) {
      * handler itself can touch a task's memory. */
     vmm_tlb_discharge();
     ticks++;
+    g_tick_tsc = rdtsc_now();   /* the anchor for sub-tick time (M2114) */
     watchdog_pet();        /* pet the HW watchdog (no-op unless armed) — a wedge that stops this IRQ lets it reset (M1881) */
     vdso_tick(ticks);      /* refresh the userspace vDSO time page (syscall-free clock_gettime, M1111) */
     prof_tick(r->rip, r->cs);  /* sampling profiler: record the interrupted kernel RIP (M1086) */
@@ -81,6 +109,58 @@ uint64_t timer_ticks(void) {
  * ample for frame pacing (e.g. DOOM's DG_GetTicksMs). */
 uint64_t timer_ms(void) {
     return ticks * 1000ull / tick_hz;
+}
+
+/* NANOSECONDS since boot. Whole ticks from the PIT, the remainder from the TSC.
+ * (M2114) */
+uint64_t timer_ns(void) {
+    uint64_t t = ticks, anchor = g_tick_tsc, per = g_tsc_per_tick;
+    uint64_t base = t * (1000000000ull / (tick_hz ? tick_hz : 100));
+    if (!per) return base;
+    uint64_t d = rdtsc_now() - anchor;
+    if (d >= per) d = per - 1;            /* never reach the next tick: stays monotonic */
+    /* d * ns_per_tick / per, ordered to keep the product inside 64 bits. */
+    uint64_t ns_per_tick = 1000000000ull / (tick_hz ? tick_hz : 100);
+    return base + (d / 1024) * ns_per_tick / (per / 1024 ? per / 1024 : 1);
+}
+
+/* The real resolution, so clock_getres can stop claiming one it does not have.
+ * Nanoseconds per TSC cycle, rounded up, or a whole tick if uncalibrated. */
+uint64_t timer_res_ns(void) {
+    if (!g_tsc_per_tick) return 1000000000ull / (tick_hz ? tick_hz : 100);
+    uint64_t ns_per_tick = 1000000000ull / (tick_hz ? tick_hz : 100);
+    uint64_t r = ns_per_tick / g_tsc_per_tick;
+    return r ? r : 1;
+}
+
+/* CALIBRATE AGAINST THE CLOCK WE ALREADY TRUST. Called once, after the PIT is
+ * running and before anything measures anything: sit on two tick edges and
+ * count cycles between them. Four ticks (40 ms) rather than one, because a
+ * single interval is dominated by whatever the interrupt itself cost. */
+void timer_calibrate_tsc(void) {
+    uint64_t t0 = ticks;
+    while (ticks == t0) { }                       /* wait for an edge */
+    uint64_t c0 = rdtsc_now(), t1 = ticks;
+    while (ticks < t1 + 4) { }
+    uint64_t c1 = rdtsc_now();
+    uint64_t per = (c1 - c0) / 4;
+    /* Sanity: anything outside 1 MHz..100 GHz is not a TSC we can use, and a
+     * wrong calibration must not be allowed to produce a wrong clock. */
+    uint64_t lo = 1000000ull / (tick_hz ? tick_hz : 100);
+    uint64_t hi = 100000000000ull / (tick_hz ? tick_hz : 100);
+    if (per > lo && per < hi) {
+        g_tsc_per_tick = per;
+        g_tick_tsc = rdtsc_now();
+        kprintf("[timer] TSC calibrated: %lu cycles/tick (~%lu MHz), clock resolution now ~%luns "
+                "instead of %ums (M2114)\n",
+                (unsigned long)per,
+                (unsigned long)(per * (tick_hz ? tick_hz : 100) / 1000000u),
+                (unsigned long)timer_res_ns(), tick_ms);
+    } else {
+        kprintf("[timer] TSC calibration REJECTED (%lu cycles/tick is outside 1MHz..100GHz): "
+                "the monotonic clock stays at %ums granularity\n",
+                (unsigned long)per, tick_ms);
+    }
 }
 
 void timer_wait(uint64_t n) {

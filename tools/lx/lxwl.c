@@ -18,6 +18,7 @@
  *   wl_registry_bind()     - binding one for real
  */
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <wayland-client.h>
@@ -398,13 +399,34 @@ int main(void) {
          * up AFTER this client does -- the compositor hands over once a surface
          * exists -- so the wait has to outlast the desktop's own startup, or
          * the client exits before there is anything to send it. */
-        for (int i = 0; i < 4000 && (n_motion < 1 || n_buttons < 1 || n_keys < 1); i++) {
-            int d = wl_display_dispatch(dpy);
-            if (d < 0) {
-                printf("LXWL-INPUT: dispatch failed (err %d) after %d motion\n",
-                       wl_display_get_error(dpy), n_motion);
-                fflush(stdout);
-                break;
+        /* A DISPATCH COUNT IS NOT A DURATION (M2113).
+         *
+         * This looped 4000 times on wl_display_dispatch, which BLOCKS when
+         * there is nothing to read -- so 4000 iterations happened to mean
+         * "quite a long time" for as long as this compositor sent nothing
+         * unprompted. M2110 made frame callbacks a periodic 60 Hz signal,
+         * because that is what vsync is and Gecko's refresh driver runs on it,
+         * and the moment events arrive on their own the 4000 iterations are
+         * spent in a fraction of a second -- before the harness has driven any
+         * input at all. The client then reported zero keys and zero motion
+         * about a compositor that was working perfectly.
+         *
+         * This is the same defect as waiting a fixed 500 ms for a marker,
+         * which this suite has already been fixed for twice. Wait on the
+         * CONDITION, with a real clock as the bound. */
+        {   struct timespec t0, now;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (;;) {
+                if (n_motion >= 1 && n_buttons >= 1 && n_keys >= 1) break;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec - t0.tv_sec > 45) break;       /* outlast the desktop's startup, without adding two minutes to every suite run */
+                int d = wl_display_dispatch(dpy);
+                if (d < 0) {
+                    printf("LXWL-INPUT: dispatch failed (err %d) after %d motion\n",
+                           wl_display_get_error(dpy), n_motion);
+                    fflush(stdout);
+                    break;
+                }
             }
         }
         printf("LXWL-INPUT-RESULT: %d key event(s), %d motion, %d button\n",

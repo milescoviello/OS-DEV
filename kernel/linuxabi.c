@@ -2695,9 +2695,11 @@ static void lx_dispatch_body(struct registers *r) {
         if (!r->rsi) { r->rax = 0; break; }
         if (!vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         int64_t *ts = (int64_t *)r->rsi;
-        /* Our clocks tick in milliseconds, and saying so is more useful than
-         * claiming nanoseconds we cannot deliver. */
-        ts[0] = 0; ts[1] = 1000000;
+        /* SAY WHAT IT ACTUALLY IS (M2114). This claimed one millisecond while
+         * the clock underneath moved in TEN, and now that a TSC-anchored
+         * nanosecond clock exists it would be understating it by four orders
+         * of magnitude instead. Ask the clock. */
+        ts[0] = 0; ts[1] = (int64_t)timer_res_ns();
         r->rax = 0;
         break;
     }
@@ -3619,7 +3621,13 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_clock_gettime: {               /* (clk_id, struct timespec*) */
         if (!vmm_user_ok(r->rsi, 16)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        uint64_t ms = timer_ms();
+        /* NANOSECONDS, not a millisecond multiplied up (M2114). This
+         * returned `(ms % 1000) * 1000000` -- so every tv_nsec was a multiple
+         * of a million and the clock jumped ten milliseconds at a time,
+         * because the PIT runs at 100 Hz. Gecko measures frame intervals with
+         * this; 10 ms is coarser than the 16.7 ms it is trying to measure. */
+        uint64_t ns = timer_ns();
+        uint64_t ms = ns / 1000000ull;
         int64_t *ts = (int64_t *)r->rsi;
         /* CLOCK_REALTIME(0) wants wall time; everything else (MONOTONIC and
          * the CPU-time clocks) is satisfied from uptime, which is what our
@@ -3635,9 +3643,10 @@ static void lx_dispatch_body(struct registers *r) {
          * and monotonic like the real thing. */
         if (a1 == 0) {
             ts[0] = lx_realtime_sec();
-            ts[1] = (int64_t)((ms % 1000) * 1000000);
+            ts[1] = (int64_t)(ns % 1000000000ull);
         }
-        else         { ts[0] = (int64_t)(ms / 1000); ts[1] = (int64_t)((ms % 1000) * 1000000); }
+        else         { ts[0] = (int64_t)(ns / 1000000000ull); ts[1] = (int64_t)(ns % 1000000000ull); }
+        (void)ms;
         r->rax = 0;
         break;
     }

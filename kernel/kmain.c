@@ -747,6 +747,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     timer_init(100);
     keyboard_init();
     interrupts_enable();
+    /* AFTER interrupts are on, because calibration WAITS FOR PIT TICKS -- with
+     * them still masked it would spin for ever on a counter nothing increments.
+     * Gives the monotonic clock real resolution before anything measures
+     * anything: the PIT alone moves in 10 ms steps, which is coarser than the
+     * 16.7 ms frame interval a browser's refresh driver tries to measure.
+     * (M2114) */
+    timer_calibrate_tsc();
     serial_enable_rx_irq();        /* let the serial line feed keyboard input */
     pmm_init(mb_info);
     vmm_init();
@@ -1494,7 +1501,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * they name the surface and size decisions that feed
                          * it; Event and DBus are dropped, because every line
                          * costs serial time and neither is in the path. */
-                        app_set_next_env("MOZ_LOG=timestamp,sync,webrender:5,Widget:4,nsWindow:4");
+                        /* ipcmessages LOGS EVERY IPDL MESSAGE (M2113), which is
+                         * the one thing that can settle the remaining question:
+                         * does the content process ever send the parent a
+                         * display list? Everything else has been inferred. The
+                         * `webrender` module produced nothing at level 5, so it
+                         * is not a log module here whatever the string table
+                         * says -- checking that cost one run. */
+                        /* KNOWN-GOOD MODULE NAMES ONLY (M2114). `webrender`
+                         * produced nothing at level 5 and `ipcmessages`
+                         * produced nothing AND took Widget down with it -- one
+                         * unrecognised name appears to void the whole spec, so
+                         * a bad guess does not cost one module, it costs the
+                         * run. Widget/nsWindow are the two that have actually
+                         * reported anything here. */
+                        app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,nsWindow:5");
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }

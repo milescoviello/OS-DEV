@@ -121,7 +121,14 @@ for g in wl_compositor wl_shm wl_seat xdg_wm_base wl_output wl_data_device_manag
         echo "  FAIL: $g was not received by libwayland:"; grep -a "LXWL-GLOBAL" "$SLOG" | head -4; f=1
     fi
 done
-if grep -aq "LXWL: connected, 7 globals, wl_compositor bound, 2 roundtrips OK" "$SLOG"; then
+# DO NOT PIN THE GLOBAL COUNT (M2113). This grepped for "connected, 7 globals"
+# and M2113 advertised an eighth (xdg_activation_v1, which Firefox asks for by
+# name), so the client printed "8 globals" and this assertion could no longer
+# match a run in which everything worked. Every check after it was then skipped
+# as collateral. The raw-handshake check twenty lines above was already written
+# as `>= 7` for exactly this reason and says so in its comment; this one was
+# not. Assert the SHAPE.
+if grep -aqE "LXWL: connected, [0-9]+ globals, wl_compositor bound, 2 roundtrips OK" "$SLOG"; then
     echo "  ok: A REAL libwayland CLIENT COMPLETED THE HANDSHAKE (bind + 2 roundtrips)"
 else
     echo "  FAIL: the client did not complete:"; grep -aE "LXWL|roundtrip" "$SLOG" | tail -4; f=1

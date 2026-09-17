@@ -179,7 +179,8 @@ enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
                WLK_XDG_SURFACE, WLK_XDG_TOPLEVEL, WLK_POINTER, WLK_KEYBOARD,
                WLK_OUTPUT, WLK_DDM, WLK_DATA_DEVICE, WLK_DATA_SOURCE,
                WLK_SUBCOMPOSITOR, WLK_SUBSURFACE,
-               WLK_REGION, WLK_XDG_POPUP, WLK_XDG_POSITIONER };
+               WLK_REGION, WLK_XDG_POPUP, WLK_XDG_POSITIONER,
+               WLK_ACTIVATION, WLK_ACTIVATION_TOKEN };   /* xdg_activation_v1 (M2113) */
 
 /* WHAT A SURFACE IS FOR -- and why a compositor has to know (M2058).
  *
@@ -227,6 +228,13 @@ static const struct wl_global g_globals[] = {
     { "wl_output",               4, WLK_OUTPUT },
     { "wl_seat",                 7, WLK_SEAT },
     { "xdg_wm_base",             3, WLK_XDG_WM_BASE },
+    /* FIREFOX ASKS FOR THIS BY NAME (M2113):
+     *   D/Widget RequestWaylandFocusPromise() missing xdg_activation
+     * It is how a client says "please give this window focus" and how a
+     * launcher hands a startup token to the app it started. Gecko builds a
+     * focus promise on it and, without it, gives up on focusing its own
+     * window -- which is one half of why it believed it had none. */
+    { "xdg_activation_v1",       1, WLK_ACTIVATION },
 };
 #define WL_NGLOBAL (int)(sizeof(g_globals) / sizeof(g_globals[0]))
 
@@ -793,6 +801,8 @@ static const char *wl_kind_name(int k) {
     case WLK_POINTER: return "wl_pointer";
     case WLK_KEYBOARD: return "wl_keyboard";
     case WLK_XDG_WM_BASE: return "xdg_wm_base";
+    case WLK_ACTIVATION: return "xdg_activation_v1";
+    case WLK_ACTIVATION_TOKEN: return "xdg_activation_token_v1";
     case WLK_XDG_SURFACE: return "xdg_surface";
     case WLK_XDG_TOPLEVEL: return "xdg_toplevel";
     case WLK_OUTPUT: return "wl_output";
@@ -1067,6 +1077,7 @@ static void wl_toplevel_configure(struct wl_client *c, struct wl_object *o, uint
     wl_send(c, o->id, XDG_SURFACE_EV_CONFIGURE, sb, 4);
 }
 
+static void wl_kbd_enter(struct wl_client *c);   /* focus is granted on map, not on a keypress (M2113) */
 static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     uint32_t obj = rd32(m + 0);
     uint32_t sz_op = rd32(m + 4);
@@ -1486,6 +1497,62 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
          * framebuffer showed for this entire campaign. */
         wl_toplevel_configure(c, o, tid, 0, 0, 0);
         return;
+    }
+    /* --- xdg_activation_v1 (M2113) -------------------------------------- *
+     *
+     * Firefox names this in its own log when it gives up on focusing itself:
+     *
+     *     D/Widget RequestWaylandFocusPromise() missing xdg_activation
+     *
+     * The shape is a two-step handshake, because the point of the protocol is
+     * that a token can be MINTED by one client and REDEEMED by another (a
+     * launcher starting an app, and the app then asking to be raised). A
+     * client asks for a token object, sets whatever it knows on it, commits,
+     * and is handed a string back; later, someone calls activate() with that
+     * string and a surface.
+     *
+     * The token is a plain counter here. That is the whole of its contract --
+     * it is opaque to the client and only ever compared for equality by us --
+     * and inventing a cryptographic one would be dressing up a single-user
+     * machine as a multi-tenant compositor. */
+    if (o->kind == WLK_ACTIVATION && opcode == 1 && alen >= 4) {   /* get_activation_token */
+        uint32_t nid = rd32(args + 0);
+        if (obj_add(c, nid, WLK_ACTIVATION_TOKEN))
+            kprintf("[wl] xdg_activation: token object %u created\n", nid);
+        return;
+    }
+    if (o->kind == WLK_ACTIVATION && opcode == 2 && alen >= 4) {   /* activate(token, surface) */
+        /* The surface follows the string, which is length-prefixed and padded.
+         * Focus is what is being asked for, and this compositor's focus rule is
+         * one window, so honour it by entering the keyboard on this client. */
+        uint32_t slen = rd32(args + 0);
+        uint32_t pad = (slen + 3u) & ~3u;
+        uint32_t sid = (4 + pad + 4 <= (uint32_t)alen) ? rd32(args + 4 + pad) : 0;
+        kprintf("[wl] xdg_activation: activate surface %u -- granting keyboard focus\n", sid);
+        wl_kbd_enter(c);
+        return;
+    }
+    if (o->kind == WLK_ACTIVATION_TOKEN) {
+        if (opcode == 3) {                                          /* commit */
+            /* done(token). A client that committed a token and got no `done`
+             * waits for it, which is the failure mode this interface's absence
+             * already produced by another route. */
+            static uint32_t g_tok;
+            char tok[24]; int tp = 0;
+            const char *pre = "osdev-";
+            while (pre[tp]) { tok[tp] = pre[tp]; tp++; }
+            uint32_t v = ++g_tok;
+            char dg[12]; int nd = 0;
+            do { dg[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+            while (nd) tok[tp++] = dg[--nd];
+            tok[tp] = 0;
+            uint8_t b[32]; int p2 = put_string(b, 0, tok);
+            wl_send(c, obj, 0 /* done */, b, p2);
+            kprintf("[wl] xdg_activation: token committed -> done(\"%s\")\n", tok);
+            return;
+        }
+        if (opcode == 0 || opcode == 1 || opcode == 2) return;      /* set_serial/app_id/surface */
+        if (opcode == 4) { wl_destroy_obj(c, o); return; }          /* destroy */
     }
     if (o->kind == WLK_XDG_TOPLEVEL &&
         (opcode == XDG_TOPLEVEL_SET_MAXIMIZED || opcode == XDG_TOPLEVEL_UNSET_MAXIMIZED)) {
@@ -2093,7 +2160,6 @@ void wl_page_probe(uint32_t want) {
  * surface the client has not committed is correct and is the point -- it means
  * "draw again now". Each is cleared as it fires, so nothing is answered twice,
  * and the id is released with delete_id exactly as before. */
-static void wl_kbd_enter(struct wl_client *c);
 static unsigned g_frame_ticks, g_frame_done;
 unsigned wl_frame_ticks(void) { return g_frame_ticks; }
 unsigned wl_frame_callbacks_sent(void) { return g_frame_done; }
