@@ -911,6 +911,37 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * real depth on top of ECDSA's own call chain in a way a quiet `make
      * check` run doesn't reliably exercise). Bumped with real headroom rather
      * than the smallest number that happens to stop reproducing it. */
+    /* GET AN ADDRESS BEFORE ANYTHING USES THE NETWORK (M2125).
+     *
+     * net_demo runs as a TASK, and M2120 put net_dhcp() inside it -- so the
+     * lease was acquired concurrently with everything else the boot goes on to
+     * do, including launching Linux programs. A guest that sent a datagram in
+     * that window used the SLIRP default 10.0.2.15 as its source address, and
+     * the reply went to a host that does not exist on this segment. The
+     * evidence was in the receive log all along, in the parenthesis nobody was
+     * reading:
+     *
+     *   [udpq] NOT OURS: dst 192.168.1.255 port 32412 (we are 10.0.2.15)
+     *   ...
+     *   [udpq] NOT OURS: dst 192.168.1.255 port 32412 (we are 192.168.1.224)
+     *
+     * -- the address changed HALFWAY THROUGH the boot. And it explains why
+     * `-append nonetdemo` worked while the default did not: the nonetdemo
+     * branch below does its DHCP synchronously, in this thread, before any
+     * program runs.
+     *
+     * So bring the interface up and lease an address HERE, synchronously, for
+     * every configuration. An address is not a diagnostic and has no business
+     * being acquired by one. */
+    if (!g_netcon) {
+        int nr = nic_init();                       /* idempotent since M2125 */
+        int leased = (nr == 0) && (net_dhcp() == 0);
+        const uint8_t *bip = net_ip();
+        kprintf("[net] %s up, IP = %u.%u.%u.%u (%s)\n",
+                nr == 0 ? nic_name() : "no NIC",
+                bip[0], bip[1], bip[2], bip[3],
+                leased ? "DHCP" : "no lease -- SLIRP default, only valid under QEMU user-mode");
+    }
     if (!g_netcon && !g_nonetdemo)
         task_create_stack(net_demo, 0, 0, 512 * 1024);
     else if (g_nonetdemo) {
@@ -918,7 +949,20 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * demo without this leaves the NIC uninitialised and every later network
          * user dead — the first attempt at this flag turned httpdtest from flaky
          * into failing 100%. */
+        /* The address was already leased above, synchronously, for every
+         * configuration (M2125). */
         int nr = nic_init();
+        /* (historical note) net_dhcp() lived inside
+         * net_demo, so `nonetdemo` -- which every test in the tree passes --
+         * skipped the lease as well as the self-test and left the machine on
+         * the SLIRP default. That is right under QEMU user-mode networking and
+         * useless on real hardware, so a flag meant to skip a diagnostic was
+         * quietly deciding whether the machine had an address at all.
+         *
+         * Separating them also makes the guest's network testable with no
+         * prior kernel traffic on the wire, which is the one configuration
+         * that has not been tried while chasing why a guest datagram gets no
+         * reply in a boot where the kernel's own does. */
         kprintf("[net] boot network self-test skipped (-append nonetdemo); NIC %s\n\n",
                 nr == 0 ? "initialised" : "absent");
     }
@@ -1144,36 +1188,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * and this kernel boots on real hardware too. */
         {
             const uint8_t *ns = net_dns();
-            /* PREFER AN ON-LINK RESOLVER FOR THE GUEST (M2124).
+            /* THE LEASE'S RESOLVER, NOT THE GATEWAY (M2125).
              *
-             * The lease here names 1.1.1.1, which this kernel's own resolver
-             * reaches perfectly well -- an HTTP and an HTTPS GET of example.com
-             * both return 200 in the same boot. A Linux program in the guest
-             * asking the same server times out, and the difference is that the
-             * guest's datagrams take a different receive path.
+             * M2124 preferred the gateway whenever the lease's nameserver was
+             * off-segment, reasoning that one hop needs no routing and that
+             * every consumer router answers DNS. Measured: it does not. The
+             * guest's query reached 192.168.1.1:53 -- transmitted correctly,
+             * right ports, the router's own MAC --
              *
-             * The gateway is ON OUR OWN SEGMENT and every consumer router
-             * answers DNS, so naming it removes routing from the guest's path
-             * entirely. That is worth doing on its own merits -- a resolver one
-             * hop away is faster and survives the upstream one being blocked,
-             * which is common on networks that run their own -- and it also
-             * isolates the remaining bug: if the guest resolves through the
-             * gateway, what is left is specifically the off-segment receive
-             * path and not DNS. The off-link server is still recorded in the
-             * log, so nothing is hidden. */
-            {   const uint8_t *gw = net_gw();
-                int ns_onlink = 1;
-                const uint8_t *mask = net_mask();
-                for (int i = 0; i < 4; i++)
-                    if ((ns[i] & mask[i]) != (net_ip()[i] & mask[i])) { ns_onlink = 0; break; }
-                if (!ns_onlink && gw && (gw[0] | gw[1] | gw[2] | gw[3])) {
-                    kprintf("[lxabi] the lease's resolver %u.%u.%u.%u is OFF-SEGMENT; giving the "
-                            "guest the gateway %u.%u.%u.%u instead (one hop, no routing)\n",
-                            ns[0], ns[1], ns[2], ns[3], gw[0], gw[1], gw[2], gw[3]);
-                    ns = gw;
-                }
-            }
-            if (ns && (ns[0] | ns[1] | ns[2] | ns[3])) {
+             *   [udp] tx 29 bytes 49152 -> 192.168.1.1:53 via 192.168.1.1
+             *
+             * and nothing ever answered. A DHCP server that hands out 1.1.1.1
+             * is quite often a server whose own host does NOT resolve, which is
+             * exactly why it hands out someone else's. So the guess made things
+             * worse: it replaced a resolver that answers with one that does
+             * not, and then the failure looked identical.
+             *
+             * Use what the lease says. It is the one address on the network
+             * that something has actually promised to answer on. */            if (ns && (ns[0] | ns[1] | ns[2] | ns[3])) {
                 char rc_buf[64]; int n = 0;
                 const char *pfx = "nameserver ";
                 for (int i = 0; pfx[i]; i++) rc_buf[n++] = pfx[i];

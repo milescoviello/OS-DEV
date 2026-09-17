@@ -1,5 +1,105 @@
 # What's next
 
+> **(M2121-M2126) THIS MACHINE NEVER ANSWERED ARP, SO THE LAN FORGOT IT EXISTED.**
+>
+> A Linux program inside OS-DEV could send a DNS query to `1.1.1.1` and never
+> get an answer. It looked like a receive bug in the guest, and for a long time
+> it looked like the kernel's own network demo was stealing the reply -- because
+> skipping that demo made the test pass. A packet capture on the bridge ended
+> the theory in five lines:
+>
+>     05:11:17.569  we ARP for the gateway, it replies  -> it now knows our MAC
+>     05:11:17.883  the kernel's DNS query from :5587   -> answered in 11 ms
+>     05:11:22.661  gateway: "who-has 192.168.1.224"    -> WE NEVER ANSWER
+>     05:11:23.685  gateway: "who-has 192.168.1.224"    -> WE NEVER ANSWER
+>     05:12:11.717  the guest's DNS query from :49152   -> NEVER ANSWERED
+>
+> Same host, same gateway MAC, the same 29-byte query, 54 seconds apart. The
+> variable was never the demo -- it was the *delay*: skipping the demo started
+> the guest's test inside the window where the router still remembered us. Once
+> the router's neighbour entry expired it asked who we were, got silence, and
+> from that moment every packet addressed to this machine was dropped before it
+> reached the wire.
+>
+> `arp_maybe_reply` had existed since M1878 and was called from three of the
+> four loops that take frames off the card. The two it was missing from --
+> `udp_pump_once`, which discarded the request as "not IPv4", and
+> `tcp_recv_seg`, which parked it in the ICMP ring where nothing ever looks --
+> are exactly the paths a Linux guest's sockets use. So the answer was not a
+> fourth copy of the check: it was to stop having four copies. One function now
+> takes frames off the card and answers ARP for this host before any consumer
+> gets an opinion about what the frame is for, because a reply is owed by the
+> machine, not by whichever loop happened to be polling.
+>
+> With that one change, on a real bridged LAN, with the kernel's network demo
+> running alongside it:
+>
+>     LXINET-DNS: example.com -> 104.20.23.154
+>     LXINET-HTTP: status 200, 868 bytes, poll-driven
+>     [udpq] FILED: 61 bytes from 1.1.1.1:53 -> our port 49152 (slot 0)
+>
+> **THE REST OF THE BLOCK: THE STACK WORKED BECAUSE QEMU WAS ANSWERING.**
+>
+> Every network feature in this OS -- DHCP, ARP, DNS, TCP, TLS, HTTP,
+> WebSockets -- had been developed and asserted against QEMU's user-mode SLIRP,
+> which is a helpful fiction: one host, one /24, a router that is always
+> `10.0.2.2`, a resolver that is always `10.0.2.3`, and nobody else's traffic on
+> the segment. Put the same kernel on a real bridged LAN and four defects
+> surfaced at once, none of which any of the 130-odd green checkpoints could
+> see, because SLIRP's defaults had been quietly promoted to facts about how
+> networks behave.
+>
+> **The lease had no gateway, so we kept one from a different network**
+> (M2121). `net_dhcp` parsed option 3 and, when the server did not send one,
+> left `GW_IP` at its compiled-in `10.0.2.2`. So the stack held an address on
+> `192.168.1.0/24` and a next hop on `10.0.2.0/24` -- a configuration that
+> cannot route anywhere and reported itself as a successful lease. It now parses
+> the netmask from option 1, derives `<our network>.1` when the lease is silent,
+> and prints the whole lease so a wrong one is visible at boot rather than three
+> layers up as a timeout.
+>
+> **This stack had no routing decision -- it ARPed the destination** (M2122).
+> There was no on-link test anywhere: every send resolved the *destination's*
+> MAC by ARP. Under SLIRP that works, because SLIRP answers ARP for the entire
+> internet. On a real segment `1.1.1.1` is not on the wire, nothing answers, and
+> the datagram is never sent. `next_hop()` now makes the decision every IP stack
+> makes -- destination if `(dst ^ ours) & netmask` is zero, gateway otherwise --
+> which is the single line that turned "no DNS reply" into `HTTP GET
+> example.com -> 200 OK` over the real internet.
+>
+> **An optimisation measured on one machine class, shipped for both, became a
+> timeout** (M2123). The poll nap spun 64 yields before sleeping, a number tuned
+> on KVM where a yield costs nothing. Under TCG the same 64 yields are
+> milliseconds of emulated work per pass, and three probes that had passed for
+> months began timing out. Eight yields, then 1ms, then 5ms. The lesson is the
+> one this project keeps relearning: a constant is a measurement, and a
+> measurement taken on one machine is not a fact about all of them.
+>
+> **The UDP queue filed every datagram on the segment, including other
+> machines' mail** (M2124). `udpq_put` filed whatever the card handed it. On a
+> real LAN that is a steady drizzle of broadcast discovery -- ports 32412,
+> 32414, 20002 -- which fills a fixed-size queue with datagrams addressed to
+> other hosts and evicts the one reply this machine was waiting for. It now
+> keeps unicast addressed to us, plus broadcast for the DHCP ports only, and
+> counts the rest.
+>
+> **And two instruments were lying again** (M2125). `nic_send` returns zero for
+> "sent" *and* for "the firewall dropped it", so a transmit check written as
+> `txr <= 0` produced a confident "TRANSMIT FAILED" about a frame that had gone
+> out perfectly -- and the ambiguity is now counted separately. The kernel's own
+> resolver used a hardcoded source port 5353, which meant a packet capture
+> showing a healthy DNS exchange from `:5353` was evidence about the *kernel*,
+> not about the guest program that appeared to be failing. Both were found while
+> chasing a bug that turned out to be neither of them.
+>
+> **Still open, stated plainly:** answering ARP is still something only a
+> *polling* consumer does, so an idle OS-DEV -- the desktop up, no socket open
+> -- goes unreachable again about a minute after boot. Being reachable is not a
+> service any one consumer can provide, so it should not be one; that is the
+> next milestone, along with the fact that `nic_receive` pops a software queue
+> whose tail it assumes it alone owns, an assumption that stopped being true the
+> moment a guest polled sockets from more than one thread.
+
 > **(M2108-M2120) FIREFOX RENDERS A REAL WEB PAGE INSIDE OS-DEV.**
 >
 > `docs/img/firefox-page-in-osdev.png` is a document Gecko parsed, styled, laid

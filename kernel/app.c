@@ -9996,7 +9996,7 @@ int app_inotify_rm(int fd, int wd) {
 /* AF_INET datagram sockets (M1267): a BSD socket() fd API over the userspace
  * UDP path (M1258) + loopback (M1264). fd type 9; the bound local port lives in
  * fdent.off (0 = unbound -> an ephemeral port is assigned on first sendto). */
-static uint16_t g_ephemeral = 49152;
+static uint16_t g_ephemeral = 49152;   /* the IANA ephemeral range; must not collide with the kernel resolver's own port (M2125) */
 /* ---- AF_INET SERVER SOCKETS: bind / listen / accept (M2020) ---------------
  *
  * bind() on an AF_INET socket used to be accepted and ignored, with the

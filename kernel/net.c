@@ -113,6 +113,53 @@ static int arp_maybe_reply(const uint8_t *buf, int len) {
     return 1;
 }
 
+/* ---- THE ONE PLACE A FRAME COMES OFF THE CARD (M2126) ----
+ *
+ * Every drain loop in this file used to call nic_receive directly, and each one
+ * decided for itself what to do with a frame it did not recognise. Three of
+ * them answered an inbound ARP request; `udp_pump_once` discarded it as "not
+ * IPv4", and `tcp_recv_seg` parked it in the ICMP ring where nothing ever
+ * looks at it. Those two are exactly the paths a Linux guest program's socket
+ * uses -- so for the whole time a guest was polling a socket, THIS MACHINE DID
+ * NOT ANSWER ARP.
+ *
+ * On QEMU's SLIRP that is invisible: it proxies ARP and never asks. On a real
+ * LAN the router's neighbour entry for us expires in well under a minute, and
+ * from that moment every packet addressed to us is dropped by the router
+ * because it cannot resolve our MAC. A packet capture on the bridge shows the
+ * shape of it exactly:
+ *
+ *   05:11:17.569  we ARP for the gateway, it replies  -> it now knows our MAC
+ *   05:11:17.883  the kernel's DNS query from :5587   -> answered in 11 ms
+ *   05:11:22.661  gateway: "who-has 192.168.1.224"    -> WE NEVER ANSWER
+ *   05:11:23.685  gateway: "who-has 192.168.1.224"    -> WE NEVER ANSWER
+ *   05:12:11.717  the guest's DNS query from :49152   -> NEVER ANSWERED
+ *
+ * Same machine, same gateway MAC, same 29-byte query, 54 seconds apart. That
+ * delay was the entire difference between the configuration that worked and
+ * the one that did not -- I had spent a long time believing the variable was
+ * whether the kernel's own network demo was running, because skipping it made
+ * the guest's test start sooner, inside the window where the router still
+ * remembered us.
+ *
+ * So the answer is not a fourth copy of the ARP check. It is to stop having
+ * four copies: one function takes frames off the card, and it answers ARP for
+ * this host before any consumer gets an opinion about what the frame is for.
+ * A reply is owed by the MACHINE, not by whichever loop happened to be
+ * polling. */
+static uint64_t g_arp_answered;
+static int rx_next(uint8_t *buf, int max) {
+    for (int guard = 0; guard < 64; guard++) {         /* bounded: never spin on a flood */
+        int len = nic_receive(buf, max);
+        if (len <= 0) return len;
+        if (!arp_maybe_reply(buf, len)) return len;
+        g_arp_answered++;
+    }
+    return 0;
+}
+uint64_t net_arp_answered(void) { return g_arp_answered; }
+
+
 /* ---- ONE RX DEMUX: nothing is discarded because of who happened to poll ----
  *
  * There is one NIC and several independent consumers -- a TCP connection's
@@ -136,6 +183,7 @@ static int arp_maybe_reply(const uint8_t *buf, int len) {
 static void park_put(const uint8_t *f, int len);   /* the TCP park ring, defined with the TCP demux below */
 static void udpq_put(const uint8_t *f, int len);   /* the UDP datagram queue */
 static uint64_t g_udpq_foreign;   /* datagrams addressed to some other host, dropped rather than queued (M2124) */
+static uint64_t g_udp_tx_fail;    /* datagrams nic_send refused, which used to be reported as SENT (M2125) */
 uint64_t net_udp_foreign(void) { return g_udpq_foreign; }
 /* 16 -> 48 (M2022): same reasoning as PARK_N. This ring holds the protocols
  * that have nowhere else to go, and it is written by every drain site. */
@@ -192,7 +240,28 @@ static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
 
 /* Wait up to `ticks` for a frame; return its length (0 on timeout). Loopback
  * frames (M1264) are drained first so a NIC flood can't starve them. */
-static int recv_timeout(uint8_t *buf, int max, uint64_t ticks) {
+/* `my_udp_port`: the local UDP port THIS caller is waiting on. Any UDP datagram
+ * for a different port is FILED into the datagram queue instead of being handed
+ * up to be discarded. -1 means "file nothing" (a raw receiver wants every
+ * frame); 0 means "I want no UDP at all" (an ARP resolve, a ping).
+ *
+ * THIS IS THE FIX FOR A GUEST PROGRAM'S DATAGRAMS BEING DESTROYED BY THE
+ * KERNEL (M2125). recv_timeout returned every UDP frame to its caller, and the
+ * comment below said filing them would break dns_resolve and net_tftp_get,
+ * which read their own datagrams THROUGH here. True -- and the consequence was
+ * that those callers then dropped everyone ELSE's on the floor. So while the
+ * boot network self-test held a DNS or TFTP loop open, a Linux program in the
+ * guest could send a query, have the reply arrive, and never see it:
+ *
+ *   with net_demo running:  LXINET: no DNS reply (poll revents=0)
+ *   with net_demo skipped:  LXINET-DNS: example.com -> 104.20.23.154
+ *                           LXINET-HTTP: status 200, 868 bytes, poll-driven
+ *
+ * Same boot, same network, same code -- the only difference was whether the
+ * kernel was also listening. This is the "no cross-connection RX demux" the
+ * stack's own comments describe, and TCP got its park ring for exactly this in
+ * M2017; UDP never got the equivalent. Now it has one. */
+static int recv_timeout(uint8_t *buf, int max, uint64_t ticks, int my_udp_port) {
     uint64_t deadline = timer_ticks() + ticks;
     /* A TICK DEADLINE IS NOT A BOUND WITH INTERRUPTS OFF (M2068).
      *
@@ -241,9 +310,8 @@ static int recv_timeout(uint8_t *buf, int max, uint64_t ticks) {
         }
         l = lo_dequeue(buf, max);
         if (l > 0) return l;
-        int len = nic_receive(buf, max);
+        int len = rx_next(buf, max);                   /* answers ARP for us first (M2126) */
         if (len > 0) {
-            if (arp_maybe_reply(buf, len)) continue;   /* answered an ARP query — keep waiting */
             /* TCP belongs to a connection, never to these callers: an ARP
              * resolve, a ping, a DNS query and a TFTP transfer all filter for
              * their own protocol and drop the rest. So a connect()'s ARP
@@ -255,6 +323,16 @@ static int recv_timeout(uint8_t *buf, int max, uint64_t ticks) {
              * the UDP queue would leave those callers waiting for something
              * that had already been put away. Their own filters handle it. */
             if (len >= 34 && get16(buf + 12) == 0x0800 && buf[14 + 9] == 6) { park_put(buf, len); continue; }
+            /* ...and a UDP datagram for somebody else's port goes to the UDP
+             * queue rather than up to a caller that will drop it (M2125). */
+            if (my_udp_port >= 0 && len >= 34 && get16(buf + 12) == 0x0800 && buf[14 + 9] == 17) {
+                int ihl = (buf[14] & 0x0F) * 4;
+                if (ihl >= 20 && len >= 14 + ihl + 8 &&
+                    get16(buf + 14 + ihl + 2) != (uint16_t)my_udp_port) {
+                    udpq_put(buf, len);
+                    continue;
+                }
+            }
             return len;
         }
         /* Nothing yet: instead of tight-spinning the CPU, SLEEP until the next
@@ -340,7 +418,7 @@ static int arp_resolve(const uint8_t *ip, uint8_t *out_mac) {
     uint8_t buf[1600];
     uint64_t deadline = timer_ticks() + 200;
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(buf, sizeof(buf), 20);
+        int len = recv_timeout(buf, sizeof(buf), 20, 0);
         if (len >= 42 && get16(buf + 12) == 0x0806 && get16(buf + 20) == 2 /*reply*/
             && memcmp(buf + 28, ip, 4) == 0) {
             memcpy(out_mac, buf + 22, 6);    /* sender MAC of the reply */
@@ -432,7 +510,7 @@ static int ping(const uint8_t *ip, const uint8_t *dst_mac, uint16_t seq) {
     uint8_t buf[1600];
     uint64_t deadline = timer_ticks() + 200;   /* deadline-bounded (see arp_resolve) */
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(buf, sizeof(buf), 20);
+        int len = recv_timeout(buf, sizeof(buf), 20, 0);
         if (len >= 42 && get16(buf + 12) == 0x0800 && buf[14 + 9] == 1 /*ICMP*/
             && buf[34] == 0 /*echo reply*/ && memcmp(buf + 26, ip, 4) == 0) {
             return 1;
@@ -538,7 +616,17 @@ int dns_resolve(const char *host, uint8_t out_ip[4]) {
     put16(ip + 6, 0); ip[8] = 64; ip[9] = 17; put16(ip + 10, 0);
     memcpy(ip + 12, OUR_IP, 4); memcpy(ip + 16, DNS_IP, 4);
     put16(ip + 10, inet_checksum(ip, 20));
-    put16(udp + 0, 5353); put16(udp + 2, 53); put16(udp + 4, 8 + dl); put16(udp + 6, 0);
+    /* A HARDCODED SOURCE PORT IS A COLLISION WAITING TO HAPPEN (M2125). This
+     * sent from 5353 on every lookup, and recv_timeout now routes a datagram to
+     * whichever caller claims that port -- so any guest socket that happened to
+     * bind 5353 would have its replies handed to this function and discarded.
+     * That is not hypothetical: it is what happened while testing, when the
+     * guest's ephemeral allocator was temporarily pointed at 5353, and the
+     * symptom was indistinguishable from the network being broken. Vary it, and
+     * keep it below the ephemeral range a guest allocates from. */
+    static uint16_t g_dns_sport = 5353;
+    uint16_t sport = 5353 + (uint16_t)(++g_dns_sport % 256);
+    put16(udp + 0, sport); put16(udp + 2, 53); put16(udp + 4, 8 + dl); put16(udp + 6, 0);
     memcpy(udp + 8, q, dl);
     nic_send(pkt, 34 + 8 + dl);
 
@@ -548,7 +636,7 @@ int dns_resolve(const char *host, uint8_t out_ip[4]) {
     uint8_t buf[1600];
     uint64_t deadline = timer_ticks() + 500;
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(buf, sizeof(buf), 20);
+        int len = recv_timeout(buf, sizeof(buf), 20, (int)sport);
         if (len < 42 || get16(buf + 12) != 0x0800 || buf[14 + 9] != 17) continue;   /* IPv4/UDP */
         int ihl = (buf[14] & 0x0F) * 4;        /* honor the real IP header length (IP options -> IHL>5); SLIRP uses 20 so this is a no-op there, but real routers may not */
         int doff = 14 + ihl + 8;               /* eth(14) + IP(ihl) + UDP(8) -> DNS payload (was hardcoded 42 = IHL 5) */
@@ -626,7 +714,7 @@ static int dhcp_recv(uint32_t xid, uint64_t ticks, uint8_t *yiaddr,
     uint8_t buf[1600];
     uint64_t deadline = timer_ticks() + ticks;
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(buf, sizeof buf, 20);
+        int len = recv_timeout(buf, sizeof buf, 20, 68);   /* our DHCP client port (M2125) */
         if (len < 282) continue;                           /* eth14+ip20+udp8+bootp240 */
         if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 17) continue;   /* IPv4 + UDP */
         int ihl = (buf[14] & 0x0F) * 4; if (ihl < 20) continue;
@@ -748,13 +836,36 @@ static void udp_send_to(const uint8_t *dstmac, const uint8_t *dstip,
     uint8_t pkt[1500];
     memcpy(pkt + 0, dstmac, 6); memcpy(pkt + 6, me, 6); put16(pkt + 12, 0x0800);
     uint8_t *ip = pkt + 14, *udp = pkt + 34, *pl = pkt + 42;
-    ip[0] = 0x45; ip[1] = 0; put16(ip + 2, (uint16_t)(20 + 8 + plen)); put16(ip + 4, 0); put16(ip + 6, 0);
+    /* A VARYING IP IDENTIFICATION (M2125). This wrote ZERO into the ID field of
+     * every datagram it ever sent. RFC 6864 requires the ID to be unique per
+     * source/destination/protocol for any packet that may be fragmented, and
+     * DF is not set here -- so a constant zero is not merely lazy, it is
+     * non-conformant, and middleboxes and conntrack implementations do drop or
+     * mis-associate such packets. The kernel's own DNS query -- which is
+     * answered reliably by the same server that ignores the guest's -- is
+     * byte-identical to this one except that it writes 0x42 here. A counter
+     * costs nothing and removes the difference. */
+    static uint16_t g_ip_id;
+    ip[0] = 0x45; ip[1] = 0; put16(ip + 2, (uint16_t)(20 + 8 + plen));
+    put16(ip + 4, ++g_ip_id); put16(ip + 6, 0);
     ip[8] = 64; ip[9] = 17; put16(ip + 10, 0);
     memcpy(ip + 12, OUR_IP, 4); memcpy(ip + 16, dstip, 4);
     put16(ip + 10, inet_checksum(ip, 20));
     put16(udp + 0, sport); put16(udp + 2, dport); put16(udp + 4, (uint16_t)(8 + plen)); put16(udp + 6, 0);
     for (int i = 0; i < plen; i++) pl[i] = payload[i];
-    nic_send(pkt, 42 + plen);
+    /* A FAILED TRANSMIT WAS INVISIBLE (M2125). This function returns void and
+     * discarded nic_send's result, so net_udp_send reported success whatever
+     * happened -- a full TX ring, a firewall drop, a driver error. The caller
+     * then waited for a reply to a datagram that was never put on the wire.
+     * Report it; the count is what tells a lost reply from a lost query. */
+    int txr = nic_send(pkt, 42 + plen);
+    if (txr < 0) {   /* 0 means SENT here -- e1000_send returns 0 on success (M2125) */
+        g_udp_tx_fail++;
+        static int told;
+        if (told < 4) { told++;
+            kprintf("[udp] TRANSMIT FAILED (%d) for %d bytes %u -> %u.%u.%u.%u:%u\n",
+                    txr, plen, sport, dstip[0], dstip[1], dstip[2], dstip[3], dport); }
+    }
 }
 
 /* ===================================================================== *
@@ -787,6 +898,14 @@ int net_udp_send(const uint8_t dstip[4], uint16_t dport, uint16_t sport,
     }
     uint8_t mac[6];
     if (!arp_resolve(next_hop(dstip), mac)) return -1;   /* one decision, no guaranteed timeout (M2122) */
+    {   static int told;
+        if (told < 4) { told++;
+            const uint8_t *nh = next_hop(dstip);
+            kprintf("[udp] tx %d bytes %u -> %u.%u.%u.%u:%u via %u.%u.%u.%u "
+                    "(mac %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                    plen, sport, dstip[0], dstip[1], dstip[2], dstip[3], dport,
+                    nh[0], nh[1], nh[2], nh[3],
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]); } }
     udp_send_to(mac, dstip, sport, dport, (const uint8_t *)payload, plen);
     return 0;
 }
@@ -866,6 +985,15 @@ static void udpq_put(const uint8_t *f, int len) {
             uint16_t dp = get16(f + 14 + ihl + 2);
             if (!((bcast_all || bcast_sub) && (dp == 67 || dp == 68))) {
                 g_udpq_foreign++;
+                /* WHOSE, EXACTLY (M2125). If this filter is rejecting our own
+                 * reply, that is the bug and not the flood it was written for,
+                 * and the destination address is the only thing that tells
+                 * those apart. */
+                {   static int told;
+                    if (told < 10) { told++;
+                        kprintf("[udpq] NOT OURS: dst %u.%u.%u.%u port %u (we are %u.%u.%u.%u)\n",
+                                dst[0], dst[1], dst[2], dst[3], dp,
+                                OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3]); } }
                 return;
             }
         }
@@ -896,6 +1024,18 @@ static void udpq_put(const uint8_t *f, int len) {
     g_udpq[slot].srcport = get16(udp + 0);
     for (int i = 0; i < 4; i++) g_udpq[slot].srcip[i] = f[14 + 12 + i];
     g_udpq[slot].at      = now;
+    /* FILED, AND FOR WHOM (M2125). The last unknown on this path: a reply that
+     * is filed but never matched, and one that never arrives, look identical
+     * from the waiter's side. DHCP's port 67/68 traffic is excluded because it
+     * is the only broadcast this stack keeps and it would drown the rest. */
+    if (g_udpq[slot].dport >= 1024) {
+        static int told;
+        if (told < 10) { told++;
+            kprintf("[udpq] FILED: %d bytes from %u.%u.%u.%u:%u -> our port %u (slot %d)\n",
+                    plen, g_udpq[slot].srcip[0], g_udpq[slot].srcip[1],
+                    g_udpq[slot].srcip[2], g_udpq[slot].srcip[3],
+                    g_udpq[slot].srcport, g_udpq[slot].dport, slot); }
+    }
 }
 
 /* Dequeue a datagram for `sport`. Returns its length, or -1 if none. */
@@ -917,12 +1057,15 @@ static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint1
 
 /* Drain the NIC once: UDP datagrams to the queue, TCP frames to the park ring,
  * everything else discarded. Returns 1 if a datagram for `want` arrived. */
+static uint64_t g_pump_calls, g_pump_frames;
 static int udp_pump_once(uint16_t want) {
     uint8_t rb[1600];
     int got = 0;
+    g_pump_calls++;
     for (;;) {
-        int len = nic_receive(rb, sizeof rb);
+        int len = rx_next(rb, sizeof rb);              /* answers ARP for us first (M2126) */
         if (len < 14) break;
+        g_pump_frames++;
         if (get16(rb + 12) != 0x0800) continue;                 /* not IPv4 */
         if (rb[14 + 9] == 17 && len >= 14 + 20 + 8) {           /* UDP */
             int ihl = (rb[14] & 0x0F) * 4;
@@ -969,18 +1112,42 @@ int net_udp_readable(uint16_t sport) {
     for (int i = 0; i < UDPQ_N; i++)
         if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL && g_udpq[i].dport == sport) return 1;
     udp_pump_once(sport);
-    /* RE-READ THE CLOCK AFTER THE PUMP (M2124).
-     *
-     * The second pass reused the `now` taken before it, and udpq_put stamps a
-     * freshly-filed datagram with the CURRENT tick -- so if a tick landed
-     * during the pump, `at` was greater than `now`, and `now - at` on unsigned
-     * values wrapped to about 2^64 and failed the comparison. The datagram the
-     * pump had just collected was reported as not readable. The `+ 1` here was
-     * an attempt to absorb exactly that and only covered the case where the
-     * clock had not moved at all. */
+    /* RE-READ THE CLOCK AFTER THE PUMP (M2124). udpq_put stamps a freshly-filed
+     * datagram with the CURRENT tick, so if a tick landed during the pump then
+     * `at` was greater than the `now` taken before it, and `now - at` on
+     * unsigned values wrapped to about 2^64 and failed the window test -- the
+     * datagram the pump had just collected read as not readable. */
     now = timer_ticks();
     for (int i = 0; i < UDPQ_N; i++)
         if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL && g_udpq[i].dport == sport) return 1;
+    /* NOTHING FOR US, AGAIN: account for it once (M2125). The stack has no
+     * single demux point -- its own comments say so -- so "is another consumer
+     * eating the frames this socket is waiting for" can only be answered by
+     * comparing what the pump saw against every frame nic_receive has ever
+     * handed out. */
+    {   static unsigned misses;
+        static uint64_t rx0, pf0, fo0;
+        if (misses < 400) misses++;
+        /* MEASURE A WINDOW, NOT A LIFETIME (M2126). The first version of this
+         * printed nic_rx_total() -- a count since boot -- beside the pump's own
+         * count, and the difference was DHCP, the boot self-test and net_demo's
+         * HTTP GET, all long finished. It read as "53 frames went to a second
+         * consumer" and it meant nothing. Anchor both at the first miss so the
+         * question asked is the one that matters: while THIS socket saw
+         * nothing, did anyone else take a frame off the card? */
+        if (misses == 1) { rx0 = nic_rx_total(); pf0 = g_pump_frames; fo0 = g_udpq_foreign; }
+        if (misses == 300) {
+            uint64_t rx = nic_rx_total() - rx0, pf = g_pump_frames - pf0;
+            kprintf("[udpq] 300 misses on port %u, and in that window: %lu frame(s) came off the "
+                    "card, this pump took %lu of them, %lu were addressed to another host; "
+                    "%lu went to SOME OTHER consumer; %lu tx failed; %lu ARP request(s) for us "
+                    "answered since boot\n",
+                    sport, (unsigned long)rx, (unsigned long)pf,
+                    (unsigned long)(g_udpq_foreign - fo0),
+                    (unsigned long)(rx > pf ? rx - pf : 0),
+                    (unsigned long)g_udp_tx_fail, (unsigned long)g_arp_answered);
+        }
+    }
     return 0;
 }
 
@@ -1026,7 +1193,7 @@ int net_raw_recv(void *buf, int max, int timeout_ms) {
     uint8_t rb[1600];
     uint64_t deadline = timer_ticks() + (uint64_t)timeout_ms / 10 + 1;
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(rb, sizeof(rb), 20);
+        int len = recv_timeout(rb, sizeof(rb), 20, -1);   /* raw: file nothing (M2125) */
         if (len < 14) continue;                               /* runt / nothing */
         if (len > max) len = max;
         for (int i = 0; i < len; i++) ((uint8_t *)buf)[i] = rb[i];
@@ -1323,7 +1490,7 @@ long net_tftp_get(const char *server_str, const char *filename, void *out, uint3
     uint8_t buf[1600];
     int idle = 0;
     for (;;) {
-        int len = recv_timeout(buf, sizeof buf, 100);   /* ~1 s */
+        int len = recv_timeout(buf, sizeof buf, 100, (int)myport);   /* ~1 s */
         if (len <= 0) { if (++idle > 6) return -1; if (tid == 0) udp_send_to(mac, srv, myport, 69, rrq, rl); continue; }   /* no DATA yet: re-send RRQ; mid-transfer: await the server's retransmit */
         if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 17) continue;   /* IPv4/UDP */
         int ihl = (buf[14] & 0x0F) * 4; if (ihl < 20) continue;
@@ -1394,7 +1561,7 @@ int net_sntp(void) {
     uint8_t buf[1600];
     uint64_t deadline = timer_ticks() + 400;                /* ~4 s */
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(buf, sizeof buf, 50);
+        int len = recv_timeout(buf, sizeof buf, 50, (int)myport);
         if (len < 14 + 20 + 8 + 48) continue;
         if (get16(buf + 12) != 0x0800 || buf[14 + 9] != 17) continue;   /* IPv4/UDP */
         int ihl = (buf[14] & 0x0F) * 4; if (ihl < 20) continue;
@@ -1586,11 +1753,11 @@ static int tcp_recv_seg(uint8_t *buf, int max, const uint8_t *dip,
              * socket it owns on every turn, so the question has to be cheap
              * and must not block on any one of them. (M1967) */
             if (ticks == 0) {
-                len = nic_receive(buf, max);
+                len = rx_next(buf, max);               /* answers ARP for us first (M2126) */
                 if (len <= 0) return 0;
             } else {
                 if (timer_ticks() >= deadline) return 0;
-                len = nic_receive(buf, max);
+                len = rx_next(buf, max);               /* answers ARP for us first (M2126) */
             }
             if (len < 34) continue;
             /* NOT TCP IS NOT RUBBISH (M2017). This used to `continue` -- i.e.
@@ -1679,7 +1846,7 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
 static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
                   const uint8_t *cip, uint64_t deadline, uint8_t **tcp_out, int *dlen_out) {
     while (timer_ticks() < deadline) {
-        int len = nic_receive(buf, max);
+        int len = rx_next(buf, max);                   /* answers ARP for us first (M2126) */
         if (len < 34) {
             /* Idle (no packet / a runt): SLEEP to the next interrupt instead of
              * tight-spinning. Interrupt-driven RX (M1858) wakes us the moment a
@@ -2963,7 +3130,12 @@ static void net_selftest_rx_demux(const uint8_t *gw_mac) {
     uint8_t buf[1600], dummy[64], sip[4];
     uint16_t sport;
 
-    while (recv_timeout(buf, sizeof buf, 0) > 0) { }      /* start from a clean queue */
+    /* FILE, DO NOT DESTROY (M2126). This drain passed -1 -- "file nothing" --
+     * so it emptied the NIC ring into the bin, including datagrams belonging
+     * to a guest program that was mid-query. 0 means "I want no UDP", which
+     * files it for its owner instead. Same rule the TCP loops adopted in
+     * M2017/M2018 and this site never did. */
+    while (recv_timeout(buf, sizeof buf, 0, 0) > 0) { }      /* start from a clean queue */
 
     ping_send(GW_IP, gw_mac, 0xBEEF);
     (void)net_udp_recv(60999, dummy, sizeof dummy, sip, &sport, 300);   /* the other consumer */
@@ -2971,7 +3143,7 @@ static void net_selftest_rx_demux(const uint8_t *gw_mac) {
     int got = 0;
     uint64_t deadline = timer_ticks() + 100;
     while (timer_ticks() < deadline) {
-        int len = recv_timeout(buf, sizeof buf, 20);
+        int len = recv_timeout(buf, sizeof buf, 20, 0);   /* file UDP, keep ICMP (M2126) */
         if (len >= 42 && get16(buf + 12) == 0x0800 && buf[14 + 9] == 1 &&
             buf[34] == 0 && memcmp(buf + 26, GW_IP, 4) == 0) { got = 1; break; }
     }
@@ -3024,14 +3196,11 @@ void net_demo(void) {
      * "IP = 10.0.2.15" whatever the address actually was, which is why the
      * first defect could sit here: a successful lease and no lease at all
      * produced identical output. Print the real bytes. */
-    if (net_dhcp() == 0) {
+    {   /* The lease is acquired synchronously in kmain now (M2125) -- doing it
+         * here meant it raced everything else the boot launched. Just report. */
         const uint8_t *ip = net_ip();
-        kprintf(", IP = %u.%u.%u.%u (DHCP)\n", ip[0], ip[1], ip[2], ip[3]);
-    } else {
-        const uint8_t *ip = net_ip();
-        kprintf(", IP = %u.%u.%u.%u (NO DHCP LEASE -- this is the SLIRP default, "
-                "which only works under QEMU user-mode networking)\n",
-                ip[0], ip[1], ip[2], ip[3]);
+        kprintf(", IP = %u.%u.%u.%u (%s)\n", ip[0], ip[1], ip[2], ip[3],
+                net_have_lease() ? "DHCP" : "no lease -- SLIRP default");
     }
 
     uint8_t gw_mac[6];
@@ -3136,7 +3305,8 @@ static int np_str(char *b, int p, int max, const char *s) { while (*s && p < max
 static int np_dec(char *b, int p, int max, uint64_t v) {
     char t[20]; int n = 0; if (!v) t[n++] = '0';
     while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
-    while (n && p < max - 1) b[p++] = t[--n]; return p;
+    while (n && p < max - 1) b[p++] = t[--n];
+    return p;
 }
 static int np_ip(char *b, int p, int max, const uint8_t *ip) {
     for (int i = 0; i < 4; i++) { if (i && p < max - 1) b[p++] = '.'; p = np_dec(b, p, max, ip[i]); }

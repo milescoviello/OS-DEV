@@ -20,6 +20,7 @@ int  nic_init(void);
 const uint8_t *nic_mac(void);                  /* our 6-byte hardware address */
 int  nic_send(const void *frame, uint16_t len);            /* 0 on success   */
 int  nic_receive(void *out, uint16_t max);                 /* len, or 0 none */
+uint64_t nic_rx_total(void);   /* frames handed out by nic_receive, ever: the only way to see a second consumer (M2125) */
 
 /* Human-readable name of the active card ("e1000", "rtl8139", or "none") — for
  * the boot banner so it's clear which driver carried the traffic. */
