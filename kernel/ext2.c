@@ -36,12 +36,29 @@ typedef struct {
     uint32_t block_size, inodes_per_group, inode_size, gdt_block;
     uint32_t blocks_per_group, first_data_block, first_ino, blocks_count, groups;   /* for allocation (M1132) */
     uint32_t feat_incompat;          /* s_feature_incompat; bit 0x40 = `extent` (M1189) */
+    /* A FAILED BLOCK READ IS NOT A MISSING FILE (M2155).
+     *
+     * `walk_d` returns 0 both when a path component is genuinely absent and
+     * when the READ of the directory or inode block failed, and `walk_cached`
+     * then wrote that 0 into the table as a NEGATIVE entry -- so one transient
+     * device error made a shared library permanently "not there" for the rest
+     * of the boot, and no retry could recover because the retry hit the cache.
+     * That is what zeroed an executable page of libxul under eight cores, and
+     * it is the dominant bug class in this project wearing yet another hat: a
+     * mechanism answering with a plausible WRONG VALUE instead of failing.
+     *
+     * `ext2_t` is stack-allocated per call, so a flag in it is per-call state
+     * and needs no lock. Set by rdblk/rdblks; read by walk_cached (which then
+     * refuses to cache anything) and by ext2_pread (which reports it). */
+    int ioerr;
 } ext2_t;
 
 /* read ext2 block `blk` (block_size bytes) into buf (>= block_size) */
 static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
-    return v->read(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
+    int r = v->read(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
+    if (r < 0) v->ioerr = 1;                       /* see ext2_t.ioerr (M2155) */
+    return r;
 }
 /* `n` PHYSICALLY CONSECUTIVE blocks in one request (M2101).
  *
@@ -58,7 +75,9 @@ static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
  * traffic as much as on the transfers. */
 static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
-    return v->read(v->ctx, v->start + (uint64_t)blk * spb, n * spb, buf);
+    int r = v->read(v->ctx, v->start + (uint64_t)blk * spb, n * spb, buf);
+    if (r < 0) v->ioerr = 1;
+    return r;
 }
 /* How many blocks a single request may cover: the block device's own transfer
  * ceiling, in blocks. Asking for more than it can do in one go makes it split
@@ -68,7 +87,8 @@ static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
 /* parse + validate the superblock; 0 on a supported ext2, -1 otherwise */
 static int ext2_open(blk_read_fn read, void *ctx, uint64_t start, ext2_t *v) {
     uint8_t sb[1024];
-    if (read(ctx, start + 2, 2, sb) < 0) return -1;        /* superblock: byte 1024 = LBA+2, 1024 bytes */
+    v->ioerr = 0;
+    if (read(ctx, start + 2, 2, sb) < 0) { v->ioerr = 1; return -1; }   /* superblock: byte 1024 = LBA+2, 1024 bytes */
     if (e_rd16(sb + 56) != EXT2_MAGIC) return -1;
     uint32_t logbs = e_rd32(sb + 24);
     if (logbs > 2) return -1;                              /* only 1024/2048/4096 */
@@ -263,10 +283,64 @@ static uint32_t walk_d(ext2_t *v, uint32_t startino, const char *path,
  * timestamps that a write changes, and re-reading one inode block is the cheap
  * part -- the walk was the expensive part. A negative entry caches nothing but
  * the absence. */
+/* THE CACHE WAS SHARED MUTABLE STATE WITH NO LOCK (M2155).
+ *
+ * This is the 8-core Firefox corruption, root-caused. Every thread that faults
+ * a page of a demand-paged library comes through here, and on eight cores
+ * several are inside the insert at once. Two of them scan the same LRU array,
+ * pick the SAME victim slot, and interleave their field writes -- so the slot
+ * ends up holding one path's name with the other's inode number, or with the
+ * other's `negative` flag. A later lookup of a perfectly good library path then
+ * gets "absent", ext2_pread returns -1, and the page-fault handler mapped the
+ * still-zero frame anyway. Execution fell into the hole and `00 00` decoded as
+ * `add %al,(%rax)`, which is a STORE, which faulted as a write to a read-only
+ * mapping half a megabyte from the cause. Three sessions of hunting a
+ * "corrupted executable page" and the corruption was one unlocked 256-entry
+ * table answering with a plausible wrong value.
+ *
+ * NOT a spinlock, for two reasons that both matter here. ext2.c is #included
+ * and compiled by tests/ext2/ext2_test.c on the HOST, where `cli` is a #GP --
+ * so the primitive has to be something GCC gives both builds. And the lookup
+ * path does DISK I/O (read_inode), which no lock in this file may span.
+ *
+ * So: claim the slot with an atomic exchange, and if the claim is already
+ * taken, DON'T CACHE. A cache is allowed to miss; that is the whole of its
+ * contract. The reader is safe against a torn entry because `used` is cleared
+ * before the fields are written and set after, with a fence either side -- so
+ * `used == 1` means the entry is whole. */
 #define E2PC_N 256
-static struct { char path[128]; uint32_t ino; uint8_t used, isdir, negative; } g_e2pc[E2PC_N];
+/* `gen` is a seqlock: ODD = published and whole, EVEN = free or mid-write. It
+ * replaces the old `used` flag because a flag cannot express "being rewritten",
+ * and that is the state a reader has to detect. See walk_cached. */
+static struct { char path[128]; uint32_t ino; uint8_t isdir, negative;
+                volatile unsigned gen; volatile int claim; } g_e2pc[E2PC_N];
 static unsigned g_e2pc_clk;
 static uint8_t  g_e2pc_lru[E2PC_N];
+unsigned long g_e2pc_races;      /* inserts abandoned because another core held the slot */
+unsigned long g_e2pc_ioerrs;     /* lookups a device error spoiled, and so were NOT cached */
+int g_e2pc_racy;                 /* -append e2pcracy: the pre-M2155 unlocked insert, for the revert proof */
+/* WIDEN THE WINDOW, IN BOTH ARMS (M2155).
+ *
+ * The unlocked insert's bad window is the handful of instructions between
+ * writing the path and writing the inode -- perhaps fifty cycles, against
+ * millions between inserts. A test that waits for two cores to land inside
+ * that window will not see it in any run anyone would sit through, so `0
+ * failures` from the racy arm proves nothing about the racy arm.
+ *
+ * `-append e2pcwiden` puts the same delay in BOTH the fixed and the racy
+ * insert, so the arms differ only in whether the entry is ATOMIC, which is the
+ * property under test. The fixed path is unaffected by any delay because the
+ * entry is unpublished (even generation) for the whole write; the racy path
+ * leaves the previous occupant's odd generation in place and is therefore
+ * readable, half-rewritten, for the duration.
+ *
+ * This is the same technique M1913/M1894 used to prove their races, and it is
+ * the only honest way to make an intermittent defect testable. */
+int g_e2pc_widen;
+static void e2pc_widen(void) {
+    if (!g_e2pc_widen) return;
+    for (volatile int q = 0; q < 20000; q++) { }
+}
 unsigned long g_e2pc_hits, g_e2pc_misses, g_e2pc_neg_hits, g_e2pc_flushes;
 
 static int e2pc_eq(const char *a, const char *b) {
@@ -276,7 +350,10 @@ static int e2pc_eq(const char *a, const char *b) {
 /* Any write to this volume drops the whole cache. Called from every mutating
  * entry point in this file. */
 void ext2_path_cache_flush(void) {
-    for (int i = 0; i < E2PC_N; i++) g_e2pc[i].used = 0;
+    for (int i = 0; i < E2PC_N; i++) {
+        unsigned g = __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE);
+        if (g & 1u) __atomic_store_n(&g_e2pc[i].gen, g + 1, __ATOMIC_RELEASE);
+    }
     g_e2pc_flushes++;
 }
 void ext2_path_cache_stats(unsigned long *hits, unsigned long *misses,
@@ -320,18 +397,41 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
     int slot = -1;
     if (cacheable) {
         for (int i = 0; i < E2PC_N; i++) {
-            if (!g_e2pc[i].used || !e2pc_eq(g_e2pc[i].path, path)) continue;
+            /* READ THE ENTRY AS ONE VALUE OR NOT AT ALL (M2155).
+             *
+             * A flag test is not enough. A reader that passes the test and is
+             * then overtaken mid-`e2pc_eq` by a writer recycling the slot can
+             * match a HALF-REWRITTEN name -- the new path shares a prefix with
+             * the old often enough on a library directory -- and then read the
+             * new path's inode for the old path's name. That is the same wrong
+             * answer the unlocked version gave, just through a narrower window,
+             * and a narrower window is not a fix.
+             *
+             * So: odd generation = published, and re-read it after copying the
+             * fields out. If it moved, the entry we just read never existed as
+             * a whole and we fall through to the real walk. */
+            unsigned g1 = __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE);
+            if (!(g1 & 1u)) continue;                  /* free, or being written */
+            if (!e2pc_eq(g_e2pc[i].path, path)) continue;
+            uint32_t cino = g_e2pc[i].ino;
+            uint8_t  cdir = g_e2pc[i].isdir, cneg = g_e2pc[i].negative;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (!g_e2pc_racy && __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE) != g1) continue;
             g_e2pc_lru[i] = (uint8_t)(++g_e2pc_clk);
-            if (g_e2pc[i].negative) { g_e2pc_neg_hits++; return 0; }   /* known absent: no walk at all */
+            if (cneg) { g_e2pc_neg_hits++; return 0; }   /* known absent: no walk at all */
             /* Positive: we still read the one inode, because its SIZE and
              * timestamps must be current -- but not the directories above it,
              * which is where the cost was. */
-            if (read_inode(v, g_e2pc[i].ino, inode_out) >= 0) {
-                if (is_dir) *is_dir = g_e2pc[i].isdir;
+            if (read_inode(v, cino, inode_out) >= 0) {
+                if (is_dir) *is_dir = cdir;
                 g_e2pc_hits++;
-                return g_e2pc[i].ino;
+                return cino;
             }
-            g_e2pc[i].used = 0;                   /* the inode is gone: the entry was wrong */
+            /* The inode is gone: retire the entry, but only if it is still the
+             * one we read -- otherwise we would be invalidating a stranger. */
+            if (__atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE) == g1)
+                __atomic_compare_exchange_n(&g_e2pc[i].gen, &g1, g1 + 1, 0,
+                                            __ATOMIC_RELEASE, __ATOMIC_RELAXED);
             break;
         }
         g_e2pc_misses++;
@@ -339,24 +439,58 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
     int isd = 0;
     uint32_t ino = walk_d(v, EXT2_ROOT_INO, path, inode_out, &isd, 0);
     if (is_dir) *is_dir = isd;
+    /* NEVER CACHE AN ANSWER A DEVICE ERROR PRODUCED (M2155). A negative entry
+     * written from a failed read is the whole bug: it makes a transient error
+     * permanent, and it makes it permanent for the one path that was unlucky. */
+    if (v->ioerr) { g_e2pc_ioerrs++; return ino; }
     if (cacheable) {
         /* Least-recently-used victim, or the first free slot. A linear scan of
          * 256 entries is nothing against the directory reads it replaces. */
         int v2 = -1; uint8_t oldest = 0xFF;
         for (int i = 0; i < E2PC_N; i++) {
-            if (!g_e2pc[i].used) { v2 = i; break; }
+            if (!(__atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE) & 1u)) { v2 = i; break; }
             uint8_t age = (uint8_t)(g_e2pc_clk - g_e2pc_lru[i]);
             if (age >= oldest) { oldest = age; v2 = i; }
         }
-        if (v2 >= 0) {
+        /* Claim the slot, and if another core already has it, DON'T CACHE. A
+         * cache is allowed to miss; that is the whole of its contract, and it
+         * is much cheaper than any lock that would have to be held across the
+         * disk read this function performs. */
+        /* THE REVERT PROOF, AS A BOOT FLAG (M2155). `-append e2pcracy` restores
+         * the original unlocked insert -- no generation, no claim, fields
+         * written straight into the victim slot -- so the test that proves this
+         * milestone can be failed on demand without editing a line. The same
+         * reasoning as `nodma` and `nopathcache`: a fix that cannot be switched
+         * off is a fix you cannot be acquitted of. */
+        if (v2 >= 0 && g_e2pc_racy) {
             slot = v2;
             int j = 0; for (; path[j] && j < (int)sizeof g_e2pc[0].path - 1; j++) g_e2pc[slot].path[j] = path[j];
             g_e2pc[slot].path[j] = 0;
+            e2pc_widen();
             g_e2pc[slot].ino = ino;
             g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
             g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
-            g_e2pc[slot].used = 1;
+            g_e2pc[slot].gen |= 1u;                  /* "published", with no ordering at all */
             g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
+        } else if (v2 >= 0 && !__atomic_exchange_n(&g_e2pc[v2].claim, 1, __ATOMIC_ACQUIRE)) {
+            slot = v2;
+            unsigned g0 = __atomic_load_n(&g_e2pc[slot].gen, __ATOMIC_ACQUIRE);
+            if (g0 & 1u)                                 /* published -> mark it in-flight */
+                __atomic_store_n(&g_e2pc[slot].gen, g0 + 1, __ATOMIC_RELEASE);
+            int j = 0; for (; path[j] && j < (int)sizeof g_e2pc[0].path - 1; j++) g_e2pc[slot].path[j] = path[j];
+            g_e2pc[slot].path[j] = 0;
+            e2pc_widen();                                /* the same delay as the racy arm */
+            g_e2pc[slot].ino = ino;
+            g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
+            g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            __atomic_store_n(&g_e2pc[slot].gen,
+                             (__atomic_load_n(&g_e2pc[slot].gen, __ATOMIC_RELAXED) | 1u) + 2u,
+                             __ATOMIC_RELEASE);          /* publish: odd, and different */
+            g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
+            __atomic_store_n(&g_e2pc[v2].claim, 0, __ATOMIC_RELEASE);
+        } else if (v2 >= 0) {
+            g_e2pc_races++;      /* another core owns that slot: miss rather than corrupt it */
         }
     }
     return ino;
@@ -370,11 +504,32 @@ int ext2_probe(blk_read_fn read, void *ctx, uint64_t start_lba) {
 /* Positioned read: up to `max` bytes starting at byte `offset` (M1196). Walks
  * blocks from offset/bs with a partial first/last block, so file fds read at an
  * arbitrary position without the read-the-whole-prefix workaround. */
+/* WHY THE LAST ext2_pread RETURNED -1 (M2155).
+ *
+ * `-1` from here is three different failures wearing one number, and the one
+ * that mattered -- "the path cache answered absent for a file that exists" --
+ * was indistinguishable from "that file really is not there". A caller can now
+ * name it. Not a kprintf: ext2.c is #included and compiled on the host by
+ * tests/ext2/ext2_test.c and deliberately calls nothing outside itself. */
+int g_e2_pread_why;      /* 0 = ok, 1 = superblock unreadable, 2 = path not found, 3 = is a directory */
+const char *ext2_pread_why(void) {
+    switch (g_e2_pread_why) {
+    case 1:  return "the ext2 SUPERBLOCK could not be read";
+    case 2:  return "the PATH was not found (a real walk, or the path cache, said absent)";
+    case 3:  return "the path is a DIRECTORY";
+    case 4:  return "a BLOCK READ FAILED during the path walk -- a device error, not a missing file";
+    case 5:  return "a BLOCK READ FAILED while reading the file's data";
+    default: return "no recorded reason";
+    }
+}
+
 long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
                 void *buf, unsigned long max, unsigned long offset) {
-    ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
+    ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) { g_e2_pread_why = 1; return -1; }
     uint8_t inode[256]; int isdir = 0;
-    if (!walk_cached(&v, path, inode, &isdir) || isdir) return -1;
+    if (!walk_cached(&v, path, inode, &isdir)) { g_e2_pread_why = v.ioerr ? 4 : 2; return -1; }
+    if (isdir) { g_e2_pread_why = 3; return -1; }
+    g_e2_pread_why = 0;
     uint32_t size = e_rd32(inode + 4);
     if (offset >= size) return 0;                          /* at/after EOF */
     unsigned long avail = size - offset;
@@ -413,6 +568,12 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
         else { if (rdblk(&v, db, blk) < 0) break; memcpy((uint8_t *)buf + done, blk + bo, chunk); }
         done += chunk;
     }
+    /* A SHORT COUNT FROM A DEVICE ERROR IS A SILENT HOLE (M2155). Both `break`s
+     * above leave `done` short of `want`, and the caller cannot tell that from
+     * a file that simply ends there -- so the page-fault fill zero-filled the
+     * remainder of an executable page and mapped it. An error is an error: say
+     * so, and let the caller retry the whole read. */
+    if (v.ioerr) { g_e2_pread_why = 5; return -1; }
     return (long)done;
 }
 long ext2_read_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,

@@ -3316,6 +3316,58 @@ void app_describe_fault_addr(void) {
     if (!found) kprintf("[fault]   in NO VMA of this process (%d vmas)\n", a->nvma);
 }
 
+/* WHO FILLED THIS PAGE, AND WITH WHAT (M2154).
+ *
+ * The code check below can now prove that a read-only mapping of libxul does
+ * not match libxul. That is the corruption, confirmed against an independent
+ * oracle -- and it still does not say whether WE wrote the zeros or whether
+ * something zeroed a page we had filled correctly. Those two have disjoint fix
+ * sets, and every round of guessing between them has cost a run.
+ *
+ * So record the decision at the moment it is made: one slot per page, direct
+ * mapped, last writer wins. 8192 slots is 384 KiB and covers 32 MiB of recently
+ * faulted address space -- and a collision is harmless because the lookup
+ * checks the address back.
+ *
+ * Direct-mapped and not a ring on purpose: a ring answers "what happened
+ * lately", and the question here is "what happened to THIS page", which a ring
+ * can only answer by luck. */
+#define FILL_SLOTS 8192
+enum { FILL_ANON = 0, FILL_FILE, FILL_READAHEAD, FILL_COW, FILL_HUGE, FILL_UFFD };
+static const char *const fill_kind_name[] = {
+    "demand-ZERO (anonymous)", "read from the file", "readahead from the file",
+    "copy-on-write copy", "2 MiB demand-zero hugepage", "userfaultfd copy"
+};
+static struct fillrec {
+    uint64_t va, foff, fvalid;
+    unsigned long want;
+    long got;
+    int tid;
+    unsigned char kind, used;
+} g_fill[FILL_SLOTS];
+
+static void fill_note(uint64_t va, unsigned char kind, uint64_t foff,
+                      uint64_t fvalid, unsigned long want, long got) {
+    struct fillrec *f = &g_fill[(va >> 12) & (FILL_SLOTS - 1)];
+    f->va = va; f->kind = kind; f->foff = foff; f->fvalid = fvalid;
+    f->want = want; f->got = got; f->tid = task_current_id(); f->used = 1;
+}
+
+/* Printed by the code check when memory and file disagree. */
+static void fill_report(uint64_t va) {
+    struct fillrec *f = &g_fill[(va >> 12) & (FILL_SLOTS - 1)];
+    if (!f->used || f->va != (va & ~(uint64_t)0xFFF)) {
+        kprintf("[fault]   no fill record for page %lx -- either it was filled longer ago than "
+                "the last 32 MiB of faulted address space, or NOTHING IN THIS KERNEL EVER "
+                "FILLED IT\n", va & ~(uint64_t)0xFFF);
+        return;
+    }
+    kprintf("[fault]   this page was filled by: %s, tid %d, file offset %lx, fvalid %lu, "
+            "wanted %lu, got %ld\n",
+            fill_kind_name[f->kind < 6 ? f->kind : 0], f->tid,
+            (unsigned long)f->foff, (unsigned long)f->fvalid, f->want, f->got);
+}
+
 /* ELF FILE OFFSET -> LIBRARY VADDR (M2153). The fault report knows which
  * file a faulting address came from and at what offset INTO THAT FILE; what a
  * human needs is the address `objdump -d` uses, which for a PT_LOAD whose
@@ -3416,6 +3468,46 @@ void app_describe_addr(uint64_t addr) {
             kprintf("[fault] %lx is in %s + %lx (FILE offset, not a vaddr) "
                     "(mapping %lx-%lx prot=%d)\n",
                     addr, path, fo, vstart, vend, prot);
+        /* IS THE CODE IN MEMORY THE CODE ON DISK? (M2154)
+         *
+         * The whole 8-core hunt turned on this one question and there was no
+         * way to ask it. A read-only PRIVATE file mapping MUST equal the file:
+         * nothing may write it, no relocation touches PIC text. So read both
+         * and compare. IDENTICAL exonerates the storage and paging path in one
+         * line and sends the search back to the register frame; DIFFER is proof
+         * of corruption together with the bytes to characterise it.
+         *
+         * Only for a mapping with no write permission -- a writable private
+         * mapping is allowed to differ, and saying "DIFFER" about one would be
+         * the next instrument to lie. vmm_pte_raw first, never a dereference:
+         * a demand-zero fill here would manufacture its own answer, which is
+         * exactly what M2152 had to undo. */
+        if (fb && !(prot & 2)) {
+            uint64_t p0 = addr & ~(uint64_t)0xFFF, p1 = (addr + 15) & ~(uint64_t)0xFFF;
+            if ((vmm_pte_raw(p0) & PTE_PRESENT) && (vmm_pte_raw(p1) & PTE_PRESENT)) {
+                unsigned char disk[16];
+                if (vfs_pread(path, disk, sizeof(disk), fo) == (long)sizeof(disk)) {
+                    const unsigned char *mem = (const unsigned char *)addr;
+                    static const char hx[] = "0123456789abcdef";
+                    char ml[16 * 3 + 1], dl[16 * 3 + 1];
+                    int same = 1;
+                    for (int b = 0; b < 16; b++) {
+                        ml[b*3] = ' '; ml[b*3+1] = hx[mem[b] >> 4];  ml[b*3+2] = hx[mem[b] & 15];
+                        dl[b*3] = ' '; dl[b*3+1] = hx[disk[b] >> 4]; dl[b*3+2] = hx[disk[b] & 15];
+                        if (mem[b] != disk[b]) same = 0;
+                    }
+                    ml[48] = dl[48] = 0;
+                    kprintf("[fault] code check at %lx: memory%s\n"
+                            "[fault]                  file%s   -- %s\n",
+                            addr, ml, dl,
+                            same ? "IDENTICAL, so the mapping is intact and the fault is "
+                                   "NOT corrupted code"
+                                 : "*** DIFFER: this read-only mapping does not match "
+                                   "its file ***");
+                    if (!same) fill_report(addr);
+                }
+            }
+        }
         return;
     }
     vma_unlock(a, fl);
@@ -6236,6 +6328,7 @@ static void app_fault_readahead(struct app *a, const void *vcopy, uint64_t page)
         __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
         a->majflt++;                                   /* it came from disk, like any other filled page */
         g_readahead_pages++;
+        fill_note(va, FILL_READAHEAD, v->foff + voff + off, v->fvalid, (unsigned long)have, have);
     }
     kfree(buf);
 }
@@ -6664,6 +6757,8 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                 uint8_t *z = (uint8_t *)hhdm(phys);
                 for (uint64_t b = 0; b < HUGE_SIZE; b++) z[b] = 0;   /* never leak stale RAM */
                 vmm_map_huge(hpage, phys, PTE_WRITABLE | PTE_USER | PTE_NX);
+                for (uint64_t hq = 0; hq < HUGE_SIZE; hq += PAGE_SIZE)
+                    fill_note(hpage + hq, FILL_HUGE, 0, 0, HUGE_SIZE, 0);
                 a->minflt++;                             /* one fault mapped the whole 2 MiB (M1150/M1155) */
                 return 1;
             }
@@ -6731,13 +6826,21 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                     want = (voff >= v.fvalid) ? 0 : v.fvalid - voff;
                     if (want > PAGE_SIZE) want = PAGE_SIZE;
                 }
+                long g_last_fill_got_local = 0;
                 if (want) {
                     __asm__ volatile("sti");            /* the FS read may touch the disk */
                     /* The interned path index came out with the copy, so the
                      * lookup does not have to re-find the VMA. */
                     const char *fp = (v.fidx >= 0 && v.fidx < g_vma_npath) ? g_vma_paths[v.fidx] : "";
                     long got = vfs_pread(fp, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
+                    /* A NEGATIVE RETURN IS AN ERROR, NOT A SHORT FILE (M2155).
+                     * Retry it before believing it: the failure this was built
+                     * for was a transient wrong answer from the ext2 path cache
+                     * under eight cores, and a retry gets the right one. */
+                    for (int rt = 0; rt < 2 && got < 0; rt++)
+                        got = vfs_pread(fp, z, want, fileoff);
                     __asm__ volatile("cli");
+                    g_last_fill_got_local = got;
                     /* A SHORT OR FAILED READ LEAVES THE PAGE ZERO, and nothing
                      * downstream can tell that from a page the file genuinely
                      * zeroes. The program starts, runs real code, and dies at
@@ -6756,6 +6859,51 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                     if (got <= 0 && v.fvalid && voff < v.fvalid)
                         kprintf("[fault] EMPTY READ filling %lx from %s+%lx: wanted %lu, got %ld -- the page is a HOLE\n",
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got);
+                    /* AND NEVER PUBLISH A PAGE WHOSE FILL FAILED (M2155).
+                     *
+                     * This is the defect that turned a transient filesystem
+                     * error into silent corruption of executable code. The read
+                     * returned -1, the frame stayed as memset zeros, and the
+                     * page was mapped and reported RESOLVED. Nothing
+                     * downstream can tell that from a page the file genuinely
+                     * zeroes, and the process died in a function half a
+                     * megabyte away from the cause.
+                     *
+                     * The guard above could not report it either: `fvalid` is 0
+                     * for a whole-file mmap -- which is how every shared library
+                     * is mapped -- so `v.fvalid && voff < v.fvalid` was false
+                     * and the one instrument aimed at this said nothing. A
+                     * NEGATIVE return needs no fvalid to interpret: we asked
+                     * for bytes and the filesystem refused. `got == 0` is left
+                     * alone, because a mapping may legally extend past its file
+                     * and those pages really are zero.
+                     *
+                     * Refuse the fault instead. The process dies either way;
+                     * this way it dies AT the cause, with the cause named. */
+                    if (got < 0) {
+                        extern const char *ext2_pread_why(void);
+                        extern unsigned long g_e2pc_races, g_e2pc_neg_hits, g_e2pc_hits, g_e2pc_ioerrs;
+                        extern void ata_error_counts(uint64_t *retries, uint64_t *failures);
+                        extern void ata_last_failure(unsigned *stage, unsigned *status, unsigned *error);
+                        extern const char *ata_fail_stage_name(void);
+                        uint64_t artry = 0, afail = 0; ata_error_counts(&artry, &afail);
+                        unsigned ast = 0, asr = 0, aer = 0; ata_last_failure(&ast, &asr, &aer);
+                        kprintf("[fault] FILL FAILED at %lx from %s+%lx: wanted %lu, got %ld -- "
+                                "refusing to map a zero page over code. This is a filesystem "
+                                "error, not a bad access, and mapping it anyway is how an "
+                                "executable page of a shared library became zeros.\n"
+                                "[fault]   ext2 says: %s (path-cache hits %lu, negative hits %lu, "
+                                "slot races %lu, lookups spoiled by a device error %lu; "
+                                "ATA read retries %lu, ATA reads that failed all retries %lu)\n"
+                                "[fault]   the last ATA failure: %s (status %x, error %x)\n",
+                                page, fp, (unsigned long)fileoff, (unsigned long)want, got,
+                                ext2_pread_why(), g_e2pc_hits, g_e2pc_neg_hits, g_e2pc_races,
+                                g_e2pc_ioerrs, (unsigned long)artry, (unsigned long)afail,
+                                ata_fail_stage_name(), asr, aer);
+                        fill_note(page, FILL_FILE, fileoff, v.fvalid, (unsigned long)want, got);
+                        pmm_free_frame(frame);
+                        return 0;
+                    }
                     /* A SHORT READ IS A HOLE TOO, AND IT SAID NOTHING (M2151).
                      *
                      * The check above only fires for got <= 0. A read that
@@ -6810,8 +6958,10 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got,
                                 want - (unsigned long)got);
                 }
+                fill_note(page, FILL_FILE, fileoff, v.fvalid, (unsigned long)want, g_last_fill_got_local);
                 a->majflt++; g_flt_major++;             /* page filled from disk => major fault (M1150) */
             } else {
+                fill_note(page, FILL_ANON, 0, 0, 0, 0);
                 a->minflt++; g_flt_minor++;             /* demand-zero anonymous page => minor fault (M1150) */
             }
             /* Honour the VMA's protection. This used to be unconditionally

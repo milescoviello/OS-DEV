@@ -280,6 +280,20 @@ static int ata_write_drive_impl_lba48(int drive, uint32_t lba, uint32_t count, c
 
 /* --- drive-parameterised read/write core ---------------------------------- */
 
+/* WHAT THE DRIVE SAID WHEN IT REFUSED (M2155). A -1 out of this function is
+ * "timed out waiting for BSY", "timed out waiting for DRQ" and "the drive set
+ * ERR" wearing one number, and the three need different fixes. The status and
+ * error bytes are one `inb` each and they are the only record of which it was.
+ * Kept in globals rather than returned, because every caller of this is only
+ * interested when something went wrong. */
+uint8_t  g_ata_last_status, g_ata_last_error;
+unsigned g_ata_last_stage;               /* 1 = BSY wait, 2 = DRQ wait, 3 = DMA */
+static void ata_snap_fail(uint16_t io, unsigned stage) {
+    g_ata_last_stage  = stage;
+    g_ata_last_status = inb(io + REG_STATUS);
+    g_ata_last_error  = inb(io + REG_ERROR);
+}
+
 static int ata_read_drive_impl(int drive, uint32_t lba, uint32_t count, void *buf) {
     if (!drive_ok(drive) || count == 0) return -1;
     /* Any access reaching sector 2^28 or beyond needs LBA48; low accesses (all of
@@ -295,12 +309,12 @@ static int ata_read_drive_impl(int drive, uint32_t lba, uint32_t count, void *bu
     while (count > 0) {
         uint32_t chunk = count > 256 ? 256 : count;
         if (wait_busy_clear(io) < 0)
-            return -1;
+            { ata_snap_fail(io, 1); return -1; }
         select_lba(io, slave, lba, (uint8_t)(chunk & 0xFF));   /* 256 -> 0 in the register */
         outb(io + REG_COMMAND, CMD_READ_SECTORS);
         for (uint32_t s = 0; s < chunk; s++) {
             if (wait_drq(io) < 0)
-                return -1;
+                { ata_snap_fail(io, 2); return -1; }
             read_data(io, p, SECTOR_SIZE / 2);                 /* 256 words = 512 bytes */
             p += SECTOR_SIZE;
         }
@@ -347,6 +361,24 @@ void ata_cache_flush(void) { bcache_flush(); }
  * boot, no amount of block-cache work will make the boot feel different, and
  * that is worth knowing BEFORE writing any of it. */
 static uint64_t io_cmds, io_sectors, io_hits, io_cyc_xfer, io_cyc_hit;
+static uint64_t io_retries, io_read_failures;
+void ata_error_counts(uint64_t *retries, uint64_t *failures) {
+    if (retries)  *retries  = io_retries;
+    if (failures) *failures = io_read_failures;
+}
+void ata_last_failure(unsigned *stage, unsigned *status, unsigned *error) {
+    if (stage)  *stage  = g_ata_last_stage;
+    if (status) *status = g_ata_last_status;
+    if (error)  *error  = g_ata_last_error;
+}
+const char *ata_fail_stage_name(void) {
+    switch (g_ata_last_stage) {
+    case 1:  return "timed out waiting for BSY to clear";
+    case 2:  return "timed out waiting for DRQ, or the drive set ERR";
+    case 3:  return "the DMA transfer errored or timed out";
+    default: return "no recorded failure";
+    }
+}
 static inline uint64_t ata_tsc(void) {
     uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
@@ -389,7 +421,17 @@ int g_ata_dma_reads = 1;        /* -append nodma turns it off, for A/B measureme
 /* A read bigger than this does not populate the block cache -- see the note at
  * the install. One eighth of the cache, so eight such reads could at worst
  * turn it over once rather than a single read wiping it. (M2101) */
-#define BCACHE_INSTALL_MAX 16u
+/* RAISED WITH THE CACHE (M2155). 16 sectors was the right bound against a
+ * 128-entry pool: one 128-sector read would have installed the whole cache and
+ * evicted everything. Against 32768 entries a 128-sector read is 0.4% of the
+ * pool, and CLOCK only protects a block read a SECOND time -- so a streaming
+ * read's blocks are the first things the hand takes back, which is precisely
+ * the scan resistance this bound was standing in for.
+ *
+ * The cost of leaving it at 16 is that ext2's 16-block runs (64 KiB, the
+ * readahead unit) populated NOTHING, so the readahead the fault handler does
+ * had to be re-read from the disk by the fault that followed it. */
+#define BCACHE_INSTALL_MAX 256u
 /* 16 FRAMES = 64 KiB = 128 SECTORS PER TRANSFER (M2101).
  *
  * Was one frame, so eight sectors, so a Firefox first paint needed 206704
@@ -435,6 +477,26 @@ int ata_read_drive(int drive, uint32_t lba, uint32_t count, void *buf) {
         if (r >= 0) io_dma_cmds++;
     }
     if (r < 0) r = ata_read_drive_impl(drive, lba, count, buf);   /* PIO fallback, always */
+    /* A TRANSIENT TIMEOUT IS NOT A FAILED READ (M2155).
+     *
+     * `ata_read_drive_impl` gives up after ATA_TIMEOUT_MS or on a set ERR bit
+     * and returns -1 with no retry, and every layer above it turned that -1
+     * into something worse: ext2's path walk reported it as "file not found",
+     * the path cache then wrote that down as a NEGATIVE entry -- making one
+     * transient error permanent for the rest of the boot -- and the page-fault
+     * fill mapped the still-zero frame over executable code and called the
+     * fault resolved. One flaky sector became a zeroed page of libxul.
+     *
+     * The layers above are fixed too (M2155 in ext2.c and app.c), but the
+     * cheapest fix is here: ask again. A retry is free when the read works and
+     * it is the difference between a stall and a corrupted process when it does
+     * not. Counted, because a retry that happens constantly is a hardware or
+     * driver problem that must not hide inside a success. */
+    for (int rt = 0; rt < 3 && r < 0; rt++) {
+        io_retries++;
+        r = ata_read_drive_impl(drive, lba, count, buf);
+    }
+    if (r < 0) io_read_failures++;
     /* SCAN-RESISTANT INSERTION (M2101). The block cache is 128 sectors, and
      * M2101 raised the transfer ceiling to 128 -- so ONE streaming read would
      * install 128 entries and evict every other thing in it. A sequential walk
@@ -1091,10 +1153,10 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
         return -1;
     uint8_t ata_st = inb(io + REG_STATUS);
     if ((ata_st & ST_ERR) || (ata_st & ST_BSY))
-        return -1;
+        { ata_snap_fail(io, 3); return -1; }
 
     if (err || !done)
-        return -1;                      /* DMA error or timed out: clean failure */
+        { ata_snap_fail(io, 3); return -1; }   /* DMA error or timed out: clean failure */
 
     if (!write)
         {   uint32_t left = bytes, off = 0;

@@ -31,6 +31,11 @@
 #define BCACHE_OWNER_ATA(drive) ((uint32_t)(drive))          /* 0..15  : ATA drives */
 #define BCACHE_OWNER_BLK(dev)   ((uint32_t)(16 + (dev)))     /* 16..   : blockdev devices */
 
+/* SIZE THE POOL FROM PHYSICAL MEMORY (M2154). Until this runs the cache is the
+ * old static 128 entries, so the very first boot sector is still cached; after
+ * it, up to 32 MiB. Idempotent-by-refusal: it only ever grows. */
+void bcache_init(void);
+
 /* Read one 512-byte block from the cache: 1 = hit (copied into buf), 0 = miss. */
 int  bcache_lookup(uint32_t owner, uint64_t lba, void *buf);
 /* Install / refresh a block in the cache (after a disk read, or a write-through). */

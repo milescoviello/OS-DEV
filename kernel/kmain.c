@@ -240,6 +240,7 @@ static volatile int g_kstack_overflow_test;
 static volatile int g_ustack_overflow_test;   /* -append ustackover: spawn a ring-3 app that overflows its USER stack (M1500) */
 static volatile int g_wx_test;                /* -append wxtest: prove W^X is enforced -- executing a no-execute data page must fault (M1501) */
 static volatile int g_smep_test;              /* -append smeptest: prove SMEP -- the kernel executing a ring-3 (user) page must fault (M1502) */
+static volatile int g_e2pcrace_test;          /* -append e2pcrace: hammer the ext2 path cache from every core (M2155) */
 static volatile int g_smpthread_test;         /* -append smpthreadtest: prove real cross-core kernel threads work (M1530) */
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
 static volatile int g_journal_test;           /* -append journalguest: prove the write-ahead journal + crash recovery on REAL ata hardware (M1865) */
@@ -682,6 +683,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "cowbatch")) { extern int g_cow_batch; g_cow_batch = 1;
             kprintf("[boot] cowbatch: M2102's batched COW free re-enabled -- this CORRUPTS the "
                     "guest on more than one core (M2106), for bisection only\n"); }
+        if (cmdline_has(cl, "e2pcwiden")) { extern int g_e2pc_widen; g_e2pc_widen = 1; }  /* widen the insert window in BOTH arms (M2155) */
+        if (cmdline_has(cl, "e2pcracy")) { extern int g_e2pc_racy; g_e2pc_racy = 1; }   /* the pre-M2155 racy insert (M2155) */
+        if (cmdline_has(cl, "e2pcrace")) g_e2pcrace_test = 1;         /* concurrent ext2 path-cache test (M2155) */
+        if (cmdline_has(cl, "bcachesmall")) { extern int g_bcache_small; g_bcache_small = 1; }
+                                                                          /* A/B the block cache back to 64 KiB (M2154) */
         if (cmdline_has(cl, "faultvaddr")) { extern int g_fault_vaddr_test; g_fault_vaddr_test = 1; }
                                                                           /* prove the fault report's offset is objdump-able (M2153) */
         if (cmdline_has(cl, "nopathcache")) g_e2_path_cache = 0;          /* A/B the ext2 path cache (M2104) */
@@ -1023,6 +1029,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * late-device rescan is what let it mount at all; this is what makes it
      * mount in time. The call below is idempotent, so the original site can
      * stay where it is and keep its self-test. */
+    /* THE BLOCK CACHE, BEFORE ANYTHING READS A DISK IN EARNEST (M2154). The
+     * heap and the pmm are both up (line ~765), and every mount, path walk and
+     * demand-paged library read after this point gets the big pool instead of
+     * the 64 KiB one. */
+    { extern void bcache_init(void); bcache_init(); }
+
     virtio_blk_init();
 
     if (g_lxabi_test) {
@@ -2591,7 +2603,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * win. This measures the number a prediction needs, in isolation, and it
      * is the difference between "not shredding requests should help" and a
      * figure that can be checked afterwards. */
-    if (g_diskbench) ata_diskbench();
+    if (g_diskbench) { extern void bcache_selftest(void); bcache_selftest(); ata_diskbench(); }
     }
 
     /* Bring up AHCI/SATA as an ADDITIONAL storage driver (the boot disk above
@@ -2759,6 +2771,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * tests/run-ipc-tests.sh, which already boots headless and greps COM1. */
     app_memfd_selftest();
     { extern void app_fault_vaddr_selftest(void); app_fault_vaddr_selftest(); }
+    if (g_e2pcrace_test) { extern void ext2_path_cache_race_test(void); ext2_path_cache_race_test(); }
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).
      * Opt-in for the same reason as the block above: boot-to-desktop under a

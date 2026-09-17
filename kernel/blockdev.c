@@ -570,6 +570,7 @@ struct bd_mount {
 };
 static struct bd_mount g_mount[8];
 static int g_nmount, g_mount_scanned_upto = -1;
+static volatile int g_mount_scan_state;   /* 0 = never scanned, 1 = a core is scanning, 2 = done (M2155) */
 
 /* A blk_read_fn for a loop mount: serve 512-byte sectors from its in-RAM image.
  * ctx is the mount index (so we can reach g_mount[idx].loopbuf). */
@@ -618,7 +619,32 @@ static void blockdev_mount_scan(void) {
      * mounts one (kmain calls virtio_blk_init() early for exactly this), and
      * then one scan is enough. A one-shot that runs at the right time beats an
      * incremental one that has to reason about identity it does not have. */
-    if (g_mount_scanned_upto >= 0) return;
+    /* ONE CORE SCANS, AND THE OTHERS WAIT FOR IT (M2155).
+     *
+     * `if (flag >= 0) return; ... flag = 1;` is a guard with the two halves the
+     * wrong way round: the whole scan sat between the test and the set, so on
+     * eight cores two early readers could both run it -- appending to
+     * `g_mount[]` and `g_nmount` while the other walked them. Mount names here
+     * are POSITIONAL and the Linux root is hardcoded `/disk2`, so a duplicate
+     * or a renumbered volume is not cosmetic: it makes a path resolve against
+     * the wrong filesystem, which comes back as "no such file", which is the
+     * exact wrong answer M2155 is about everywhere else.
+     *
+     * A waiter that gave up and read the half-built table would be the same
+     * bug, so it spins -- bounded, and falling through to the old behaviour if
+     * the budget runs out, which is no worse than today and cannot hang. */
+    if (__atomic_load_n(&g_mount_scan_state, __ATOMIC_ACQUIRE) == 2) return;
+    {
+        int expect = 0;
+        if (!__atomic_compare_exchange_n(&g_mount_scan_state, &expect, 1, 0,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            for (unsigned long w = 0; w < 200000000ul; w++) {
+                if (__atomic_load_n(&g_mount_scan_state, __ATOMIC_ACQUIRE) == 2) return;
+                __asm__ volatile("pause");
+            }
+            return;                           /* budget spent: behave as before */
+        }
+    }
     blockdev_init();                          /* make sure devices are registered */
     g_mount_scanned_upto = 1;
     for (int i = 0; i < g_ndev && g_nmount < 8; i++) {
@@ -657,6 +683,7 @@ static void blockdev_mount_scan(void) {
             g_nmount++;
         }
     }
+    __atomic_store_n(&g_mount_scan_state, 2, __ATOMIC_RELEASE);   /* table complete (M2155) */
 }
 
 int blockdev_mount_count(void) { blockdev_mount_scan(); return g_nmount; }
