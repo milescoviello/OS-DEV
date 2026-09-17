@@ -48,6 +48,7 @@ static uint32_t          tick_ms = 10;    /* ms per tick (1000/hz), for CPU-time
  * calibration is, and degrades to exactly the old behaviour if the TSC is
  * unusable. */
 static uint64_t g_tsc_per_tick;           /* 0 = not calibrated: fall back to whole ticks */
+static uint64_t g_ns_per_cycle_q16;       /* nanoseconds per TSC cycle, 16.16 fixed point */
 static volatile uint64_t g_tick_tsc;      /* TSC at the last PIT tick */
 
 static inline uint64_t rdtsc_now(void) {
@@ -119,17 +120,26 @@ uint64_t timer_ns(void) {
     if (!per) return base;
     uint64_t d = rdtsc_now() - anchor;
     if (d >= per) d = per - 1;            /* never reach the next tick: stays monotonic */
-    /* d * ns_per_tick / per, ordered to keep the product inside 64 bits. */
-    uint64_t ns_per_tick = 1000000000ull / (tick_hz ? tick_hz : 100);
-    return base + (d / 1024) * ns_per_tick / (per / 1024 ? per / 1024 : 1);
+    /* FIXED POINT, NOT A DIVIDED-DOWN DELTA. The first version computed
+     * `(d / 1024) * ns_per_tick / (per / 1024)`, which keeps the product inside
+     * 64 bits by throwing away the bottom ten bits of the delta -- so the real
+     * resolution was 1024 cycles, about 333 ns at 3 GHz, while timer_res_ns
+     * went on reporting 1 ns. An instrument describing a resolution it does not
+     * have is the defect this whole block is about, so: 16.16 fixed point,
+     * which holds the full delta for any TSC between 1 MHz and 100 GHz without
+     * overflowing and is accurate to well under a nanosecond. */
+    return base + ((d * g_ns_per_cycle_q16) >> 16);
 }
 
 /* The real resolution, so clock_getres can stop claiming one it does not have.
  * Nanoseconds per TSC cycle, rounded up, or a whole tick if uncalibrated. */
 uint64_t timer_res_ns(void) {
     if (!g_tsc_per_tick) return 1000000000ull / (tick_hz ? tick_hz : 100);
-    uint64_t ns_per_tick = 1000000000ull / (tick_hz ? tick_hz : 100);
-    uint64_t r = ns_per_tick / g_tsc_per_tick;
+    /* One TSC cycle, in nanoseconds, rounded UP -- and never below 1, because a
+     * timespec cannot express a fraction of a nanosecond however fast the
+     * counter is. Rounding up rather than down so the figure is never better
+     * than the truth. */
+    uint64_t r = (g_ns_per_cycle_q16 + 0xffffu) >> 16;
     return r ? r : 1;
 }
 
@@ -150,6 +160,7 @@ void timer_calibrate_tsc(void) {
     uint64_t hi = 100000000000ull / (tick_hz ? tick_hz : 100);
     if (per > lo && per < hi) {
         g_tsc_per_tick = per;
+        g_ns_per_cycle_q16 = ((1000000000ull / (tick_hz ? tick_hz : 100)) << 16) / per;
         g_tick_tsc = rdtsc_now();
         kprintf("[timer] TSC calibrated: %lu cycles/tick (~%lu MHz), clock resolution now ~%luns "
                 "instead of %ums (M2114)\n",

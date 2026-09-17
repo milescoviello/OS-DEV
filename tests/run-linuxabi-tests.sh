@@ -738,6 +738,23 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: absolute deadlines:"; grep -a "LXTIME" "$SLOG3" | head -8; f3=1
     fi
+    # M2114 -- CLOCK_MONOTONIC advanced in TEN MILLISECOND JUMPS, because the PIT
+    # runs at 100 Hz and clock_gettime answered `(ms % 1000) * 1000000`, so every
+    # tv_nsec was a multiple of a million. clock_getres claimed one millisecond,
+    # which is the call whose entire job is to report the resolution reporting a
+    # figure ten times better than the truth. It matters because 10 ms is coarser
+    # than a 60 Hz frame (16.7 ms), so a refresh driver asking "has enough time
+    # passed to draw" gets an answer quantised to 0 or 10.
+    #
+    # The probe does not trust clock_getres -- a wrong constant there is exactly
+    # what was wrong. It reads the clock in a tight loop and finds the smallest
+    # non-zero step it actually takes, checks the clock never goes backwards, and
+    # checks the claim is not BETTER than the measurement.
+    if grep -aq "ok   CLOCK_MONOTONIC has sub-millisecond resolution" "$SLOG3"; then
+        echo "  ok: CLOCK_MONOTONIC has real sub-millisecond resolution and clock_getres does not overstate it (M2114)"
+    else
+        echo "  FAIL: the monotonic clock is too coarse to measure a frame:"; grep -a "LXTIME: .*step\|LXTIME: FAIL" "$SLOG3" | head -4; f3=1
+    fi
     if grep -aq "LXCAGE: 4GiB/4GiB wrote and read back" "$SLOG3" && \
        grep -aq "LXCAGE: 0 failure(s)" "$SLOG3"; then
         echo "  ok: reserve 8 GiB, align to 4 GiB, trim head and tail -- and the kept region is still writable end to end"

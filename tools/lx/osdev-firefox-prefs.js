@@ -92,6 +92,18 @@ pref("browser.newtabpage.enabled",   false);
 // because the target is a fast first paint, not a light one.
 pref("layout.frame_rate",            60);
 
+// WEBRENDER'S OWN HUD, DRAWN INTO THE WINDOW (M2115).
+//
+// The content area is blank while the chrome paints, the document is loaded
+// and active, and Gecko renders the same page correctly headless. What is left
+// is whether WebRender is compositing the window at all, and no MOZ_LOG module
+// name tried so far reports anything about it (`webrender` and `ipcmessages`
+// both produced nothing). The profiler overlay is WebRender describing itself
+// in pixels: if it appears in the framebuffer dump, WebRender is live and the
+// missing thing is the content pipeline specifically; if it does not, the
+// chrome is arriving by some other route and WebRender is not running.
+pref("gfx.webrender.debug.profiler", true);
+
 // Nothing may open a second tab, phone home, or replace the URL we asked for.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("browser.aboutwelcome.enabled",      false);

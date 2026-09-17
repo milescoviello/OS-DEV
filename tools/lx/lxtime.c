@@ -178,6 +178,54 @@ int main(void)
         else { printf("LXTIME: a 100us sleep took %ldms\n", el); fails++; }
     }
 
+    /* THE MONOTONIC CLOCK'S ACTUAL RESOLUTION (M2114).
+     *
+     * It advanced in TEN MILLISECOND JUMPS -- the PIT runs at 100 Hz and
+     * clock_gettime answered `(ms % 1000) * 1000000`, so every tv_nsec it ever
+     * returned was a multiple of a million -- while clock_getres claimed one
+     * millisecond. The one call whose whole job is to report the resolution
+     * was reporting a figure ten times better than the truth.
+     *
+     * It matters because 10 ms is coarser than a 60 Hz frame interval (16.7
+     * ms), so a browser's refresh driver measuring "has enough time passed to
+     * draw" gets an answer quantised to 0 or 10.
+     *
+     * This does not trust clock_getres -- a wrong constant there is exactly
+     * what was wrong before. It MEASURES: read the clock in a tight loop and
+     * find the smallest non-zero step it actually takes. */
+    {
+        struct timespec r;
+        long res_ns = -1;
+        if (clock_getres(CLOCK_MONOTONIC, &r) == 0) res_ns = (long)r.tv_nsec;
+
+        long smallest = 1000000000L;
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        for (int i = 0; i < 200000; i++) {
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long d = (long)(b.tv_sec - a.tv_sec) * 1000000000L + (long)(b.tv_nsec - a.tv_nsec);
+            if (d < 0) { printf("LXTIME: FAIL the monotonic clock went BACKWARDS by %ldns\n", -d); fails++; break; }
+            if (d > 0 && d < smallest) smallest = d;
+            a = b;
+        }
+        printf("LXTIME: clock_getres says %ldns; the smallest step actually observed is %ldns\n",
+               res_ns, smallest);
+        if (smallest < 1000000L)
+            printf("LXTIME: ok   CLOCK_MONOTONIC has sub-millisecond resolution\n");
+        else {
+            printf("LXTIME: FAIL CLOCK_MONOTONIC moves in steps of %ldns -- a 60Hz frame is "
+                   "16666666ns, so a refresh driver cannot measure one\n", smallest);
+            fails++;
+        }
+        /* And the claim must not be BETTER than the measurement. Understating
+         * resolution is safe; overstating it is the original bug. */
+        if (res_ns > 0 && smallest < 1000000L && res_ns > smallest * 4)
+            { printf("LXTIME: FAIL clock_getres claims %ldns but the clock steps %ldns\n", res_ns, smallest); fails++; }
+        else
+            printf("LXTIME: ok   clock_getres does not overstate what the clock delivers\n");
+    }
+
+    if (!fails) printf("LXTIME: OK\n");
     printf("LXTIME: %d failure(s)\n", fails);
     return fails ? 1 : 0;
 }
