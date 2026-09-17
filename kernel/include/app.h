@@ -142,6 +142,7 @@ int  app_unix_peek_fd(int sockfd);        /* are MORE descriptors queued than we
 int  app_live_pids(int *out, int max);    /* every live Linux process: the content process is not the biggest one (M2108) */
 int  app_thread_count(int pid);
 int  app_biggest_pid(void);               /* the process with the most threads: the browser, whatever its pid (M2105) */
+void app_unix_fds_report(int pid);        /* every AF_UNIX fd a pid holds + BOTH ring states (M2131) */
 void app_wait_summary(int pid);            /* every thread's wchan, GROUPED: what are they all waiting for (M2103) */
 void app_scm_drop_conn(int ci);           /* a dead connection releases the descriptors still queued on it (M2104) */
 int  app_scm_capacity(void);              /* in-flight SCM_RIGHTS slots left: check BEFORE sending any of a cmsg (M2104) */

@@ -1793,9 +1793,31 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                             if (k == 4 || k == 20 || k == 38) {
                                                 int pids[16];
                                                 int np = app_live_pids(pids, 16);
+                                                /* EVERY LIVE PROCESS, WITH ITS
+                                                 * THREAD COUNT, BEFORE ANY
+                                                 * FILTERING (M2131). The detail
+                                                 * dump below skips a process
+                                                 * with <=2 threads, on the
+                                                 * reasoning that it has not
+                                                 * started yet -- but "the
+                                                 * content process has two
+                                                 * threads" IS the answer to
+                                                 * why the page is blank, and
+                                                 * the filter was hiding
+                                                 * exactly that. Every reading
+                                                 * so far showed only the
+                                                 * 44-thread parent, which
+                                                 * looks healthy and is not the
+                                                 * process in question. */
+                                                kprintf("[page] %d live Linux process(es):", np);
+                                                for (int j = 0; j < np; j++)
+                                                    kprintf(" pid %d (%d thr)", pids[j],
+                                                            app_thread_count(pids[j]));
+                                                kprintf("\n");
                                                 for (int j = 0; j < np; j++)
                                                     if (app_thread_count(pids[j]) > 2) {
                                                         app_wait_summary(pids[j]);
+                                                        app_unix_fds_report(pids[j]);
                                                         /* ...and WHAT IT LAST
                                                          * ASKED FOR. A wchan
                                                          * says where a thread

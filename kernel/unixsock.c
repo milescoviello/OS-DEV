@@ -245,6 +245,54 @@ static struct uconn *ep_conn(int ep, int *side) {
     return &conns[ci];
 }
 
+/* THE DIRECTION THAT IS FAILING (M2131).
+ *
+ * unix_nread reports this endpoint's RX ring -- what WE can read. A send that
+ * returns EAGAIN is about the TX ring, which is the PEER's RX ring, and nothing
+ * could report it. So the spin detector printed
+ *
+ *   EAGAIN from sendmsg(fd 59) 1000 times in a row -- ... queued=0 readable=0
+ *
+ * about a socket whose send ring was completely full: two different rings, one
+ * of them empty, and the empty one is the one that got printed. "The peer is
+ * not draining" and "we wrongly believe we are full" are the two explanations
+ * for that message and it could not tell them apart. */
+long unix_txqueued(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    if (!c) { usock_irq_restore(fl); return -1; }
+    struct uring *tx = s ? &c->b2a : &c->a2b;
+    long n = rcount(tx);
+    usock_irq_restore(fl);
+    return n;
+}
+int unix_txroom(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    if (!c) { usock_irq_restore(fl); return -1; }
+    struct uring *tx = s ? &c->b2a : &c->a2b;
+    int n = rfree(tx);
+    usock_irq_restore(fl);
+    return n;
+}
+/* Has the peer registered a BLOCKING reader on the ring we write into?
+ *
+ * READ THE LIMIT OF THIS BEFORE USING IT: only unix_recv's blocking path sets
+ * that waiter. A peer sitting in poll()/epoll() does NOT register one, because
+ * this kernel's poll is a re-checking nap loop rather than a wait queue. So 0
+ * means "nobody is parked in a blocking read", NOT "the peer is not reading" --
+ * a poll-driven peer, which is what every event loop is, always reports 0 here.
+ * Written down because a field that looks like it answers "is the peer stuck"
+ * and does not is the failure mode this campaign keeps paying for. */
+int unix_peer_reader_waiting(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    if (!c) { usock_irq_restore(fl); return -1; }
+    int w = (s ? c->a_waiter : c->b_waiter) ? 1 : 0;
+    usock_irq_restore(fl);
+    return w;
+}
+
 long unix_send(int ep, const void *buf, unsigned long len) { return unix_send_ex(ep, buf, len, 0); }
 
 /* `nb` = the caller's O_NONBLOCK. Returns bytes written (a SHORT count is

@@ -9146,6 +9146,7 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max);
  * for the consumer side and epoll_note_post for the producer side. */
 static void epoll_note_drain(struct app *a, int fd);
 static void epoll_note_post(struct app *a, int fd);
+static void epoll_note_peer_ready(int fdtype, int obj);   /* re-arm the PEER's edge, in its own process (M2131) */
 long app_fd_read(int fd, void *buf, unsigned long max) {
     long n = app_fd_read_inner(fd, buf, max);
     if (g_net_trace) { struct app *a = cur(); if (a) eof_spin_watch(a, fd, n); }
@@ -9530,6 +9531,10 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
          * progress while believing it is working; Firefox's fork server hit
          * the ENETUNREACH this got turned into and tore its channel down. */
         long w = unix_send_ex(a->fd[fd].obj, buf, len, app_fd_nonblock(fd));
+        /* The bytes just landed in the PEER's receive ring, in the peer's
+         * process. Re-arm its edge there -- see epoll_note_peer_ready. The
+         * endpoint pairing is ep ^ 1: ep = (connection << 1) | side. */
+        if (w > 0) epoll_note_peer_ready(12, a->fd[fd].obj ^ 1);
         if (w == UNIX_EAGAIN) return APP_FD_EAGAIN;
         /* A dead peer is EPIPE, not EBADF. Node reported "write EBADF" on a
          * connection that was fine, because this whole case was MISSING and
@@ -10647,7 +10652,7 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
  * So treat a post as an edge, which is what Linux does. This cannot spin: it
  * requires an actual write each time, and a write is work the producer chose
  * to do. */
-static void epoll_note_post(struct app *a, int fd) {
+static void epoll_rearm_edge(struct app *a, int fd) {
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].epwatch) return;
     for (int j = 0; j < APP_NFD; j++) {
         if (!a->fd[j].used || a->fd[j].type != 6) continue;
@@ -10671,6 +10676,51 @@ static void epoll_note_post(struct app *a, int fd) {
         }
     }
 }
+
+/* THE EDGE BELONGS TO WHOEVER IS WAITING FOR IT, NOT TO WHOEVER CAUSED IT
+ * (M2131).
+ *
+ * M2062 re-armed an edge-triggered epoll registration when a write made the
+ * descriptor ready again, and it looked complete because its one caller was an
+ * eventfd waker -- where the producer and the consumer are the same process, so
+ * "the posting app's fd table" happened to be the right table to search.
+ *
+ * It is the wrong table in general. A write to one end of an AF_UNIX
+ * socketpair makes the OTHER end readable, and that end lives in a DIFFERENT
+ * PROCESS with its own epoll instance. Nothing re-armed it, so Gecko's IPC
+ * pump -- which registers its channel EPOLLET -- was told "readable" exactly
+ * once, drained the channel, and never heard about another byte:
+ *
+ *   parent   fd 59 = ep 4  tx_queued=280
+ *   child166 fd 6  = ep 5  readable=1 rx_queued=280   <- there, and unclaimed
+ *   ...and every thread in pid 166 BLOCKED, MainThread in poll(3 fds, -1)
+ *
+ * until the ring filled and the parent spun on EAGAIN for ever:
+ *
+ *   SPINNING: ... EAGAIN from sendmsg(fd 57) 1000 times in a row
+ *             ... TX_queued=16383 tx_room=0
+ *
+ * That is why Firefox painted its chrome and never a page: the content process
+ * was never told to load one. It is the same shape as M2126 -- a rule applied
+ * at one of the places that needed it -- and the tell was the same, an
+ * instrument (`queued=0`) that described the ring that was fine.
+ *
+ * `app_fd_ready` is still the gate, so scanning is safe: an fd that is not
+ * actually ready for what its owner asked about is never re-armed. */
+static void epoll_note_peer_ready(int fdtype, int obj) {
+    if (obj < 0) return;
+    for (int k = 0; k < MAX_APPS; k++) {
+        struct app *pa = &apps[k];
+        if (!pa->used || pa->exited) continue;
+        for (int f = 0; f < APP_NFD; f++) {
+            if (!pa->fd[f].used || pa->fd[f].type != fdtype) continue;
+            if (pa->fd[f].obj != obj || !pa->fd[f].epwatch) continue;
+            epoll_rearm_edge(pa, f);
+        }
+    }
+}
+
+static void epoll_note_post(struct app *a, int fd) { epoll_rearm_edge(a, fd); }
 static void epoll_note_drain(struct app *a, int fd) {
     if (!a || fd < 0 || fd >= APP_NFD) return;
     /* EVERY read and write reaches here, so the uninteresting case has to be
@@ -11184,8 +11234,10 @@ void app_fd_print(int fd) {
     }
     case 2: kprintf("file '%s' off=%ld nonblock=%d cloexec=%d", a->fd[fd].path, a->fd[fd].off, nb, cx); break;
     case 3: kprintf("memfd obj %d off=%ld nonblock=%d cloexec=%d", obj, a->fd[fd].off, nb, cx); break;
-    case 12: kprintf("AF_UNIX ep %d queued=%ld readable=%d nonblock=%d cloexec=%d",
-                     obj, unix_nread(obj), unix_readable(obj), nb, cx); break;
+    case 12: kprintf("AF_UNIX ep %d rx_queued=%ld readable=%d TX_queued=%ld tx_room=%d "
+                     "peer_reader_waiting=%d nonblock=%d cloexec=%d",
+                     obj, unix_nread(obj), unix_readable(obj), unix_txqueued(obj),
+                     unix_txroom(obj), unix_peer_reader_waiting(obj), nb, cx); break;
     case 10: kprintf("AF_INET stream sock %d queued=%ld nonblock=%d cloexec=%d",
                      obj, net_tcp_sock_nread(obj), nb, cx); break;
     case 14: kprintf("console alias, %d key(s) queued, nonblock=%d", iq_count(a->out_to ? a->out_to : a), nb); break;
@@ -11232,6 +11284,50 @@ int app_thread_count(int pid) {
         if (tk && task_state_of(tk) != TASK_DEAD) n++;
     }
     return n;
+}
+
+/* EVERY AF_UNIX DESCRIPTOR A GIVEN PROCESS HOLDS, AND THE STATE OF BOTH ITS
+ * RINGS (M2131).
+ *
+ * The parent's send ring to each content process is full -- 16383 of 16384
+ * bytes, twice over, on two separate channels -- which means the children have
+ * not read one byte of their IPC. Their MainThreads sit in poll(3 fds, -1).
+ * The question that decides the bug is whether the child even holds the
+ * endpoint the parent is filling, and whether that endpoint looks readable
+ * from the child's side: "the child is polling the wrong descriptor" and "the
+ * child is polling the right one and poll is lying to it" need completely
+ * different fixes, and nothing could tell them apart from outside.
+ *
+ * app_fd_print reads the CURRENT process, so it cannot answer this. This walks
+ * a named pid's table instead. */
+void app_unix_fds_report(int pid) {
+    struct app *a = app_by_pid(pid); if (!a) { kprintf("[fds] pid %d: gone\n", pid); return; }
+    int shown = 0;
+    for (int i = 0; i < APP_NFD; i++) {
+        if (!a->fd[i].used || a->fd[i].type != 12) continue;
+        int ep = a->fd[i].obj;
+        if (shown++ == 0) kprintf("[fds] pid %d AF_UNIX descriptors:\n", pid);
+        kprintf("[fds]   fd %d = ep %d  readable=%d rx_queued=%ld  tx_queued=%ld tx_room=%d\n",
+                i, ep, unix_readable(ep), unix_nread(ep), unix_txqueued(ep), unix_txroom(ep));
+        if (shown >= 12) { kprintf("[fds]   (more, not shown)\n"); break; }
+    }
+    if (!shown) kprintf("[fds] pid %d holds NO AF_UNIX descriptor at all\n", pid);
+
+    /* ...AND EVERY EPOLL SET IT HOLDS, UNCONDITIONALLY (M2131).
+     *
+     * The stalled-epoll report only fires when ONE epoll_wait call has been
+     * waiting over three seconds, and a content process's IPC pump calls
+     * epoll_wait with a short timeout in a loop -- so it never qualified, and
+     * the only dumps ever printed were the browser parent's. That is not an
+     * absence of evidence about the child; it is an instrument whose trigger
+     * the child cannot satisfy. Print the set whenever the census runs: the
+     * question "is this descriptor even registered, and does the kernel think
+     * it is ready" needs no stall to be worth answering. */
+    for (int i = 0; i < APP_NFD; i++) {
+        if (!a->fd[i].used || a->fd[i].type != 6) continue;
+        kprintf("[fds] pid %d epoll instance fd %d:\n", pid, i);
+        app_epoll_dump_of((app_t *)a, i);
+    }
 }
 
 int app_biggest_pid(void) {

@@ -25,6 +25,9 @@ int  unix_socketpair(int *a, int *b);                          /* socketpair(2):
 int  unix_ep_conn(int ep);                                     /* connection index behind an endpoint (SCM_RIGHTS key); -1 invalid (M1265) */
 int  unix_readable(int ep);      /* non-blocking: is there data (or a closed peer)? for poll/epoll (M1965) */
 long unix_nread(int ep);         /* FIONREAD: bytes queued on this endpoint's RX ring; -1 bad ep (M2086) */
+long unix_txqueued(int ep);      /* bytes waiting in the ring WE WRITE INTO (the peer's RX); -1 bad ep (M2131) */
+int  unix_txroom(int ep);        /* free bytes in that same ring: 0 means a send will EAGAIN */
+int  unix_peer_reader_waiting(int ep);  /* is the peer parked waiting to read from us? */
 int  unix_peer_pid(int ep);      /* SO_PEERCRED: the pid on the far end, 0 = not accepted yet (M2088) */
 int  unix_ring_bytes(void);      /* SO_SNDBUF/SO_RCVBUF: the real usable capacity per direction (M2088) */
 #define UNIX_EAGAIN (-11)        /* unix_send_ex(nb): the ring is full and nothing moved (M2090) */

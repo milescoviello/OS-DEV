@@ -1110,6 +1110,32 @@ static const char *lx_proc_self_tail(const char *p) {
 }
 
 int g_poll_trace;
+/* A REPORT BUDGET PER PROCESS, NOT ONE FOR THE WHOLE MACHINE (M2131).
+ *
+ * This was a single global cap of 24, and the browser PARENT spends its whole
+ * life with threads parked in epoll_wait on pipes -- so it consumed the entire
+ * budget before either content process had stalled, and the stalled-epoll
+ * report for the process actually under investigation was never printed. Three
+ * separate instruments have hidden the case being hunted today in exactly this
+ * way: a one-shot keyed on part of a socket's type, a per-machine cap here, and
+ * a thread-count filter in the page sampler. A budget that is shared between
+ * the healthy majority and the one interesting process spends itself on the
+ * majority. */
+#define POLLRPT_PIDS 8
+#define POLLRPT_EACH 4
+static struct { int pid, n; } g_poll_rpt[POLLRPT_PIDS];
+static int poll_report_ok(void) {
+    int pid = app_current_pid();
+    for (int i = 0; i < POLLRPT_PIDS; i++) {
+        if (g_poll_rpt[i].pid == pid) {
+            if (g_poll_rpt[i].n >= POLLRPT_EACH) return 0;
+            g_poll_rpt[i].n++; return 1;
+        }
+    }
+    for (int i = 0; i < POLLRPT_PIDS; i++)
+        if (!g_poll_rpt[i].pid) { g_poll_rpt[i].pid = pid; g_poll_rpt[i].n = 1; return 1; }
+    return 0;
+}
 static int g_poll_reports;
 
 /* HOW MANY SYSCALLS THIS THREAD HAS MADE (M2066). Per-task, so a thread that
@@ -3028,7 +3054,7 @@ static void lx_dispatch_body(struct registers *r) {
             if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
             espins++;
             if (g_poll_trace && !etold && (long)(timer_ms() - start) > 3000 &&
-                g_poll_reports < 24) {
+                poll_report_ok()) {
                 etold = 1; g_poll_reports++;
                 kprintf("[poll] pid %d tid %d STALLED in epoll_wait(%d), timeout %ld:\n",
                         app_current_pid(), task_current_id(), (int)a1, timeout);
@@ -3080,7 +3106,7 @@ static void lx_dispatch_body(struct registers *r) {
             if (timeout >= 0 && (long)(timer_ms() - start) >= timeout) break;
             spins++;
             if (g_poll_trace && !told && (long)(timer_ms() - start) > 3000 &&
-                g_poll_reports < 24) {
+                poll_report_ok()) {
                 told = 1; g_poll_reports++;
                 kprintf("[poll] pid %d tid %d STALLED on %ld fd(s), timeout %ld:\n",
                         app_current_pid(), task_current_id(), nfds, timeout);
