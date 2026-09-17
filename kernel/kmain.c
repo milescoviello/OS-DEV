@@ -1006,6 +1006,23 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * not need the keyboard, so the whole check is a COM1 assertion -- the
      * Linux write(2) lands on the kernel console, which is mirrored to serial,
      * unlike ring-3 print() from our own apps. */
+    /* BRING UP EVERY DISK BEFORE ANYTHING MOUNTS ONE (M2145).
+     *
+     * virtio_blk_init() used to run ~1600 lines below this, which is fine
+     * while the Linux root lives on ATA and pointless work otherwise -- and
+     * fatal once it does not. With the root moved to virtio-blk the mount
+     * table came out as:
+     *
+     *   [mount] disk1 = blockdev 0 (ata0) at LBA 0, fstype fat
+     *   [lxabi] root /disk2: vfs_stat FAILED
+     *   [mount] disk2 = blockdev 1 (virtio-blk) at LBA 0, fstype ext2
+     *
+     * The root was stat'd BEFORE the device it lives on existed. M2144's
+     * late-device rescan is what let it mount at all; this is what makes it
+     * mount in time. The call below is idempotent, so the original site can
+     * stay where it is and keep its self-test. */
+    virtio_blk_init();
+
     if (g_lxabi_test) {
         /* FIRST, because every other probe in this block -- and every program
          * the kernel will ever run -- depends on it, and because the suite

@@ -345,8 +345,49 @@ int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
             off += n; left -= n;
         }
     } else {
-        for (uint32_t s = 0; s < count; s++)
-            if (bread(i, lba + s, out + (uint64_t)s * BLOCKDEV_SECSZ) < 0) return -1;
+        /* NOT SHREDDING IS NOT AN ATA PRIVILEGE (M2147).
+         *
+         * M2091 stopped turning every request into single-sector commands --
+         * for ATA-backed devices only. Every other block device in the tree
+         * kept the sector-at-a-time loop: virtio-blk, AHCI, NVMe, USB storage.
+         * So moving the Linux root onto virtio-blk, a transport with far less
+         * per-request overhead than IDE, made it SLOWER: IDE was getting
+         * 128-sector DMA batches while virtio got one sector per request. This
+         * benchmark's own numbers say what that costs -- 8-sector versus
+         * 1-sector DMA is 8.04x, and single-sector DMA is no better than PIO.
+         *
+         * The ATA branch above can batch freely because that driver caches
+         * internally. Here the block cache IS the cache, so batching has to
+         * keep it working or it silently turns filesystem caching off: try the
+         * whole range first, and on any miss read it in driver-sized chunks
+         * and install each sector individually. Sector-granular keys are kept
+         * deliberately -- bcache_inval_range invalidates per sector for the
+         * single-sector writes fat32 and the journal do, and re-keying to
+         * block size would leave a stale journal descriptor in front of the
+         * recovery path, which is undetectable corruption. */
+        blk_lock_take(i);
+        uint32_t hit = 0;
+        for (; hit < count; hit++)
+            if (!bcache_lookup(BCACHE_OWNER_BLK(i), lba + hit,
+                               out + (uint64_t)hit * BLOCKDEV_SECSZ)) break;
+        if (hit < count) {
+            uint32_t left = count - hit, off = hit;
+            while (left) {
+                uint32_t n = left > BLOCKDEV_MAX_BATCH ? BLOCKDEV_MAX_BATCH : left;
+                if (raw_read(i, lba + off, n, out + (uint64_t)off * BLOCKDEV_SECSZ) < 0) {
+                    blk_lock_give(i); return -1;
+                }
+                /* Install per sector, and only for requests small enough that
+                 * one of them cannot turn the whole cache over -- the same
+                 * scan-resistance rule ata_read_drive applies. */
+                if (n <= 16)
+                    for (uint32_t k = 0; k < n; k++)
+                        bcache_install(BCACHE_OWNER_BLK(i), lba + off + k,
+                                       out + (uint64_t)(off + k) * BLOCKDEV_SECSZ);
+                off += n; left -= n;
+            }
+        }
+        blk_lock_give(i);
     }
     g_dev[i].rd_ios++; g_dev[i].rd_sectors += count;       /* /proc/diskstats (M1256) */
     return 0;
@@ -558,28 +599,29 @@ static int loop_blk_write(void *ctx, uint64_t lba, uint32_t count, const void *b
 }
 
 static void blockdev_mount_scan(void) {
-    /* A DEVICE THAT REGISTERS LATE WAS NEVER SCANNED (M2144).
+    /* SCAN ONCE, AND MAKE SURE EVERY DISK EXISTS BY THEN (M2148).
      *
-     * This was a one-shot: the first caller set a flag and every later call
-     * returned immediately. That is correct only if every block device exists
-     * before the first mount lookup, and virtio-blk does not -- it is brought
-     * up after the ATA disks. Moving the Linux root onto virtio-blk therefore
-     * produced a machine that could SEE the disk and read its ext2 superblock
-     * in a self-test, and had no /disk2 at all:
+     * M2144 made this scan incrementally, keyed on the block-device INDEX, so
+     * that a device registering after the first mount lookup would still be
+     * picked up. That assumed device indices are stable across calls, and they
+     * are not: a later blockdev_init() re-registers, and ata0 came back at a
+     * different index. The result was the boot volume mounted TWICE under two
+     * names --
      *
-     *   blockdev 1: virtio-blk, 6553600 sectors (3200 MiB)
-     *   [ ok ] blockdev browse: 1 volume(s) listed across 2 DEVICES
-     *   [lxabi] root /disk2: vfs_stat FAILED
+     *   [mount] disk2 = blockdev 1 (ata1) ... ext2
+     *   [mount] disk3 = blockdev 2 (ata0) ... fat     <- ata0, again
      *
-     * Scan forward from wherever the last scan stopped instead. Mount names
-     * are assigned in append order, so picking up new devices later cannot
-     * rename an existing mount -- which matters, because LX_ROOT hardcodes
-     * `disk2` and a silent renumbering would move the whole Linux root. */
+     * -- which renumbered the volumes under a running system. Mount names are
+     * positional and LX_ROOT hardcodes `disk2`, so that is not a cosmetic bug.
+     *
+     * The real fix is upstream and simpler: bring every disk up BEFORE anything
+     * mounts one (kmain calls virtio_blk_init() early for exactly this), and
+     * then one scan is enough. A one-shot that runs at the right time beats an
+     * incremental one that has to reason about identity it does not have. */
+    if (g_mount_scanned_upto >= 0) return;
     blockdev_init();                          /* make sure devices are registered */
-    if (g_mount_scanned_upto >= g_ndev) return;
-    int scan_from = g_mount_scanned_upto < 0 ? 0 : g_mount_scanned_upto;
-    g_mount_scanned_upto = g_ndev;
-    for (int i = scan_from; i < g_ndev && g_nmount < 8; i++) {
+    g_mount_scanned_upto = 1;
+    for (int i = 0; i < g_ndev && g_nmount < 8; i++) {
         uint64_t starts[17];
         int ns = collect_fat_starts(i, starts, 16);
         /* Also consider LBA 0 for a table-less volume (e.g. a raw `mke2fs` image,
@@ -603,6 +645,15 @@ static void blockdev_mount_scan(void) {
             m->name[0]='d'; m->name[1]='i'; m->name[2]='s'; m->name[3]='k';
             m->name[4] = (char)('1' + g_nmount); m->name[5] = 0;   /* disk1..disk8 */
             m->dev = i; m->start = starts[v]; m->fstype = fstype;
+            /* NAME THE MOUNTS AS THEY ARE MADE (M2145). LX_ROOT hardcodes
+             * `/disk2`, so which volume gets that name decides whether the
+             * whole Linux side of this OS has a filesystem -- and nothing ever
+             * printed it. Moving the root to another transport produced a
+             * machine with two mounted volumes and no /disk2, and the table
+             * that would have said why in one line did not exist. */
+            kprintf("[mount] %s = blockdev %d (%s) at LBA %lu, fstype %s\n",
+                    m->name, i, g_dev[i].name, (unsigned long)starts[v],
+                    fstype == FS_EXT2 ? "ext2" : (fstype == FS_ISO9660 ? "iso9660" : "fat"));
             g_nmount++;
         }
     }

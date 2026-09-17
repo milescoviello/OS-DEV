@@ -45,6 +45,7 @@
 #include "string.h"
 #include "console.h"
 #include "io.h"
+#include "kheap.h"
 
 /* ---- legacy virtio-over-PCI config registers (I/O-port BAR, byte offsets) ---
  * This is the "legacy common configuration" header that begins at the start of
@@ -165,6 +166,13 @@ static uint64_t phys_of(const void *p) {
 }
 
 int virtio_blk_init(void) {
+    /* IDEMPOTENT (M2145). This has to run before anything mounts a filesystem
+     * on the device, and the original call site is ~1600 lines later in the
+     * boot -- so it is now called early AND left where it was. A second call
+     * must not memset the queue state out from under a live mount: `used_seen`
+     * would go back to zero and the next completion would be read as a stale
+     * one. Same fix as nic_init needed for the same reason (M2125). */
+    if (vb.present) return 0;
     memset(&vb, 0, sizeof(vb));
 
     /* Legacy virtio-blk over PCI: vendor 0x1AF4 (Red Hat / virtio), device
@@ -287,19 +295,31 @@ static int virtio_phys_contiguous(const void *p, uint32_t len) {
     return 1;
 }
 
-static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
-    if (!vb.present || count == 0 || !buf)
+/* WHY A TRANSFER FAILED, SAID OUT LOUD (M2145). Every rejection below was a
+ * bare `return -1`, so a filesystem that could not read a block had no way to
+ * find out which of six different refusals it had hit -- and neither did I.
+ * One line per distinct reason, capped, naming the request. */
+static void vblk_why(const char *reason, uint64_t lba, uint32_t count, int write) {
+    static int told;
+    if (told++ >= 12) return;
+    kprintf("[virtio-blk] %s %s lba %lu count %u REFUSED: %s\n",
+            write ? "write" : "read", "request", (unsigned long)lba, count, reason);
+}
+
+static int virtio_blk_xfer_locked(uint64_t lba, uint32_t count, void *buf, int write) {
+    if (!vb.present || count == 0 || !buf) {
+        vblk_why(!vb.present ? "no device" : (!buf ? "null buffer" : "zero count"),
+                 lba, count, write);
         return -1;
+    }
     /* Need three descriptors (header, data, status). The queue must hold them. */
-    if (vb.qsz < 3)
-        return -1;
+    if (vb.qsz < 3) { vblk_why("queue too small for a 3-descriptor chain", lba, count, write); return -1; }
     /* Bound the transfer: a single data descriptor's len is 32-bit, and we don't
      * want a multi-MiB request — cap at 256 sectors (128 KiB) per call, well
      * within range. Also refuse reads/writes past the device. */
-    if (count > 256)
-        return -1;
-    if (vb.capacity && (lba >= vb.capacity || count > vb.capacity - lba))
-        return -1;
+    if (count > 256) { vblk_why("more than 256 sectors in one request", lba, count, write); return -1; }
+    if (vb.capacity && (lba >= vb.capacity || count > vb.capacity - lba)) {
+        vblk_why("past the end of the device", lba, count, write); return -1; }
 
     /* One in-flight request at a time (this is a simple blocking driver), so we
      * always use descriptors 0,1,2 and avail/used slot 0. A persistent on-stack
@@ -343,7 +363,7 @@ static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
     void *dma = buf;
     int bounced = 0;
     if (!virtio_phys_contiguous(buf, bytes)) {
-        if (bytes > sizeof bounce) return -1;   /* capped at 256 sectors above */
+        if (bytes > sizeof bounce) { vblk_why("too big to bounce", lba, count, write); return -1; }
         dma = bounce;
         bounced = 1;
         if (write) for (uint32_t k = 0; k < bytes; k++) bounce[k] = ((const uint8_t *)buf)[k];
@@ -387,8 +407,7 @@ static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
         if (vb.used->idx != vb.used_seen) { done = 1; break; }
         __asm__ volatile("pause");
     }
-    if (!done)
-        return -1;                           /* timeout */
+    if (!done) { vblk_why("the device never completed the request (timeout)", lba, count, write); return -1; }
 
     if (bounced && !write)
         for (uint32_t k = 0; k < bytes; k++) ((uint8_t *)buf)[k] = bounce[k];
@@ -397,7 +416,46 @@ static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
     vb.used_seen++;
     (void)vcfg_r8(VIRTIO_PCI_ISR);           /* read ISR to ack any pending IRQ  */
 
-    return (status == VIRTIO_BLK_S_OK) ? 0 : -1;
+    if (status != VIRTIO_BLK_S_OK) {
+        vblk_why(status == 1 ? "the device reported an I/O error"
+                             : (status == 2 ? "the device reported an unsupported request"
+                                            : "the device left the status byte unwritten"),
+                 lba, count, write);
+        return -1;
+    }
+    return 0;
+}
+
+/* ONE REQUEST AT A TIME WAS AN ASSERTION, NOT A MECHANISM (M2145).
+ *
+ * virtio_blk_xfer_locked's own comment says "one in-flight request at a time,
+ * so we always use descriptors 0,1,2 and avail/used slot 0" -- and nothing
+ * enforced it. Two tasks in there at once overwrite each other's descriptor
+ * chain, publish the same avail slot twice, and then both consume one used
+ * entry: each gets whatever the other asked for, or nothing.
+ *
+ * It held for years because the only caller was a boot self-test, which is
+ * single-threaded by construction. Mounting a filesystem on this device makes
+ * every process a caller. The symptom was the worst kind: the device came up,
+ * the self-test read three sectors correctly, ext2's superblock probe
+ * succeeded and the volume mounted -- and then no file on it could be read,
+ * because by then several processes were reading at once.
+ *
+ * Same shape as the CMOS, PCI-config and kprintf races of M1913-M1916: a
+ * single shared hardware resource with a comment where the lock should be.
+ * A plain spinlock, per pci.c's reasoning -- no interrupt handler touches this
+ * queue (the driver polls the used ring and takes no IRQ). */
+static volatile int vblk_lock;
+static void vblk_take(void) {
+    while (__atomic_exchange_n(&vblk_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+}
+static void vblk_give(void) { __atomic_store_n(&vblk_lock, 0, __ATOMIC_RELEASE); }
+
+static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
+    vblk_take();
+    int r = virtio_blk_xfer_locked(lba, count, buf, write);
+    vblk_give();
+    return r;
 }
 
 int virtio_blk_read(uint64_t lba, uint32_t count, void *buf) {
@@ -414,6 +472,60 @@ int virtio_blk_write(uint64_t lba, uint32_t count, const void *buf) {
  * (identity-mapped low RAM, so its physical address is its own address). */
 static uint8_t selftest_buf[VIRTIO_BLK_SECTOR_SIZE * 4] __attribute__((aligned(PAGE_SIZE)));
 
+/* DOES A BIG TRANSFER RETURN THE RIGHT BYTES? (M2146)
+ *
+ * The three bugs fixed in M2144/M2145 got the ext2 root mounted and the whole
+ * Linux-ABI battery passing on this device -- 24 probes, zero failures -- and
+ * Firefox still dies on it, faulting inside fontconfig with the browser
+ * process gone. The ABI probes do a few thousand small reads; Firefox demand-
+ * pages ~740 MB. So the question is whether a LARGE transfer, into the kind of
+ * buffer the fault handler actually uses, returns the same bytes as the
+ * one-sector-at-a-time path that is known to work.
+ *
+ * NON-DESTRUCTIVE ON PURPOSE. The whole device is the ext2 filesystem, so
+ * there is nowhere safe to write: this reads the same region twice and
+ * compares. Reference reads go one sector at a time into a static BSS buffer
+ * (identity-mapped, contiguous, the shape the original self-test used and the
+ * only shape known good). The comparison read is one big transfer into a
+ * kmalloc'd buffer -- not page-aligned, not necessarily physically
+ * contiguous, and translated through the same phys_of path a demand-paged
+ * read uses. If those disagree, the transport is lying to the filesystem, and
+ * it says at which byte. */
+static void virtio_blk_verify_big(void) {
+    enum { VN = 128 };                      /* 64 KiB: one readahead window */
+    static uint8_t ref[VN * VIRTIO_BLK_SECTOR_SIZE];
+    const uint64_t lba = 2048;              /* inside the volume, read-only */
+
+    for (uint32_t i = 0; i < VN; i++)
+        if (virtio_blk_read(lba + i, 1, ref + (uint64_t)i * VIRTIO_BLK_SECTOR_SIZE) != 0) {
+            kprintf("[virtio-blk] verify: the single-sector reference read FAILED at +%u\n", i);
+            return;
+        }
+
+    uint8_t *big = (uint8_t *)kmalloc(VN * VIRTIO_BLK_SECTOR_SIZE);
+    if (!big) { kprintf("[virtio-blk] verify: no memory for the comparison buffer\n"); return; }
+    for (uint32_t k = 0; k < VN * VIRTIO_BLK_SECTOR_SIZE; k++) big[k] = 0xA5;
+
+    if (virtio_blk_read(lba, VN, big) != 0) {
+        kprintf("[virtio-blk] verify: the %d-sector read FAILED outright\n", VN);
+        return;
+    }
+    uint32_t bad = 0xFFFFFFFFu;
+    for (uint32_t k = 0; k < VN * VIRTIO_BLK_SECTOR_SIZE; k++)
+        if (big[k] != ref[k]) { bad = k; break; }
+
+    if (bad == 0xFFFFFFFFu) {
+        kprintf("[ ok ] virtio-blk: a %d-sector read into a kmalloc'd buffer is byte-identical "
+                "to %d single-sector reads\n", VN, VN);
+    } else {
+        kprintf("[FAIL] virtio-blk: a %d-sector read DIFFERS from the single-sector reads at "
+                "byte %u (sector +%u, offset %u): big=%02x ref=%02x -- the transport is "
+                "returning the wrong bytes\n",
+                VN, bad, bad / VIRTIO_BLK_SECTOR_SIZE, bad % VIRTIO_BLK_SECTOR_SIZE,
+                big[bad], ref[bad]);
+    }
+}
+
 /* Read a few sectors off the virtio block device and log the first bytes + a
  * simple additive checksum, so the read can be matched against known on-disk
  * content. This is the boot verification hook; a no-op if no virtio block
@@ -428,6 +540,8 @@ void virtio_blk_selftest(void) {
     kprintf("[ ok ] virtio-blk up: %lu sectors (%lu MiB) via virtqueue "
             "(boot stays on legacy ATA).\n",
             vb.capacity, (vb.capacity * VIRTIO_BLK_SECTOR_SIZE) / (1024 * 1024));
+
+    virtio_blk_verify_big();
 
     for (uint64_t lba = 0; lba < 3; lba++) {
         if (virtio_blk_read(lba, 1, selftest_buf) != 0) {

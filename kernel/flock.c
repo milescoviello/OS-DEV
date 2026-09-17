@@ -18,6 +18,7 @@
  * need no locking of their own). Same idiom as the other five files this
  * session already fixed the same way. */
 #include "flock.h"
+#include "console.h"   /* kprintf: a full lock table must announce itself (M2149) */
 #include "syscall.h"   /* LOCK_SH/EX/NB/UN */
 #include "task.h"
 
@@ -34,7 +35,28 @@ static inline void flk_irq_restore(uint64_t irqf) {
 }
 
 #define FLK_N 32                 /* max concurrent held locks */
-#define FLK_PATH 64
+/* A LOCK KEY THAT IS TRUNCATED LOCKS THE WRONG FILE (M2149).
+ *
+ * This was 64 bytes, and the path is the ONLY thing identifying what a lock
+ * covers -- so two files whose names agree for 63 characters became one lock.
+ * Firefox's profile makes that the normal case, not a corner:
+ *
+ *   /disk2/root/.mozilla/firefox/xx586yef.default-release/   = 54 chars
+ *
+ * leaving nine characters to distinguish places.sqlite from places.sqlite-wal
+ * from places.sqlite-journal from permissions.sqlite. sqlite locks the
+ * database and its write-ahead log separately and expects them to be
+ * independent; here a lock on one conflicted with a lock on the other, held by
+ * a different process, and sqlite reported exactly what it saw:
+ *
+ *   console.error: "Error opening database: Error executing SQL: database is
+ *                   locked"
+ *
+ * That is the fixed-buffer truncation class this project has paid for before
+ * (M604-M610), in the one structure where a collision is not a truncated
+ * string but a false mutual exclusion. VFS_PATH_MAX is what every other path
+ * in the kernel is sized to, so this is sized to it too. */
+#define FLK_PATH 256
 
 struct flk { char path[FLK_PATH]; int owner; int type; int used; };  /* type: LOCK_SH / LOCK_EX */
 static struct flk fl[FLK_N];
@@ -96,7 +118,13 @@ int flock_op(const char *path, int pid, int op) {
  * A SEPARATE lock space from flock() above (POSIX keeps the two independent),
  * keyed by {path, [start,len)} + owner pid. type F_RDLCK (shared) / F_WRLCK
  * (exclusive); len <= 0 means "to EOF". Released on F_UNLCK or process exit. */
-#define RLK_N 64
+/* AND ENOUGH OF THEM (M2149). 64 record locks for the whole machine, and a
+ * full table returned a silent -1 that the Linux layer turns into EAGAIN --
+ * which sqlite also reports as "database is locked", so the two failures were
+ * indistinguishable from outside. One browser profile holds locks on places,
+ * cookies, favicons, permissions, content-prefs, storage and their WAL and
+ * journal siblings, from more than one process. */
+#define RLK_N 256
 struct rlk { char path[FLK_PATH]; int owner, type, used; long start, len; };
 static struct rlk rl[RLK_N];
 
@@ -141,6 +169,13 @@ int rlock_set(const char *path, int pid, int type, long start, long len, int can
         return 0;
     }
     flk_irq_restore(irqf);
+    /* SAY IT, rather than looking like a lock conflict (M2149). A caller told
+     * EAGAIN retries for ever; a caller told the truth can at least be
+     * debugged. */
+    {   static int told;
+        if (!told) { told = 1;
+            kprintf("[flock] the record-lock table is FULL (%d entries) -- refusing a lock on "
+                    "\"%s\"; this is NOT a conflict with another holder\n", RLK_N, path); } }
     return -1;                                        /* table full */
 }
 /* F_GETLK: if a conflicting lock exists, report it in *out_* and return 1; else 0. */
