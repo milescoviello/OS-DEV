@@ -1116,7 +1116,22 @@ unsigned long g_poll_naps, g_poll_nap_ms, g_poll_yields;
  * of the wall clock. That is the mistake this project keeps making with
  * instruments, and it is cheaper to keep two counters. */
 static int lx_poll_nap(int spins) {
-    if (spins < 64) { g_poll_yields++; task_yield(); return 0; }
+    /* EIGHT YIELDS, NOT SIXTY-FOUR (M2122).
+     *
+     * Sixty-four was chosen from a measurement taken on hardware
+     * virtualisation, where a Firefox boot is 88% idle and a yield costs
+     * nothing anybody is waiting for. Under TCG the CPU IS the bottleneck --
+     * this project's laptop has no KVM at all -- and a poller that stays
+     * runnable for sixty-four reschedules competes with the very thread that
+     * would make it ready. Three probes in the Linux-ABI suite went from
+     * passing to TIMING OUT (`LXTLSMANY exit -> -2`, 120 threads), which is
+     * the opposite of the intended effect.
+     *
+     * So: a few yields, which is enough to see a descriptor that becomes ready
+     * within a couple of reschedules and is where nearly all of the latency win
+     * is, and then a real sleep. An optimisation measured on one machine class
+     * and shipped for both is how a 15-second win becomes a timeout. */
+    if (spins < 8) { g_poll_yields++; task_yield(); return 0; }
     int ms = spins < 512 ? 1 : 5;
     g_poll_naps++;
     g_poll_nap_ms += (unsigned long)ms;
