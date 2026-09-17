@@ -280,6 +280,7 @@ static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claud
  * Implies lxout -- there is no point running this and not being able to read
  * what it said. */
 static volatile int g_lxask;
+static volatile int g_lxbash;      /* -append lxbash: ask Claude Code to RUN A COMMAND, which is the Bash-tool demo (M2118) */
 static volatile int g_termtest;               /* -append termtest: the VT/ANSI terminal self-test (M2057) */
 /* -append lxhist: every 15 s, print the top syscall numbers each live Linux
  * process has made SINCE THE LAST SAMPLE (M2066). The one instrument that
@@ -722,6 +723,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnojit"))  g_lx_env_cmdline[0] = "BUN_JSC_useJIT=0";
         if (cmdline_has(cl, "lxnogc"))   g_lx_env_cmdline[1] = "BUN_JSC_useConcurrentGC=0";
         if (cmdline_has(cl, "lxnogen"))  g_lx_env_cmdline[2] = "BUN_JSC_useGenerationalGC=0";   /* what each Linux process is actually doing (M2066) */
+        if (cmdline_has(cl, "lxbash")) { g_lxabi_test = 1; g_lxask = 1; g_lxbash = 1; }   /* the Bash-tool demo (M2118) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
@@ -2027,11 +2029,29 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * HTTP/retry/stream logging is the only thing that can say what it
              * believes is happening on a connection we cannot decrypt, and
              * with lxout it lands in this log as text. (M2056) */
+            /* ...AND WITH -append lxbash, ASK IT TO RUN A COMMAND (M2118).
+             *
+             * The Bash tool has never worked inside OS-DEV, and M2107 found
+             * why: st_dev came back 0x801 from stat and ZERO from statx, so
+             * Bun's Zig standard library -- which records (st_dev, st_ino) for
+             * the working directory and re-checks it before spawning -- decided
+             * the directory had been swapped underneath it and refused. The
+             * guest Claude diagnosed that itself, from the inside.
+             *
+             * A fix for that has to be demonstrated by a TOOL CALL, not by
+             * `claude --version`. So the prompt asks for one, and asks for a
+             * string that cannot appear by accident: if OSDEV-BASH-OK reaches
+             * this log, a Linux program running on this kernel spawned a
+             * subprocess, read its output back, and returned it through a live
+             * HTTPS conversation. */
             static const char *av_ask[] = { "--dangerously-skip-permissions", "--debug", "-p",
                                             "Reply with exactly: OS-DEV" };
+            static const char *av_bash[] = { "--dangerously-skip-permissions", "--debug", "-p",
+                                             "Use the Bash tool to run exactly: echo OSDEV-BASH-OK" };
+            const char **av_use2 = g_lxbash ? av_bash : av_ask;
             app_set_next_cwd("/disk2/src");
             kprintf("[lxask] PHASE 7 DEMO: claude -p, in /src, on this kernel...\n");
-            int arc = app_run_linux_sync("/disk2/usr/bin/claude", av_ask, 4, 900000);
+            int arc = app_run_linux_sync("/disk2/usr/bin/claude", av_use2, 4, 900000);
             kprintf("[lxask] claude -p -> %d\n", arc);
         }
         if (g_lxinet_test) {

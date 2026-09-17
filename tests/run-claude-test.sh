@@ -33,7 +33,18 @@ cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait
 trap cleanup EXIT
 
 echo "booting and running Claude Code in-guest (minutes: a 214 MB image under TCG)..."
-timeout -s KILL 1800 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 4G -smp 4 -kernel "$KERNEL" \
+# -m 8G AND ONE CORE, both deliberate (M2118).
+#
+# 4G was measured as the point where JavaScriptCore's GC starts thrashing, so
+# every timing taken from this suite was taken against the one memory size the
+# project had already recorded as bad -- and COW always copies since M2044,
+# which makes headroom matter more, not less.
+#
+# One core because M2106 measured guest memory corruption on more than one:
+# Firefox took a #GP on a garbage pointer two runs out of two with M2102's COW
+# batching on, and once out of two with it off. That bug is open. A test must
+# not be the place that flakes on it.
+timeout -s KILL 1800 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 8G -smp 1 -kernel "$KERNEL" \
     -append "lxclaudetest nonetdemo" \
     -drive file="$DISK",format=raw,if=ide \
     -drive file="$EXT2",format=raw,if=ide \

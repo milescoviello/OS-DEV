@@ -2334,6 +2334,19 @@ static void lx_dispatch_body(struct registers *r) {
                 if (level == 1 /*SOL_SOCKET*/ && ctype == 1 /*SCM_RIGHTS*/ &&
                     clen >= 16 && clen <= ctllen) {
                     int nfd = (int)((clen - 16) / sizeof(int));
+                    /* HOW MANY DESCRIPTORS TRAVEL AT ONCE (M2118). Gecko sets
+                     * up a content process's rendering by sending it several
+                     * IPDL ENDPOINTS in a single message -- the compositor
+                     * bridge, the image bridge, the decoder managers -- so the
+                     * peak here is the number this kernel's SCM path has to
+                     * carry in one sendmsg without dropping any. M2083 found it
+                     * capped at three, and a content process that receives its
+                     * image bridge but not its compositor bridge is a content
+                     * process that never paints. Report the peak once it moves. */
+                    {   static int peak;
+                        if (nfd > peak) { peak = nfd;
+                            kprintf("[scm] most descriptors in one sendmsg so far: %d "
+                                    "(capacity %d)\n", nfd, app_scm_capacity()); } }
                     const int *fds = (const int *)(cm + 16);
                     /* ALL OF THEM, OR NONE, AND SAY SO (M2104).
                      *
