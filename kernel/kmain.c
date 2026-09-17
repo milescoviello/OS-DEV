@@ -2158,6 +2158,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] launching the AF_INET socket test (DNS + HTTP over poll)...\n");
             int inetrc = app_run_linux_sync("/disk2/lxinet", 0, 0, 60000);
             kprintf("[lxabi] lxinet exit -> %d\n", inetrc);
+            /* ...AND THEN THE SAME QUESTION THROUGH GLIBC (M2128). lxinet builds
+             * its own DNS query, so it proves the wire works and says nothing
+             * about getaddrinfo -- which is the only thing Node and Claude Code
+             * use, and which fails with EAI_AGAIN while lxinet succeeds on the
+             * same boot. lxgai is dynamically linked for exactly that reason. */
+            kprintf("[lxabi] launching the glibc getaddrinfo probe...\n");
+            int gairc = app_run_linux_sync("/disk2/lxgai", 0, 0, 60000);
+            kprintf("[lxabi] lxgai exit -> %d\n", gairc);
         }
         if (g_lxtool_test) {
             /* PHASE 4 (M1955): drive the BORROWED host toolchain inside OS-DEV.

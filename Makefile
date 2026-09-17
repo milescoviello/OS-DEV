@@ -389,6 +389,18 @@ $(LXROOT)/lxinet: tools/lx/lxinet.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (AF_INET sockets: DNS over UDP + HTTP over TCP, poll-driven)"
 
+# DYNAMICALLY linked on purpose: this probe exists to exercise glibc's real
+# getaddrinfo -- nsswitch.conf, a dlopen'd libnss_dns.so.2, resolv.conf -- which
+# is the path Node and Claude Code take and which a -static-pie binary cannot
+# reach. (M2128)
+$(LXROOT)/lxgai: tools/lx/lxgai.c
+	@mkdir -p $(LXROOT)/lib64 $(LXROOT)/usr/lib64
+	$(CC) -O2 -o $@ $< -lresolv
+	@for so in $$(ldd $@ 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do \
+	   d=$(LXROOT)$$(dirname $$so); mkdir -p $$d; cp -f $$so $$d/ 2>/dev/null || true; \
+	 done
+	@echo "  HOSTCC  $@ (glibc getaddrinfo: nsswitch -> libnss_dns -> resolv.conf)"
+
 $(LXROOT)/lxvmagap: tools/lx/lxvmagap.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -419,7 +431,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

@@ -75,6 +75,29 @@ if grep -aqE "LXINET-HTTP: status 200, [0-9]+ bytes, poll-driven" "$SLOG"; then
 else
     echo "  FAIL: the HTTP request did not complete:"; grep -aE "LXINET" "$SLOG" | head -3; fail=1
 fi
+# GLIBC'S OWN RESOLVER, which is a different question from the one above and the
+# one that actually matters: lxinet builds its DNS query by hand, so it can pass
+# while every real program fails. getaddrinfo is what Node and Claude Code use,
+# and it went through nsswitch.conf, /etc/hosts and a dlopen-free nss_dns to a
+# UDP socket that had to accept setsockopt(SOL_IP, IP_RECVERR) before glibc
+# would even connect it. Each line below is a separate step of that path, so a
+# failure says WHICH one broke instead of "check your internet or DNS". (M2128)
+if grep -aq "LXGAI-OK: getaddrinfo(AF_UNSPEC)" "$SLOG"; then
+    echo "  ok: glibc getaddrinfo(AF_UNSPEC) resolved a real name ($(grep -ao 'getaddrinfo(AF_UNSPEC) -> [0-9a-f.:]*' "$SLOG" | head -1 | sed 's/.*-> //'))"
+else
+    echo "  FAIL: glibc getaddrinfo(AF_UNSPEC) failed -- this is the EAI_AGAIN that blocked Claude Code:"
+    grep -aE "LXGAI" "$SLOG" | head -8 | sed 's/^/      /'; fail=1
+fi
+if grep -aq "LXGAI-OK: res_query" "$SLOG"; then
+    echo "  ok: and the resolver below NSS sent a query and got an answer ($(grep -ao 'res_query -> [0-9]* bytes' "$SLOG" | head -1))"
+else
+    echo "  FAIL: res_query got no answer -- the resolver could not reach the nameserver"; fail=1
+fi
+if grep -aq "LXGAI: 0 failure(s)" "$SLOG"; then
+    echo "  ok: every glibc name-resolution path succeeded, not just the ones that printed"
+else
+    echo "  FAIL: the glibc resolver probe reported failures:"; grep -a "LXGAI-FAIL" "$SLOG" | head -4 | sed 's/^/      /'; fail=1
+fi
 if grep -aq "lxinet exit -> 0" "$SLOG"; then
     echo "  ok: and it exited 0 -- every step succeeded, not just the ones that printed"
 else

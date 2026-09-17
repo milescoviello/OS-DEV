@@ -10095,11 +10095,19 @@ int app_socket(int domain, int type) {
      * opposite. (M1965) */
     int nb = (type & 0x800) ? 1 : 0, coe = (type & 0x80000) ? 1 : 0;
     type &= 0xF;
-    if (domain != 2 /*AF_INET*/ && domain != 1 /*AF_UNIX*/) return -1;
-    if (type != 2 /*SOCK_DGRAM*/ && type != 1 /*SOCK_STREAM*/) return -1;
+    /* FIVE CAUSES, FIVE ANSWERS (M2128). Every one of these returned a bare -1,
+     * which the Linux layer mapped to EAFNOSUPPORT -- "this machine does not do
+     * that address family". So "you are out of descriptors" and "I do not do
+     * raw sockets" and "the TCB table is full" all told the caller the same
+     * untrue thing, and a resolver that would have retried on EMFILE instead
+     * concluded the network stack could not do IPv4 and gave up. This is the
+     * dominant bug class in this project: a mechanism that answers with a
+     * plausible WRONG VALUE instead of failing honestly. */
+    if (domain != 2 /*AF_INET*/ && domain != 1 /*AF_UNIX*/) return -1;   /* -> EAFNOSUPPORT */
+    if (type != 2 /*SOCK_DGRAM*/ && type != 1 /*SOCK_STREAM*/) return -2;/* -> ESOCKTNOSUPPORT */
     int fd = -1;
     if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
-    if (fd < 0) return -1;
+    if (fd < 0) return -3;                                               /* -> EMFILE */
     if (domain == 1) {
         /* AF_UNIX (M1965). unixsock.c has been a complete implementation since
          * M1169, but its endpoints were bare integers OUTSIDE the fd table --
@@ -10112,7 +10120,7 @@ int app_socket(int domain, int type) {
         return fd;
     }
     if (type == 1) {                                       /* SOCK_STREAM: a TCP client socket (M1268) */
-        int idx = net_tcp_sock_open(); if (idx < 0) return -1;
+        int idx = net_tcp_sock_open(); if (idx < 0) return -4;           /* -> ENOBUFS: TCB table full */
         a->fd[fd] = (struct fdent){ 1, 10, 0, idx, {0}, 0, 0 };  /* type=AF_INET stream, obj=TCB slot */
     } else {
         a->fd[fd] = (struct fdent){ 1, 9, 0, 0, {0}, 0, 0 };     /* type=AF_INET dgram, off=0 (unbound) */
@@ -10930,6 +10938,9 @@ int app_fd_nread(int fd, long *out) {
 #define SOCKF_OOBINLINE  (1u << 5)
 #define SOCKF_DONTROUTE  (1u << 6)
 #define SOCKF_REUSEPORT  (1u << 7)
+#define SOCKF_IP_RECVERR  (1u << 8)   /* SOL_IP/IP_RECVERR: see app_sock_setopt (M2128) */
+#define SOCKF_IP_PKTINFO  (1u << 9)
+#define SOCKF_IP_FREEBIND (1u << 10)
 
 /* Is this descriptor a socket at all, and of what shape? */
 static int fd_is_sock(int ty) {
@@ -10971,6 +10982,21 @@ int app_sock_getopt(int fd, int level, int opt, void *out, int max) {
     if (level == 6 /*SOL_TCP*/) {
         if (opt == 1 /*TCP_NODELAY*/) { v = (a->fd[fd].sockflags & SOCKF_NODELAY) ? 1 : 0; goto give4; }
         return -92;                                                    /* ENOPROTOOPT */
+    }
+    if (level == 0 /*SOL_IP*/) {
+        /* The partner of the SOL_IP set path (M2128): a stored value read back
+         * is what makes the round trip honest, and answering zero to every
+         * option was its own bug (M2088). */
+        switch (opt) {
+        case 11: v = (a->fd[fd].sockflags & SOCKF_IP_RECVERR)  ? 1 : 0; break;
+        case 8:  v = (a->fd[fd].sockflags & SOCKF_IP_PKTINFO)  ? 1 : 0; break;
+        case 15: v = (a->fd[fd].sockflags & SOCKF_IP_FREEBIND) ? 1 : 0; break;
+        case 1:  v = 0;  break;                                        /* IP_TOS */
+        case 2:  v = 64; break;                                        /* IP_TTL: what we actually send */
+        default: return -92;
+        }
+        *(int32_t *)out = v;
+        return 4;
     }
     if (level != 1 /*SOL_SOCKET*/) return -92;
     switch (opt) {
@@ -11037,7 +11063,61 @@ int app_sock_setopt(int fd, int level, int opt, const void *in, int len) {
         if (opt == 1) { if (v) a->fd[fd].sockflags |= SOCKF_NODELAY; else a->fd[fd].sockflags &= ~SOCKF_NODELAY; return 0; }
         return -92;
     }
-    if (level != 1 /*SOL_SOCKET*/) return -92;
+    if (level == 0 /*SOL_IP*/) {
+        /* THE OPTION THAT MADE DNS IMPOSSIBLE (M2128).
+         *
+         * glibc's resolver, between socket() and connect(), calls
+         * __res_enable_icmp() -> setsockopt(SOL_IP, IP_RECVERR). If that fails
+         * it CLOSES the socket and reports the nameserver unusable -- it never
+         * connects and never sends. So refusing this one option made every
+         * getaddrinfo() in the system fail with EAI_AGAIN, "Temporary failure
+         * in name resolution", while a program that built its own DNS query
+         * over the same UDP path succeeded on the same boot. The trace was four
+         * identical sockets created and closed with nothing in between:
+         *
+         *   [sock] socket(domain 2, type 0x80802) -> fd 3      (x4)
+         *   ...no connect, no transmit, no error anywhere
+         *
+         * And it is a REGRESSION I introduced. setsockopt used to be
+         * `r->rax = 0` for everything, which is why Node's DNS worked in M1967;
+         * M2088 made it honest, and honest included refusing an option we do
+         * not implement. This is the case where that rule is wrong, and the
+         * reason is worth being precise about: IP_RECVERR asks the kernel to
+         * QUEUE ICMP errors for retrieval via recvmsg(MSG_ERRQUEUE). A stack
+         * that queues none is in a legal state -- "no errors have occurred" --
+         * and every caller copes with an empty error queue. Linux has no way to
+         * refuse this option at all, so ENOPROTOOPT is not a truthful answer
+         * about a Linux socket; it is an answer Linux cannot give. Accept it,
+         * record it, deliver nothing, which is what "no ICMP errors" looks
+         * like from the outside. */
+        switch (opt) {
+        case 11: if (v) a->fd[fd].sockflags |= SOCKF_IP_RECVERR;  else a->fd[fd].sockflags &= ~SOCKF_IP_RECVERR;  return 0;
+        case 8:  if (v) a->fd[fd].sockflags |= SOCKF_IP_PKTINFO;  else a->fd[fd].sockflags &= ~SOCKF_IP_PKTINFO;  return 0;
+        case 15: if (v) a->fd[fd].sockflags |= SOCKF_IP_FREEBIND; else a->fd[fd].sockflags &= ~SOCKF_IP_FREEBIND; return 0;
+        case 1: case 2: case 10:        /* IP_TOS / IP_TTL / IP_MTU_DISCOVER: advisory here */
+            return 0;
+        default: {
+            static uint32_t moaned_ip[8];
+            if (opt >= 0 && opt < 256 && !(moaned_ip[opt >> 5] & (1u << (opt & 31)))) {
+                moaned_ip[opt >> 5] |= 1u << (opt & 31);
+                kprintf("[sock] setsockopt(SOL_IP, option %d) is not implemented -- "
+                        "answering ENOPROTOOPT rather than pretending it took\n", opt);
+            }
+            return -92;
+        }
+        }
+    }
+    if (level != 1 /*SOL_SOCKET*/) {
+        /* SAY WHICH LEVEL. The entire cost of the bug above was that the
+         * refusal carried no information about what had been refused. */
+        static uint32_t moaned_lv;
+        if (level >= 0 && level < 32 && !(moaned_lv & (1u << level))) {
+            moaned_lv |= 1u << level;
+            kprintf("[sock] setsockopt(level %d, option %d): this level is not implemented -- "
+                    "answering ENOPROTOOPT\n", level, opt);
+        }
+        return -92;
+    }
     switch (opt) {
     case 7: case 8: {                                                  /* SO_SNDBUF / SO_RCVBUF */
         /* LINUX DOUBLES IT, and then clamps to the system maximum. Both halves

@@ -585,7 +585,34 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * old cwd-relative behaviour. The stored fd path is ALREADY kernel-side
  * (/disk2/...), so it must not be translated a second time. */
 #define LX_AT_FDCWD (-100)
+/* WHICH RESOLVER FILES DID GLIBC ACTUALLY LOOK AT (M2128).
+ *
+ * `getaddrinfo` fails inside OS-DEV while `lxinet`, which builds its own DNS
+ * query, succeeds on the same boot -- and glibc's failure is reported as
+ * "Temporary failure in name resolution", which names neither the step nor the
+ * reason. What is observable from the kernel is which files it opened or
+ * stat'd on the way, and there are only a handful of them, so logging every
+ * one is free and it distinguishes "it never asked" from "it asked and we said
+ * no". Logged here because lx_xlate_at is the one place every path-bearing
+ * syscall passes through, whatever its spelling. */
+static int lx_res_seen;
+static void lx_resolver_watch(const char *up) {
+    if (lx_res_seen >= 60 || !up) return;
+    static const char *const names[] = { "resolv.conf", "nsswitch.conf",
+                                         "/etc/hosts", "nss_", "nscd", "host.conf" };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        for (const char *h = up; *h; h++) {
+            const char *a = h, *b = names[i];
+            while (*b && *a == *b) { a++; b++; }
+            if (!*b) { lx_res_seen++;
+                       kprintf("[resolver] the guest asked for \"%s\"\n", up);
+                       return; }
+        }
+    }
+}
+
 static const char *lx_xlate_at(long dirfd, const char *up, char *out, int max) {
+    lx_resolver_watch(up);
     if (!up) return lx_xlate(up, out, max);
     if (up[0] == '/' || dirfd == LX_AT_FDCWD) return lx_xlate(up, out, max);
     const char *base = app_fd_path_of((int)dirfd);
@@ -1876,7 +1903,39 @@ static void lx_dispatch_body(struct registers *r) {
         int dom = (int)a1;
         int sfd = app_socket(dom, (int)r->rsi);
         if (g_lx_systrace) kprintf("[sock] socket(dom %d, type %lx) -> %d\n", dom, r->rsi, sfd);
-        r->rax = (sfd < 0) ? (uint64_t)-(long)LX_EAFNOSUPPORT : (uint64_t)sfd;
+        if (sfd < 0) {
+            /* ALWAYS, not only under a trace flag. A program that cannot make a
+             * socket reports it as "check your internet or DNS", which names
+             * neither the call nor the reason -- and Claude Code spent a whole
+             * session reporting EAI_AGAIN with nothing in any log to say that a
+             * socket() had been refused, or which one. (M2128) */
+            static const char *why[] = { "", "address family not supported",
+                                         "socket type not supported",
+                                         "out of file descriptors",
+                                         "no free TCB slot" };
+            int k = -sfd; if (k < 1 || k > 4) k = 1;
+            kprintf("[sock] socket(domain %d, type 0x%lx) REFUSED: %s\n", dom, r->rsi, why[k]);
+            long e = (sfd == -2) ? LX_ESOCKTNOSUPPORT
+                   : (sfd == -3) ? LX_EMFILE
+                   : (sfd == -4) ? LX_ENOBUFS : LX_EAFNOSUPPORT;
+            r->rax = (uint64_t)-e;
+            break;
+        }
+        /* And say ONCE, for each shape of socket a program asks for, that it got
+         * one. "Zero [udp] tx lines" told me the query never went out; it could
+         * not tell me whether a UDP socket had even been created, which is the
+         * difference between a send path bug and a resolver that never started.
+         * A socket is a rare, structural event -- one line each is free. (M2128) */
+        {   /* EVERY ONE, not one per shape (M2128). The one-shot version keyed on
+             * the low bits of `type`, so glibc's resolver socket -- DGRAM with
+             * SOCK_NONBLOCK|SOCK_CLOEXEC -- collided with a plain DGRAM already
+             * seen and was never printed, which is exactly the call I was trying
+             * to observe. Sockets are rare; count them and print them all. */
+            static int n;
+            if (n < 200) { n++;
+                kprintf("[sock] socket(domain %d, type 0x%lx) -> fd %d\n", dom, r->rsi, sfd); }
+        }
+        r->rax = (uint64_t)sfd;
         break;
     }
     case LXS_bind_:
@@ -2115,6 +2174,15 @@ static void lx_dispatch_body(struct registers *r) {
          * that is just write(). */
         if (!r->r8) {
             long w = app_fd_write((int)a1, (const void *)r->rsi, (unsigned long)slen);
+            if (w < 0 && app_fd_type((int)a1) == 9) {
+                /* send() on a datagram socket with no default peer. glibc's
+                 * resolver reaches here after connect(), so a failure means the
+                 * connect did not take -- and a bare -1 says none of that. */
+                static int told;
+                if (!told) { told = 1;
+                    kprintf("[sock] send(fd %ld, %ld bytes) on a datagram socket FAILED: "
+                            "no connected peer\n", a1, slen); }
+            }
             r->rax = (w < 0) ? (uint64_t)lx_fd_err(w) : (uint64_t)w;
             break;
         }

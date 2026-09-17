@@ -134,4 +134,20 @@ done
 mkdir -p "$ROOT/etc"
 printf 'hosts:\tfiles dns\npasswd:\tfiles\ngroup:\tfiles\n' > "$ROOT/etc/nsswitch.conf"
 
+# /etc/hosts AND /etc/host.conf, which were both missing (M2128). Every Linux
+# system has them, and glibc's resolver asks for all four files on every single
+# lookup -- traced from the kernel:
+#
+#   [resolver] the guest asked for "/etc/resolv.conf"
+#   [resolver] the guest asked for "/etc/nsswitch.conf"
+#   [resolver] the guest asked for "/etc/host.conf"
+#   [resolver] the guest asked for "/etc/hosts"
+#
+# `hosts: files dns` means the `files` source runs FIRST, and it is the one that
+# reads /etc/hosts. A missing file there is NSS_STATUS_UNAVAIL rather than
+# "not found", which is a different thing to glibc and not the thing we mean:
+# we mean "this machine has a loopback name and nothing else, go ask DNS".
+printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > "$ROOT/etc/hosts"
+printf 'multi on\n' > "$ROOT/etc/host.conf"
+
 echo "  STAGE   $NAME <- $BIN (+ $n shared libs)"
