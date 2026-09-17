@@ -1603,6 +1603,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                             kprintf("[page] --- sample %d, %ds after the first paint ---\n",
                                                     k + 1, (k + 1) * 8);
                                             wl_page_probe(0x101820);
+                                            /* AND WHAT EVERY LINUX PROCESS IS
+                                             * WAITING FOR (M2108). The page
+                                             * area is blank while the content
+                                             * process is alive, so the
+                                             * question is what that process is
+                                             * parked on -- and until now
+                                             * nothing could even name it: the
+                                             * reports were all keyed on the
+                                             * browser PARENT. wchan is a
+                                             * kernel PC; tools/wchan.sh turns
+                                             * it into a function name. */
+                                            if (k == 2 || k == 6) {
+                                                int pids[16];
+                                                int np = app_live_pids(pids, 16);
+                                                for (int j = 0; j < np; j++)
+                                                    if (app_thread_count(pids[j]) > 2)
+                                                        app_wait_summary(pids[j]);
+                                            }
                                             {   int cp2 = 0, cs2 = lx_fatal_signal(&cp2);
                                                 if (cs2) { kprintf("[page] pid %d CRASHED with signal %d "
                                                                    "during the page wait\n", cp2, cs2); break; } }

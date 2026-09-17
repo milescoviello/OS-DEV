@@ -139,6 +139,8 @@ void   app_fd_print(int fd);               /* kprintf an fd's kind AND state, fo
 int  app_sock_getopt(int fd, int level, int opt, void *out, int max);        /* bytes written, or -errno (M2088) */
 int  app_sock_setopt(int fd, int level, int opt, const void *in, int len);   /* 0, or -errno (M2088) */
 int  app_unix_peek_fd(int sockfd);        /* are MORE descriptors queued than were taken? for MSG_CTRUNC (M2090) */
+int  app_live_pids(int *out, int max);    /* every live Linux process: the content process is not the biggest one (M2108) */
+int  app_thread_count(int pid);
 int  app_biggest_pid(void);               /* the process with the most threads: the browser, whatever its pid (M2105) */
 void app_wait_summary(int pid);            /* every thread's wchan, GROUPED: what are they all waiting for (M2103) */
 void app_scm_drop_conn(int ci);           /* a dead connection releases the descriptors still queued on it (M2104) */

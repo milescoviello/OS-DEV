@@ -11131,6 +11131,29 @@ void app_fd_print(int fd) {
  * instrument keyed on app_last_spawn_pid() is asking about a process that
  * stopped existing four seconds in. The browser is identifiable without a pid
  * at all: it is the process with by far the most threads. */
+/* EVERY LIVE LINUX PROCESS, so the one being waited on can be asked directly
+ * (M2108). app_biggest_pid finds the browser parent, and the parent is not the
+ * process in question any more: the content process is alive, its frames are
+ * what is missing, and nothing could enumerate it. */
+int app_live_pids(int *out, int max) {
+    int n = 0;
+    for (int i = 0; i < MAX_APPS && n < max; i++) {
+        struct app *a = &apps[i];
+        if (!a->used || a->exited || !a->lxcalls) continue;   /* Linux processes only */
+        out[n++] = a->pid;
+    }
+    return n;
+}
+int app_thread_count(int pid) {
+    struct app *a = app_by_pid(pid); if (!a) return -1;
+    int n = 0;
+    for (int t = 0; t <= APP_MAXTHREAD; t++) {
+        task_t *tk = (t == APP_MAXTHREAD) ? a->task : a->thr[t];
+        if (tk && task_state_of(tk) != TASK_DEAD) n++;
+    }
+    return n;
+}
+
 int app_biggest_pid(void) {
     int best = -1, bestn = 0;
     for (int i = 0; i < MAX_APPS; i++) {
