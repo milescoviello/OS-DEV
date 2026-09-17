@@ -129,7 +129,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -1763,6 +1763,13 @@ browsertest: $(KERNEL) $(DISK)
 # in `make check`: minutes per start under TCG. SKIPs when it was never staged.
 firefoxtest: $(KERNEL) $(DISK) $(EXT2IMG)
 	@tests/run-firefox-test.sh
+
+# THE PIXELS, not the file. See tests/run-firefox-page-test.sh. Deliberately NOT
+# in check-all, like firefoxtest: a headless Gecko render on one TCG core takes
+# the better part of half an hour, and a suite whose slowest member is thirty
+# minutes stops being run. (M2118)
+firefoxpagetest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-firefox-page-test.sh
 
 # PHASE 8: OS-DEV's own Wayland compositor, exercised by a REAL libwayland
 # client (the same library Firefox uses). In `make check`: one 2 GiB boot.
