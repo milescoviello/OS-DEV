@@ -267,6 +267,7 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_vfork_        58
 #define LXS_execve_       59
 #define LX_WNOHANG        1      /* wait4/waitid: do not block (M2025) */
+#define LX_WNOWAIT        0x01000000  /* waitid: report the status, leave the child waitable (M2106) */
 #define LXS_wait4_        61
 /* waitid(2), which app_waitid has implemented since M1227 and which was never
  * given a Linux number (M2105). A fork server reaps its children with waitid
@@ -787,6 +788,14 @@ void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid) {
         else            kprintf("   t%d %u(%lx, %lx, %lx) = %lx\n", e->tid, e->nr, e->a1, e->a2, e->a3, e->ret);
     }
 }
+
+/* WHAT KILLED THE PROCESS BEING WATCHED (M2106). The boot timeline polls
+ * counters; a crash is an event, and an event that happened 4000 log lines ago
+ * is invisible to a poller. Record it so the watcher can report the cause
+ * instead of the silence that followed it. */
+static int g_fatal_pid, g_fatal_sig;
+void lx_fatal_record(int pid, int sig) { g_fatal_pid = pid; g_fatal_sig = sig; }
+int  lx_fatal_signal(int *pid) { if (pid) *pid = g_fatal_pid; return g_fatal_sig; }
 
 void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }
 
@@ -1667,10 +1676,25 @@ static void lx_dispatch_body(struct registers *r) {
          * be lost, which is the case abort() depends on. */
         if (rc < 0) rc = app_raise_signal_to((int)tpid, sig);
         if (rc == 1) {                               /* SIG_DFL and fatal, at ourselves */
-            kprintf("[linuxabi] process raised signal %d at itself with no handler -- terminating\n", sig);
-            /* abort() prints nothing of its own and leaves no fault address, so
-             * without this the only evidence is the exit status. (M1970) */
-            if (sig == 6) { lx_trace_dump("abort()"); lx_user_backtrace(r); }
+            /* SAY IT LOUDLY, AND SAY IT FOR EVERY FATAL SIGNAL (M2106).
+             *
+             * This line was one of four thousand in a boot log, so a run where
+             * Firefox CRASHED four seconds in was indistinguishable, from the
+             * outside, from a run where it hung -- and I read the latter for
+             * eighty seconds of an eighty-five second silence. The crash is the
+             * headline: nothing after it means anything.
+             *
+             * And the backtrace was gated on `sig == 6`. abort() was singled
+             * out in M1970 because it "prints nothing of its own and leaves no
+             * fault address" -- but a SIGSEGV re-raised by a crash handler
+             * (which is what Firefox's does, restoring SIG_DFL and re-raising)
+             * arrives here exactly the same way and needs the stack exactly as
+             * much. One of two paths again. */
+            kprintf("\n[linuxabi] *** pid %d DIED of signal %d (raised at itself, no handler) ***\n",
+                    app_sys_getpid(), sig);
+            lx_fatal_record(app_sys_getpid(), sig);
+            lx_trace_dump(sig == 6 ? "abort()" : "the fatal signal");
+            lx_user_backtrace(r);
             app_sys_exit(128 + sig);
             break;
         }
@@ -4193,6 +4217,21 @@ static void lx_dispatch_body(struct registers *r) {
                         path, LX_EXEC_ARGS);
         }
         av[na] = 0;
+        /* NAME THE CHILD (M2106). Seven of Firefox's child processes exited
+         * with status 1 in one startup and the log could not say what any of
+         * them WAS -- so "a content process is dying" was an assumption, not
+         * an observation. Firefox puts the process type LAST in argv (`tab`,
+         * `gpu`, `rdd`, `utility`, `forkserver`), and the two arguments before
+         * it are the parent pid and the "is for browser" flag, so the tail of
+         * the vector identifies the process completely. */
+        if (na > 0) {
+            if (na >= 4)
+                kprintf("[exec] pid %d -> %s (%d args, type '%s', from pid %s)\n",
+                        app_sys_getpid(), path, na, av[na - 1], av[na - 3]);
+            else
+                kprintf("[exec] pid %d -> %s (%d args, argv1 '%s')\n",
+                        app_sys_getpid(), path, na, na > 1 ? av[1] : "");
+        }
         if (uev && vmm_user_ok(r->rdx, sizeof(char *))) {
             for (; ne < LX_EXEC_ARGS && uev[ne]; ne++) {
                 const char *sp = uev[ne]; int k = 0;
@@ -4288,12 +4327,28 @@ static void lx_dispatch_body(struct registers *r) {
         if (sip && !vmm_user_ok(sip, 128)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         struct siginfo si;
         for (unsigned i = 0; i < sizeof si; i++) ((char *)&si)[i] = 0;
-        long got = app_waitid(idtype, id, &si, (opts & LX_WNOHANG) ? 1 : 0);
+        /* PASS THE OPTIONS THROUGH, don't reduce them to a bool: WNOWAIT is
+         * the one Chromium's process watcher depends on, and WNOHANG has the
+         * same value here as on Linux. (M2106) */
+        long got = app_waitid(idtype, id, &si, opts & (LX_WNOHANG | LX_WNOWAIT));
         if (got < 0) { r->rax = (uint64_t)-(long)LX_ECHILD; break; }
         if (sip) {
             uint8_t *o = (uint8_t *)sip;
             for (int i = 0; i < 128; i++) o[i] = 0;
-            if (got > 0) {
+            /* IT WAS `got > 0`, AND app_waitid RETURNS 0 ON SUCCESS (M2106).
+             *
+             * So this branch was never once taken: every waitid reaped a child
+             * and then handed back 128 zero bytes with a return value of
+             * success. Firefox read si_pid == 0 and si_signo == 0 -- "nothing
+             * has exited" -- about a child that had just been collected, so it
+             * waited for a process that no longer existed and the tab never
+             * came up. Success carrying a plausible wrong value, which is the
+             * same defect as M2088's getsockopt and M2104's SCM_RIGHTS.
+             *
+             * The witness is si_pid: app_waitid sets it to the child's pid on a
+             * real reap and to 0 for the WNOHANG "nothing ready yet" case,
+             * which are exactly the two outcomes that must be distinguished. */
+            if (si.si_pid) {
                 *(int *)(o + 0)  = 17;            /* si_signo = SIGCHLD */
                 *(int *)(o + 4)  = 0;             /* si_errno */
                 *(int *)(o + 8)  = 1;             /* si_code = CLD_EXITED */

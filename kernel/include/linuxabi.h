@@ -35,6 +35,11 @@ uint64_t lx_spawn_stack(const void *image, uint64_t base, uint64_t entry,
 extern int g_lx_mmap_trace;    /* -append lxmmaptrace: log every Linux mmap/mprotect (M1955) */
 extern int g_lx_systrace;      /* -append lxsystrace: log EVERY Linux syscall */
 void lx_trace_dump(const char *why);
+/* The last fatal signal a Linux process died of, and which pid. Returns 0 if
+ * nothing has crashed. A crash is an event; the boot timeline polls counters
+ * and cannot see one. (M2106) */
+void lx_fatal_record(int pid, int sig);
+int  lx_fatal_signal(int *pid);
 void lx_trace_dump_last(const char *why, unsigned long want);  /* ...or just the last `want` (M1985) */
 void lx_trace_dump_fault(void);   /* the ring at a ring-3 fault: deep under lxsystrace, modest otherwise (M2003) */
 void lx_trace_dump_addr(const char *why, unsigned long addr);   /* every mmap/munmap/mprotect that covered ONE address (M2088) */

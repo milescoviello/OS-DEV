@@ -1842,6 +1842,93 @@ int wl_compositor_init(void) {
  * 5 ms is a compromise -- a display that polls is not what we want long term
  * (the AF_UNIX layer can wake a waiter), but it is honest about what this is
  * today, and it keeps the server responsive without spinning a core. */
+/* IS A PAGE ON SCREEN, OR ONLY THE CHROME? (M2106)
+ *
+ * "Firefox has painted" has meant `wl_largest_window() >= 640x480` for three
+ * milestones, and that is a statement about GEOMETRY. A browser showing its own
+ * chrome around an empty content area satisfies it exactly as well as one
+ * showing a web page, so the one question this campaign exists to answer was
+ * the one thing not being measured -- and I have been answering it by taking a
+ * screenshot and reading a pixel out of it by hand, once per run, at the centre
+ * of the window, which lands on whatever happens to be there.
+ *
+ * So: sample a grid across the CONTENT area -- below the chrome, which is about
+ * 90px of tab strip and toolbar -- and report what colour actually dominates
+ * it, with the top few runners-up. A page whose background we chose (#101820,
+ * tools/lx/ffpage.html) is then a fact about the framebuffer rather than an
+ * impression: either most of the content area is that colour or it is not.
+ *
+ * Reporting the DISTRIBUTION rather than a single yes/no is deliberate. The
+ * failure modes are not binary -- a page that loaded but painted white, a page
+ * behind a translucent overlay, and a content area that never got a buffer are
+ * three different bugs, and they are distinguishable only by what else is
+ * there. A bare "no" would have sent me looking in the wrong place. */
+#define WL_PROBE_GRID 32
+void wl_page_probe(uint32_t want) {
+    int best = -1; uint64_t barea = 0;
+    for (int ci = 0; ci < WL_MAXCLIENT; ci++) {
+        if (!g_cl[ci].used) continue;
+        uint32_t w = 0, h = 0; wl_client_extent(ci, &w, &h);
+        if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = ci; }
+    }
+    if (best < 0 || barea == 0) { kprintf("[page] no client has a window to sample\n"); return; }
+    uint32_t ww = 0, wh = 0; wl_client_extent(best, &ww, &wh);
+    struct wl_layer L[WL_MAXOBJ > 32 ? 32 : WL_MAXOBJ];
+    int nl = wl_client_layers(best, L, (int)(sizeof L / sizeof L[0]));
+    if (nl <= 0) { kprintf("[page] client %d has a %ux%u extent but no layers\n", best, ww, wh); return; }
+
+    /* The chrome is at the top. Sample below it, and never outside the window. */
+    uint32_t y0 = wh > 200 ? 92 : 0;
+    struct { uint32_t c; int n; } tally[10];
+    int nt = 0, sampled = 0, hit = 0, uncovered = 0;
+    for (int gy = 0; gy < WL_PROBE_GRID; gy++) {
+        for (int gx = 0; gx < WL_PROBE_GRID; gx++) {
+            uint32_t x = (uint32_t)((uint64_t)gx * ww / WL_PROBE_GRID);
+            uint32_t y = y0 + (uint32_t)((uint64_t)gy * (wh - y0) / WL_PROBE_GRID);
+            /* Topmost layer covering the point wins: wl_layers writes parents
+             * first, so the LAST match is the one actually visible. */
+            const uint32_t *px = 0; uint32_t got = 0; int found = 0;
+            for (int i = 0; i < nl; i++) {
+                if (!L[i].px) continue;
+                if ((int)x < L[i].x || (int)y < L[i].y) continue;
+                uint32_t lx = x - (uint32_t)L[i].x, ly = y - (uint32_t)L[i].y;
+                if (lx >= L[i].w || ly >= L[i].h) continue;
+                px = L[i].px; got = px[ly * (L[i].stride / 4) + lx]; found = 1;
+            }
+            sampled++;
+            if (!found) { uncovered++; continue; }
+            if ((got & 0x00ffffffu) == (want & 0x00ffffffu)) hit++;
+            int f = -1;
+            for (int i = 0; i < nt; i++) if (tally[i].c == got) { f = i; break; }
+            if (f < 0 && nt < 10) { f = nt++; tally[f].c = got; tally[f].n = 0; }
+            if (f >= 0) tally[f].n++;
+        }
+    }
+    kprintf("[page] client %d ('%s') %ux%u, %d layer(s): %d samples of the content area (y >= %u)\n",
+            best, wl_client_title_of(best), ww, wh, nl, sampled, y0);
+    /* Selection sort by count -- ten entries, and the order is the whole point. */
+    for (int i = 0; i < nt; i++) {
+        int m = i;
+        for (int j = i + 1; j < nt; j++) if (tally[j].n > tally[m].n) m = j;
+        if (m != i) { uint32_t c = tally[i].c; int n = tally[i].n;
+                      tally[i] = tally[m]; tally[m].c = c; tally[m].n = n; }
+    }
+    for (int i = 0; i < nt && i < 5; i++)
+        kprintf("[page]   %08x  %d (%d%%)%s\n", tally[i].c, tally[i].n,
+                sampled ? tally[i].n * 100 / sampled : 0,
+                (tally[i].c & 0x00ffffffu) == (want & 0x00ffffffu) ? "   <-- the page background" : "");
+    if (uncovered) kprintf("[page]   %d sample(s) were not covered by any layer at all\n", uncovered);
+    /* State the verdict, and state it against a threshold, so a page that
+     * painted a thin strip of itself cannot read as a page that loaded. */
+    int pct = sampled ? hit * 100 / sampled : 0;
+    if (pct >= 50)
+        kprintf("[page] VERDICT: the PAGE is on screen -- %d%% of the content area is %06x\n",
+                pct, want & 0x00ffffffu);
+    else
+        kprintf("[page] VERDICT: only the CHROME -- %d%% of the content area is the page's %06x, "
+                "so the content area is showing something else\n", pct, want & 0x00ffffffu);
+}
+
 void wl_server_task(void) {
     for (;;) {
         wl_compositor_poll();

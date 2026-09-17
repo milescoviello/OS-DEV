@@ -54,7 +54,11 @@ int  wl_client_count(void);
 int  wl_client_layers(int ci, struct wl_layer *out, int max);
 void wl_client_extent(int ci, uint32_t *w, uint32_t *h);
 const char *wl_client_title_of(int ci);
-void wl_largest_window(uint32_t *w, uint32_t *h);   /* has ANY client painted a real window? (M2089) */
+void wl_largest_window(uint32_t *w, uint32_t *h);
+/* Sample the CONTENT area of the biggest window and report what colour
+ * dominates it. "Painted" has meant a >=640x480 extent, which chrome around an
+ * empty page satisfies just as well as a page. (M2106) */
+void wl_page_probe(uint32_t want_rgb);   /* has ANY client painted a real window? (M2089) */
 const char     *wl_surface_title(void);   /* that surface's xdg_toplevel.set_title (M1981) */
 /* Drive the dispatcher with a multi-surface client and assert the compositor
  * draws the toplevel rather than the cursor. No socket, no client, no display:

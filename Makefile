@@ -310,6 +310,11 @@ $(LXROOT)/lxsockopt: tools/lx/lxsockopt.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (getsockopt answered a confident ZERO to every option ever asked)"
 
+$(LXROOT)/lxmadv: tools/lx/lxmadv.c
+	@mkdir -p $(LXROOT)
+	$(CC) -static-pie -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (MADV_DONTNEED kept every fork-shared page and returned success)"
+
 $(LXROOT)/lxnread: tools/lx/lxnread.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -414,7 +419,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
@@ -506,7 +511,7 @@ $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 # still newer than its prerequisites. That is how bash and git were added to
 # LXTOOLS and never actually staged, leaving every ext2 rebuild without them
 # while manual injections into the image kept being wiped.
-$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile
+$(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools/lx/osdev-firefox-prefs.js
 	@mkdir -p $(LXROOT)
 	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
 	@tools/stage-linux-tool.sh $(LXROOT) make "$$(command -v gmake || command -v make)"
@@ -593,7 +598,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile
 	@# shared-library closure comes from libxul rather than the launcher: the
 	@# launcher is a 600 KB stub with six dependencies, and everything real
 	@# (GTK, cairo, pango, fontconfig, dbus) is libxul's. (M1982)
-	@if [ -d "$(FIREFOX_DIR)" ]; then 	    mkdir -p $(LXROOT)$(FIREFOX_DIR) && cp -a "$(FIREFOX_DIR)/." $(LXROOT)$(FIREFOX_DIR)/ && 	    echo "  STAGE   firefox <- $(FIREFOX_DIR) ($$(du -sh $(FIREFOX_DIR) | cut -f1))"; 	    tools/stage-linux-tool.sh $(LXROOT) libxul "$(FIREFOX_DIR)/libxul.so" >/dev/null 2>&1 || true; 	    n=0; for so in $$(ldd "$(FIREFOX_DIR)/libxul.so" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do 	        r=$$(readlink -f "$$so" 2>/dev/null) || continue; [ -f "$$r" ] || continue; 	        mkdir -p $(LXROOT)$$(dirname "$$so") $(LXROOT)/usr/lib64; 	        cp -f "$$r" $(LXROOT)$$so; cp -f "$$r" $(LXROOT)/usr/lib64/$$(basename "$$so") 2>/dev/null || true; 	        n=$$((n+1)); done; 	    echo "  STAGE   libxul closure (+ $$n shared libs)"; 	 else echo "  SKIP    firefox (not installed; set FIREFOX_DIR=)"; fi
+	@if [ -d "$(FIREFOX_DIR)" ]; then 	    mkdir -p $(LXROOT)$(FIREFOX_DIR) && cp -a "$(FIREFOX_DIR)/." $(LXROOT)$(FIREFOX_DIR)/ && 	    echo "  STAGE   firefox <- $(FIREFOX_DIR) ($$(du -sh $(FIREFOX_DIR) | cut -f1))"; 	    tools/stage-linux-tool.sh $(LXROOT) libxul "$(FIREFOX_DIR)/libxul.so" >/dev/null 2>&1 || true; 	    n=0; for so in $$(ldd "$(FIREFOX_DIR)/libxul.so" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do 	        r=$$(readlink -f "$$so" 2>/dev/null) || continue; [ -f "$$r" ] || continue; 	        mkdir -p $(LXROOT)$$(dirname "$$so") $(LXROOT)/usr/lib64; 	        cp -f "$$r" $(LXROOT)$$so; cp -f "$$r" $(LXROOT)/usr/lib64/$$(basename "$$so") 2>/dev/null || true; 	        n=$$((n+1)); done; 	    echo "  STAGE   libxul closure (+ $$n shared libs)"; 	 mkdir -p $(LXROOT)$(FIREFOX_DIR)/browser/defaults/preferences && cp -f tools/lx/osdev-firefox-prefs.js $(LXROOT)$(FIREFOX_DIR)/browser/defaults/preferences/osdev-prefs.js && echo "  STAGE   osdev-prefs.js (software WebRender: there is no EGL in this image)"; 	 else echo "  SKIP    firefox (not installed; set FIREFOX_DIR=)"; fi
 	@# ...and the DATA FILES a GTK program cannot start without. None of these
 	@# come through ld.so, so nothing above brings them in, and each one fails
 	@# in a way that does not name itself: no fonts.conf and fontconfig reports

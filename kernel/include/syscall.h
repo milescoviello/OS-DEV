@@ -454,6 +454,7 @@ struct siginfo { int si_signo, si_errno, si_code, si_pid, si_uid, si_status; };
 #define P_PGID  2
 #define P_PIDFD 3
 #define WNOHANG     1
+#define WNOWAIT     0x01000000   /* waitid: REPORT the status but leave the child waitable (M2106) */
 #define WSTOPPED    2
 #define WEXITED     4
 #define WCONTINUED  8

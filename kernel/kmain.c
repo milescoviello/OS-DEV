@@ -664,6 +664,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
         if (cmdline_has(cl, "nodma")) { extern int g_ata_dma_reads; g_ata_dma_reads = 0; }   /* A/B the DMA read path (M2091) */
+        if (cmdline_has(cl, "freepoison")) { extern int g_freepoison; g_freepoison = 1;
+            kprintf("[boot] freepoison: every guest frame that becomes free is filled with "
+                    "0xDEADF00DDEADF00D -- if the guest faults on that, we freed a page it still maps\n"); }
+        if (cmdline_has(cl, "cowbatch")) { extern int g_cow_batch; g_cow_batch = 1;
+            kprintf("[boot] cowbatch: M2102's batched COW free re-enabled -- this CORRUPTS the "
+                    "guest on more than one core (M2106), for bisection only\n"); }
         if (cmdline_has(cl, "nopathcache")) g_e2_path_cache = 0;          /* A/B the ext2 path cache (M2104) */
         if (cmdline_has(cl, "noreadrun"))   g_e2_read_runs = 0;           /* A/B the ext2 run coalescing (M2104) */
         if (cmdline_has(cl, "diskbench")) g_diskbench = 1;                /* per-command disk cost (M2091) */
@@ -974,6 +980,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the readable-byte-count probe...\n");
         {   int nrrc = app_run_linux_sync("/disk2/lxnread", 0, 0, 120000);
             kprintf("[lxabi] LXNREAD exit -> %d\n", nrrc); }
+        /* MADV_DONTNEED KEPT EVERY FORK-SHARED PAGE AND RETURNED SUCCESS, so
+         * the caller was promised zeroes and read back stale bytes. mozjemalloc
+         * is built on that promise, Firefox forks, and mozjemalloc fills freed
+         * memory with 0xe5 -- which is how a pointer came back as
+         * 0xe5e5e5e5e5e5e5e5 and #GP'd pthread_mutex_lock. The FORK is the
+         * test: without one every page is single-owner and the old code looks
+         * correct. (M2106) */
+        kprintf("[lxabi] launching the madvise purge probe...\n");
+        {   int mvrc = app_run_linux_sync("/disk2/lxmadv", 0, 0, 120000);
+            kprintf("[lxabi] LXMADV exit -> %d\n", mvrc); }
         /* sendmsg answered ENETUNREACH -- impossible on a Unix socket -- for
          * six different failures, and Firefox's FORK SERVER got it after
          * successfully forking a content process. Every content process died
@@ -1508,6 +1524,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                 {   uint32_t pw = 0, ph = 0; wl_largest_window(&pw, &ph);
                                     if (pw >= 640 && ph >= 480) {
                                         kprintf("[t] PAINTED at t=%ds\n", q + 1);
+                                        /* ...AND IS IT A PAGE, OR JUST CHROME?
+                                         * A >=640x480 extent is geometry, and
+                                         * chrome around an empty content area
+                                         * satisfies it exactly as well as a
+                                         * loaded page does. (M2106) */
+                                        wl_page_probe(0x101820);
                                         break;
                                     }
                                 }
@@ -1528,6 +1550,19 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                  * connection" -- which is a property of the
                                  * thing being measured rather than of a pid
                                  * that was only ever the first process. */
+                                /* A CRASH IS AN EVENT, NOT A COUNTER (M2106).
+                                 * Checking liveness by polling could only ever
+                                 * report the silence AFTER the crash, and the
+                                 * crash line itself was four thousand lines
+                                 * back in the log. Ask what killed it. */
+                                {   int cpid = 0, csig = lx_fatal_signal(&cpid);
+                                    if (csig) {
+                                        kprintf("[t] *** pid %d CRASHED with signal %d at t=%ds -- "
+                                                "everything after this is the corpse, not a hang ***\n",
+                                                cpid, csig, q + 1);
+                                        break;
+                                    }
+                                }
                                 if (app_state_of(fpid) < 0 && wl_clients_connected() < 2) {
                                     kprintf("[t] no Wayland client left at t=%ds "
                                             "(launcher pid %d also gone)\n", q + 1, fpid);
@@ -1539,10 +1574,27 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                             task_sleep_ms(15000);
                             unsigned long now = lx_syscalls_made();
                             int st = app_state_of(fpid);
-                            kprintf("[ff] t=%ds pid %d state=%d syscalls +%lu\n",
-                                    (t + 1) * 15, fpid, st, now - prev);
+                            /* THE SAME FALSE SIGNAL, IN THE OTHER LOOP (M2106).
+                             * M2105 fixed the launcher-is-not-the-browser
+                             * confusion in the timeline above and left this
+                             * copy of it fifteen lines below -- so the run was
+                             * still cut short by `[ff] the process is GONE`,
+                             * just one heartbeat later. Adding a fix to one of
+                             * two paths is the mistake this campaign keeps
+                             * making; the only defence is to grep for the
+                             * other one every time. */
+                            int bp2 = app_biggest_pid();
+                            kprintf("[ff] t=%ds launcher pid %d state=%d, browser pid %d, "
+                                    "%u Wayland client(s), syscalls +%lu\n",
+                                    (t + 1) * 15, fpid, st, bp2, wl_clients_connected(), now - prev);
                             prev = now;
-                            if (st < 0) { kprintf("[ff] the process is GONE\n"); break; }
+                            {   int cpid = 0, csig = lx_fatal_signal(&cpid);
+                                if (csig) { kprintf("[ff] *** pid %d CRASHED with signal %d ***\n",
+                                                    cpid, csig); break; } }
+                            if (st < 0 && wl_clients_connected() < 2) {
+                                kprintf("[ff] no Wayland client left (launcher pid %d also gone)\n", fpid);
+                                break;
+                            }
                             /* IF IT HAS PAINTED A WINDOW, STOP WATCHING AND GO
                              * SHOW IT (M2089). This loop spent a fixed six
                              * minutes diagnosing a startup before the window
@@ -1558,6 +1610,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                 if (pw >= 640 && ph >= 480) {
                                     kprintf("[ff] it has PAINTED: a %ux%u window is ready -- "
                                             "handing over to the desktop now rather than at t=360s\n", pw, ph);
+                                    wl_page_probe(0x101820);      /* chrome, or a PAGE? (M2106) */
                                     kmain_budget("Firefox has painted its first frame");
                                     break;
                                 }

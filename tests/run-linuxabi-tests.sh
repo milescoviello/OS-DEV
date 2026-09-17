@@ -218,6 +218,7 @@ LXSIG: ALL PASSED
 LXTLS: OK
 LXLOCK: OK
 LXNREAD: OK
+LXMADV: OK
 LXSOCKOPT: OK
 LXMSG: OK
 LXTLSMANY: OK
@@ -402,6 +403,25 @@ LXWAIT: reaped 40/40 children
         echo "  ok: FIONREAD reports real byte counts on sockets/pipes/files/ptys/inotify, refuses the types Linux refuses, and FIONBIO/FIOCLEX/FIONCLEX reach the fcntl state they name (M2086, 32 checks)"
     else
         echo "  FAIL: FIONREAD or the FIO* family is wrong:"; grep -a "LXNREAD" "$SLOG3" | grep -a FAIL | head -6; f3=1
+    fi
+    # M2106 -- MADV_DONTNEED RECLAIMED A PAGE ONLY IF NOTHING ELSE REFERENCED
+    # IT, so every page a fork had left copy-on-write shared was silently kept
+    # and madvise returned 0 anyway. The contract is not "free this if
+    # convenient", it is "the next read of this range sees zeroes", and
+    # mozjemalloc purges free runs on exactly that promise before handing them
+    # out without clearing them. It fills freed memory with 0xe5, Firefox
+    # forks, and the result was:
+    #
+    #   [fault] General Protection Fault at libc.so.6+971c4  rdi=e5e5e5e5e5e5e5e5
+    #           -- pthread_mutex_lock+4, `mov 0x10(%rdi),%edx`, non-canonical
+    #
+    # The probe FORKS before purging, which is the only reason it can fail:
+    # without a live child every page is single-owner and the old code passes.
+    # All 13 checks were validated against a real Linux kernel first.
+    if grep -aq "LXMADV: OK" "$SLOG3"; then
+        echo "  ok: MADV_DONTNEED zeroes a COW-shared range and leaves the forked child's copy intact (M2106, 13 checks)"
+    else
+        echo "  FAIL: MADV_DONTNEED is not honouring its zero-fill contract:"; grep -a "LXMADV" "$SLOG3" | grep -a FAIL | head -6; f3=1
     fi
     # M2088 -- getsockopt ANSWERED A CONFIDENT ZERO TO EVERY OPTION EVER ASKED.
     # It wrote a 4-byte zero into the caller's buffer and returned success

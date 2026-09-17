@@ -2246,7 +2246,20 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
         }
         if (z) {
             int code = z->exit_code, cpid = z->pid;
-            z->used = 0; z->zombie = 0;             /* collect the zombie slot */
+            /* WNOWAIT MEANS LOOK, DO NOT TAKE (M2106).
+             *
+             * Chromium's process watcher -- which is Firefox's -- peeks at a
+             * child with waitid(...WNOWAIT) to learn whether it has exited,
+             * deliberately leaving it reapable so the code that owns the
+             * reaping still gets its status. Collecting the zombie here anyway
+             * consumed a status nobody had asked for, and Firefox's real wait
+             * then failed:
+             *
+             *   WARNING: waiting for process 173 failed with error 10
+             *
+             * -- error 10 being ECHILD, for a child it had just been told
+             * about. */
+            if (!(options & WNOWAIT)) { z->used = 0; z->zombie = 0; }   /* collect the zombie slot */
             irq_restore(f);
             if (si) { si->si_signo = SIGCHLD; si->si_errno = 0; si->si_code = CLD_EXITED;
                       si->si_pid = cpid; si->si_uid = 0; si->si_status = code; }
@@ -4671,7 +4684,74 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
  * process still pays nothing at all -- app_tlb_sync already returns without an
  * IPI when there are no siblings to shoot down. */
 static int app_tlb_sync(struct app *a);
+/* M2102's BATCHING IS OFF, BECAUSE IT CORRUPTED THE GUEST (M2106).
+ *
+ * M2102 deferred the copy-on-write FREE behind one TLB shootdown per sixty-four
+ * breaks, and argued it was safe: the sibling core's stale translation for the
+ * old frame is READ-ONLY, so a sibling reading through it reads byte-identical
+ * data and a sibling writing through it takes its own fault -- therefore the
+ * shootdown is needed only to make the free safe, and holding our reference is
+ * enough to make holding the frame safe.
+ *
+ * MEASURED, and the argument is wrong somewhere:
+ *
+ *   -smp 8, batching ON  : #GP on a garbage pointer at t=4s, 2 runs of 2.
+ *                          0xe5e5e5e5e5e5e5e5 in pthread_mutex_lock one run,
+ *                          0xc71c24447ffac5dc in libgobject the next.
+ *   -smp 8, batching OFF : PAINTED at t=29s, no fault.
+ *   -smp 1, batching ON  : PAINTED at t=20s, no fault.
+ *
+ * Different garbage at a different site each run, only with more than one core,
+ * and only with the deferral: that is the deferral handing a live page away.
+ * The premise I most suspect is "the stale entry is read-only" -- fork's own
+ * write-protect walk publishes the COW marking one PTE at a time and shoots
+ * down only when the whole walk is finished, so a sibling can still hold a
+ * WRITABLE translation for a page another core has already broken. Its writes
+ * then land in a frame the address space no longer maps, which is a lost write
+ * rather than a stale read, and batching stretches that window from one
+ * shootdown latency to sixty-four breaks.
+ *
+ * I have not proved that mechanism, which is exactly why this defaults to off:
+ * an unproven safety argument that measurement contradicts is not a basis for
+ * shipping. `-append cowbatch` turns it back on for further bisection, and
+ * `-append freepoison` is the instrument built to pin it down. The 381271
+ * shootdowns per Firefox startup remain a real cost -- and the honest fix is
+ * almost certainly to stop CREATING them, since Firefox forks and execs
+ * immediately and write-protecting half a gigabyte for a child that replaces
+ * its address space two milliseconds later is pure waste. */
+int g_cow_batch;                /* -append cowbatch turns the M2102 batching back on */
+
+/* IS THE GUEST READING A FRAME WE FREED? (M2106)
+ *
+ * Firefox dies of a #GP on a garbage pointer -- 0xe5e5e5e5e5e5e5e5 one run,
+ * 0xc71c24447ffac5dc the next, in libc one run and in libgobject the next.
+ * Different garbage at a different site each time is memory corruption, and
+ * there are exactly two families of cause: the guest's own data is wrong, or a
+ * page of the guest's address space stopped belonging to it. Reading registers
+ * cannot tell those apart, and I have now spent three runs trying.
+ *
+ * So make the second one identify itself. When a frame is about to become
+ * genuinely free -- refcount zero, we are the last owner -- fill it with a
+ * pattern no program would ever compute. If the guest afterwards faults on
+ * 0xDEADF00DDEADF00D, the answer is not "somewhere in Gecko"; it is "this
+ * kernel handed away a page the guest still had mapped", and the path that
+ * did it is one of the two that call this.
+ *
+ * Only at refcount zero: a frame with another owner is still somebody's live
+ * memory, and poisoning it would CREATE the bug being hunted. Behind a flag
+ * because it is a 4 KiB write per freed page. */
+int g_freepoison;               /* -append freepoison */
+static void poison_if_last(uint64_t frame) {
+    if (!g_freepoison || !frame) return;
+    if (pmm_refcount(frame)) return;            /* another owner: not ours to scribble on */
+    uint64_t *p = (uint64_t *)hhdm(frame);
+    for (unsigned i = 0; i < PAGE_SIZE / sizeof *p; i++) p[i] = 0xDEADF00DDEADF00Dull;
+}
 static void cow_quarantine(struct app *a, uint64_t frame) {
+    if (!g_cow_batch) {                         /* pre-M2102: shoot down, then free, per break */
+        if (app_tlb_sync(a)) { poison_if_last(frame); pmm_free_frame(frame); }
+        return;
+    }
     uint64_t batch[64]; int n = 0;
     uint64_t fl = vma_alloc_lock(a);
     if (a->ncowq < (int)(sizeof a->cowq / sizeof a->cowq[0])) {
@@ -4688,7 +4768,7 @@ static void cow_quarantine(struct app *a, uint64_t frame) {
      * is the deadlock the whole-operation VMA lock died of. */
     if (n) {
         if (app_tlb_sync(a)) {
-            for (int i = 0; i < n; i++) pmm_free_frame(batch[i]);
+            for (int i = 0; i < n; i++) { poison_if_last(batch[i]); pmm_free_frame(batch[i]); }
         } else {
             static int told;
             if (!told) { told = 1;
@@ -4697,7 +4777,7 @@ static void cow_quarantine(struct app *a, uint64_t frame) {
         }
     }
     if (frame) {                                    /* queue was full and stayed full: old path */
-        if (app_tlb_sync(a)) pmm_free_frame(frame);
+        if (app_tlb_sync(a)) { poison_if_last(frame); pmm_free_frame(frame); }
     }
 }
 /* Release whatever is still quarantined. Called at teardown, where the address
@@ -4711,7 +4791,7 @@ void app_cow_quarantine_flush(struct app *a) {
     a->ncowq = 0;
     vma_alloc_unlock(a, fl);
     if (!n) return;
-    if (app_tlb_sync(a)) for (int i = 0; i < n; i++) pmm_free_frame(batch[i]);
+    if (app_tlb_sync(a)) for (int i = 0; i < n; i++) { poison_if_last(batch[i]); pmm_free_frame(batch[i]); }
 }
 
 static int app_tlb_sync(struct app *a) {
@@ -5238,32 +5318,91 @@ int app_madvise(uint64_t addr, uint64_t len, int advice) {
     uint64_t start = addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t end   = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (end < start) return -1;
-    int dropped = 0;
+    /* MADV_DONTNEED ON A COW PAGE DID NOTHING AND SAID IT WORKED (M2106).
+     *
+     * `pmm_refcount(ph) == 0` -- "single-owner anon page: safe to reclaim" --
+     * silently skipped every page that a fork had left COW-shared, and then
+     * returned success. But the contract of MADV_DONTNEED is not "drop this if
+     * it is convenient", it is THE NEXT READ OF THIS RANGE MUST SEE ZEROS. A
+     * page left in place keeps its old contents, and the caller has been told
+     * it is gone.
+     *
+     * mozjemalloc is built on that guarantee: it purges a free run with
+     * MADV_DONTNEED, records the run as zeroed, and later hands it out for an
+     * allocation it therefore need not clear. Firefox forks (content processes,
+     * glxtest), so a large part of its heap is COW-shared -- and mozjemalloc
+     * fills freed memory with 0xe5. So the pages came back holding poison that
+     * jemalloc believed was zeroes, and Firefox read a pointer field as
+     * 0xe5e5e5e5e5e5e5e5:
+     *
+     *   [fault] General Protection Fault at rip=libc.so.6+971c4  rdi=e5e5e5e5e5e5e5e5
+     *           -- pthread_mutex_lock+4, `mov 0x10(%rdi),%edx`
+     *
+     * which is non-canonical, hence #GP rather than #PF. That is the crash
+     * that has been ending these runs at a different moment every time -- 14s,
+     * 26s, 30s, never -- because WHICH page gets recycled and whether a fork
+     * had shared it first is a race. It reads as a hang because Firefox's own
+     * crash handler re-raises the signal and prints nothing.
+     *
+     * Dropping a COW page is safe and needs no special care: pmm_free_frame
+     * DECREMENTS a refcounted frame and keeps it allocated, so the forked
+     * sibling that still maps it is untouched, and our next touch demand-zeros
+     * a fresh frame.
+     *
+     * MAP_SHARED is the one case that must still be skipped -- the data
+     * belongs to every other mapper too, and zero-filling our view would
+     * destroy theirs. That is a property of the VMA, which is why the test is
+     * now the VMA's `shared` flag rather than a refcount that cannot tell
+     * "shared with another process on purpose" from "COW, temporarily".
+     *
+     * A SKIP MUST NEVER AGAIN BE SILENT: the counts are reported. */
+    int dropped = 0, sk_novma = 0, sk_locked = 0, sk_shared = 0, sk_absent = 0, cow_dropped = 0;
     while (start < end) {
         uint64_t frames[64]; int nf = 0;
         uint64_t chunk = start + 64ull * PAGE_SIZE;
         if (chunk > end || chunk < start) chunk = end;
         uint64_t f_ = vma_lock(a_);
         for (uint64_t p = start; p < chunk; p += PAGE_SIZE) {
-            int in_vma = 0, locked = 0;
+            int in_vma = 0, locked = 0, shared = 0;
             for (int i = 0; i < a_->nvma; i++)
                 if (a_->vma[i].len && p >= a_->vma[i].start &&
-                    p < a_->vma[i].start + a_->vma[i].len) { in_vma = 1; locked = a_->vma[i].locked; break; }
-            if (!in_vma || locked) continue;          /* demand-paged mmap regions; mlock'd pages are pinned (M1149) */
+                    p < a_->vma[i].start + a_->vma[i].len) {
+                    in_vma = 1; locked = a_->vma[i].locked; shared = a_->vma[i].shared; break; }
+            if (!in_vma) { sk_novma++;  continue; }   /* not a VMA of ours at all */
+            if (locked)  { sk_locked++; continue; }   /* mlock'd pages are pinned (M1149) */
+            if (shared)  { sk_shared++; continue; }   /* MAP_SHARED: not ours alone to zero */
             uint64_t ph = vmm_translate(p);
-            if (ph && pmm_refcount(ph) == 0) {        /* single-owner anon page: safe to reclaim */
-                vmm_unmap(p);
-                frames[nf++] = ph;
-            }
+            if (!ph) { sk_absent++; continue; }       /* already not resident: nothing to drop */
+            if (pmm_refcount(ph)) cow_dropped++;      /* the pages the old test skipped */
+            vmm_unmap(p);
+            frames[nf++] = ph;
         }
         vma_unlock(a_, f_);
         if (nf) {
             app_tlb_sync(a_);                         /* no core may still reach these frames */
-            for (int i = 0; i < nf; i++) pmm_free_frame(frames[i]);
+            for (int i = 0; i < nf; i++) { poison_if_last(frames[i]); pmm_free_frame(frames[i]); }
             dropped += nf;
         }
         start = chunk;
     }
+    /* Say what was NOT dropped, once. The bug above was invisible for as long
+     * as it was because the skip had no voice and the return value counted
+     * only successes -- so "madvise dropped 0 of 4096 pages" and "madvise
+     * dropped 4096 of 4096" were the same 0 on success. */
+    if (cow_dropped) {
+        static int told_cow;
+        if (!told_cow) { told_cow = 1;
+            kprintf("[madv] MADV_DONTNEED dropped %d COW-shared page(s) that the old "
+                    "refcount test would have silently kept -- the caller was promised "
+                    "zeroes and would have read stale data (M2106)\n", cow_dropped); }
+    }
+    if (sk_locked || sk_shared) {
+        static int told_skip;
+        if (!told_skip) { told_skip = 1;
+            kprintf("[madv] MADV_DONTNEED skipped pages: %d mlock'd, %d MAP_SHARED "
+                    "(both correct; neither is ours alone to zero)\n", sk_locked, sk_shared); }
+    }
+    (void)sk_novma; (void)sk_absent;
     return dropped;
 }
 
@@ -10964,24 +11103,49 @@ int app_biggest_pid(void) {
 void app_wait_summary(int pid) {
     struct app *a = app_by_pid(pid);
     if (!a) { kprintf("[wait] pid %d is gone\n", pid); return; }
+    /* "RUNNABLE" MEANT "NOT BLOCKED", WHICH IS NOT THE SAME THING (M2106).
+     *
+     * This printed `9 threads, 9 runnable, 0 blocked` for eighty-five seconds
+     * about a process making ZERO syscalls and taking ZERO page faults. Nine
+     * runnable threads that never execute is not a thing, so the report was
+     * false -- and it was false because everything that is not TASK_BLOCKED
+     * was counted as runnable, including TASK_STOPPED. The threads had been
+     * stopped by app_stop_siblings: Firefox had called exit_group and DIED,
+     * which is the one state this summary could not express.
+     *
+     * A dead process and a hung one need opposite investigations, and I spent
+     * a run reading a futex ledger looking for a lost wakeup in a process that
+     * had already crashed. So name the state. */
+    static const char *const stname[] = { "READY", "RUNNING", "BLOCKED", "DEAD", "STOPPED" };
     struct { uint64_t wchan; int n; int st; const char *name; } g[24];
-    int ng = 0, total = 0, running = 0;
+    int ng = 0, total = 0, nst[5] = { 0, 0, 0, 0, 0 };
     for (int t = 0; t <= APP_MAXTHREAD; t++) {
         task_t *tk = (t == APP_MAXTHREAD) ? a->task : a->thr[t];
         if (!tk || task_state_of(tk) == TASK_DEAD) continue;
         total++;
-        if (task_state_of(tk) != TASK_BLOCKED) { running++; continue; }
+        int st = (int)task_state_of(tk);
+        if (st >= 0 && st < 5) nst[st]++;
+        if (st != TASK_BLOCKED) continue;
         int f = -1;
         for (int i = 0; i < ng; i++) if (g[i].wchan == tk->wchan) { f = i; break; }
         if (f < 0 && ng < 24) { f = ng++; g[f].wchan = tk->wchan; g[f].n = 0;
-                                g[f].st = (int)task_state_of(tk); g[f].name = task_name_of(tk); }
+                                g[f].st = st; g[f].name = task_name_of(tk); }
         if (f >= 0) g[f].n++;
     }
-    kprintf("[wait] pid %d: %d threads, %d runnable, %d blocked on %d distinct places\n",
-            pid, total, running, total - running, ng);
+    kprintf("[wait] pid %d%s: %d threads -- %d READY %d RUNNING %d BLOCKED %d STOPPED, "
+            "on %d distinct places\n",
+            pid, a->exited ? " (EXITED)" : "", total,
+            nst[TASK_READY], nst[TASK_RUNNING], nst[TASK_BLOCKED], nst[TASK_STOPPED], ng);
+    /* STOPPED is never a state a live process puts itself in -- app_stop_siblings
+     * is the only producer -- so say what it means rather than leaving a number
+     * to be misread a second time. */
+    if (nst[TASK_STOPPED] && !nst[TASK_READY] && !nst[TASK_RUNNING] && !nst[TASK_BLOCKED])
+        kprintf("[wait]   every thread is STOPPED: this process is DEAD (exit_group or a fatal "
+                "signal stopped its siblings), not hung. Look for why it exited, not for a "
+                "lost wakeup.\n");
     for (int i = 0; i < ng; i++)
-        kprintf("[wait]   %d thread(s) at wchan=%p (e.g. '%s')\n",
-                g[i].n, (void *)g[i].wchan, g[i].name);
+        kprintf("[wait]   %d thread(s) %s at wchan=%p (e.g. '%s')\n",
+                g[i].n, stname[g[i].st], (void *)g[i].wchan, g[i].name);
 }
 
 /* WHO HOLDS THE OTHER END, AND WHAT ARE THEY DOING? (M2103)
