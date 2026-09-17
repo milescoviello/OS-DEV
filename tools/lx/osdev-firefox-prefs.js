@@ -163,27 +163,13 @@ pref("extensions.autoDisableScopes",      0);
 pref("devtools.console.stdout.chrome", true);
 pref("browser.dom.window.dump.enabled", true);
 
-// SILENCE THE STARTUP SERVICES THAT THROW (M2134)
+// TRIED AND MADE NO DIFFERENCE, RECORDED SO IT IS NOT RETRIED (M2135)
 //
-// With the chrome console reaching the serial log (M2133), two startup
-// services are reporting failures, and they VARY BETWEEN RUNS -- one boot
-// shows BackupService throwing an uncaught NotAllowedError out of
-// PathUtils.join, another shows Region.sys.mjs failing with
-// "JSON.parse: unexpected character at line 1 column 1", which means a
-// response arrived and was not JSON.
-//
-// Neither service has anything to do with showing a page, and neither is
-// something this OS needs. They are disabled here so they cannot abort chrome
-// startup, which is the sequence that creates and navigates the first tab --
-// the thing M2132 showed never happens. If the page appears once these are
-// out of the way, one of them was the blocker; if it does not, chrome startup
-// is failing somewhere else and these were noise. Either answer is progress.
-//
-// The pref names are checked against omni.ja, not libxul: these are read by JS
-// modules, so libxul is the wrong place to look and "absent from libxul" would
-// have been a wrong conclusion about a pref that exists.
-pref("browser.region.update.enabled",      false);
-pref("browser.region.network.url",         "");
-pref("browser.backup.scheduled.enabled",   false);
-pref("toolkit.telemetry.enabled",          false);
-pref("datareporting.healthreport.uploadEnabled", false);
+// browser.region.update.enabled, browser.region.network.url,
+// browser.backup.scheduled.enabled, toolkit.telemetry.enabled and
+// datareporting.healthreport.uploadEnabled were all turned off together on the
+// theory that one of them was aborting chrome startup before the first tab was
+// created. The page did start rendering in that run -- and it renders just the
+// same with all five put back, so they were not the reason. Removing them
+// again rather than shipping prefs that do nothing: a setting kept "just in
+// case" is a setting someone later has to disprove.
