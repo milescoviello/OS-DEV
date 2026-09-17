@@ -451,15 +451,43 @@ void isr_dispatch(struct registers *r) {
                  * printing -- which is both unreadable and slow enough to blow
                  * a test's boot budget. Format first, print once. */
                 static const char hx[] = "0123456789abcdef";
+                /* DO NOT LET THE DUMP INVENT ITS OWN EVIDENCE (M2152).
+                 *
+                 * This dereferenced the user rip directly. If that page is not
+                 * present the read faults AGAIN from inside the fault handler,
+                 * and this kernel services that as a demand-zero fault -- so
+                 * the act of printing the bytes MAPS A FRESH ZEROED FRAME over
+                 * the address and then prints the zeros it just created. The
+                 * report then reads "bytes at rip: 00 00 00 ..." whatever was
+                 * really there, and I spent a long stretch of the 8-core hunt
+                 * treating exactly that line as proof that an executable page
+                 * of libxul had been corrupted.
+                 *
+                 * Check the translation first and say "not mapped" when it is
+                 * absent. A diagnostic that can cause the condition it reports
+                 * is the worst instrument in the tree. */
                 const uint8_t *ip = (const uint8_t *)r->rip;
                 char line[16 * 3 + 1];
-                for (int bi = 0; bi < 16; bi++) {
-                    line[bi * 3 + 0] = ' ';
-                    line[bi * 3 + 1] = hx[ip[bi] >> 4];
-                    line[bi * 3 + 2] = hx[ip[bi] & 15];
+                int ip_ok = 1;
+                for (int pg = 0; pg < 2; pg++) {          /* 16 bytes can straddle a page */
+                    uint64_t va = (r->rip & ~(uint64_t)0xFFF) + (uint64_t)pg * 0x1000;
+                    if (pg && va > ((r->rip + 15) & ~(uint64_t)0xFFF)) break;
+                    if (!(vmm_pte_raw(va) & PTE_PRESENT)) { ip_ok = 0; break; }
                 }
-                line[16 * 3] = 0;
-                kprintf("[fault] bytes at rip:%s\n", line);
+                if (!ip_ok) {
+                    kprintf("[fault] bytes at rip: NOT MAPPED -- rip %lx has no present "
+                            "translation, so this was an instruction-fetch failure and there "
+                            "are no bytes to show (reading them would have demand-zeroed the "
+                            "page and printed the zeros back)\n", (unsigned long)r->rip);
+                } else {
+                    for (int bi = 0; bi < 16; bi++) {
+                        line[bi * 3 + 0] = ' ';
+                        line[bi * 3 + 1] = hx[ip[bi] >> 4];
+                        line[bi * 3 + 2] = hx[ip[bi] & 15];
+                    }
+                    line[16 * 3] = 0;
+                    kprintf("[fault] bytes at rip:%s\n", line);
+                }
                 /* NAME THE CANARY READ (M2012). `64 48 8b 04 25 28 00 00 00`
                  * is `mov %fs:0x28,%rax` -- the stack-protector canary, which
                  * every glibc function with a local buffer does on entry. When
