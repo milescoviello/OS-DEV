@@ -92,6 +92,86 @@ int main(void) {
     printf("LXSCM: memfd + SCM_RIGHTS + MAP_SHARED -- fd %d passed as %d, %d KiB shared both ways\n",
            mfd, got, SHM_SIZE / 1024);
     fflush(stdout);
-    close(got); close(mfd); close(sv[0]); close(sv[1]);
+    close(got);
+
+    /* ---- AND NOW ACROSS TWO PROCESSES, WHICH IS THE CASE THAT MATTERS -----
+     *
+     * Everything above happens inside ONE process: socketpair(), sendmsg on
+     * sv[0], recvmsg on sv[1], both ends owned by the same address space. So
+     * the "received" descriptor referred to the same memfd object by
+     * construction, and the mapping came out of the same page tables -- which
+     * means this file has never once tested the thing it is named for.
+     *
+     * Firefox's case is the other one: the parent creates a memfd, forks and
+     * execs a content process, hands the descriptor over a socket, and the
+     * CHILD maps it in a different address space. Its rendered frames travel
+     * that way, and the content area on screen is blank while the content
+     * process is demonstrably alive -- so whether two address spaces really
+     * see one set of physical pages is precisely the open question.
+     *
+     * Both directions are checked, because a receiver that gets a private
+     * copy passes every read and fails only when the parent looks for the
+     * child's write. (M2107) */
+    int xv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, xv) != 0) {
+        printf("LXSCM: cross-process socketpair failed\n"); fflush(stdout); return 13; }
+    int xfd = memfd_create("lxscm-cross", 0);
+    if (xfd < 0 || ftruncate(xfd, SHM_SIZE) != 0) {
+        printf("LXSCM: cross-process memfd failed\n"); fflush(stdout); return 14; }
+    unsigned char *pm = mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, xfd, 0);
+    if (pm == MAP_FAILED) { printf("LXSCM: cross-process parent mmap failed\n"); fflush(stdout); return 15; }
+    memset(pm, 0xA7, SHM_SIZE);                      /* what the child must SEE */
+
+    pid_t kid = fork();
+    if (kid < 0) { printf("LXSCM: cross-process fork failed\n"); fflush(stdout); return 16; }
+    if (kid == 0) {
+        close(xv[0]); close(xfd);                    /* the child must rely on the PASSED fd only */
+        char cb[CMSG_SPACE(sizeof(int))]; char one = 0;
+        struct iovec iv = { &one, 1 };
+        struct msghdr m = { 0 };
+        m.msg_iov = &iv; m.msg_iovlen = 1; m.msg_control = cb; m.msg_controllen = sizeof cb;
+        if (recvmsg(xv[1], &m, 0) != 1) _exit(21);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        if (!c || c->cmsg_type != SCM_RIGHTS) _exit(22);
+        int rfd; memcpy(&rfd, CMSG_DATA(c), sizeof rfd);
+        if (rfd < 0) _exit(23);
+        unsigned char *cm = mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0);
+        if (cm == MAP_FAILED) _exit(24);
+        for (int i = 0; i < SHM_SIZE; i += 4096) if (cm[i] != 0xA7) _exit(25);
+        if (cm[SHM_SIZE - 1] != 0xA7) _exit(26);
+        cm[0] = 0x11; cm[8192] = 0x22; cm[SHM_SIZE - 1] = 0x33;   /* what the PARENT must see */
+        if (write(xv[1], "d", 1) != 1) _exit(27);
+        _exit(0);
+    }
+    close(xv[1]);
+    {   char one = 'x';
+        struct iovec iv = { &one, 1 };
+        char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+        struct msghdr m = { 0 };
+        m.msg_iov = &iv; m.msg_iovlen = 1; m.msg_control = cb; m.msg_controllen = sizeof cb;
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &xfd, sizeof xfd);
+        if (sendmsg(xv[0], &m, 0) != 1) { printf("LXSCM: cross-process sendmsg failed\n"); fflush(stdout); return 17; }
+    }
+    { char d; if (read(xv[0], &d, 1) != 1) printf("LXSCM: the child never reported back\n"); }
+    int xs = 0; waitpid(kid, &xs, 0);
+    if (!WIFEXITED(xs) || WEXITSTATUS(xs) != 0) {
+        printf("LXSCM: FAIL a FORKED child could not use the passed memfd (exit %d: "
+               "21=recvmsg 22=no SCM_RIGHTS 23=bad fd 24=mmap 25/26=parent's bytes NOT visible)\n",
+               WIFEXITED(xs) ? WEXITSTATUS(xs) : -1);
+        fflush(stdout); return 18;
+    }
+    printf("LXSCM: ok   a FORKED child mapped the passed memfd and saw the parent's bytes\n");
+    if (pm[0] != 0x11 || pm[8192] != 0x22 || pm[SHM_SIZE - 1] != 0x33) {
+        printf("LXSCM: FAIL the child's writes are NOT visible to the parent (%02x %02x %02x) -- "
+               "two address spaces, two different sets of physical pages\n",
+               pm[0], pm[8192], pm[SHM_SIZE - 1]);
+        fflush(stdout); return 19;
+    }
+    printf("LXSCM: ok   and the parent sees the CHILD's writes -- one memfd, one set of pages\n");
+    printf("LXSCM: CROSS OK\n");
+    fflush(stdout);
+    close(xfd); close(xv[0]); close(mfd); close(sv[0]); close(sv[1]);
     return 0;
 }

@@ -206,6 +206,7 @@ LXMMAP: MAP_FIXED honoured
 LXMMAP-PROT:
 LXFMAP: file-backed mmap at offset 8192 read the right page
 LXVMAGAP: a 2MiB mmap next to an unaligned gap
+LXSCM: CROSS OK
 LXSCM: memfd + SCM_RIGHTS + MAP_SHARED
 LXMEMFD-RESULT:
 LXNOPIE: ET_EXEC ran below 1 GiB
@@ -427,6 +428,19 @@ LXWAIT: reaped 40/40 children
     # unchanged sets nothing while returning success -- a descriptor silently
     # surviving an exec meant to close it. Both halves are asserted, plus
     # dup2 leaving the flag CLEAR (M2037) and dup3(fd,fd) being EINVAL.
+    # M2107 -- lxscm did its whole SCM_RIGHTS test inside ONE process: both ends
+    # of the socketpair, both mappings, one address space. So the "received"
+    # descriptor named the same object by construction and the file never tested
+    # the thing it is named for. Firefox's case is the other one -- a forked and
+    # exec'd content process receives a memfd over a socket and maps it in a
+    # different address space, and that is how its rendered frames travel. Both
+    # directions are asserted: a receiver handed a private copy passes every
+    # read and fails only when the parent looks for the child's write.
+    if grep -aq "LXSCM: CROSS OK" "$SLOG3"; then
+        echo "  ok: a FORKED child maps a memfd passed over SCM_RIGHTS and both processes see one set of pages (M2107)"
+    else
+        echo "  FAIL: cross-process memfd sharing is broken:"; grep -a "LXSCM: FAIL" "$SLOG3" | head -3; f3=1
+    fi
     if grep -aq "LXBOX: DUP3 OK" "$SLOG3"; then
         echo "  ok: dup3 duplicates and really sets FD_CLOEXEC, dup2 really clears it, dup3(fd,fd) is EINVAL (M2107, 4 checks)"
     else

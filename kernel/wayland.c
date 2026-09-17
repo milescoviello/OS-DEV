@@ -1906,6 +1906,14 @@ void wl_page_probe(uint32_t want) {
     }
     kprintf("[page] client %d ('%s') %ux%u, %d layer(s): %d samples of the content area (y >= %u)\n",
             best, wl_client_title_of(best), ww, wh, nl, sampled, y0);
+    /* NAME THE LAYERS (M2107). "2 layer(s)" cannot distinguish a window whose
+     * content surface is present and blank from one whose content surface was
+     * never created -- and those are opposite bugs. A toolkit puts the page in
+     * its own subsurface, so the geometry of each layer says which. */
+    for (int i = 0; i < nl; i++)
+        kprintf("[page]   layer %d: %ux%u at +%d,+%d stride %u%s\n",
+                i, L[i].w, L[i].h, L[i].x, L[i].y, L[i].stride,
+                L[i].px ? "" : "  (NO BUFFER)");
     /* Selection sort by count -- ten entries, and the order is the whole point. */
     for (int i = 0; i < nt; i++) {
         int m = i;

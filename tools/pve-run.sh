@@ -72,7 +72,7 @@ $SSH "qm stop $VMID >/dev/null 2>&1; sleep 1; rm -f $PVE_DIR/boot.log; \
 echo "==> waiting for a marker (not for a duration)..."
 i=0
 while [ $i -lt "$CAP" ]; do
-    if $SSH "grep -aqE 'it has PAINTED|no Wayland client left|the process is GONE|KERNEL PANIC|desktop is taking over' $PVE_DIR/boot.log 2>/dev/null"; then break; fi
+    if $SSH "grep -aqE 'it has PAINTED|FFSHOT-PNGEND|FFSHOT: no PNG|no Wayland client left|the process is GONE|KERNEL PANIC|desktop is taking over' $PVE_DIR/boot.log 2>/dev/null"; then break; fi
     sleep 2; i=$((i+2))
 done
 echo "==> marker after ~${i}s"

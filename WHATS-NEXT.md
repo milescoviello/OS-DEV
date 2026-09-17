@@ -1,5 +1,94 @@
 # What's next
 
+> **(M2096-M2107) THE BROWSER WAS NEVER HANGING. IT WAS CRASHING, AND EVERY
+> INSTRUMENT DESCRIBED THE CORPSE AS A HANG.**
+>
+> Twelve milestones, and the one that matters most is not a fix: it is that the
+> thing this campaign had been calling "Firefox goes silent mid-startup" was a
+> General Protection Fault on a corrupted pointer, and had been for sessions.
+> The boot timeline printed
+>
+>     [wait] pid 164: 9 threads, 9 runnable, 0 blocked on 0 distinct places
+>
+> once a second for eighty-five seconds, about a process making **zero**
+> syscalls and taking **zero** page faults. Nine runnable threads that never
+> execute is not a thing. The report was false because everything that was not
+> `TASK_BLOCKED` was counted as runnable -- including `TASK_STOPPED`, which is
+> exactly what `app_stop_siblings` leaves every thread in after a fatal signal.
+> So the one state that mattered was the one state the summary could not
+> express, and a whole run was spent reading a futex ledger hunting a lost
+> wakeup in a process that had already died.
+>
+> **A dead process and a hung one need opposite investigations.** That is the
+> lesson, and it cost more than any single defect in this block.
+>
+> What the working instruments then found:
+>
+> - **`MADV_DONTNEED` reclaimed a page only if nothing else referenced it**, so
+>   every page a fork had left copy-on-write shared was silently skipped -- and
+>   madvise returned success. But its contract is not "free this if
+>   convenient", it is *the next read of this range sees zeroes*. mozjemalloc
+>   purges free runs on exactly that promise and then hands them out without
+>   clearing them, and it fills freed memory with `0xe5`. Hence
+>   `rdi=e5e5e5e5e5e5e5e5` in `pthread_mutex_lock+4` -- non-canonical, so a
+>   `#GP` rather than a page fault. The new probe reproduces the exact byte when
+>   the fix is reverted.
+> - **M2102's batched COW free corrupts the guest**, and it was our own
+>   optimisation. It argued that a sibling's stale translation is read-only, so
+>   the shootdown was only needed to make the *free* safe. Measured: batching on
+>   crashes at t=4s two runs of two; off, one run painted at t=29s and one
+>   crashed at t=10s; one core paints at t=20s. So the deferral makes it far
+>   worse **and is not the whole cause** -- a second corruption bug is still at
+>   large, and that is stated in the code rather than dressed up as a fix.
+> - **The same shootdown rule was missing at two more sites.** `app_madvise` and
+>   `app_swap_out` both called `app_tlb_sync` and threw the answer away, then
+>   freed the frames regardless -- `app_madvise` with the comment *"no core may
+>   still reach these frames"* standing directly above the call whose return
+>   value was the only thing that could establish it.
+> - **`waitid` reaped the child and reported nothing.** It filled the siginfo
+>   only `if (got > 0)`, and the underlying call returns 0 on success -- so that
+>   branch was never once taken. Firefox said so itself: *"waiting for process
+>   173 failed with error 10"*, which is `ECHILD`, about a child it had just
+>   been handed.
+> - **Claude Code's Bash tool was blocked by one path reporting two device
+>   numbers.** `st_dev` was `0x801` from `stat` and **zero** from `statx`,
+>   because `statx` zeroes its buffer and never writes `stx_dev_major/minor`.
+>   Bun's Zig runtime records `(dev, ino)` for a directory and re-checks it
+>   before running a command, so the two answers read as the directory being
+>   swapped underneath it. The guest Claude diagnosed this itself, from the
+>   inside: *"two stats of one path disagree."*
+> - **Firefox's fork server was killing every content process.** Seven children
+>   exited with status 1 per startup, silently. A new exec log naming each
+>   process type from argv's tail showed that only `glxtest` and `forkserver`
+>   were ever exec'd -- no `tab` process existed at all. With the fork server
+>   off, `tab` and `utility` processes exec and **zero** children die.
+> - **There is no OpenGL in this image**, so Firefox's GPU process was failing
+>   to create an EGL display and respawning in a loop. Gecko ships a complete
+>   CPU rasteriser for that case; a staged default-preferences file turns it on.
+> - **`--window-size` is a flag of `--screenshot`.** Firefox's own `--help` says
+>   so. Without `--screenshot` it left `800,600` as the first non-flag argument,
+>   and Firefox's default handler opens the first non-flag argument as a URL --
+>   so the browser spent this campaign trying to visit `800,600`.
+>
+> **Two test holes closed, both of the same kind: a test that could not fail.**
+> `lxscm` did its entire `SCM_RIGHTS` exercise inside one process -- both ends
+> of the socketpair, both mappings, one address space -- so the "received"
+> descriptor named the same object by construction and the file never tested the
+> thing it is named for. It forks now, which is Firefox's actual case. And
+> `lxcwd` had stat'd the same path three ways since M1998 while printing only
+> `mode` from `statx`, so `st_dev` was never read and the divergence above sat
+> in plain sight through every green run.
+>
+> **Honest state of the north star.** Firefox renders its own chrome in a
+> 1256x968 OS-DEV window, reliably on one core (first paint ~20s) and about half
+> the time on eight. The URL is honoured, `/ffpage.html` is opened, the content
+> process stays alive -- and sixty seconds of framebuffer samples still report
+> 84% `#f9f9fb`, Firefox's blank-document white, and 0% of the page's own
+> background. A `data:` URL whose entire source is in argv behaves identically,
+> which rules out `file://` resolution, the ext2 walk and the document loader's
+> I/O completely. **A page has still never been displayed**, and what remains is
+> the content-to-compositor frame path.
+
 > **(M2086-M2095) FIREFOX RENDERS ITS OWN CHROME INSIDE OS-DEV, AND A BOOT
 > THAT TOOK MINUTES TAKES SECONDS.**
 >

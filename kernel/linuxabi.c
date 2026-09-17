@@ -816,6 +816,25 @@ void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid) {
  * counters; a crash is an event, and an event that happened 4000 log lines ago
  * is invisible to a poller. Record it so the watcher can report the cause
  * instead of the silence that followed it. */
+/* WHICH DESCRIPTORS ARE THE DOCUMENT'S, AND WHAT DO THEY DELIVER? (M2107) */
+#define LX_WATCH_N 6
+static int g_watch_fd[LX_WATCH_N];
+static int g_watch_n;
+void lx_watch_fd(int fd) {
+    for (int i = 0; i < g_watch_n; i++) if (g_watch_fd[i] == fd) return;
+    if (g_watch_n < LX_WATCH_N) g_watch_fd[g_watch_n++] = fd;
+}
+static int lx_watched(int fd) {
+    for (int i = 0; i < g_watch_n; i++) if (g_watch_fd[i] == fd) return 1;
+    return 0;
+}
+static void lx_watch_report(const char *what, int fd, long off, long n) {
+    static int lines;
+    if (lines++ > 40) return;
+    if (off >= 0) kprintf("[html] %s(fd %d, off %ld) -> %ld\n", what, fd, off, n);
+    else          kprintf("[html] %s(fd %d) -> %ld\n", what, fd, n);
+}
+
 static int g_fatal_pid, g_fatal_sig;
 void lx_fatal_record(int pid, int sig) { g_fatal_pid = pid; g_fatal_sig = sig; }
 int  lx_fatal_signal(int *pid) { if (pid) *pid = g_fatal_pid; return g_fatal_sig; }
@@ -3850,9 +3869,19 @@ static void lx_dispatch_body(struct registers *r) {
              * exactly one such file in this image. */
             { int e = 0; while (path[e]) e++;
               if (e > 5 && path[e-5]=='.' && path[e-4]=='h' && path[e-3]=='t'
-                         && path[e-2]=='m' && path[e-1]=='l')
+                         && path[e-2]=='m' && path[e-1]=='l') {
                   kprintf("[linuxabi] OPENED AN HTML FILE: %s -> fd %d "
-                          "(so the document loader did reach it)\n", path, fd); }
+                          "(so the document loader did reach it)\n", path, fd);
+                  /* ...AND WATCH WHAT IT ACTUALLY GETS BACK (M2107). A
+                   * successful open is not a successful load. A document whose
+                   * bytes never arrive renders as a blank white page, which is
+                   * EXACTLY what the content area shows -- and Gecko opened
+                   * this file twice, which is what one failed load and a retry
+                   * look like. So the reads on this descriptor are the next
+                   * fact needed, and "openat returned a number" was never
+                   * evidence that the page had been read. */
+                  lx_watch_fd(fd);
+              } }
             r->rax = (uint64_t)fd; break;
         }
         /* WHY it failed matters. Reporting ENOENT for everything told `ld`
@@ -3889,6 +3918,7 @@ static void lx_dispatch_body(struct registers *r) {
          * (launched with `linux` from a shell) still gets the keyboard. */
         if (a1 == 0 && !app_fd_is_open(0) && !app_out_to()) { r->rax = 0; break; }
         long got = app_fd_read((int)a1, (void *)r->rsi, (unsigned long)n);
+        if (lx_watched((int)a1)) lx_watch_report("read", (int)a1, -1, got);
         r->rax = (got < 0) ? (uint64_t)lx_fd_err(got) : (uint64_t)got;
         break;
     }

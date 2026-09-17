@@ -264,7 +264,6 @@ static volatile int g_wlraw;                  /* -append wlraw: also run the raw
 static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
 static volatile int g_lxcage;                /* -append lxcagetest: the huge-reservation probes, on demand (M2041) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
-static volatile int g_ffshot;                 /* -append ffshot: render the page to a PNG headlessly and hex-dump it (M2107) */
 static volatile int g_ffdata;                 /* -append ffdata: render a data: URL instead of the staged file, so the filesystem is not part of the question (M2107) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
@@ -1418,55 +1417,6 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     task_sleep_ms(10);
                     if (wl_commits() > 0 && t > 60) break;
                 }
-                /* GECKO'S OWN RENDERER, WITH NO COMPOSITOR IN THE WAY (M2107).
-                 *
-                 * Firefox opens /ffpage.html, its content process stays alive,
-                 * and the content area on screen is still a blank document. So
-                 * the remaining question is narrow: does Gecko PAINT the page
-                 * and we fail to get the pixels, or does it never paint?
-                 *
-                 * Firefox answers that itself. `--headless --screenshot` runs
-                 * the whole pipeline -- parse, cascade, layout, paint -- and
-                 * encodes the result to a PNG, touching no display server at
-                 * all. So the PNG existing, and having the page's own colours
-                 * in it, proves the renderer works on this kernel and puts the
-                 * fault squarely in the content-to-compositor frame path.
-                 *
-                 * The file is dumped as hex to the console because the image
-                 * lives inside a `-snapshot` disk that is discarded at power
-                 * off -- there is nothing to copy out afterwards, so it has to
-                 * leave through the serial line. Small window: the point is the
-                 * pixels, not the resolution. */
-                if (g_ffshot) {
-                    static const char *av_sh[] = { "--headless", "--screenshot", "/shot.png",
-                                                   "--window-size", "400,300",
-                                                   "file:///ffpage.html" };
-                    kprintf("[ffshot] rendering /ffpage.html to a PNG with no compositor...\n");
-                    int rc = app_run_linux_sync("/disk2/usr/lib64/firefox/firefox", av_sh, 6, 300000);
-                    kprintf("[ffshot] firefox --screenshot exited %d\n", rc);
-                    int fd = app_open("/disk2/shot.png", 0);
-                    if (fd < 0) {
-                        kprintf("[ffshot] NO PNG: /shot.png was never created, so Gecko did not "
-                                "get as far as encoding a frame\n");
-                    } else {
-                        static unsigned char buf[4096];
-                        long total = 0, n;
-                        kprintf("[ffshot] PNGBEGIN\n");
-                        while ((n = app_fd_read(fd, buf, sizeof buf)) > 0) {
-                            for (long i = 0; i < n; i++) {
-                                kprintf("%02x", buf[i]);
-                                if (((total + i + 1) % 48) == 0) kprintf("\n");
-                            }
-                            total += n;
-                        }
-                        kprintf("\n[ffshot] PNGEND %ld bytes\n", total);
-                        app_fd_close(fd);
-                        if (total > 8 && buf[0] != 0)
-                            kprintf("[ffshot] (first bytes of the last chunk: %02x %02x %02x %02x)\n",
-                                    buf[0], buf[1], buf[2], buf[3]);
-                    }
-                    kmain_budget("the headless screenshot finished");
-                }
                 if (g_ffwl) {
                     /* FIREFOX ON OUR OWN DISPLAY (M1985). Spawned
                      * ASYNCHRONOUSLY and then left alone: the desktop below is
@@ -1812,10 +1762,17 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              *
              * Synchronous: the assertion is on the PNG existing afterwards. */
             vfs_mkdir("/disk2/tmp");
+            /* RENDER THE PAGE WE ACTUALLY WANT TO SEE (M2107). /etc/hosts is
+             * plain text: it proves the encoder runs, and says nothing about
+             * the cascade or about box layout. ffpage.html has a body
+             * background, a heading colour and three positioned boxes, so the
+             * PNG's own pixels answer whether Gecko styles and lays out on
+             * this kernel -- which is the question left after the on-screen
+             * content area turned out to be a blank document. */
             static const char *av_fs[] = { "--headless", "--no-remote", "--new-instance",
                                            "--screenshot", "/tmp/ffshot.png",
-                                           "--window-size", "800,600",
-                                           "file:///etc/hosts" };
+                                           "--window-size", "400,300",
+                                           "file:///ffpage.html" };
             kprintf("[ff] FIREFOX HEADLESS: rendering a page to /tmp/ffshot.png...\n");
             int src = app_run_linux_sync("/disk2/usr/lib64/firefox/firefox", av_fs, 8, 1500000);
             kprintf("[ff] firefox --screenshot -> %d\n", src);
@@ -1826,6 +1783,32 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                         (unsigned long)sx.stx_size, hdr[0], hdr[1], hdr[2], hdr[3],
                         hdr[4], hdr[5], hdr[6], hdr[7]);
                 (void)got;
+                /* AND THE PIXELS THEMSELVES (M2107). "A PNG exists and starts
+                 * with the right magic" is a statement about the encoder. It
+                 * was true while the on-screen content area was blank, so it
+                 * cannot distinguish a rendered page from a rendered blank
+                 * one -- which is the only distinction that matters now.
+                 *
+                 * The image lives on a -snapshot disk that is discarded at
+                 * power off, so there is nothing to copy out afterwards: it
+                 * has to leave through the serial line. Hex, in 48-byte lines,
+                 * reassembled and decoded on the host. */
+                {
+                    static uint8_t pb[2048];
+                    long off = 0, total = (long)sx.stx_size;
+                    kprintf("[ff] FFSHOT-PNGBEGIN %ld\n", total);
+                    while (off < total) {
+                        long want = total - off; if (want > (long)sizeof pb) want = (long)sizeof pb;
+                        long n = vfs_pread("/disk2/tmp/ffshot.png", pb, (unsigned long)want, (uint64_t)off);
+                        if (n <= 0) { kprintf("\n[ff] FFSHOT-PNGCUT at %ld (pread -> %ld)\n", off, n); break; }
+                        for (long i = 0; i < n; i++) {
+                            kprintf("%02x", pb[i]);
+                            if (((off + i + 1) % 48) == 0) kprintf("\n");
+                        }
+                        off += n;
+                    }
+                    kprintf("\n[ff] FFSHOT-PNGEND %ld\n", off);
+                }
             } else {
                 kprintf("[ff] FFSHOT: no PNG was written\n");
             }

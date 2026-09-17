@@ -38,6 +38,7 @@ void lx_trace_dump(const char *why);
 /* The last fatal signal a Linux process died of, and which pid. Returns 0 if
  * nothing has crashed. A crash is an event; the boot timeline polls counters
  * and cannot see one. (M2106) */
+void lx_watch_fd(int fd);   /* follow the reads on a document's descriptor: a successful open is not a successful load (M2107) */
 void lx_fatal_record(int pid, int sig);
 int  lx_fatal_signal(int *pid);
 void lx_trace_dump_last(const char *why, unsigned long want);  /* ...or just the last `want` (M1985) */
