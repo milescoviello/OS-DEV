@@ -5931,14 +5931,33 @@ static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
      * over an untouched mapping read every page of it from disk just to set
      * a PTE bit. That is why an mmap with a non-default prot was never lazy.
      * (M1956) */
+    /* WALK VMAs, NOT PAGES (M2164).
+     *
+     * This asked "is this page inside any VMA?" for EVERY PAGE of the range,
+     * scanning the whole VMA table each time: O(pages x nvma). M2162 then made
+     * this function run on every mmap rather than only when the requested
+     * protection differed from the default -- necessary for correctness, and it
+     * turned the cost into a wall. libxul's text segment is 0x743c000, which is
+     * 29184 pages, against a table that reaches ~1900 entries in Firefox's
+     * parent: 55 million iterations for ONE mmap, on a path that runs hundreds
+     * of times during startup. The page stopped appearing inside seven minutes,
+     * having taken about 24 seconds before.
+     *
+     * The same question answered by hopping: find the VMA containing the
+     * current position, jump to its END, repeat. One iteration for the normal
+     * case of a range inside a single mapping, and it can never be worse than
+     * the old loop. */
     int covered = 0;
     if (a) {
+        uint64_t p = a0;
         covered = 1;
-        for (uint64_t p = a0; p < end && covered; p += PAGE_SIZE) {
-            int in = 0;
-            for (int i = 0; i < a->nvma; i++)
-                if (p >= a->vma[i].start && p < a->vma[i].start + a->vma[i].len) { in = 1; break; }
-            if (!in) covered = 0;
+        while (p < end) {
+            int found = 0;
+            for (int i = 0; i < a->nvma; i++) {
+                uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+                if (a->vma[i].len && p >= s0 && p < e0) { p = e0; found = 1; break; }
+            }
+            if (!found) { covered = 0; break; }
         }
     }
     /* Record the protection on the VMA REGARDLESS of whether every page of the
@@ -5950,7 +5969,33 @@ static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
      * and Node died with "instruction fetch from a non-executable mapping".
      * (M1965) */
     {
-        uint8_t np = (uint8_t)((prot & 0x7) ? (prot & 0x7) : VMA_PROT_READ);
+        /* PROT_NONE MEANS PROT_NONE (M2164).
+         *
+         * This read `(prot & 0x7) ? (prot & 0x7) : VMA_PROT_READ` -- so an
+         * mprotect(PROT_NONE) was recorded as READ-ONLY. The fallback dates
+         * from when zero meant "not recorded"; M1987 gave every mapping a real
+         * protection so that zero could mean what it says, and M2060 then made
+         * the fault handler honour it. This line kept a requested PROT_NONE
+         * from ever reaching either of them.
+         *
+         * It matters for the reason M2060 documents at length: a reservation
+         * the program made precisely so that touching it would FAIL instead
+         * answers every read with a zeroed page. glibc mprotects the gap
+         * between a library's segments PROT_NONE, and JavaScriptCore reserves
+         * its 4 GiB structure heap that way on purpose so that StructureID 0
+         * is an invalid id. Recording READ turns both into silent garbage --
+         * the same defect M2060 fixed, through the other door. Fixed in one
+         * place and not the other, for the fifth time in this campaign. */
+        uint8_t np = (uint8_t)(prot & 0x7);
+        if (!np) {
+            static int told;
+            if (told < 4) {
+                told++;
+                kprintf("[mprotect] %lx+%lx -> PROT_NONE (recorded as none, not as read-only: "
+                        "a read of it must FAULT, not answer zeros -- M2060/M2164)\n",
+                        (unsigned long)a0, (unsigned long)(end - a0));
+            }
+        }
         int s1ok = a ? app_vma_split_at(a, a0) : -1;
         int s2ok = a ? app_vma_split_at(a, end) : -1;
         if (a && s1ok == 0 && s2ok == 0) {
