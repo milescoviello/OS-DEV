@@ -656,9 +656,18 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * syscall passes through, whatever its spelling. */
 static int lx_res_seen;
 static void lx_resolver_watch(const char *up) {
-    if (lx_res_seen >= 60 || !up) return;
+    if (lx_res_seen >= 120 || !up) return;
+    /* Plus the Firefox preference files (M2132). The content area has shown
+     * about:home's background all campaign, which means a document loads and
+     * paints -- so the renderer works and the URL is wrong. Our prefs file sets
+     * browser.startup.homepage to the page we want, and that plainly did not
+     * take effect, so the first thing to establish is whether Firefox reads the
+     * file at all. A successful openat is not logged anywhere, which is why
+     * this could be assumed for several sessions without being checked. */
     static const char *const names[] = { "resolv.conf", "nsswitch.conf",
-                                         "/etc/hosts", "nss_", "nscd", "host.conf" };
+                                         "/etc/hosts", "nss_", "nscd", "host.conf",
+                                         "prefs.js", "greprefs", "defaults/pref",
+                                         "channel-prefs", "omni.ja" };
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
         for (const char *h = up; *h; h++) {
             const char *a = h, *b = names[i];

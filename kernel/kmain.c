@@ -1598,7 +1598,22 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * a bad guess does not cost one module, it costs the
                          * run. Widget/nsWindow are the two that have actually
                          * reported anything here. */
-                        app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,nsWindow:5");
+                        /* THE DOCUMENT LOAD, NOT THE WINDOW (M2132).
+                         *
+                         * Widget/nsWindow have said everything they can: the
+                         * window exists, it is 1280x960, it is ACTIVATED and
+                         * not occluded, and it paints. What is missing is a
+                         * DOCUMENT -- the content area shows an in-content
+                         * background and the title never leaves "Mozilla
+                         * Firefox" -- so the question is which URI Gecko ever
+                         * tried to load, and these are the modules that say so.
+                         *
+                         * M2114's rule applies: one unrecognised module name
+                         * appears to void the whole spec, so a bad guess costs
+                         * the run rather than one module. Both of these appear
+                         * as exact standalone strings in libxul, which is the
+                         * check `webrender` and `ipcmessages` failed. */
+                        app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,nsDocShell:5");
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }

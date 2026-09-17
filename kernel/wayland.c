@@ -2138,6 +2138,36 @@ void wl_page_probe(uint32_t want) {
         kprintf("[page]   layer %d: %ux%u at +%d,+%d stride %u%s\n",
                 i, L[i].w, L[i].h, L[i].x, L[i].y, L[i].stride,
                 L[i].px ? "" : "  (NO BUFFER)");
+    /* WHAT IS IN EACH LAYER, SEPARATELY (M2132).
+     *
+     * The tally above reports what is VISIBLE -- the topmost non-transparent
+     * pixel at each sample point -- which is the right question for "is the
+     * page on screen" and the wrong one for "did the page arrive at all".
+     * This window consistently presents TWO full-size layers at the same
+     * origin, and if the page were in the lower one and something blank
+     * were on top, or if one of them were a stale buffer, the visible tally
+     * could not tell. So sample the page's own colour in each layer
+     * independently: a layer that contains it is a layer Gecko painted. */
+    for (int i = 0; i < nl; i++) {
+        if (!L[i].px) continue;
+        int n = 0, hits = 0, opaque = 0;
+        uint32_t first = 0; int uniform = 1;
+        for (int gy = 0; gy < WL_PROBE_GRID; gy++)
+            for (int gx = 0; gx < WL_PROBE_GRID; gx++) {
+                uint32_t lx2 = (uint32_t)((uint64_t)gx * L[i].w / WL_PROBE_GRID);
+                uint32_t ly2 = (uint32_t)((uint64_t)gy * L[i].h / WL_PROBE_GRID);
+                uint32_t v = L[i].px[ly2 * (L[i].stride / 4) + lx2];
+                if (!n) first = v;
+                else if (v != first) uniform = 0;
+                n++;
+                if (L[i].format != 0 || (v >> 24)) opaque++;
+                if ((v & 0x00ffffffu) == (want & 0x00ffffffu)) hits++;
+            }
+        kprintf("[page]   layer %d content: %d/%d sample(s) are the page's %06x, "
+                "%d opaque, %s (first px %08x)\n",
+                i, hits, n, (unsigned)(want & 0x00ffffffu), opaque,
+                uniform ? "UNIFORM -- one colour everywhere" : "varied", first);
+    }
     /* Selection sort by count -- ten entries, and the order is the whole point. */
     for (int i = 0; i < nt; i++) {
         int m = i;
