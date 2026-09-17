@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>OS-DEV</title>
+<style>
+  body { background:#101820; color:#e8e8f0; font:16px sans-serif; margin:0; padding:40px; }
+  h1   { color:#4fd1c5; font-size:44px; margin:0 0 8px; }
+  .k   { display:inline-block; width:180px; height:120px; margin:12px;
+         background:#e4572e; border-radius:12px; }
+  .g   { background:#17b890; } .b { background:#3d5a80; }
+  p    { font-size:20px; line-height:1.5; max-width:40em; }
+  code { background:#000; color:#4fd1c5; padding:2px 6px; border-radius:4px; }
+</style></head>
+<body>
+  <h1>Firefox is rendering a page inside OS-DEV.</h1>
+  <p>This document was parsed, styled and laid out by Gecko, painted into a
+     <code>wl_shm</code> buffer, and blitted into an OS-DEV window by a
+     compositor written from scratch for this kernel.</p>
+  <div class="k"></div><div class="k g"></div><div class="k b"></div>
+  <p>The three blocks above are CSS-styled boxes with border radius. If they
+     are coloured rectangles in a row, layout and painting both work.</p>
+</body></html>

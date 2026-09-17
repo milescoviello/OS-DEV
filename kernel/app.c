@@ -10942,6 +10942,25 @@ void app_fd_print(int fd) {
  * Found necessary by a seven-second stretch of a Firefox startup making sixty
  * syscalls a second -- too quiet to sample from the syscall ring, because at
  * that rate the ring holds a minute of stale history. */
+/* THE BIGGEST PROCESS, BECAUSE THE PID I HAVE IS THE WRONG ONE (M2105).
+ *
+ * Firefox's launcher exits after re-exec'ing the real browser, so every
+ * instrument keyed on app_last_spawn_pid() is asking about a process that
+ * stopped existing four seconds in. The browser is identifiable without a pid
+ * at all: it is the process with by far the most threads. */
+int app_biggest_pid(void) {
+    int best = -1, bestn = 0;
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app *a = &apps[i];
+        if (!a->used || a->exited) continue;
+        int n = 0;
+        for (int t = 0; t < APP_MAXTHREAD; t++)
+            if (a->thr[t] && task_state_of(a->thr[t]) != TASK_DEAD) n++;
+        if (n > bestn) { bestn = n; best = a->pid; }
+    }
+    return best;
+}
+
 void app_wait_summary(int pid) {
     struct app *a = app_by_pid(pid);
     if (!a) { kprintf("[wait] pid %d is gone\n", pid); return; }

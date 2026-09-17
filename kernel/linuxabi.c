@@ -268,6 +268,13 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_execve_       59
 #define LX_WNOHANG        1      /* wait4/waitid: do not block (M2025) */
 #define LXS_wait4_        61
+/* waitid(2), which app_waitid has implemented since M1227 and which was never
+ * given a Linux number (M2105). A fork server reaps its children with waitid
+ * because it needs the siginfo -- WEXITED tells it a content process is gone,
+ * WNOWAIT lets it look without consuming -- and ENOSYS there leaves its child
+ * bookkeeping permanently wrong. Firefox asked five times in one startup. */
+#define LXS_waitid_      247
+#define LXS_fchown_       93   /* 26 asks per startup: SQLite fchown()s every file it creates */
 #define LXS_pipe_         22
 #define LXS_pipe2_       293
 #define LXS_dup2_         33
@@ -4263,6 +4270,52 @@ static void lx_dispatch_body(struct registers *r) {
             *(int *)r->rsi = (st & 0xFF) << 8;
         }
         r->rax = (uint64_t)got;
+        break;
+    }
+    case LXS_waitid_: {                     /* (idtype, id, siginfo*, options, rusage*) */
+        /* THE CAPABILITY EXISTED AND HAD NO NUMBER (M2105). app_waitid has
+         * done idtype/WNOHANG/siginfo since M1227, wired only to the native
+         * syscall -- so the Linux path fell through to ENOSYS, five times per
+         * Firefox startup, in the fork server that reaps content processes.
+         *
+         * The siginfo buffer is 128 bytes on Linux and the fields a caller
+         * reads are si_signo/si_errno/si_code/si_pid/si_uid/si_status at
+         * fixed offsets. Writing a short struct and leaving the rest as
+         * whatever was on the caller's stack is the struct-layout-lie class
+         * (M1975): zero it all first, then fill what we know. */
+        int idtype = (int)a1, id = (int)r->rsi;
+        uint64_t sip = r->rdx; int opts = (int)r->r10;
+        if (sip && !vmm_user_ok(sip, 128)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        struct siginfo si;
+        for (unsigned i = 0; i < sizeof si; i++) ((char *)&si)[i] = 0;
+        long got = app_waitid(idtype, id, &si, (opts & LX_WNOHANG) ? 1 : 0);
+        if (got < 0) { r->rax = (uint64_t)-(long)LX_ECHILD; break; }
+        if (sip) {
+            uint8_t *o = (uint8_t *)sip;
+            for (int i = 0; i < 128; i++) o[i] = 0;
+            if (got > 0) {
+                *(int *)(o + 0)  = 17;            /* si_signo = SIGCHLD */
+                *(int *)(o + 4)  = 0;             /* si_errno */
+                *(int *)(o + 8)  = 1;             /* si_code = CLD_EXITED */
+                *(int *)(o + 16) = si.si_pid;     /* si_pid */
+                *(int *)(o + 20) = 0;             /* si_uid */
+                *(int *)(o + 24) = si.si_status;  /* si_status */
+            }
+        }
+        /* waitid returns 0 on success, INCLUDING a WNOHANG call that found
+         * nothing ready -- the caller distinguishes the two by whether
+         * si_signo was filled in, which is why zeroing it above matters. */
+        r->rax = 0;
+        break;
+    }
+    case LXS_fchown_: {                     /* (fd, uid, gid) */
+        /* SINGLE-USER: there is one identity, so a chown to it is a no-op and
+         * a chown away from it is not representable. Answering 0 is the honest
+         * reading of "the file is already owned by the only user there is" --
+         * and ENOSYS is not, because it makes SQLite log a failure for every
+         * file it creates. A bad descriptor is still EBADF. */
+        if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+        r->rax = 0;
         break;
     }
     case LXS_pipe_:

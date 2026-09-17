@@ -1405,8 +1405,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * nothing could ever appear. Firefox takes minutes to
                      * reach a first paint under TCG; the compositor task and
                      * the window manager both keep running while it does. */
+                    /* A REAL PAGE, NOT about:blank (M2105). about:blank proves
+                     * a window exists; it does not prove that Gecko parsed
+                     * HTML, applied CSS, laid out boxes and painted them --
+                     * which is the difference between "the chrome renders"
+                     * and "the browser works". file:// needs no network, so it
+                     * can be asserted on any boot. */
                     static const char *av_fw[] = { "--no-remote", "--new-instance",
-                                                   "--window-size", "800,600", "about:blank" };
+                                                   "--window-size", "800,600",
+                                                   "file:///ffpage.html" };
                     /* When Firefox parks, the syscall trace shows a futex
                      * address and nothing else -- it cannot name the Gecko
                      * code that is waiting. Firefox can: MOZ_LOG prints the
@@ -1470,7 +1477,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                  * wanted then is not "which call" but "what is
                                  * everyone blocked on", grouped. (M2103) */
                                 else if (ns - ps < 400) {
-                                    app_wait_summary(fpid);
+                                    /* ZERO syscalls for a whole second is not
+                                     * "quiet", it is DEADLOCK -- every thread
+                                     * blocked with nothing to wake them. That
+                                     * is this codebase's dominant bug class,
+                                     * and app_futex_dump has been able to name
+                                     * it since M1959: was a WAKE ever issued
+                                     * for a key somebody is STILL parked on?
+                                     * (M2105) */
+                                    int bp = app_biggest_pid();
+                                    app_wait_summary(bp > 0 ? bp : fpid);
+                                    if (ns == ps) {
+                                        static int dumped;
+                                        if (dumped++ < 2) {
+                                            kprintf("[t] ZERO syscalls in a second -- every thread is "
+                                                    "blocked. The futex ledger:\n");
+                                            app_futex_dump();
+                                        }
+                                    }
                                     /* AND THE FEW CALLS THAT DID HAPPEN. The
                                      * ring TOP is meaningless at forty calls a
                                      * second -- it reports a minute of stale
@@ -1478,7 +1502,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                      * process is exactly the last few things
                                      * it asked for, which is the only clue to
                                      * what it is waiting on. (M2103) */
-                                    lx_trace_dump_pid("this quiet second", 10, fpid);
+                                    lx_trace_dump_pid("this quiet second", 10, bp > 0 ? bp : fpid);
                                 }
                                 ps = ns; pf0 = pf1;
                                 {   uint32_t pw = 0, ph = 0; wl_largest_window(&pw, &ph);
@@ -1487,8 +1511,26 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                         break;
                                     }
                                 }
-                                if (app_state_of(fpid) < 0) {
-                                    kprintf("[t] the process is GONE at t=%ds\n", q + 1);
+                                /* THE LAUNCHER'S PID IS NOT THE BROWSER'S
+                                 * (M2105). This broke the loop the moment
+                                 * app_state_of(fpid) went negative and called
+                                 * it "the process is GONE" -- and Firefox's
+                                 * launcher EXITS after re-exec'ing the real
+                                 * browser, so that happens at about four
+                                 * seconds every single time while the browser
+                                 * goes on to create eight surfaces and commit
+                                 * frames.
+                                 *
+                                 * So the reading was of the instrument, not
+                                 * the program, and it cut every measurement
+                                 * short at four seconds. Liveness is now
+                                 * "does a Wayland client still hold a
+                                 * connection" -- which is a property of the
+                                 * thing being measured rather than of a pid
+                                 * that was only ever the first process. */
+                                if (app_state_of(fpid) < 0 && wl_clients_connected() < 2) {
+                                    kprintf("[t] no Wayland client left at t=%ds "
+                                            "(launcher pid %d also gone)\n", q + 1, fpid);
                                     break;
                                 }
                             }
