@@ -386,6 +386,10 @@ void ata_io_stats(uint64_t *cmds, uint64_t *sectors, uint64_t *hits,
  * failure falls back to PIO rather than failing the read, so a controller that
  * misbehaves costs speed and not correctness. */
 int g_ata_dma_reads = 1;        /* -append nodma turns it off, for A/B measurement */
+/* A read bigger than this does not populate the block cache -- see the note at
+ * the install. One eighth of the cache, so eight such reads could at worst
+ * turn it over once rather than a single read wiping it. (M2101) */
+#define BCACHE_INSTALL_MAX 16u
 /* 16 FRAMES = 64 KiB = 128 SECTORS PER TRANSFER (M2101).
  *
  * Was one frame, so eight sectors, so a Firefox first paint needed 206704
@@ -431,7 +435,18 @@ int ata_read_drive(int drive, uint32_t lba, uint32_t count, void *buf) {
         if (r >= 0) io_dma_cmds++;
     }
     if (r < 0) r = ata_read_drive_impl(drive, lba, count, buf);   /* PIO fallback, always */
-    if (r >= 0)
+    /* SCAN-RESISTANT INSERTION (M2101). The block cache is 128 sectors, and
+     * M2101 raised the transfer ceiling to 128 -- so ONE streaming read would
+     * install 128 entries and evict every other thing in it. A sequential walk
+     * through a 500 MB library closure would leave the cache holding only the
+     * last 64 KiB it happened to touch, which is the one thing nobody is about
+     * to ask for again.
+     *
+     * So a big read does not populate it. The cache exists for the small,
+     * repeated, random reads -- inodes, directory blocks, indirect blocks, the
+     * superblock -- which are exactly the ones that fit under this bound and
+     * exactly the ones a large read must not be allowed to push out. */
+    if (r >= 0 && count <= BCACHE_INSTALL_MAX)
         for (uint32_t k = 0; k < count; k++)
             bcache_install(BCACHE_OWNER_ATA(drive), lba + k,
                            (const uint8_t *)buf + (uint64_t)k * SECTOR_SIZE);
@@ -1229,32 +1244,65 @@ void ata_dma_selftest(void) {
      * This is the assertion that fires if the PRD count is truncated, if the
      * bounce buffer is copied short, or if a frame above 4 GiB slips through
      * the 32-bit base. Nothing else in the tree would notice any of those. */
+    /* AT EVERY TRANSFER SIZE THE READ PATH CAN ASK FOR, NOT JUST ONE (M2101).
+     *
+     * This tested EIGHT sectors -- and eight sectors is exactly one 4 KiB
+     * bounce frame, so it exercised exactly ONE PRD entry. M2101 made the
+     * bounce buffer sixteen frames described by sixteen PRD entries, and the
+     * second through sixteenth entries, the EOT placement, the scatter of a
+     * write and the gather of a read were all completely untested by a check
+     * that reported "BYTE-IDENTICAL to PIO" and passed.
+     *
+     * A test that cannot fail is worse than no test. Every size the read path
+     * can issue now: 1 sector, 8 (one frame), 9 (the first size that crosses a
+     * PRD boundary), 16, 64, and the full ceiling. And at four LBAs spread
+     * over each disk rather than clustered at zero, where the bytes are mostly
+     * identical anyway and a misplaced frame would not show. */
     {
-        static uint8_t d8[8 * SECTOR_SIZE], p8[8 * SECTOR_SIZE];
-        int n8 = 0, ok8 = 0;
+        static uint8_t dbig[128 * SECTOR_SIZE], pbig[128 * SECTOR_SIZE];
+        uint32_t sizes[6] = { 1, 8, 9, 16, 64, ata_dma_max_sectors() };
+        int total = 0, okall = 0;
         for (int drv = 0; drv < 2; drv++) {
             const struct ata_drive_info *di = ata_drive(drv);
-            if (!di || !di->present || di->sectors < 4096) continue;
+            if (!di || !di->present || di->sectors < 8192) continue;
             uint32_t spots[4] = { 64, (uint32_t)(di->sectors / 4),
                                   (uint32_t)(di->sectors / 2),
-                                  (uint32_t)(di->sectors - 64) };
-            for (int k = 0; k < 4; k++) {
-                if ((uint64_t)spots[k] + 8 > di->sectors) continue;
-                if (ata_read_dma(drv, spots[k], 8, d8) != 0) continue;
-                if (ata_read_drive_pio(drv, spots[k], 8, p8) != 0) continue;
-                n8++;
-                if (memcmp(d8, p8, sizeof d8) == 0) ok8++;
-                else kprintf("[ata-dma] MISMATCH: drive %d lba %u, 8 sectors, DMA != PIO\n",
-                             drv, spots[k]);
+                                  (uint32_t)(di->sectors - 256) };
+            for (int z = 0; z < 6; z++) {
+                uint32_t n = sizes[z];
+                if (!n || n > 128 || n > ata_dma_max_sectors()) continue;
+                for (int k = 0; k < 4; k++) {
+                    if ((uint64_t)spots[k] + n > di->sectors) continue;
+                    /* Poison the destination so a SHORT transfer is caught as
+                     * well as a wrong one: bytes the DMA never wrote would
+                     * otherwise compare equal to whatever was there before. */
+                    for (uint32_t b = 0; b < n * SECTOR_SIZE; b++) dbig[b] = 0xA5;
+                    if (ata_read_dma(drv, spots[k], n, dbig) != 0) {
+                        kprintf("[ata-dma] FAIL: %u-sector DMA read at lba %u REFUSED\n", n, spots[k]);
+                        total++; continue;
+                    }
+                    if (ata_read_drive_pio(drv, spots[k], n, pbig) != 0) continue;
+                    total++;
+                    if (memcmp(dbig, pbig, n * SECTOR_SIZE) == 0) okall++;
+                    else {
+                        unsigned long first = 0;
+                        while (first < n * SECTOR_SIZE && dbig[first] == pbig[first]) first++;
+                        kprintf("[ata-dma] MISMATCH: drive %d lba %u, %u sectors, first differing "
+                                "byte at offset %lu (that is PRD entry %lu of %u)\n",
+                                drv, spots[k], n, first, first / PAGE_SIZE,
+                                (n * SECTOR_SIZE + PAGE_SIZE - 1) / PAGE_SIZE);
+                    }
+                }
             }
         }
-        if (n8 && ok8 == n8)
-            kprintf("[ ok ] IDE DMA: %d eight-sector reads across both drives are BYTE-IDENTICAL "
-                    "to PIO (this is the size the read path uses)\n", n8);
-        else if (n8)
-            kprintf("[ata-dma] FAIL: only %d of %d eight-sector reads matched PIO\n", ok8, n8);
+        if (total && okall == total)
+            kprintf("[ ok ] IDE DMA: %d reads at 1/8/9/16/64/%u sectors across both drives are "
+                    "BYTE-IDENTICAL to PIO -- every PRD entry, not just the first\n",
+                    total, ata_dma_max_sectors());
+        else if (total)
+            kprintf("[ata-dma] FAIL: only %d of %d multi-size reads matched PIO\n", okall, total);
         else
-            kprintf("[ata-dma] no drive large enough for the eight-sector comparison\n");
+            kprintf("[ata-dma] no drive large enough for the multi-size comparison\n");
     }
 
     /* DMA write round-trip on a scratch sector near the end of the disk (so the
