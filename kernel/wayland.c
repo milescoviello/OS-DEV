@@ -102,6 +102,13 @@
 #define XDG_SURFACE_EV_CONFIGURE    0
 #define XDG_TOPLEVEL_DESTROY        0
 #define XDG_TOPLEVEL_SET_TITLE      2
+#define XDG_TOPLEVEL_SET_MAXIMIZED    9
+#define XDG_TOPLEVEL_UNSET_MAXIMIZED 10
+/* xdg_toplevel.state. ACTIVATED is the one that decides whether a toolkit
+ * thinks its window is in the FOREGROUND, and Gecko throttles painting for a
+ * window it believes is not. (M2113) */
+#define XDG_STATE_MAXIMIZED   1
+#define XDG_STATE_ACTIVATED   4
 #define XDG_TOPLEVEL_EV_CONFIGURE   0
 #define XDG_POPUP_DESTROY           0
 #define XDG_POSITIONER_DESTROY      0
@@ -1037,6 +1044,29 @@ static void wl_client_release(struct wl_client *c) {
 /* Handle one complete message. Returns 0 always (an unknown object or opcode is
  * ignored rather than fatal: a client may create objects we do not model yet,
  * and killing the connection would turn a missing feature into a hang). */
+/* One place that builds an xdg_toplevel.configure, because there are now three
+ * callers and the states array is the part that was wrong. `maximized` adds
+ * that state and a concrete size; ACTIVATED is always present, because this
+ * compositor has exactly one focused window and it is this one. (M2113) */
+static void wl_toplevel_configure(struct wl_client *c, struct wl_object *o, uint32_t tid,
+                                  uint32_t w, uint32_t h, int maximized) {
+    uint8_t b[32]; int p = 0;
+    wr32(b + p, w); p += 4;
+    wr32(b + p, h); p += 4;
+    /* wl_array: byte length, then the u32 values, padded to 4. */
+    if (maximized) {
+        wr32(b + p, 8); p += 4;
+        wr32(b + p, XDG_STATE_MAXIMIZED); p += 4;
+        wr32(b + p, XDG_STATE_ACTIVATED); p += 4;
+    } else {
+        wr32(b + p, 4); p += 4;
+        wr32(b + p, XDG_STATE_ACTIVATED); p += 4;
+    }
+    wl_send(c, tid, XDG_TOPLEVEL_EV_CONFIGURE, b, p);
+    uint8_t sb[4]; wr32(sb, ++c->serial);
+    wl_send(c, o->id, XDG_SURFACE_EV_CONFIGURE, sb, 4);
+}
+
 static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     uint32_t obj = rd32(m + 0);
     uint32_t sz_op = rd32(m + 4);
@@ -1436,13 +1466,50 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
          * that never gets configure never attaches a buffer, and waits
          * forever having done nothing wrong. 0x0 means "you choose your own
          * size", which is what a client wants for its first frame. */
-        uint8_t b[16]; int p = 0;
-        wr32(b + p, 0); p += 4;                          /* width  */
-        wr32(b + p, 0); p += 4;                          /* height */
-        wr32(b + p, 0); p += 4;                          /* states: an empty array */
-        wl_send(c, tid, XDG_TOPLEVEL_EV_CONFIGURE, b, p);
-        uint8_t sb[4]; wr32(sb, ++c->serial);
-        wl_send(c, o->id, XDG_SURFACE_EV_CONFIGURE, sb, 4);
+        /* ...AND IT MUST SAY THE WINDOW IS ACTIVATED (M2113).
+         *
+         * The states array was EMPTY. That is a well-formed configure and it
+         * tells a toolkit its window is not focused, not maximized, not
+         * anything -- and Gecko throttles painting for a window it believes is
+         * in the background. Firefox's own log said what it thought:
+         *
+         *     D/Widget nsWindow::SetSizeMode 2
+         *     D/Widget     set maximized
+         *
+         * and this compositor answered that request with
+         *
+         *     [wl] UNHANDLED request: xdg_toplevel(id 27).opcode 9
+         *
+         * -- nothing. So the browser asked to be maximized, was never told it
+         * had been, and was never told it was active either. It painted its
+         * chrome once and then never painted a page, which is exactly what the
+         * framebuffer showed for this entire campaign. */
+        wl_toplevel_configure(c, o, tid, 0, 0, 0);
+        return;
+    }
+    if (o->kind == WLK_XDG_TOPLEVEL &&
+        (opcode == XDG_TOPLEVEL_SET_MAXIMIZED || opcode == XDG_TOPLEVEL_UNSET_MAXIMIZED)) {
+        /* GRANT IT, and say so with a configure (M2113). The protocol is a
+         * request/confirm pair: a client asks, and it is the compositor's
+         * configure that makes it true. Swallowing the request leaves the
+         * client waiting for a state change that never arrives -- and Firefox
+         * asks to be maximized during startup, every time.
+         *
+         * Maximized means the whole screen here, because this window manager
+         * has one output and it is the framebuffer. */
+        int maxi = (opcode == XDG_TOPLEVEL_SET_MAXIMIZED);
+        uint32_t mw = maxi ? fb_width() : 0, mh = maxi ? fb_height() : 0;
+        /* An xdg_toplevel's `link` is its xdg_surface, and the paired
+         * xdg_surface.configure has to go to THAT object -- the serial in it is
+         * what the client acks. */
+        struct wl_object *surf = 0;
+        for (int i = 0; i < c->nobj; i++)
+            if (c->obj[i].id == o->link && c->obj[i].kind == WLK_XDG_SURFACE)
+                { surf = &c->obj[i]; break; }
+        if (!surf) surf = o;                 /* fall back: still better than silence */
+        kprintf("[wl] xdg_toplevel %s -> configure %ux%u with states\n",
+                maxi ? "set_maximized" : "unset_maximized", mw, mh);
+        wl_toplevel_configure(c, surf, obj, mw, mh, maxi);
         return;
     }
     if (o->kind == WLK_XDG_TOPLEVEL && opcode == XDG_TOPLEVEL_SET_TITLE && alen >= 4) {
@@ -2026,11 +2093,33 @@ void wl_page_probe(uint32_t want) {
  * surface the client has not committed is correct and is the point -- it means
  * "draw again now". Each is cleared as it fires, so nothing is answered twice,
  * and the id is released with delete_id exactly as before. */
+static void wl_kbd_enter(struct wl_client *c);
 static unsigned g_frame_ticks, g_frame_done;
 unsigned wl_frame_ticks(void) { return g_frame_ticks; }
 unsigned wl_frame_callbacks_sent(void) { return g_frame_done; }
 void wl_frame_tick(void) {
     g_frame_ticks++;
+    /* GIVE THE WINDOW KEYBOARD FOCUS (M2113).
+     *
+     * wl_keyboard.enter was only ever sent from the INPUT path -- so a client
+     * received focus when somebody pressed a key, and never otherwise. With
+     * nobody typing, Firefox spent every run believing it had no focused
+     * window, and said so itself:
+     *
+     *     D/Widget nsWindowWayland::TransferFocusTo() gFocusWindow 0
+     *     D/Widget   quit, failed to create focus promise
+     *
+     * A compositor gives focus when a window is mapped, not when a key
+     * arrives. The biggest mapped window gets it, which is the same rule the
+     * rest of this file uses to decide which window is the real one. */
+    {   int best = -1; uint64_t barea = 0;
+        for (int ci = 0; ci < WL_MAXCLIENT; ci++) {
+            if (!g_cl[ci].used) continue;
+            uint32_t w = 0, h = 0; wl_client_extent(ci, &w, &h);
+            if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = ci; }
+        }
+        if (best >= 0 && barea) wl_kbd_enter(&g_cl[best]);   /* no-ops if already entered */
+    }
     uint32_t ms = (uint32_t)timer_ms();
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
