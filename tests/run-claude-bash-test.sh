@@ -45,11 +45,21 @@ else
     f=1
 fi
 # The OUTPUT: the marker came back up through the harness, not just into argv.
-if printf '%s\n' "$LOG" | grep -q "Output: \`OSDEV-BASH-OK\`"; then
+# THE MARKER OUTSIDE THE COMMAND LINE THAT CARRIED IT (M2150).
+#
+# This used to require the literal `Output: \`OSDEV-BASH-OK\`` -- one exact
+# formatting of a MODEL'S prose, which is not a stable interface: the same
+# successful run put the marker in a fenced code block instead and the test
+# called it a failure. So match the marker itself, but only on lines that are
+# not the exec log -- the string necessarily appears in the argv of the bash we
+# spawned (`eval 'echo OSDEV-BASH-OK'`), and counting that would pass whether
+# or not anything came back, which is the one distinction this assertion
+# exists to make.
+if printf '%s\n' "$LOG" | grep -v 'exec\] pid' | grep -q 'OSDEV-BASH-OK'; then
     echo "  ok: and it read the command's output back -- OSDEV-BASH-OK"
 else
     echo "  FAIL: the command's output never came back:"
-    printf '%s\n' "$LOG" | grep -a "OSDEV-BASH-OK\|refused" | head -3 | sed 's/^/      /'
+    printf '%s\n' "$LOG" | grep -a 'OSDEV-BASH-OK\|task output swap refused' | head -3 | sed 's/^/      /'
     f=1
 fi
 if printf '%s\n' "$LOG" | grep -q "claude -p -> 0"; then

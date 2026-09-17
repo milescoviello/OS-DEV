@@ -52,7 +52,12 @@ fi
 
 if [ "${onscreen:-0}" -ge 1 ]; then
     pct=$(printf '%s\n' "$LOG" | grep -o 'is on screen -- [0-9]*%' | head -1 | grep -o '[0-9]*%')
-    echo "  ok: the PAGE is on screen in $onscreen of $samples samples ($pct of the content area is the page's background)"
+    # Count verdicts against VERDICTS, not against sample headers: the two are
+    # printed by different lines and a stray extra verdict made this report "41
+    # of 40 samples". A count that exceeds its own denominator is an instrument
+    # nobody should trust, however harmless the cause. (M2150)
+    verdicts=$(printf '%s\n' "$LOG" | grep -c 'VERDICT:' || true)
+    echo "  ok: the PAGE is on screen in $onscreen of $verdicts verdict(s), across $samples sample(s) ($pct of the content area is the page's background)"
 else
     echo "  FAIL: the content area never showed the page in $samples samples:"
     printf '%s\n' "$LOG" | grep -a 'VERDICT' | tail -2 | sed 's/^/      /'

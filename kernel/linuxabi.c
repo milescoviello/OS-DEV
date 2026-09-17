@@ -4596,8 +4596,35 @@ static void lx_dispatch_body(struct registers *r) {
  * from the heap; per-call, so still free of the cross-process race that made
  * them stack-allocated in the first place (M1952). */
 #define LX_EXEC_ARGS 512
-        char (*abuf)[256] = kmalloc(LX_EXEC_ARGS * 256);
-        char (*ebuf)[256] = kmalloc(LX_EXEC_ARGS * 256);
+/* EVERY ARGUMENT WAS CAPPED AT 255 BYTES, SILENTLY (M2150).
+ *
+ * Each argv/envp string was copied into its own fixed 256-byte slot, and the
+ * copy loop stopped at 255 with no diagnostic. The argv COUNT limit right
+ * below announces itself when it bites; this one did not, which is the
+ * asymmetry that let it live.
+ *
+ * `bash -c` is where it hurts, because the whole script is ONE argument.
+ * Claude Code's Bash tool sources a shell snapshot -- a multi-line script far
+ * over 255 bytes -- and cutting a script mid-quote produces precisely the
+ * error it reported to me from inside the guest:
+ *
+ *   /bin/bash: -c: line 1: unexpected EOF while looking for matching '
+ *
+ * about a command containing no unmatched quote. It retried and succeeded,
+ * because the retry was shorter -- so the failure looked transient and was
+ * not: it was deterministic in the length of the string.
+ *
+ * Linux allows 128 KiB per argument (MAX_ARG_STRLEN). This packs the strings
+ * into one pool instead of giving each a fixed slot, so a single long command
+ * may use the whole pool and short arguments cost only their length -- the
+ * SAME total allocation as before, with the per-string ceiling raised from 255
+ * bytes to the pool. Overflow is E2BIG, which is what Linux returns, rather
+ * than a quietly shortened command. */
+#define LX_EXEC_POOL (LX_EXEC_ARGS * 256)      /* 128 KiB per vector, as before */
+        char *apool = kmalloc(LX_EXEC_POOL);
+        char *ebuf_pool = kmalloc(LX_EXEC_POOL);
+        char (*abuf)[256] = (char (*)[256])apool;    /* kept for the free below */
+        char (*ebuf)[256] = (char (*)[256])ebuf_pool;
         const char **av = kmalloc((LX_EXEC_ARGS + 1) * sizeof *av);
         const char **ev = kmalloc((LX_EXEC_ARGS + 1) * sizeof *ev);
         if (!abuf || !ebuf || !av || !ev) {
@@ -4609,11 +4636,23 @@ static void lx_dispatch_body(struct registers *r) {
         const char *const *uav = (const char *const *)r->rsi;
         const char *const *uev = (const char *const *)r->rdx;
         if (uav && vmm_user_ok(r->rsi, sizeof(char *))) {
+            unsigned long ao = 0; int atoobig = 0;
             for (; na < LX_EXEC_ARGS && uav[na]; na++) {
-                const char *sp = uav[na]; int k = 0;
+                const char *sp = uav[na];
                 if (!vmm_user_ok((uint64_t)sp, 1)) break;
-                while (sp[k] && k < 255) { abuf[na][k] = sp[k]; k++; }
-                abuf[na][k] = 0; av[na] = abuf[na];
+                unsigned long len = 0;
+                while (sp[len] && ao + len + 1 < LX_EXEC_POOL) len++;
+                if (sp[len]) { atoobig = 1; break; }     /* pool exhausted, not a short arg */
+                for (unsigned long q = 0; q <= len; q++) apool[ao + q] = sp[q];
+                av[na] = apool + ao;
+                ao += len + 1;
+            }
+            if (atoobig) {
+                kprintf("[linuxabi] execve(%s): argument %d does not fit the %d-byte argument "
+                        "pool -- returning E2BIG rather than a SHORTENED command line\n",
+                        path, na, LX_EXEC_POOL);
+                kfree(abuf); kfree(ebuf); kfree(av); kfree(ev);
+                r->rax = (uint64_t)-(long)LX_E2BIG; break;
             }
             if (na == LX_EXEC_ARGS && uav[na])
                 kprintf("[linuxabi] execve(%s): argv TRUNCATED at %d -- the program will see a short command line\n",
@@ -4636,11 +4675,27 @@ static void lx_dispatch_body(struct registers *r) {
                         app_sys_getpid(), path, na, na > 1 ? av[1] : "");
         }
         if (uev && vmm_user_ok(r->rdx, sizeof(char *))) {
+            /* The environment gets the same treatment (M2150): LS_COLORS and a
+             * long PATH both exceed 255 bytes on an ordinary desktop, and a
+             * truncated environment variable is a wrong value rather than a
+             * missing one. */
+            unsigned long eo = 0; int etoobig = 0;
             for (; ne < LX_EXEC_ARGS && uev[ne]; ne++) {
-                const char *sp = uev[ne]; int k = 0;
+                const char *sp = uev[ne];
                 if (!vmm_user_ok((uint64_t)sp, 1)) break;
-                while (sp[k] && k < 255) { ebuf[ne][k] = sp[k]; k++; }
-                ebuf[ne][k] = 0; ev[ne] = ebuf[ne];
+                unsigned long len = 0;
+                while (sp[len] && eo + len + 1 < LX_EXEC_POOL) len++;
+                if (sp[len]) { etoobig = 1; break; }
+                for (unsigned long q = 0; q <= len; q++) ebuf_pool[eo + q] = sp[q];
+                ev[ne] = ebuf_pool + eo;
+                eo += len + 1;
+            }
+            if (etoobig) {
+                kprintf("[linuxabi] execve(%s): environment entry %d does not fit the %d-byte "
+                        "pool -- returning E2BIG rather than a TRUNCATED variable\n",
+                        path, ne, LX_EXEC_POOL);
+                kfree(abuf); kfree(ebuf); kfree(av); kfree(ev);
+                r->rax = (uint64_t)-(long)LX_E2BIG; break;
             }
             if (ne == LX_EXEC_ARGS && uev[ne])
                 kprintf("[linuxabi] execve(%s): envp TRUNCATED at %d\n", path, LX_EXEC_ARGS);
