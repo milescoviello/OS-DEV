@@ -1,5 +1,49 @@
 # What's next
 
+> **(M2142) FIREFOX SHOWS ITS PAGE IN ~24 SECONDS. ATA WRITES WERE PURE PIO.**
+>
+>     first paint                       22s  ->   9s
+>     page on screen              ~172s        ->  ~24s
+>     pwrite64 thread-time per 15s  13815ms    ->  ~0
+>     the 100-second plateau        present    ->  gone
+>
+> M2091/M2101 moved *reads* onto DMA and measured an 11x win per sector.
+> Writes were left on the port loop, and nothing measured them -- because
+> `ata_diskbench` benchmarks reads only, off the end of the disk where writing
+> would be unsafe. **So the slowest path in the driver was the one with no
+> instrument pointed at it**, and it stayed that way through an entire campaign
+> of asking why the browser was slow. The DMA write path already existed and
+> already had a byte-correctness round-trip self-test; it was never wired to
+> the real write. Three lines, behind the same gate reads use.
+>
+> **How it was found, because the route matters more than the fix.** Counting
+> syscalls said the pre-page interval was a flat plateau -- ~26000 calls per 15s
+> and *four* page faults -- so the guest looked idle. That sent me chasing which
+> subsystem was waiting: the region lookup (wrong), captive-portal detection
+> (wrong), IPC wake latency (a real 2x win, but not this). Timing each syscall
+> per number answered it in one run:
+>
+>     pwrite64(18) = 13815ms of thread time in 15000ms of wall clock
+>
+> One thread inside `write()` 92% of the time, ~37ms per write, ~35 sectors
+> each. A 35-sector PIO write is ~9000 `outw` instructions and every one is a
+> port trap to the hypervisor -- the arithmetic matched the measurement before
+> the fix was written.
+>
+> **The lesson is this project's oldest one, in a new costume:** an instrument
+> that measures the wrong quantity costs more than no instrument. A call *count*
+> made the guest look idle -- and it *was* idle, in the sense of blocked -- while
+> one thread burned 92% of the wall clock inside a single syscall. Counting found
+> the plateau; only timing found the cost.
+>
+> Verified by the write-heavy suites, which is the bar a write-path change has
+> to clear: `idedmatest` (DMA==PIO byte-identical + write round-trip),
+> `ext2test` (extent writes, **e2fsck clean** -- an independent checker on the
+> filesystem our DMA writes produced), `journaltest` (still crash-consistent
+> across every injected crash; the `FLUSH CACHE` is retained so durability
+> ordering is unchanged), `fstest` (FAT32 write stress, ASan/UBSan clean), plus
+> the full Linux-ABI battery at zero FAILs and all 24 probes exiting 0.
+
 > **(M2136-M2137) TIME TO PAGE IS 172 SECONDS, AND IT IS A WAIT, NOT WORK.**
 >
 > The page is on screen (M2135) but it is not *fast*, and "slow" and "stuck"
