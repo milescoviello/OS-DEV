@@ -52,7 +52,10 @@ echo "booting kernel headless under QEMU (COM1 capture)..."
 # being run on one. A single-core boot cannot fail any of them, which made a
 # green result mean less than it read. The TLB shootdown check is the first one
 # that says so out loud: on one core it prints "nothing to shoot down".
-timeout -s KILL 60 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 2 -kernel "$KERNEL" \
+# 300, NOT 60: the outer net must be generous enough for the stage-2 poll above
+# to actually reach its bound, or raising that bound changes nothing -- SIGKILL
+# at 60s would still cut the boot off mid-handshake under parallel load. (M2097)
+timeout -s KILL 300 "$QEMU" -snapshot -no-reboot -no-shutdown -m 256M -smp 2 -kernel "$KERNEL" \
     -append "selftest termtest" \
     -drive file="$DISK",format=raw,if=ide \
     -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -67,7 +70,19 @@ while [ $i -lt 50 ]; do
     sleep 0.5; i=$((i+1))
 done
 i=0
-while [ $i -lt 90 ]; do
+# 360, NOT 90 (M2097). This bound was measured on an IDLE host -- the comment
+# above says so: "terminal lines at 2.0s online and 6.6s fully blackholed". It
+# does not run on an idle host. `make check` runs its suites in parallel, so
+# this boot shares 24 TCG cores with a dozen other VMs, and a real ARP + three
+# ICMP round-trips + an HTTP GET + a bignum-heavy TLS 1.3 handshake does not
+# fit in 45 seconds under that. The marker never arrived, the log was captured
+# early, and `require "Networking works!"` failed -- aborting the whole run at
+# 110 of 132 checkpoints over a network that works perfectly: booted alone it
+# prints "3/3 echo replies" and a live "HTTP/1.1 200 OK" from example.com.
+#
+# Costs nothing when it is not needed, for the reason the comment above already
+# gives: the loop breaks the moment the marker lands.
+while [ $i -lt 360 ]; do
     grep -q "boot network self-test finished" "$LOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))

@@ -4523,10 +4523,15 @@ static void lx_dispatch_body(struct registers *r) {
      * dup2 landed elsewhere, or the number was never right. Once per process,
      * because a program that has lost a descriptor asks about it in a loop. */
     if ((long)r->rax == -(long)LX_EBADF) {
-        static int dumped_pid[8]; static int ndumped;
+        /* 64 SLOTS, NOT 8 (M2097). Eight filled up with the ABI probes' own
+         * deliberate EBADFs long before Firefox's content process reached its
+         * one, which is the descriptor the whole hunt is about. A one-shot
+         * diagnostic has to survive everything that legitimately trips it
+         * earlier in the boot. */
+        static int dumped_pid[64]; static int ndumped;
         int pid_e = app_current_pid(), seen_e = 0;
         for (int i = 0; i < ndumped; i++) if (dumped_pid[i] == pid_e) { seen_e = 1; break; }
-        if (!seen_e && ndumped < 8) {
+        if (!seen_e && ndumped < 64) {
             dumped_pid[ndumped++] = pid_e;
             uint32_t nr_e = g_lxring[ring_slot & (LXRING_N - 1)].seq == ring_slot
                           ? g_lxring[ring_slot & (LXRING_N - 1)].nr : 0xffffffffu;
