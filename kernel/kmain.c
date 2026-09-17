@@ -562,6 +562,13 @@ void kmain_budget(const char *when) {
         if (g_pf_count > named)
             kprintf("[budget]     %8lu UNCLASSIFIED -- faults the handler took that none of the above explains\n",
                     g_pf_count - named);
+        {   extern uint64_t g_fsbase_repairs;
+            if (g_fsbase_repairs)
+                kprintf("[budget]     %8lu FS_BASE REPAIRS -- a thread found running with a ZERO TLS base\n"
+                        "[budget]              against a good saved one, reloaded and retried. Each one is a\n"
+                        "[budget]              crash that did not happen and a bug that is still unfound.\n",
+                        g_fsbase_repairs);
+        }
         if (cow > maj + min)
             kprintf("[budget]     COPY-ON-WRITE DOMINATES: the cost is fork, not the disk and not demand-zero\n");
     }

@@ -5768,9 +5768,54 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
     return r;
 }
 
+/* How many faults the FS_BASE repair below has had to make (M2099). */
+uint64_t g_fsbase_repairs;
+
 static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
     struct app *a = cur();
     if (!a) return 0;
+    /* A ZERO FS BASE AGAINST A GOOD SAVED ONE IS REPAIRABLE (M2099).
+     *
+     * This is the fault that kills Firefox, and it arrives in a very specific
+     * shape: a read of `%fs:0x28` -- the stack-protector canary that every
+     * glibc function with a local buffer performs on entry -- landing at
+     * absolute address 0x28 because the FS base is zero, while the THREAD'S
+     * OWN SAVED BASE is a perfectly good pointer:
+     *
+     *   saved=0x15f2006c0 live=0x0 cached=0x0 core=0
+     *
+     * task.c's own comment names the authority: "load_fs_base() on every
+     * context switch is the single authority" for the MSR, and the task's
+     * fs_base is what it loads. So when the two disagree the saved value is
+     * right by definition, and zero is never a legitimate TLS base for a
+     * thread that has one -- a thread with no TLS has saved == 0 too, and this
+     * repair deliberately does not fire for it.
+     *
+     * Reloading and retrying is exactly what the stale-TLB repair below does
+     * for a hardware/page-table disagreement, for the same reason, and it
+     * cannot loop: if the MSR still reads zero after a wrmsr then the CPU is
+     * not honouring writes and the second fault falls through to be reported.
+     *
+     * THIS IS A REPAIR, NOT A FIX. The bug is whatever wrote the zero, it is
+     * still unfound, and the counter is here so that a run can say how often
+     * it happened rather than how often it was survived. What it buys is a
+     * browser that does not die of it, which is the difference between
+     * "sometimes works" and "consistent". */
+    if (cr2 == 0x28 && !(err & 2)) {
+        uint64_t live = 0, cached = 0; int core = -1;
+        task_fs_base_live(&live, &cached, &core);
+        uint64_t saved = task_fs_base();
+        if (live == 0 && saved != 0) {
+            task_set_fs_base(saved);          /* re-assert it, and re-sync the per-core shadow */
+            g_fsbase_repairs++;
+            if (g_fsbase_repairs <= 4 || (g_fsbase_repairs % 64) == 0)
+                kprintf("[fault] FS_BASE REPAIR #%lu: tid %d read %%fs:0x28 with a zero base while "
+                        "its saved base is %p (core %d, this core last loaded %p) -- reloaded and "
+                        "retried. The write of that zero is still unfound.\n",
+                        g_fsbase_repairs, task_current_id(), (void *)saved, core, (void *)cached);
+            return 1;                          /* retry the instruction */
+        }
+    }
     uint64_t fpage = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t pte = vmm_pte_raw(fpage);
     /* Copy-on-write (M1116): a WRITE fault (err bit 1) to a present, COW-marked

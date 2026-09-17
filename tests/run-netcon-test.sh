@@ -52,7 +52,21 @@ done
 [ "$got" -eq 1 ] || { echo "FAIL: never reached desktop"; tail -8 "$SLOG"; exit 1; }
 # Let the boot net_demo self-test finish so it isn't polling the RX ring at the
 # same time as netcon (the stack has no cross-connection demux -- see netcon.c).
-sleep 3
+#
+# POLL FOR IT, DO NOT SLEEP FOR IT (M2099). `sleep 3` is an assumption about
+# how fast the host is, and the Makefile's own CHECKJOBS comment already says
+# where that leads: "under six concurrent TCG guests that assumption is simply
+# wrong". Six suites were moved to serial for exactly this, and this one was
+# left in the pool -- so it failed in a `make check` run with "netcon did not
+# return the expected responses" while passing alone. The self-test prints a
+# marker when it ends; wait for THAT, with the old three seconds as the floor
+# and a generous cap for a loaded host.
+i=0
+while [ $i -lt 120 ]; do
+    grep -aq "boot network self-test finished" "$SLOG" 2>/dev/null && break
+    sleep 0.5; i=$((i+1))
+done
+sleep 1
 
 # Drive the console from the host. Connect, read the banner, send a batch of
 # commands, and collect everything the guest sends back over ~a few seconds. The
