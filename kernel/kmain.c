@@ -1604,7 +1604,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                          * first few seconds of a browser's
                                          * life, which is blank on any
                                          * machine. Sample a time series. */
-                                        for (int k = 0; k < 8; k++) {
+                                        /* TWENTY SAMPLES, NOT EIGHT (M2110).
+                                         * The homepage is not requested until
+                                         * about ninety seconds in on one core
+                                         * -- the document's open appeared in
+                                         * the log AFTER the last sample -- so
+                                         * a sixty-four second window was
+                                         * measuring a browser that had not got
+                                         * to the page yet and reporting it as
+                                         * "only the chrome". */
+                                        for (int k = 0; k < 20; k++) {
                                             task_sleep_ms(8000);
                                             kprintf("[page] --- sample %d, %ds after the first paint ---\n",
                                                     k + 1, (k + 1) * 8);
@@ -1620,7 +1629,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                              * browser PARENT. wchan is a
                                              * kernel PC; tools/wchan.sh turns
                                              * it into a function name. */
-                                            if (k == 2 || k == 6) {
+                                            if (k == 9 || k == 19) wl_page_dump();
+                                            if (k == 2 || k == 10 || k == 18) {
                                                 int pids[16];
                                                 int np = app_live_pids(pids, 16);
                                                 for (int j = 0; j < np; j++)

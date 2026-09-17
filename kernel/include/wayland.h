@@ -20,6 +20,12 @@ int  wl_compositor_init(void);
  * Called from the compositor task; never blocks. Returns messages handled. */
 int  wl_compositor_poll(void);
 void wl_server_task(void);      /* the display server's own task (M1978) */
+/* Answer every outstanding wl_surface.frame callback. Vsync is a periodic
+ * signal from the compositor, not a reply to a commit -- and Gecko's refresh
+ * driver, which is what paints page content, runs on it. (M2110) */
+void wl_frame_tick(void);
+unsigned wl_frame_ticks(void);
+unsigned wl_frame_callbacks_sent(void);
 /* Counters for the boot self-test to assert against, rather than inferring
  * success from output that could have come from anywhere. */
 unsigned wl_clients_connected(void);
@@ -58,7 +64,10 @@ void wl_largest_window(uint32_t *w, uint32_t *h);
 /* Sample the CONTENT area of the biggest window and report what colour
  * dominates it. "Painted" has meant a >=640x480 extent, which chrome around an
  * empty page satisfies just as well as a page. (M2106) */
-void wl_page_probe(uint32_t want_rgb);   /* has ANY client painted a real window? (M2089) */
+void wl_page_probe(uint32_t want_rgb);
+/* The composited window as a small PPM in hex, so it can be LOOKED at rather
+ * than inferred from a colour histogram. (M2110) */
+void wl_page_dump(void);   /* has ANY client painted a real window? (M2089) */
 const char     *wl_surface_title(void);   /* that surface's xdg_toplevel.set_title (M1981) */
 /* Drive the dispatcher with a multi-surface client and assert the compositor
  * draws the toplevel rather than the cursor. No socket, no client, no display:

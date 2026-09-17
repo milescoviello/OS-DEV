@@ -563,18 +563,29 @@ static int wl_layers_of(struct wl_client *c, struct wl_object *root, struct wl_l
      * than recursively: the parent links come from a client and a client can
      * make a cycle, which recursion would follow until the kernel stack ran
      * out. Four levels is deeper than any real toolkit nests. */
-    uint32_t gen[16]; int ngen = 1; gen[0] = root->id;
+    /* A SUBSURFACE POSITION IS RELATIVE TO ITS PARENT, NOT TO THE WINDOW
+     * (M2110). This wrote `o->sub_x` straight into a field the caller treats
+     * as an offset from the window origin, which is right for a direct child
+     * of the root and wrong for everything deeper: a grandchild at +8,+4
+     * inside a child at +26,+23 was reported at +8,+4 from the window, so it
+     * would be composited 26 and 23 pixels out of place. The walk has handled
+     * four generations since M2089 and only the first of them had correct
+     * coordinates. Carry the parent's absolute offset down with the id. */
+    struct { uint32_t id; int x, y; } gen[16], next[16];
+    int ngen = 1; gen[0].id = root->id; gen[0].x = 0; gen[0].y = 0;
     for (int depth = 0; depth < 4 && ngen && n < max; depth++) {
-        uint32_t next[16]; int nnext = 0;
+        int nnext = 0;
         for (int j = 0; j < c->nobj && n < max; j++) {
             struct wl_object *o = &c->obj[j];
             if (!o->id || o->kind != WLK_SURFACE || !o->parent) continue;
-            int isChild = 0;
-            for (int g = 0; g < ngen; g++) if (o->parent == gen[g]) { isChild = 1; break; }
+            int px = 0, py = 0, isChild = 0;
+            for (int g = 0; g < ngen; g++)
+                if (o->parent == gen[g].id) { isChild = 1; px = gen[g].x; py = gen[g].y; break; }
             if (!isChild) continue;
-            if (nnext < 16) next[nnext++] = o->id;
+            int ax = px + o->sub_x, ay = py + o->sub_y;
+            if (nnext < 16) { next[nnext].id = o->id; next[nnext].x = ax; next[nnext].y = ay; nnext++; }
             if (!o->base || !o->width || !o->height || !o->stride) continue;   /* unmapped child */
-            out[n].x = o->sub_x; out[n].y = o->sub_y;
+            out[n].x = ax; out[n].y = ay;
             out[n].w = o->width; out[n].h = o->height;
             out[n].stride = o->stride;
             out[n].px = (const uint32_t *)o->base;
@@ -1863,6 +1874,54 @@ int wl_compositor_init(void) {
  * behind a translucent overlay, and a content area that never got a buffer are
  * three different bugs, and they are distinguishable only by what else is
  * there. A bare "no" would have sent me looking in the wrong place. */
+/* LOOK AT IT (M2110).
+ *
+ * "84% of the content area is #f9f9fb" has been the whole description of what
+ * Firefox is showing for this entire campaign, and a colour histogram cannot
+ * tell a blank page from a page rendered somewhere unexpected, from a page
+ * scrolled off, from chrome drawn twice. The highest-yield thing anyone has
+ * ever done to this project's browser work was render a real page and LOOK at
+ * the pixels -- one screenshot of example.com exposed three separate gaps.
+ *
+ * So emit the composited window as a small PPM, nearest-neighbour downscaled,
+ * in hex over the serial line, and reassemble it on the host. 64x48 is big
+ * enough to see where a dark page background is and is not, and costs 18 KB of
+ * log rather than the 4.4 MB the real buffer would. */
+#define WL_DUMP_W 64
+#define WL_DUMP_H 48
+void wl_page_dump(void) {
+    int best = -1; uint64_t barea = 0;
+    for (int ci = 0; ci < WL_MAXCLIENT; ci++) {
+        if (!g_cl[ci].used) continue;
+        uint32_t w = 0, h = 0; wl_client_extent(ci, &w, &h);
+        if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = ci; }
+    }
+    if (best < 0 || !barea) { kprintf("[dump] no window to dump\n"); return; }
+    uint32_t ww = 0, wh = 0; wl_client_extent(best, &ww, &wh);
+    struct wl_layer L[32];
+    int nl = wl_client_layers(best, L, 32);
+    if (nl <= 0) { kprintf("[dump] no layers\n"); return; }
+    kprintf("[dump] PPMBEGIN %d %d (from a %ux%u window, %d layer(s))\n",
+            WL_DUMP_W, WL_DUMP_H, ww, wh, nl);
+    for (int gy = 0; gy < WL_DUMP_H; gy++) {
+        for (int gx = 0; gx < WL_DUMP_W; gx++) {
+            uint32_t x = (uint32_t)((uint64_t)gx * ww / WL_DUMP_W);
+            uint32_t y = (uint32_t)((uint64_t)gy * wh / WL_DUMP_H);
+            uint32_t got = 0;
+            for (int i = 0; i < nl; i++) {
+                if (!L[i].px) continue;
+                if ((int)x < L[i].x || (int)y < L[i].y) continue;
+                uint32_t lx = x - (uint32_t)L[i].x, ly = y - (uint32_t)L[i].y;
+                if (lx >= L[i].w || ly >= L[i].h) continue;
+                got = L[i].px[ly * (L[i].stride / 4) + lx];
+            }
+            kprintf("%02x%02x%02x", (got >> 16) & 0xff, (got >> 8) & 0xff, got & 0xff);
+        }
+        kprintf("\n");
+    }
+    kprintf("[dump] PPMEND\n");
+}
+
 #define WL_PROBE_GRID 32
 void wl_page_probe(uint32_t want) {
     int best = -1; uint64_t barea = 0;
@@ -1906,6 +1965,13 @@ void wl_page_probe(uint32_t want) {
     }
     kprintf("[page] client %d ('%s') %ux%u, %d layer(s): %d samples of the content area (y >= %u)\n",
             best, wl_client_title_of(best), ww, wh, nl, sampled, y0);
+    /* VSYNC, because the refresh driver that paints page content runs on it
+     * and a stalled one is indistinguishable from a page that will not render
+     * (M2110). Callbacks SENT against ticks OFFERED: if the first is ~0 while
+     * the second climbs, the client is not asking -- which is a different bug
+     * from a compositor that is not answering. */
+    kprintf("[page]   vsync: %u tick(s) offered, %u frame callback(s) answered, %u commit(s)\n",
+            wl_frame_ticks(), wl_frame_callbacks_sent(), wl_commits());
     /* NAME THE LAYERS (M2107). "2 layer(s)" cannot distinguish a window whose
      * content surface is present and blank from one whose content surface was
      * never created -- and those are opposite bugs. A toolkit puts the page in
@@ -1937,9 +2003,60 @@ void wl_page_probe(uint32_t want) {
                 "so the content area is showing something else\n", pct, want & 0x00ffffffu);
 }
 
+/* VSYNC IS A PERIODIC SIGNAL, NOT A REPLY TO A COMMIT (M2110).
+ *
+ * M2042 answered wl_surface.frame from inside the commit handler for the
+ * surface the callback was requested on. That is enough for a client which
+ * requests a callback and then commits that same surface -- our own test client
+ * does exactly that -- and it is NOT what a compositor does, because the
+ * protocol's meaning of the callback is "it is a good time to draw the next
+ * frame", which is a property of the compositor's repaint cycle and not of the
+ * client's last request.
+ *
+ * It matters because GECKO'S REFRESH DRIVER RUNS ON THIS. Firefox's content is
+ * painted by the refresh driver, the refresh driver is driven by vsync, and on
+ * Wayland vsync IS the frame callback. Firefox commits its content subsurface
+ * 127 times in a startup and its toplevel twice -- so any callback outstanding
+ * on a surface that is not the one being committed was answered late or never,
+ * and a refresh driver that stops ticking paints the chrome once and never
+ * paints a page. Which is precisely what the framebuffer showed for this whole
+ * campaign.
+ *
+ * So: answer every outstanding callback on a steady tick. Firing one for a
+ * surface the client has not committed is correct and is the point -- it means
+ * "draw again now". Each is cleared as it fires, so nothing is answered twice,
+ * and the id is released with delete_id exactly as before. */
+static unsigned g_frame_ticks, g_frame_done;
+unsigned wl_frame_ticks(void) { return g_frame_ticks; }
+unsigned wl_frame_callbacks_sent(void) { return g_frame_done; }
+void wl_frame_tick(void) {
+    g_frame_ticks++;
+    uint32_t ms = (uint32_t)timer_ms();
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used) continue;
+        for (int o = 0; o < c->nobj; o++) {
+            struct wl_object *ob = &c->obj[o];
+            if (!ob->id || !ob->frame_cb) continue;
+            uint32_t cb = ob->frame_cb;
+            ob->frame_cb = 0;                    /* one done per request */
+            uint8_t ts[4]; wr32(ts, ms);
+            wl_send(c, cb, WL_CALLBACK_EV_DONE, ts, 4);
+            uint8_t dq[4]; wr32(dq, cb);
+            wl_send(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, dq, 4);
+            g_frame_done++;
+        }
+    }
+}
+
 void wl_server_task(void) {
+    /* ~60 Hz, which is what a client asking for vsync expects to get. The poll
+     * itself stays on its 5 ms cadence: draining the socket promptly and
+     * pacing repaints are different jobs and were previously the same one. */
+    unsigned n = 0;
     for (;;) {
         wl_compositor_poll();
+        if (++n % 3 == 0) wl_frame_tick();       /* 3 x 5 ms ~= 60 Hz */
         task_sleep_ms(5);
     }
 }

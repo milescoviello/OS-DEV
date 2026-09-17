@@ -74,6 +74,24 @@ pref("browser.startup.page",         1);
 pref("browser.startup.homepage",     "file:///ffpage.html");
 pref("browser.newtabpage.enabled",   false);
 
+// A SOFTWARE VSYNC TIMER, NOT THE WAYLAND ONE (M2110).
+//
+// Gecko's refresh driver is what paints page content, and it is driven by
+// vsync. On Wayland that vsync comes from wl_surface.frame callbacks -- the
+// client requests one, commits, and the compositor answers `done`. Our
+// compositor answers `done` only on a commit of the SAME surface the callback
+// was requested on, and Firefox commits its content subsurface 127 times per
+// startup while committing its toplevel twice. If the vsync callback is on the
+// toplevel, the refresh driver gets two ticks and then stops -- and a browser
+// whose refresh driver has stopped paints its chrome once and never paints a
+// page, which is exactly what the framebuffer shows.
+//
+// layout.frame_rate >= 0 makes Gecko use its own timer instead, so this
+// separates "the compositor's vsync is wrong" from "the content never renders"
+// without changing a line of kernel code. 60 rather than something lower
+// because the target is a fast first paint, not a light one.
+pref("layout.frame_rate",            60);
+
 // Nothing may open a second tab, phone home, or replace the URL we asked for.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("browser.aboutwelcome.enabled",      false);
