@@ -33,6 +33,7 @@
 /* The SLIRP defaults — used as-is until a DHCP lease (net_dhcp) overwrites them. */
 static uint8_t  OUR_IP[4]  = {10, 0, 2, 15};
 static uint8_t  GW_IP[4]   = {10, 0, 2, 2};
+static uint8_t  NETMASK[4] = {255, 255, 255, 0};   /* from the lease's option 1 (M2122) */
 static const uint8_t  BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 const uint8_t *net_ip(void)      { return OUR_IP; }
@@ -278,6 +279,31 @@ static void print_mac(const uint8_t *m) {
 static struct { uint8_t ip[4], mac[6]; uint64_t exp; int used; } arp_cache[ARP_CACHE_N];
 
 /* Resolve `ip` to a MAC via ARP. Returns 1 + fills `out_mac`, or 0 on timeout. */
+/* WHICH MACHINE TO HAND THE FRAME TO (M2122).
+ *
+ * This stack had no routing decision at all: each caller either ARPed the
+ * DESTINATION, or ARPed the gateway, or -- in two places -- ARPed the
+ * destination and fell back to the gateway when that timed out. Under QEMU's
+ * user-mode networking every address is on-link, so ARPing the destination
+ * always worked and the absence never showed. On a real LAN it is the
+ * difference between working and not:
+ *
+ *   [net] lease: ip 192.168.1.224  gw 192.168.1.1  dns 1.1.1.1
+ *   [net] HTTP GET example.com failed: the NAME did not resolve
+ *
+ * because dns_resolve ARPed 1.1.1.1 -- a host on the other side of the
+ * internet -- and no machine on this segment was ever going to answer for it.
+ *
+ * The "destination, else gateway" spelling is not a fix either: for an
+ * off-link address the first ARP is a GUARANTEED timeout, so every such
+ * connection paid a full ARP timeout before doing anything. Decide it from the
+ * netmask instead, which the lease carries and which this client now keeps. */
+static const uint8_t *next_hop(const uint8_t *dst) {
+    for (int i = 0; i < 4; i++)
+        if ((dst[i] & NETMASK[i]) != (OUR_IP[i] & NETMASK[i])) return GW_IP;
+    return dst;                                    /* on our own segment */
+}
+
 static int arp_resolve(const uint8_t *ip, uint8_t *out_mac) {
     for (int i = 0; i < ARP_CACHE_N; i++)          /* serve a fresh cached mapping */
         if (arp_cache[i].used && timer_ticks() < arp_cache[i].exp
@@ -475,7 +501,10 @@ int dns_resolve(const char *host, uint8_t out_ip[4]) {
             return 0;
         }
     uint8_t mac[6];
-    if (!arp_resolve(DNS_IP, mac))
+    /* VIA THE GATEWAY IF THE RESOLVER IS NOT ON OUR SEGMENT (M2122). This
+     * ARPed DNS_IP itself, which is right for SLIRP's on-link 10.0.2.3 and
+     * impossible for the 1.1.1.1 a real lease hands out. */
+    if (!arp_resolve(next_hop(DNS_IP), mac))
         return -1;
     const uint8_t *me = nic_mac();
 
@@ -612,6 +641,7 @@ static int dhcp_recv(uint32_t xid, uint64_t ticks, uint8_t *yiaddr,
             int l = bp[o++]; if (boff + o + l > len) break;
             if      (t == 53 && l == 1) mtype = bp[o];
             else if (t == 54 && l == 4 && srvid)  memcpy(srvid,  bp + o, 4);
+            else if (t == 1  && l >= 4) memcpy(NETMASK, bp + o, 4);   /* subnet mask: the routing decision needs it (M2122) */
             else if (t == 3  && l >= 4 && router) memcpy(router, bp + o, 4);
             else if (t == 6  && l >= 4 && dns)    memcpy(dns,    bp + o, 4);
             o += l;
@@ -675,8 +705,9 @@ int net_dhcp(void) {
     }
     if (dns[0] | dns[1] | dns[2] | dns[3])             memcpy(DNS_IP, dns, 4);
     g_have_lease = 1;                                      /* a server really answered (M2120) */
-    kprintf("[net] lease: ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
+    kprintf("[net] lease: ip %u.%u.%u.%u/%u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
             OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3],
+            NETMASK[0], NETMASK[1], NETMASK[2], NETMASK[3],
             GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3],
             DNS_IP[0], DNS_IP[1], DNS_IP[2], DNS_IP[3]);
     return 0;
@@ -751,7 +782,7 @@ int net_udp_send(const uint8_t dstip[4], uint16_t dport, uint16_t sport,
         return 0;
     }
     uint8_t mac[6];
-    if (!arp_resolve(dstip, mac) && !arp_resolve(GW_IP, mac)) return -1;   /* dest, else via gateway */
+    if (!arp_resolve(next_hop(dstip), mac)) return -1;   /* one decision, no guaranteed timeout (M2122) */
     udp_send_to(mac, dstip, sport, dport, (const uint8_t *)payload, plen);
     return 0;
 }
@@ -1219,7 +1250,7 @@ long net_tftp_get(const char *server_str, const char *filename, void *out, uint3
     uint8_t srv[4];
     if (parse_ipv4(server_str, srv) < 0) return -1;
     uint8_t mac[6];
-    if (!arp_resolve(srv, mac) && !arp_resolve(GW_IP, mac)) return -1;   /* server, else via gateway */
+    if (!arp_resolve(next_hop(srv), mac)) return -1;     /* one decision, no guaranteed timeout (M2122) */
 
     const uint16_t myport = 0x8200;            /* our client TID */
     uint16_t tid = 0;                          /* server's TID, learned from its first DATA */
@@ -2954,7 +2985,12 @@ void net_demo(void) {
         kprintf("[net] ARP for %u.%u.%u.%u timed out.\n\n", g[0], g[1], g[2], g[3]);
         goto done;
     }
-    kprintf("[net] ARP: 10.0.2.2 is at ");
+    /* PRINT THE ADDRESS, NOT A LITERAL (M2121). This said "10.0.2.2" whatever
+     * the gateway actually was, so a DHCP lease that changed it left the log
+     * claiming the old one -- and the lease had just set 192.168.1.1 while
+     * this line insisted on 10.0.2.2. Same defect as the "IP = 10.0.2.15"
+     * literal fixed in M2120, ten lines away, which is how these survive. */
+    kprintf("[net] ARP: %u.%u.%u.%u is at ", GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3]);
     print_mac(gw_mac);
     kprintf("\n");
 
@@ -2964,10 +3000,12 @@ void net_demo(void) {
     int got = 0;
     for (uint16_t seq = 1; seq <= 3; seq++) {
         if (ping(GW_IP, gw_mac, seq)) {
-            kprintf("[net] ping 10.0.2.2: reply seq=%u\n", seq);
+            kprintf("[net] ping %u.%u.%u.%u: reply seq=%u\n",
+                    GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], seq);
             got++;
         } else {
-            kprintf("[net] ping 10.0.2.2: seq=%u timed out\n", seq);
+            kprintf("[net] ping %u.%u.%u.%u: seq=%u timed out\n",
+                    GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], seq);
         }
     }
     kprintf("[net] %d/3 echo replies. Networking works!\n", got);
@@ -2981,7 +3019,23 @@ void net_demo(void) {
         page[eol] = 0;
         kprintf("[net] HTTP GET example.com -> %d bytes, status: %s\n\n", n, page);
     } else {
-        kprintf("[net] HTTP GET example.com failed (no internet route?)\n\n");
+        /* SAY WHICH STEP FAILED (M2121). "no internet route?" is a guess with a
+         * question mark, and there are three completely different failures
+         * behind it: the name did not resolve, the connect did not complete, or
+         * the response did not arrive. Resolving the name separately
+         * distinguishes the first from the other two, which is the difference
+         * between debugging DNS and debugging TCP. */
+        uint8_t rip[4] = {0,0,0,0};
+        int rr = dns_resolve("example.com", rip);
+        if (rr != 0)
+            kprintf("[net] HTTP GET example.com failed: the NAME did not resolve "
+                    "(dns %u.%u.%u.%u, gw %u.%u.%u.%u)\n\n",
+                    DNS_IP[0], DNS_IP[1], DNS_IP[2], DNS_IP[3],
+                    GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3]);
+        else
+            kprintf("[net] HTTP GET example.com failed: the name resolved to "
+                    "%u.%u.%u.%u but the HTTP exchange did not complete\n\n",
+                    rip[0], rip[1], rip[2], rip[3]);
     }
 
     /* Prove the from-scratch TLS 1.3 stack end to end: a real HTTPS GET exercises
