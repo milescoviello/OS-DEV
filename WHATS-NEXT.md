@@ -1,5 +1,74 @@
 # What's next
 
+> **(M2132-M2135) FIREFOX RENDERS A REAL WEB PAGE ON SCREEN, IN AN OS-DEV
+> WINDOW, THROUGH OS-DEV'S OWN WAYLAND COMPOSITOR.**
+>
+> ![Firefox rendering a page on screen in OS-DEV](docs/img/firefox-page-on-screen.png)
+>
+> That image is the compositor's own buffers, sampled pixel by pixel and
+> carried out over the serial line. Every colour in it belongs to the
+> document: `#101820` the body background, `#4fd1c5` the heading, `#e8e8f0`
+> the text, and `#e4572e`/`#17b890`/`#3d5a80` the three CSS-styled boxes. The
+> heading reads *"Firefox is rendering a page inside OS-DEV."* and the window
+> title is *"OS-DEV — Mozilla Firefox"* -- the document's own `<title>`, so it
+> was loaded and the chrome knows what it is.
+>
+> `make firefoxpagetest` has asserted a HEADLESS render since M2118, and that
+> is a genuinely different claim: `--screenshot` goes through `drawSnapshot`,
+> which never builds a continuous WebRender scene, so it passed for this whole
+> campaign while the on-screen content area was blank. `make
+> firefoxonscreentest` asserts the on-screen path.
+>
+> **IT WAS NEVER THE RENDERER, THE COMPOSITOR, WEBRENDER, THE CONTENT PROCESS
+> OR IPC.** All of those were working the whole time. Firefox's chrome startup
+> was waiting on `getaddrinfo`, so the first tab was never created and never
+> navigated -- there was no document to render. Revert-proven to a single line:
+>
+> | configuration | samples showing the page |
+> |---|---|
+> | `setsockopt(SOL_IP, IP_RECVERR)` implemented | 11 of 20 |
+> | that one line reverted | **0 of 29** |
+>
+> So **the same defect was blocking both north stars**: one refused socket
+> option stopped Claude Code reaching the API *and* stopped Firefox showing a
+> page.
+>
+> Getting there needed three instruments, because the ones in the tree were
+> answering questions nobody had asked:
+>
+> - **The document-load layer.** `MOZ_LOG=DocumentChannel:5,nsDocShell:5`
+>   listed every document Gecko opens -- `browser.xhtml`, six extension
+>   background pages, and never `ffpage.html` -- plus `nsDocShell::DoURILoad
+>   sync about:blank onto initial about:blank`. That one reading moved the
+>   problem from "we cannot paint it" to "it was never asked for".
+> - **The chrome console.** `devtools.console.stdout.chrome` routes chrome
+>   messages, including uncaught errors, to stdout. They do not reach stderr by
+>   default; they go to the Browser Console, which cannot be opened here.
+> - **Per-layer sampling**, which retired the last compositing hypothesis: the
+>   window is a transparent root plus one opaque chrome surface, and neither
+>   buffer contained the page.
+>
+> **And the flakiness was never flakiness.** The page appears about 150-195
+> seconds *after* first paint. Every "the content area is still blank" reading
+> in this campaign was taken from a capture that ended before the window got
+> there.
+>
+> **Four things believed here turned out to be false**, and each had been
+> written down as fact: Firefox's child processes do not die (zero non-zero
+> exits after it starts; the status-7 exits belonged to an unrelated probe);
+> `MOZ_FORCE_DISABLE_E10S` is not honoured by this build; `data:` top-level
+> navigation is blocked by default, so an earlier experiment "eliminating the
+> file channel" had proved nothing; and prefs read by JS modules live in
+> `omni.ja`, not `libxul`, so checking them against libxul gave confidently
+> wrong answers.
+>
+> **A method failure worth keeping:** M2134 credited five prefs that were
+> changed together, and a controlled revert overturned it -- they make no
+> difference and were removed again. Change one thing, revert the one thing.
+> Relatedly, editing `build/lxroot/.../osdev-prefs.js` does nothing, because
+> the staging rule depends on the source file; a "revert" run therefore used
+> the same image as the fix run, and the difference read as nondeterminism.
+
 > **(M2128-M2131) CLAUDE CODE RUNS A SHELL COMMAND INSIDE OS-DEV AND READS THE
 > RESULT BACK.**
 >

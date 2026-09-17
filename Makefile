@@ -129,7 +129,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest lanreachabletest claudebashtest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest lanreachabletest claudebashtest firefoxonscreentest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -1795,6 +1795,12 @@ lanreachabletest: $(KERNEL) $(DISK) $(EXT2IMG)
 # create. Skips cleanly without either. (M2130)
 claudebashtest: $(KERNEL) $(DISK) $(EXT2IMG)
 	@tests/run-claude-bash-test.sh
+
+# FIREFOX ON SCREEN, not headless. Not in check-all: it needs the real LAN on
+# the Proxmox node and a ~15 minute capture, because the page appears about
+# three minutes after first paint. (M2135)
+firefoxonscreentest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-firefox-onscreen-test.sh
 
 # PHASE 8: OS-DEV's own Wayland compositor, exercised by a REAL libwayland
 # client (the same library Firefox uses). In `make check`: one 2 GiB boot.
