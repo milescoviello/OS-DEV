@@ -71,3 +71,10 @@ long ext2_listxattr(blk_read_fn read, void *ctx, uint64_t start_lba,
                     const char *path, char *out, unsigned long max);                            /* NUL-sep names; total or -1 (M1182) */
 long ext2_removexattr(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, const char *name);                                      /* remove a user.* xattr; 0 or -1 (M1182) */
+/* A PATH CACHE, POSITIVE AND NEGATIVE (M2103). Every resolution used to walk
+ * from the volume root with no cache anywhere; SQLite probes for a journal and
+ * a WAL before every transaction and neither exists, so the NEGATIVE half
+ * carries most of the win. Flushed wholesale by every write in this file. */
+void ext2_path_cache_flush(void);
+void ext2_path_cache_stats(unsigned long *hits, unsigned long *misses,
+                           unsigned long *neg, unsigned long *flushes);

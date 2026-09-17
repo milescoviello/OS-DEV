@@ -617,6 +617,13 @@ void kmain_budget(const char *when) {
                     "across threads -- NOT a per-call cost)\n");
         }
     }
+    {   unsigned long ph = 0, pm = 0, pn = 0, pf2 = 0;
+        ext2_path_cache_stats(&ph, &pm, &pn, &pf2);
+        if (ph + pm + pn)
+            kprintf("[budget]   paths    %lu resolutions served from cache (%lu of them NEGATIVE -- "
+                    "a path known not to exist), %lu walked, %lu whole-cache flushes\n",
+                    ph + pn, pn, pm, pf2);
+    }
     kprintf("[budget]   console  %7lu Mcycles elapsed   %lu lines, %lu full-screen scrolls\n",
             con / 1000000, ln, sc);
     if (busy) {
@@ -1453,7 +1460,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                  * those are is the only clue to what. The
                                  * middle -- ordinary progress -- is the part
                                  * that needs no sample. (M2103) */
-                                if (ns - ps > 50000 || (ns - ps) < 400) lx_ring_top();
+                                if (ns - ps > 50000) lx_ring_top();
+                                /* A QUIET SECOND NEEDS A DIFFERENT QUESTION.
+                                 * The ring sample is useless below a few
+                                 * thousand calls a second -- at sixty a second
+                                 * it holds a MINUTE of stale history. What is
+                                 * wanted then is not "which call" but "what is
+                                 * everyone blocked on", grouped. (M2103) */
+                                else if (ns - ps < 400) {
+                                    app_wait_summary(fpid);
+                                    /* AND THE FEW CALLS THAT DID HAPPEN. The
+                                     * ring TOP is meaningless at forty calls a
+                                     * second -- it reports a minute of stale
+                                     * history -- but the ring filtered to THIS
+                                     * process is exactly the last few things
+                                     * it asked for, which is the only clue to
+                                     * what it is waiting on. (M2103) */
+                                    lx_trace_dump_pid("this quiet second", 10, fpid);
+                                }
                                 ps = ns; pf0 = pf1;
                                 {   uint32_t pw = 0, ph = 0; wl_largest_window(&pw, &ph);
                                     if (pw >= 640 && ph >= 480) {

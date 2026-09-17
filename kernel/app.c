@@ -10749,6 +10749,41 @@ void app_fd_print(int fd) {
     }
 }
 
+/* WHAT IS EVERY THREAD WAITING FOR, GROUPED (M2103).
+ *
+ * app_dump_threads prints one line per thread, and Firefox has a hundred and
+ * forty -- so a quiet stretch produces 140 lines that all say "blocked" and
+ * none of which says what for. The useful shape is the opposite: group by
+ * WCHAN, the kernel address where each blocked, and print the counts. Eighty
+ * threads parked on one address is a queue nobody is servicing; eighty threads
+ * spread over twenty addresses is a program idling normally.
+ *
+ * Found necessary by a seven-second stretch of a Firefox startup making sixty
+ * syscalls a second -- too quiet to sample from the syscall ring, because at
+ * that rate the ring holds a minute of stale history. */
+void app_wait_summary(int pid) {
+    struct app *a = app_by_pid(pid);
+    if (!a) { kprintf("[wait] pid %d is gone\n", pid); return; }
+    struct { uint64_t wchan; int n; int st; const char *name; } g[24];
+    int ng = 0, total = 0, running = 0;
+    for (int t = 0; t <= APP_MAXTHREAD; t++) {
+        task_t *tk = (t == APP_MAXTHREAD) ? a->task : a->thr[t];
+        if (!tk || task_state_of(tk) == TASK_DEAD) continue;
+        total++;
+        if (task_state_of(tk) != TASK_BLOCKED) { running++; continue; }
+        int f = -1;
+        for (int i = 0; i < ng; i++) if (g[i].wchan == tk->wchan) { f = i; break; }
+        if (f < 0 && ng < 24) { f = ng++; g[f].wchan = tk->wchan; g[f].n = 0;
+                                g[f].st = (int)task_state_of(tk); g[f].name = task_name_of(tk); }
+        if (f >= 0) g[f].n++;
+    }
+    kprintf("[wait] pid %d: %d threads, %d runnable, %d blocked on %d distinct places\n",
+            pid, total, running, total - running, ng);
+    for (int i = 0; i < ng; i++)
+        kprintf("[wait]   %d thread(s) at wchan=%p (e.g. '%s')\n",
+                g[i].n, (void *)g[i].wchan, g[i].name);
+}
+
 /* WHO HOLDS THE OTHER END, AND WHAT ARE THEY DOING? (M2103)
  *
  * The question a spin on an empty pipe raises, and the one nothing could

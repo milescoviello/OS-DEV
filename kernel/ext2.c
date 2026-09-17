@@ -233,8 +233,125 @@ static uint32_t walk_d(ext2_t *v, uint32_t startino, const char *path,
     }
     return ino;
 }
+/* ================= A PATH CACHE, POSITIVE AND NEGATIVE (M2103) ============
+ *
+ * WHY. Every path resolution walked from the volume root, reading a directory
+ * block per component, with no cache of any kind anywhere in the tree. A
+ * Firefox startup spends seven of its forty seconds in a stretch that is
+ * almost entirely this -- thousands of stat() calls, and the log shows what
+ * they are:
+ *
+ *   stat(".../storage/ls-archive.sqlite-journal") -> no such path
+ *   stat(".../storage/ls-archive.sqlite-wal")     -> no such path
+ *   stat(".../storage/ls-archive.sqlite-journal") -> no such path
+ *   stat(".../storage/ls-archive.sqlite-wal")     -> no such path
+ *
+ * SQLite probes for a journal and a write-ahead log before every transaction,
+ * and neither exists, so every probe was a full walk down eight components to
+ * find nothing. A NEGATIVE cache is worth more here than a positive one, which
+ * is not the usual way round and is exactly what the workload asked for.
+ *
+ * FLUSH EVERYTHING ON ANY WRITE, never selectively. That is the plan's own
+ * prescription and it is the right one: selective invalidation of a path cache
+ * requires knowing every path affected by a rename, an unlink, a directory
+ * grow or a symlink change, and being wrong once means serving a stale answer
+ * about whether a file exists. A whole-cache flush is one line, cannot be
+ * subtly wrong, and costs a rebuild that the reads themselves pay for. Writes
+ * are rare here; lookups are not.
+ *
+ * The inode NUMBER is cached, not the inode BYTES: the bytes carry a size and
+ * timestamps that a write changes, and re-reading one inode block is the cheap
+ * part -- the walk was the expensive part. A negative entry caches nothing but
+ * the absence. */
+#define E2PC_N 256
+static struct { char path[128]; uint32_t ino; uint8_t used, isdir, negative; } g_e2pc[E2PC_N];
+static unsigned g_e2pc_clk;
+static uint8_t  g_e2pc_lru[E2PC_N];
+unsigned long g_e2pc_hits, g_e2pc_misses, g_e2pc_neg_hits, g_e2pc_flushes;
+
+static int e2pc_eq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == 0 && *b == 0;
+}
+/* Any write to this volume drops the whole cache. Called from every mutating
+ * entry point in this file. */
+void ext2_path_cache_flush(void) {
+    for (int i = 0; i < E2PC_N; i++) g_e2pc[i].used = 0;
+    g_e2pc_flushes++;
+}
+void ext2_path_cache_stats(unsigned long *hits, unsigned long *misses,
+                           unsigned long *neg, unsigned long *flushes) {
+    if (hits)    *hits    = g_e2pc_hits;
+    if (misses)  *misses  = g_e2pc_misses;
+    if (neg)     *neg     = g_e2pc_neg_hits;
+    if (flushes) *flushes = g_e2pc_flushes;
+}
+
 static uint32_t walk(ext2_t *v, const char *path, uint8_t *inode_out, int *is_dir) {
     return walk_d(v, EXT2_ROOT_INO, path, inode_out, is_dir, 0);
+}
+
+/* THE CACHE IS FOR READERS ONLY, and that is not a simplification -- it is the
+ * fix for a bug the ext2 suite caught immediately (M2103).
+ *
+ * The first version cached inside walk() itself, and every WRITER calls walk()
+ * to find what it is about to change. So ext2_rename_path looked up the old
+ * name (caching it as present), renamed it, and left a stale positive entry
+ * behind that no amount of flushing at the function's ENTRY could remove. The
+ * test said so in six words:
+ *
+ *     old name still readable after rename
+ *
+ * Flushing on the way out instead would have worked too, and would have meant
+ * touching every return in fourteen functions. Having the readers cache and
+ * the writers not is smaller, and it cannot be got wrong by adding a
+ * fifteenth writer later. */
+static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int *is_dir) {
+    int plen = 0; while (path[plen]) plen++;
+    int cacheable = (plen > 0 && plen < (int)sizeof g_e2pc[0].path);
+    int slot = -1;
+    if (cacheable) {
+        for (int i = 0; i < E2PC_N; i++) {
+            if (!g_e2pc[i].used || !e2pc_eq(g_e2pc[i].path, path)) continue;
+            g_e2pc_lru[i] = (uint8_t)(++g_e2pc_clk);
+            if (g_e2pc[i].negative) { g_e2pc_neg_hits++; return 0; }   /* known absent: no walk at all */
+            /* Positive: we still read the one inode, because its SIZE and
+             * timestamps must be current -- but not the directories above it,
+             * which is where the cost was. */
+            if (read_inode(v, g_e2pc[i].ino, inode_out) >= 0) {
+                if (is_dir) *is_dir = g_e2pc[i].isdir;
+                g_e2pc_hits++;
+                return g_e2pc[i].ino;
+            }
+            g_e2pc[i].used = 0;                   /* the inode is gone: the entry was wrong */
+            break;
+        }
+        g_e2pc_misses++;
+    }
+    int isd = 0;
+    uint32_t ino = walk_d(v, EXT2_ROOT_INO, path, inode_out, &isd, 0);
+    if (is_dir) *is_dir = isd;
+    if (cacheable) {
+        /* Least-recently-used victim, or the first free slot. A linear scan of
+         * 256 entries is nothing against the directory reads it replaces. */
+        int v2 = -1; uint8_t oldest = 0xFF;
+        for (int i = 0; i < E2PC_N; i++) {
+            if (!g_e2pc[i].used) { v2 = i; break; }
+            uint8_t age = (uint8_t)(g_e2pc_clk - g_e2pc_lru[i]);
+            if (age >= oldest) { oldest = age; v2 = i; }
+        }
+        if (v2 >= 0) {
+            slot = v2;
+            int j = 0; for (; path[j] && j < (int)sizeof g_e2pc[0].path - 1; j++) g_e2pc[slot].path[j] = path[j];
+            g_e2pc[slot].path[j] = 0;
+            g_e2pc[slot].ino = ino;
+            g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
+            g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
+            g_e2pc[slot].used = 1;
+            g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
+        }
+    }
+    return ino;
 }
 
 int ext2_probe(blk_read_fn read, void *ctx, uint64_t start_lba) {
@@ -249,7 +366,7 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
                 void *buf, unsigned long max, unsigned long offset) {
     ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     uint8_t inode[256]; int isdir = 0;
-    if (!walk(&v, path, inode, &isdir) || isdir) return -1;
+    if (!walk_cached(&v, path, inode, &isdir) || isdir) return -1;
     uint32_t size = e_rd32(inode + 4);
     if (offset >= size) return 0;                          /* at/after EOF */
     unsigned long avail = size - offset;
@@ -306,7 +423,7 @@ int ext2_fiemap(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
                 ext2_extent_t *out, int max) {
     ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     uint8_t inode[256]; int isdir = 0;
-    if (!walk(&v, path, inode, &isdir) || isdir) return -1;
+    if (!walk_cached(&v, path, inode, &isdir) || isdir) return -1;
     uint64_t size = e_rd32(inode + 4);
     uint32_t bs = v.block_size;
     uint32_t nblk = (uint32_t)((size + bs - 1) / bs);
@@ -327,7 +444,7 @@ int ext2_fiemap(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
 int ext2_isdir_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path) {
     ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     uint8_t inode[256]; int isdir = 0;
-    if (!walk(&v, path, inode, &isdir)) return -1;
+    if (!walk_cached(&v, path, inode, &isdir)) return -1;
     return isdir;
 }
 
@@ -343,7 +460,7 @@ int ext2_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *
      * st_ino is not decoration: a dynamic linker decides whether a library is
      * already loaded by comparing (st_dev, st_ino), so a constant inode makes
      * every library look like the first one it mapped. (M1955) */
-    uint32_t ino = walk(&v, path, inode, &isdir);
+    uint32_t ino = walk_cached(&v, path, inode, &isdir);
     if (!ino) return -1;
     if (out_size)  *out_size  = e_rd32(inode + 4);
     if (out_isdir) *out_isdir = isdir;
@@ -364,7 +481,7 @@ int ext2_list_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *
                    fatvol_dirent *out, int max) {
     ext2_t v; if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     uint8_t inode[256]; int isdir = 0;
-    if (!walk(&v, path, inode, &isdir) || !isdir) return -1;
+    if (!walk_cached(&v, path, inode, &isdir) || !isdir) return -1;
     uint32_t size = e_rd32(inode + 4);
     uint8_t blk[4096]; int n = 0;
     for (uint32_t off = 0; off < size && n < max; off += v.block_size) {
@@ -891,6 +1008,13 @@ static int dir_is_empty(ext2_t *v, const uint8_t *dino) {
 }
 long ext2_unlink_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path) {
+    /* EVERY write flushes the path cache WHOLESALE (M2103). Selective
+     * invalidation of a path cache needs to know every path a rename, an
+     * unlink, a directory grow or a symlink change can affect -- and being
+     * wrong once means answering "that file does not exist" about a file
+     * that does. One line that cannot be subtly wrong beats a clever one
+     * that can. */
+    ext2_path_cache_flush();
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -968,6 +1092,7 @@ static void grp_dirs(ext2_t *v, uint32_t ino, int delta) {
  * the new dir's ".."), and bump the group's directory count. M1137. */
 long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1024,6 +1149,7 @@ long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
  * resolved by walk(); M1146). Target must be <= 60 bytes. 0/-1. */
 long ext2_symlink_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                        const char *path, const char *target) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1102,6 +1228,7 @@ long ext2_readlink_path(blk_read_fn read, void *ctx, uint64_t start_lba,
  * inode only when it hits 0, so removing either name leaves the other working. */
 long ext2_link_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                     const char *oldpath, const char *newpath) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1205,6 +1332,7 @@ static int is_ancestor(ext2_t *v, uint32_t anc, uint32_t start) {
  * ".." entry and adjusts both parents' link counts (so e2fsck stays clean). 0/-1. */
 long ext2_rename_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *oldpath, const char *newpath) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1268,6 +1396,18 @@ long ext2_rename_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
  * need ".."/parent-link fixups), keeping every result e2fsck-clean. */
 long ext2_rename2_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                        const char *oldpath, const char *newpath, int flags) {
+    /* THE FIFTEENTH WRITER (M2103). I added the flush to fourteen mutating
+     * entry points by listing the ones that take a blk_write_fn -- and missed
+     * this one, because renameat2 lives apart from rename. The ext2 suite
+     * caught it within a second: EXCHANGE atomically swaps two files, and a
+     * cached positive entry for either name is then a pointer to the other
+     * one's inode.
+     *
+     * Which is why the audit that found it is now a shell one-liner in the
+     * commit message rather than a memory of having been careful: every
+     * function here that takes a write callback must flush, and the way to
+     * know is to ask the file, not to remember. */
+    ext2_path_cache_flush();
     if (flags == 0) return ext2_rename_path(read, write, ctx, start_lba, oldpath, newpath);
     if ((flags & EXT2_RN_NOREPLACE) && (flags & EXT2_RN_EXCHANGE)) return -1;   /* mutually exclusive */
 
@@ -1320,6 +1460,7 @@ long ext2_rename2_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
  * Returns the number of blocks punched, or -1. */
 long ext2_punch_hole(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, uint64_t offset, uint64_t len) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || len == 0 || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1397,6 +1538,7 @@ long ext2_punch_hole(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
  * hole path (ext2_pread zero-fills unmapped blocks). 0/-1. */
 long ext2_truncate_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                         const char *path, uint64_t newlen) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1471,6 +1613,7 @@ long ext2_seek_data_hole(blk_read_fn read, void *ctx, uint64_t start_lba,
  * free of syscall.h). i_ctime is bumped to "now" since metadata changed. */
 long ext2_utimes_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, long atime, long mtime) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1488,6 +1631,7 @@ long ext2_utimes_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
  * bumped since metadata changed. Files and directories both. Returns 0/-1. */
 long ext2_chmod_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, uint32_t mode) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1505,6 +1649,7 @@ long ext2_chmod_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
  * syscall.h). i_ctime is bumped. Files and directories both. Returns 0/-1. */
 long ext2_chown_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, long uid, long gid) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1559,6 +1704,7 @@ static int extent_to_indirect(ext2_t *v, uint8_t *inode, uint32_t *charged) {
  * back as zeroes via map_block, which is what ext2 semantics call for. */
 long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, uint64_t off, const void *buf, unsigned long len) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1645,6 +1791,7 @@ fail:
 
 long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, const void *buf, unsigned long len) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1990,6 +2137,7 @@ static int xa_save(ext2_t *v, uint32_t ino, uint8_t *inode, struct xa_ent *ents,
  * preserves the rest (read-modify-write across in-inode + EA block). returns vlen/-1. */
 long ext2_setxattr(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                    const char *path, const char *name, const void *value, unsigned long vlen) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -2013,6 +2161,7 @@ long ext2_setxattr(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t sta
 /* remove user.<name> from `path`. returns 0 (removed), or -1 (absent/no EA). */
 long ext2_removexattr(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, const char *name) {
+    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;

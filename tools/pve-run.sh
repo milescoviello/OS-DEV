@@ -76,6 +76,10 @@ while [ $i -lt "$CAP" ]; do
     sleep 2; i=$((i+2))
 done
 echo "==> marker after ~${i}s"
+# Keep capturing past the marker: the boot budget prints at the DESKTOP
+# handover, which is after the paint, and killing the capture at the paint
+# threw away every number the run was made to produce. (M2103)
+sleep 20
 $SSH "echo '----- markers -----'; \
       grep -aE 'it has PAINTED|desktop window for client|KERNEL PANIC|Invalid Opcode|process is GONE|ata\] DMA' $PVE_DIR/boot.log | head -8; \
       echo '----- budget -----'; \
