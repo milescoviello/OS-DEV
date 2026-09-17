@@ -593,9 +593,16 @@ void kmain_budget(const char *when) {
          * instrument describing the wrong quantity yet again: these naps are
          * CONCURRENT across threads, so their sum is thread-time and has no
          * business being compared to one wall clock. (M2102) */
-        kprintf("[budget]   polling  %7lu thread-ms slept across %lu naps in poll/epoll "
-                "(concurrent: NOT a share of the wall clock)\n",
-                g_poll_nap_ms, g_poll_naps);
+        {   extern unsigned long g_poll_yields;
+            /* YIELDS ARE NOT NAPS (M2111). A yield reschedules without arming
+             * a timer, so it costs a context switch and not a millisecond --
+             * adding the two together would inflate a figure this budget
+             * reports as a share of the wall clock, which is exactly the
+             * instrument mistake this campaign keeps making. */
+            kprintf("[budget]   polling  %7lu thread-ms slept across %lu naps, plus %lu yields, "
+                    "in poll/epoll (concurrent: NOT a share of the wall clock)\n",
+                    g_poll_nap_ms, g_poll_naps, g_poll_yields);
+        }
         {   extern unsigned long g_lx_dispatch_cycles;
             unsigned long n = lx_syscalls_made();
             /* ELAPSED, AND THEREFORE NOT A PER-SYSCALL COST (M2102). I wrapped
@@ -1478,7 +1485,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * widget and Wayland layers' own view of what they are
                      * doing, to stderr, which is our console. (M2010) */
                     if (g_ffmozlog) {
-                        app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,nsWindow:5,Event:4,DBus:5");
+                        /* WEBRENDER, because that is where the question is now
+                         * (M2111). The document is loaded and active -- the
+                         * window title proves it -- the chrome paints, and the
+                         * content area in Firefox's OWN buffer is blank. That
+                         * is a compositing question, and `webrender` is the
+                         * module that answers it. Widget/nsWindow stay because
+                         * they name the surface and size decisions that feed
+                         * it; Event and DBus are dropped, because every line
+                         * costs serial time and neither is in the path. */
+                        app_set_next_env("MOZ_LOG=timestamp,sync,webrender:5,Widget:4,nsWindow:4");
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }

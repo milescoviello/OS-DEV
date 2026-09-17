@@ -1095,9 +1095,29 @@ static void lx_emit(const char *b, unsigned long n) {
  * Suspect is not the same as cause. Count the naps and the milliseconds, and
  * let the budget say what share of the wall clock they are. If it is small the
  * wait is Firefox's own and a wait-queue rewrite would buy nothing. */
-unsigned long g_poll_naps, g_poll_nap_ms;
+unsigned long g_poll_naps, g_poll_nap_ms, g_poll_yields;
+/* THE MACHINE IS IDLE, SO POLLING IS NEARLY FREE (M2111).
+ *
+ * The counter this comment asked for has now answered: a Firefox first paint
+ * on one core is 4.7 core-seconds of actual work across forty seconds of wall
+ * clock. Eighty-eight per cent of the boot is the core doing NOTHING, and
+ * 15.2 seconds of it is this nap -- 3379 naps averaging 4.5 ms. The startup is
+ * a chain of IPC round trips and every one of them pays a sleep.
+ *
+ * So spend the idle CPU instead of the wall clock. YIELD for the first stretch
+ * -- which reschedules without arming a timer, so a ready descriptor is seen
+ * on the very next pass rather than up to ten milliseconds later -- then 1 ms,
+ * and only back off to 5 ms once the wait is plainly long-lived. A loop parked
+ * on nothing still ends up at a few hundred wakeups a second, and on a core
+ * that is otherwise halted that costs nothing anybody is waiting for.
+ *
+ * The yields are counted separately: a yield is not a nap and adding them to
+ * the millisecond total would inflate a number the budget reports as a share
+ * of the wall clock. That is the mistake this project keeps making with
+ * instruments, and it is cheaper to keep two counters. */
 static int lx_poll_nap(int spins) {
-    int ms = spins < 200 ? 1 : 10;
+    if (spins < 64) { g_poll_yields++; task_yield(); return 0; }
+    int ms = spins < 512 ? 1 : 5;
     g_poll_naps++;
     g_poll_nap_ms += (unsigned long)ms;
     return ms;
@@ -2857,7 +2877,7 @@ static void lx_dispatch_body(struct registers *r) {
                         app_current_pid(), task_current_id(), (int)a1, timeout);
                 app_epoll_dump((int)a1);
             }
-            task_sleep_ms(lx_poll_nap(espins));
+            { int nms = lx_poll_nap(espins); if (nms) task_sleep_ms(nms); }
         }
         __asm__ volatile("cli");
         if (k < 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
@@ -2926,7 +2946,7 @@ static void lx_dispatch_body(struct registers *r) {
                     }
                 }
             }
-            task_sleep_ms(lx_poll_nap(spins));
+            { int nms = lx_poll_nap(spins); if (nms) task_sleep_ms(nms); }
         }
         __asm__ volatile("cli");
         r->rax = (uint64_t)ready;

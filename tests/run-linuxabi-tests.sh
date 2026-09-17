@@ -436,8 +436,17 @@ LXWAIT: reaped 40/40 children
     # different address space, and that is how its rendered frames travel. Both
     # directions are asserted: a receiver handed a private copy passes every
     # read and fails only when the parent looks for the child's write.
+    #
+    # M2111 added the second half: a SOCKET endpoint, which is fd type 12 here
+    # against a memfd's type 3 and takes a different branch on both the send and
+    # the receive side. Gecko's content process gets its compositor connection
+    # exactly that way -- the parent makes a socketpair and sends one end -- and
+    # a passing memfd test says nothing about it. The child must WRITE through
+    # the endpoint and the parent must read it out of the other end, because an
+    # endpoint that arrives as a descriptor but is connected to nothing passes
+    # every check short of that one.
     if grep -aq "LXSCM: CROSS OK" "$SLOG3"; then
-        echo "  ok: a FORKED child maps a memfd passed over SCM_RIGHTS and both processes see one set of pages (M2107)"
+        echo "  ok: a FORKED child maps a memfd AND writes through a socket endpoint passed over SCM_RIGHTS, both directions (M2107/M2111)"
     else
         echo "  FAIL: cross-process memfd sharing is broken:"; grep -a "LXSCM: FAIL" "$SLOG3" | head -3; f3=1
     fi

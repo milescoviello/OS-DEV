@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 
@@ -170,6 +171,86 @@ int main(void) {
         fflush(stdout); return 19;
     }
     printf("LXSCM: ok   and the parent sees the CHILD's writes -- one memfd, one set of pages\n");
+
+    /* ---- AND A SOCKET, WHICH IS A DIFFERENT FD TYPE ENTIRELY --------------
+     *
+     * Everything above passes a MEMFD. Gecko's content process does not get
+     * its compositor connection from a memfd: the parent creates a socketpair,
+     * forks and execs the child, and sends one END OF THE SOCKET over the
+     * existing channel with SCM_RIGHTS. The child then opens PCompositorBridge
+     * and PWebRenderBridge on it and sends its display lists through -- which
+     * is how page content reaches the compositor and appears on screen.
+     *
+     * In this kernel a socket is fd type 12 and a memfd is type 3, and they
+     * take different branches on both the send and the receive side of
+     * app_scm_send (the per-type reference in M2104 has a case for each). So a
+     * passing memfd test says nothing at all about this, and Firefox paints its
+     * chrome while the content area stays blank -- which is exactly the open
+     * symptom.
+     *
+     * The test is end to end on purpose: the child must WRITE through the
+     * passed endpoint and the parent must read it out of the other end. An
+     * endpoint that arrives as a descriptor but is not connected to anything
+     * passes every check short of that one. (M2111) */
+    int pv[2], cv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pv) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, cv) != 0) {
+        printf("LXSCM: socket-passing socketpair failed\n"); fflush(stdout); return 20; }
+    pid_t k2 = fork();
+    if (k2 < 0) { printf("LXSCM: socket-passing fork failed\n"); fflush(stdout); return 21; }
+    if (k2 == 0) {
+        close(pv[0]); close(cv[0]); close(cv[1]);
+        char cb[CMSG_SPACE(sizeof(int))]; char one = 0;
+        struct iovec iv = { &one, 1 };
+        struct msghdr m = { 0 };
+        m.msg_iov = &iv; m.msg_iovlen = 1; m.msg_control = cb; m.msg_controllen = sizeof cb;
+        if (recvmsg(pv[1], &m, 0) != 1) _exit(31);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        if (!c || c->cmsg_type != SCM_RIGHTS) _exit(32);
+        int ep; memcpy(&ep, CMSG_DATA(c), sizeof ep);
+        if (ep < 0) _exit(33);
+        /* Use it as a socket: talk through the endpoint we were handed. */
+        if (write(ep, "HELLO-FROM-CHILD", 16) != 16) _exit(34);
+        char back[8];
+        if (read(ep, back, 5) != 5) _exit(35);
+        if (memcmp(back, "REPLY", 5) != 0) _exit(36);
+        _exit(0);
+    }
+    close(pv[1]);
+    {   char one = 'e';
+        struct iovec iv = { &one, 1 };
+        char cb[CMSG_SPACE(sizeof(int))]; memset(cb, 0, sizeof cb);
+        struct msghdr m = { 0 };
+        m.msg_iov = &iv; m.msg_iovlen = 1; m.msg_control = cb; m.msg_controllen = sizeof cb;
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &cv[1], sizeof cv[1]);
+        if (sendmsg(pv[0], &m, 0) != 1) {
+            printf("LXSCM: FAIL sendmsg of a SOCKET endpoint failed (errno %d)\n", errno);
+            fflush(stdout); return 22;
+        }
+    }
+    close(cv[1]);                                 /* the child owns it now */
+    {   char buf[17]; memset(buf, 0, sizeof buf);
+        long n = read(cv[0], buf, 16);
+        if (n != 16 || memcmp(buf, "HELLO-FROM-CHILD", 16) != 0) {
+            printf("LXSCM: FAIL the child wrote through the passed SOCKET and the parent read "
+                   "%ld byte(s) '%s' -- the endpoint arrived as a descriptor but is not "
+                   "connected\n", n, buf);
+            fflush(stdout); return 23;
+        }
+        printf("LXSCM: ok   a FORKED child wrote through a SOCKET endpoint passed over SCM_RIGHTS\n");
+        if (write(cv[0], "REPLY", 5) != 5) { printf("LXSCM: FAIL reply write\n"); fflush(stdout); return 24; }
+    }
+    { int s2 = 0; waitpid(k2, &s2, 0);
+      if (!WIFEXITED(s2) || WEXITSTATUS(s2) != 0) {
+          printf("LXSCM: FAIL the child could not use the passed socket (exit %d: 31=recvmsg "
+                 "32=no SCM_RIGHTS 33=bad fd 34=write 35/36=no reply back)\n",
+                 WIFEXITED(s2) ? WEXITSTATUS(s2) : -1);
+          fflush(stdout); return 25;
+      } }
+    printf("LXSCM: ok   and the reply travelled back the other way -- a passed socket is bidirectional\n");
+    close(pv[0]); close(cv[0]);
     printf("LXSCM: CROSS OK\n");
     fflush(stdout);
     close(xfd); close(xv[0]); close(mfd); close(sv[0]); close(sv[1]);
