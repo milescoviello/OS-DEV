@@ -6858,6 +6858,27 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * under eight cores, and a retry gets the right one. */
                     for (int rt = 0; rt < 2 && got < 0; rt++)
                         got = vfs_pread(fp, z, want, fileoff);
+                    /* FINISH A SHORT READ INSTEAD OF ZEROING THE REST (M2157).
+                     *
+                     * A short read leaves the tail of the page zero, and for
+                     * the mappings that matter that is invisible: `fvalid` is 0
+                     * for a whole-file mmap -- which is how ld.so maps EVERY
+                     * shared library -- so neither the SHORT READ warning nor
+                     * anything else can tell a truncated read from a file that
+                     * genuinely ends there.
+                     *
+                     * It is decidable without knowing the file size: ask for
+                     * the remainder. Bytes come back => the first read was
+                     * short in error and now it is not. Zero comes back => that
+                     * really was end-of-file and the zeros are right. Bounded,
+                     * and it only runs on a short read, so a complete read pays
+                     * nothing. */
+                    for (int sr = 0; sr < 8 && got > 0 && (unsigned long)got < want; sr++) {
+                        long more = vfs_pread(fp, z + got, want - (unsigned long)got,
+                                              fileoff + (unsigned long)got);
+                        if (more <= 0) break;        /* EOF, or an error: leave the tail zero */
+                        got += more;
+                    }
                     __asm__ volatile("cli");
                     g_last_fill_got_local = got;
                     /* A SHORT OR FAILED READ LEAVES THE PAGE ZERO, and nothing
@@ -6905,6 +6926,7 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                         extern void ata_error_counts(uint64_t *retries, uint64_t *failures);
                         extern void ata_last_failure(unsigned *stage, unsigned *status, unsigned *error);
                         extern const char *ata_fail_stage_name(void);
+                        extern const char *blockdev_fail_why(void);
                         uint64_t artry = 0, afail = 0; ata_error_counts(&artry, &afail);
                         unsigned ast = 0, asr = 0, aer = 0; ata_last_failure(&ast, &asr, &aer);
                         kprintf("[fault] FILL FAILED at %lx from %s+%lx: wanted %lu, got %ld -- "
@@ -6914,11 +6936,12 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                                 "[fault]   ext2 says: %s (path-cache hits %lu, negative hits %lu, "
                                 "slot races %lu, lookups spoiled by a device error %lu; "
                                 "ATA read retries %lu, ATA reads that failed all retries %lu)\n"
-                                "[fault]   the last ATA failure: %s (status %x, error %x)\n",
+                                "[fault]   the last ATA failure: %s (status %x, error %x)\n"
+                                "[fault]   the last BLOCK read refusal: %s\n",
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got,
                                 ext2_pread_why(), g_e2pc_hits, g_e2pc_neg_hits, g_e2pc_races,
                                 g_e2pc_ioerrs, (unsigned long)artry, (unsigned long)afail,
-                                ata_fail_stage_name(), asr, aer);
+                                ata_fail_stage_name(), asr, aer, blockdev_fail_why());
                         fill_note(page, FILL_FILE, fileoff, v.fvalid, (unsigned long)want, got);
                         pmm_free_frame(frame);
                         return 0;

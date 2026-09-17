@@ -248,17 +248,40 @@ blockdev_t *blockdev_get(int i) {
 }
 
 /* Uncached driver dispatch + bounds — the read path before the cache. */
+/* WHY THE LAST BLOCK READ REFUSED (M2157).
+ *
+ * `-1` from this function is seven different refusals wearing one number, and
+ * by the time it reaches a caller it has been through ext2 (which called it
+ * "file not found") and the page-fault fill. M2155 traced a zeroed executable
+ * page back to exactly this -1 and could get no further than "a device error",
+ * which is not a diagnosis. Name it here, where the branch is taken. */
+int g_bd_fail_reason;
+const char *blockdev_fail_why(void) {
+    switch (g_bd_fail_reason) {
+    case 1: return "the device index was out of range";
+    case 2: return "the device has no read hook";
+    case 3: return "the request was for ZERO sectors (a batch size computed as 0)";
+    case 4: return "the starting LBA is at or past the device's reported capacity";
+    case 5: return "lba + count overflowed 64 bits";
+    case 6: return "the request runs past the device's reported capacity";
+    case 7: return "the DRIVER returned an error";
+    default: return "no recorded reason";
+    }
+}
+
 static int raw_read(int i, uint64_t lba, uint32_t count, void *buf) {
-    if (i < 0 || i >= g_ndev || !buf || count == 0) return -1;
+    if (i < 0 || i >= g_ndev || !buf) { g_bd_fail_reason = 1; return -1; }
+    if (count == 0) { g_bd_fail_reason = 3; return -1; }
     blockdev_t *d = &g_dev[i];
-    if (!d->read) return -1;
+    if (!d->read) { g_bd_fail_reason = 2; return -1; }
     /* Range-check against the known capacity (0 = unknown -> defer to the driver). */
     if (d->sectors) {
-        if (lba >= d->sectors) return -1;
-        if (lba + count < lba) return -1;            /* 64-bit overflow */
-        if (lba + count > d->sectors) return -1;
+        if (lba >= d->sectors)       { g_bd_fail_reason = 4; return -1; }
+        if (lba + count < lba)       { g_bd_fail_reason = 5; return -1; }   /* 64-bit overflow */
+        if (lba + count > d->sectors){ g_bd_fail_reason = 6; return -1; }
     }
-    return d->read(d->ctx, lba, count, buf) < 0 ? -1 : 0;
+    if (d->read(d->ctx, lba, count, buf) < 0) { g_bd_fail_reason = 7; return -1; }
+    return 0;
 }
 static int raw_write(int i, uint64_t lba, uint32_t count, const void *buf) {
     if (i < 0 || i >= g_ndev || !buf || count == 0) return -1;
@@ -308,6 +331,14 @@ static int bread(int i, uint64_t lba, uint8_t *dst) {
     return r < 0 ? -1 : 0;
 }
 
+/* Raised with the cache in M2154-M2155, for the same reason ATA's was: at 128
+ * entries one big read had to bypass the cache to avoid flushing it, and
+ * against tens of thousands of entries a 128-sector read is a fraction of a
+ * percent of the pool and is the first thing CLOCK takes back anyway. Leaving
+ * it at 16 meant a batched read populated NOTHING, so the readahead had to be
+ * re-read from the device by the fault that followed it. */
+#define BLOCKDEV_INSTALL_MAX 256u
+
 int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
     if (i < 0 || i >= g_ndev || !buf || count == 0) return -1;
     uint8_t *out = (uint8_t *)buf;
@@ -339,8 +370,15 @@ int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
      * sector-at-a-time path, which is where their own cache lives. */
     if (is_ata_backed(i)) {
         uint32_t left = count, off = 0;
+        /* NEVER LET THE BATCH BE ZERO (M2157). BLOCKDEV_MAX_BATCH is a CALL
+         * into the driver -- `ata_dma_max_sectors()` -- and it reports the
+         * bounce buffer it actually has, which can be none. A zero batch makes
+         * `n` zero, `raw_read` refuses a zero-sector request, and every read on
+         * the device fails with nothing pointing at the arithmetic. */
+        uint32_t batch = BLOCKDEV_MAX_BATCH;
+        if (!batch) batch = 1;
         while (left) {
-            uint32_t n = left > BLOCKDEV_MAX_BATCH ? BLOCKDEV_MAX_BATCH : left;
+            uint32_t n = left > batch ? batch : left;
             if (raw_read(i, lba + off, n, out + (uint64_t)off * BLOCKDEV_SECSZ) < 0) return -1;
             off += n; left -= n;
         }
@@ -372,15 +410,17 @@ int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
                                out + (uint64_t)hit * BLOCKDEV_SECSZ)) break;
         if (hit < count) {
             uint32_t left = count - hit, off = hit;
+            uint32_t batch = BLOCKDEV_MAX_BATCH;
+            if (!batch) batch = 1;
             while (left) {
-                uint32_t n = left > BLOCKDEV_MAX_BATCH ? BLOCKDEV_MAX_BATCH : left;
+                uint32_t n = left > batch ? batch : left;
                 if (raw_read(i, lba + off, n, out + (uint64_t)off * BLOCKDEV_SECSZ) < 0) {
                     blk_lock_give(i); return -1;
                 }
                 /* Install per sector, and only for requests small enough that
                  * one of them cannot turn the whole cache over -- the same
                  * scan-resistance rule ata_read_drive applies. */
-                if (n <= 16)
+                if (n <= BLOCKDEV_INSTALL_MAX)
                     for (uint32_t k = 0; k < n; k++)
                         bcache_install(BCACHE_OWNER_BLK(i), lba + off + k,
                                        out + (uint64_t)(off + k) * BLOCKDEV_SECSZ);

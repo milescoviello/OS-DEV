@@ -167,7 +167,23 @@ static inline void ata_lock_give(void) {
  * (it never is today — timer_init()+interrupts_enable() run at kmain.c's
  * boot, long before any ATA call — but a wall-clock check alone would spin
  * forever if timer_ms() ever stopped advancing). */
-#define ATA_TIMEOUT_MS    300u
+/* 300 -> 2000 (M2157). The comment above this already recorded that a
+ * wall-clock timeout "can genuinely expire before an emulated drive finishes"
+ * under host contention and called that "a real, observed source of transient
+ * read failures" -- and then set the bound to 300 ms anyway, to keep fat32's
+ * 3x retry from multiplying one stuck sector into a second of boot.
+ *
+ * That trade was made before anything measured what a transient failure COSTS
+ * on the far side. M2155 followed one to its end: a -1 here became "file not
+ * found" in ext2's path walk, a NEGATIVE path-cache entry, and finally a
+ * zero-filled executable page of libxul that the fault handler mapped and
+ * called resolved. Two 8-core Firefox runs in three died of it; one core, with
+ * a fraction of the disk contention, never did.
+ *
+ * A slower boot in the pathological case is worth orders of magnitude less
+ * than a wrong answer, so the bound goes where a real device could not
+ * plausibly still be working. */
+#define ATA_TIMEOUT_MS    2000u
 #define ATA_SPIN_HARDCAP  100000000u
 
 static int wait_busy_clear(uint16_t io) {
