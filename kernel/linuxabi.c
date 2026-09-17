@@ -4848,6 +4848,13 @@ static void lx_dispatch_body(struct registers *r) {
         }
         r->rax = (uint64_t)lx_realtime_sec();
         break;
+    case 112:                               /* setsid(): become session + group leader */
+        /* The other half of what /bin/bash asks for before it does job
+         * control, and the other ENOSYS in the Bash-tool trace. app_setsid has
+         * existed since the native TTY work; it was simply never wired to a
+         * Linux number. (M2130) */
+        r->rax = (uint64_t)app_setsid();
+        break;
     case 111: {                             /* getpgrp(): no args, == getpgid(0) */
         /* ENOSYS here showed up as `[linuxabi] ENOSYS: unimplemented Linux
          * syscall 111` from /bin/bash on every single Bash-tool invocation --

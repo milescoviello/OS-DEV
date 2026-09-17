@@ -129,7 +129,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest lanreachabletest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest lanreachabletest claudebashtest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -1789,6 +1789,12 @@ firefoxpagetest: $(KERNEL) $(DISK) $(EXT2IMG)
 # skips cleanly when the node is not there. (M2127)
 lanreachabletest: $(KERNEL) $(DISK) $(EXT2IMG)
 	@tests/run-lan-reachable-test.sh
+
+# THE NORTH STAR'S TOOL CALL. Not in check-all: needs the real LAN on the
+# Proxmox node AND a live in-guest OAuth session, which only a human can
+# create. Skips cleanly without either. (M2130)
+claudebashtest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-claude-bash-test.sh
 
 # PHASE 8: OS-DEV's own Wayland compositor, exercised by a REAL libwayland
 # client (the same library Firefox uses). In `make check`: one 2 GiB boot.

@@ -1,5 +1,102 @@
 # What's next
 
+> **(M2128-M2130) CLAUDE CODE RUNS A SHELL COMMAND INSIDE OS-DEV AND READS THE
+> RESULT BACK.**
+>
+> This is the Phase 7 north star's last step, and it is met:
+>
+>     [exec] pid 246 -> /bin/bash (4 args, type '... eval 'echo OSDEV-BASH-OK'
+>                                  ... && pwd -P >| /tmp/claude-fe2a-cwd')
+>     Output: `OSDEV-BASH-OK`
+>     [lxask] claude -p -> 0
+>
+> `OSDEV-BASH-OK` is a string that cannot appear by accident. For it to reach
+> that log it had to travel: Claude Code started on this kernel, resolved
+> `api.anthropic.com`, completed a TLS handshake, authenticated, had the model
+> decide to call a tool, spawned `/bin/bash` through the Linux ABI, run it
+> inside OS-DEV, and read its stdout back up through the harness. In the same
+> run it also ran `/bin/git --version` and `/bin/git -z` to inspect the
+> repository it was sitting in.
+>
+> **Three bugs stood between the last block and this one, and the first two had
+> the same symptom for completely different reasons.**
+>
+> **One socket option refused, and no program in the system could resolve a
+> name** (M2128). M2126 fixed a real defect that made DNS fail -- this machine
+> never answered ARP -- and Claude Code *still* reported "check your internet
+> or DNS (EAI_AGAIN)". Two independent causes, one message, and the message
+> named neither. What the kernel could see was that no DNS datagram was ever
+> sent and no `connect()` ever attempted, so it was never a receive problem.
+>
+> Finding the rest needed a probe smaller than a browser. `tools/lx/lxgai.c` is
+> dynamically linked *on purpose*: `lxinet` is `-static-pie`, so its
+> `getaddrinfo` cannot reach a dlopen'd NSS module and would answer a question
+> nobody asked. lxgai reports each step of glibc's path separately and runs in
+> seconds rather than the four minutes Claude Code needs to reach the same
+> failure. It said `resolv.conf` and `nsswitch.conf` were read correctly,
+> `res_init` had parsed our nameserver, and `res_query` -- which is below
+> nsswitch entirely -- still failed having sent nothing. Making the socket log
+> print *every* call rather than one per shape gave the answer:
+>
+>     [sock] socket(domain 2, type 0x80802) -> fd 3        (four times)
+>     ...no connect, no transmit, no error anywhere
+>
+> Four identical sockets created and closed with nothing in between. glibc does
+> exactly one thing there: `setsockopt(SOL_IP, IP_RECVERR)`. If that fails it
+> closes the socket and declares the nameserver unusable. `app_sock_setopt` had
+> `if (level != 1 /*SOL_SOCKET*/) return -92;`, and SOL_IP is level 0.
+>
+> **And it was a regression introduced by a correctness fix.** `setsockopt`
+> used to be `r->rax = 0` for everything, which is why Node's DNS worked back
+> in M1967; M2088 made it honest, and honest included refusing an option we do
+> not implement. This is the case where that rule is wrong, and the reason is
+> worth stating precisely: `IP_RECVERR` asks the kernel to *queue* ICMP errors
+> for retrieval via `recvmsg(MSG_ERRQUEUE)`. A stack that queues none is in a
+> legal state -- "no errors have occurred" -- and every caller copes with an
+> empty error queue. Linux cannot refuse this option at all, so `ENOPROTOOPT`
+> is not a truthful answer about a Linux socket; it is an answer Linux cannot
+> give.
+>
+> **`/proc/self/fd/<N>/<more>` is a path, not just a link** (M2129). With the
+> resolver fixed, Claude Code authenticated and its Bash tool *still* refused
+> to run anything -- "task output swap refused (tasks dir moved or linked)".
+> `readlink("/proc/self/fd/N")` has answered correctly since M1998, because
+> that is how Zig, and therefore Bun, and therefore Claude Code, does what
+> other runtimes do with `realpath(3)`. But the same idiom also *addresses*
+> things relative to a held descriptor, and the readlink case required the
+> number to be the end of the path -- so a directory the process was holding
+> open could not be reached by name, and its guard correctly concluded the
+> directory had been moved.
+>
+> Two wrong versions of that fix are worth recording, because both are the bug
+> class this whole campaign is about -- a wrong answer that looks like an
+> answer. The first used `app_fd_path()`, which is FILE fds only, where the fd
+> in this idiom is a *directory* opened `O_PATH`. The second fed the result
+> back through the path translator, but `app_fd_path_of` returns the path *this
+> kernel* uses, so translating twice produced `/disk2/disk2/tmp/...` -- one
+> wrong answer replaced by another, and the guard failed again for a brand new
+> reason.
+>
+> **Three more, all the same shape: a refusal that carried no information.**
+> `app_socket` returned a bare `-1` for five distinct reasons and the ABI
+> mapped all of them to `EAFNOSUPPORT`, so "out of file descriptors" told the
+> caller this machine does not do IPv4; there are five errnos now. `/etc/hosts`
+> and `/etc/host.conf` were both missing from the staged root, and glibc asks
+> for all four resolver files on every lookup. And `getpgrp` (111) and `setsid`
+> (112) were `ENOSYS`, which `/bin/bash` hit on every single tool call -- a
+> shell asks which process group and session it is in before it does job
+> control.
+>
+> **`make claudebashtest`** locks the demo in, and deliberately runs against
+> the real LAN with a real login rather than pretending to be a `make check`
+> assertion: it skips cleanly without either, because a test that quietly
+> passed without them would be asserting nothing.
+>
+> **Honest limits.** The in-guest OAuth session is created by a human and
+> expires; when it does, the demo skips rather than fails. Firefox's on-screen
+> content area is still blank, and the multi-core guest-memory corruption is
+> still open -- both are the remaining work on the standing goal.
+
 > **(M2121-M2127) THIS MACHINE NEVER ANSWERED ARP, SO THE LAN FORGOT IT EXISTED.**
 >
 > A Linux program inside OS-DEV could send a DNS query to `1.1.1.1` and never
