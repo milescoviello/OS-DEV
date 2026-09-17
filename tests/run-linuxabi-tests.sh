@@ -201,6 +201,7 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
 static-PIE LIBC binary: argc=1 argv0=/hellolibc
 LXIO: wrote+read 200 lines
 LXBOX: pipeline wc=4 writer=0
+LXBOX: DUP3 OK
 LXMMAP: MAP_FIXED honoured
 LXMMAP-PROT:
 LXFMAP: file-backed mmap at offset 8192 read the right page
@@ -418,6 +419,19 @@ LXWAIT: reaped 40/40 children
     # The probe FORKS before purging, which is the only reason it can fail:
     # without a live child every page is single-owner and the old code passes.
     # All 13 checks were validated against a real Linux kernel first.
+    # M2107 -- dup3 (292) had NO Linux syscall number at all, while app_dup3 has
+    # existed since M1218. glibc uses dup3 whenever the duplicate must be
+    # close-on-exec, which is exactly what a launcher remapping descriptors
+    # before an exec wants. The second half is the flag: Linux O_CLOEXEC is
+    # 02000000 and this kernel's is 0x10, so passing the caller's bits through
+    # unchanged sets nothing while returning success -- a descriptor silently
+    # surviving an exec meant to close it. Both halves are asserted, plus
+    # dup2 leaving the flag CLEAR (M2037) and dup3(fd,fd) being EINVAL.
+    if grep -aq "LXBOX: DUP3 OK" "$SLOG3"; then
+        echo "  ok: dup3 duplicates and really sets FD_CLOEXEC, dup2 really clears it, dup3(fd,fd) is EINVAL (M2107, 4 checks)"
+    else
+        echo "  FAIL: dup3 is wrong:"; grep -a "LXBOX" "$SLOG3" | grep -a FAIL | head -4; f3=1
+    fi
     if grep -aq "LXMADV: OK" "$SLOG3"; then
         echo "  ok: MADV_DONTNEED zeroes a COW-shared range and leaves the forked child's copy intact (M2106, 13 checks)"
     else

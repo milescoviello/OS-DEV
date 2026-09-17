@@ -264,6 +264,8 @@ static volatile int g_wlraw;                  /* -append wlraw: also run the raw
 static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
 static volatile int g_lxcage;                /* -append lxcagetest: the huge-reservation probes, on demand (M2041) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
+static volatile int g_ffshot;                 /* -append ffshot: render the page to a PNG headlessly and hex-dump it (M2107) */
+static volatile int g_ffdata;                 /* -append ffdata: render a data: URL instead of the staged file, so the filesystem is not part of the question (M2107) */
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
 static volatile int g_ffmozlog;               /* -append ffmozlog: ask Firefox itself where it is, via MOZ_LOG (M2010) */
@@ -664,6 +666,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
         if (cmdline_has(cl, "nodma")) { extern int g_ata_dma_reads; g_ata_dma_reads = 0; }   /* A/B the DMA read path (M2091) */
+        if (cmdline_has(cl, "ffshot")) { g_lxabi_test = 1; g_ffshot = 1; }   /* Gecko's renderer, no compositor (M2107) */
+        if (cmdline_has(cl, "ffdata")) g_ffdata = 1;   /* a data: URL: take the filesystem out of it (M2107) */
         if (cmdline_has(cl, "freepoison")) { extern int g_freepoison; g_freepoison = 1;
             kprintf("[boot] freepoison: every guest frame that becomes free is filled with "
                     "0xDEADF00DDEADF00D -- if the guest faults on that, we freed a page it still maps\n"); }
@@ -1414,6 +1418,55 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     task_sleep_ms(10);
                     if (wl_commits() > 0 && t > 60) break;
                 }
+                /* GECKO'S OWN RENDERER, WITH NO COMPOSITOR IN THE WAY (M2107).
+                 *
+                 * Firefox opens /ffpage.html, its content process stays alive,
+                 * and the content area on screen is still a blank document. So
+                 * the remaining question is narrow: does Gecko PAINT the page
+                 * and we fail to get the pixels, or does it never paint?
+                 *
+                 * Firefox answers that itself. `--headless --screenshot` runs
+                 * the whole pipeline -- parse, cascade, layout, paint -- and
+                 * encodes the result to a PNG, touching no display server at
+                 * all. So the PNG existing, and having the page's own colours
+                 * in it, proves the renderer works on this kernel and puts the
+                 * fault squarely in the content-to-compositor frame path.
+                 *
+                 * The file is dumped as hex to the console because the image
+                 * lives inside a `-snapshot` disk that is discarded at power
+                 * off -- there is nothing to copy out afterwards, so it has to
+                 * leave through the serial line. Small window: the point is the
+                 * pixels, not the resolution. */
+                if (g_ffshot) {
+                    static const char *av_sh[] = { "--headless", "--screenshot", "/shot.png",
+                                                   "--window-size", "400,300",
+                                                   "file:///ffpage.html" };
+                    kprintf("[ffshot] rendering /ffpage.html to a PNG with no compositor...\n");
+                    int rc = app_run_linux_sync("/disk2/usr/lib64/firefox/firefox", av_sh, 6, 300000);
+                    kprintf("[ffshot] firefox --screenshot exited %d\n", rc);
+                    int fd = app_open("/disk2/shot.png", 0);
+                    if (fd < 0) {
+                        kprintf("[ffshot] NO PNG: /shot.png was never created, so Gecko did not "
+                                "get as far as encoding a frame\n");
+                    } else {
+                        static unsigned char buf[4096];
+                        long total = 0, n;
+                        kprintf("[ffshot] PNGBEGIN\n");
+                        while ((n = app_fd_read(fd, buf, sizeof buf)) > 0) {
+                            for (long i = 0; i < n; i++) {
+                                kprintf("%02x", buf[i]);
+                                if (((total + i + 1) % 48) == 0) kprintf("\n");
+                            }
+                            total += n;
+                        }
+                        kprintf("\n[ffshot] PNGEND %ld bytes\n", total);
+                        app_fd_close(fd);
+                        if (total > 8 && buf[0] != 0)
+                            kprintf("[ffshot] (first bytes of the last chunk: %02x %02x %02x %02x)\n",
+                                    buf[0], buf[1], buf[2], buf[3]);
+                    }
+                    kmain_budget("the headless screenshot finished");
+                }
                 if (g_ffwl) {
                     /* FIREFOX ON OUR OWN DISPLAY (M1985). Spawned
                      * ASYNCHRONOUSLY and then left alone: the desktop below is
@@ -1427,9 +1480,42 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * which is the difference between "the chrome renders"
                      * and "the browser works". file:// needs no network, so it
                      * can be asserted on any boot. */
+                    /* `--window-size` IS A FLAG OF `--screenshot` (M2107).
+                     *
+                     * Firefox's own --help says so: "--window-size
+                     * width[,height]  Width and optionally height of
+                     * SCREENSHOT." With no --screenshot it sizes nothing --
+                     * and, worse, it leaves `800,600` sitting in argv as the
+                     * FIRST non-flag argument. Firefox's default command-line
+                     * handler opens the first non-flag argument as a URL, so
+                     * the browser has been dutifully trying to visit
+                     * "800,600" this whole time and `file:///ffpage.html` was
+                     * never the URL at all.
+                     *
+                     * That is why the content area is 90% #f9f9fb: it is not a
+                     * renderer that cannot paint a page, it is a browser that
+                     * was asked for a different page -- one that cannot
+                     * resolve, with no network to tell it so.
+                     *
+                     * I added the flag in M2105 assuming it meant what the same
+                     * spelling means to Chrome. `--new-window <url>` is named
+                     * in --help as taking a URL, so the URL can no longer be
+                     * positional and cannot be displaced by an argument that
+                     * happens to precede it. */
+                    /* A data: URL, SELECTABLE, so the filesystem is not part
+                     * of the question (M2107). If a page whose entire source is
+                     * in argv does not paint, then nothing about file://
+                     * resolution, the ext2 path walk or the document loader's
+                     * I/O is responsible and the renderer itself is blocked. If
+                     * it DOES paint, those are exactly where to look.
+                     * `-append ffdata` picks it. */
                     static const char *av_fw[] = { "--no-remote", "--new-instance",
-                                                   "--window-size", "800,600",
-                                                   "file:///ffpage.html" };
+                                                   "--new-window", "file:///ffpage.html" };
+                    static const char *av_fd[] = { "--no-remote", "--new-instance",
+                                                   "--new-window",
+                                                   "data:text/html,<body%20style%3D%22background%3A%23101820%22>"
+                                                   "<h1%20style%3D%22color%3A%234fd1c5%22>OS-DEV</h1>" };
+                    const char **av_use = g_ffdata ? av_fd : av_fw;
                     /* When Firefox parks, the syscall trace shows a futex
                      * address and nothing else -- it cannot name the Gecko
                      * code that is waiting. Firefox can: MOZ_LOG prints the
@@ -1440,8 +1526,29 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }
-                    kprintf("[ff] spawning FIREFOX against our compositor...\n");
-                    int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_fw, 5);
+                    /* RENDER THE PAGE IN THE PARENT (M2107).
+                     *
+                     * Seven of Firefox's child processes exit with status 1 per
+                     * startup, silently, and the content area has never shown
+                     * anything but Firefox's own blank white. A content process
+                     * that cannot start is a content process that cannot lay
+                     * out a page, so every page-rendering question was gated
+                     * behind a child-process question -- and the two need
+                     * completely different fixes.
+                     *
+                     * MOZ_FORCE_DISABLE_E10S is still honoured by this build
+                     * (the string is in libxul; checked, not assumed), and it
+                     * puts the content in the parent process. That separates
+                     * the two questions: if a page paints this way, Gecko can
+                     * parse, style, lay out and paint on OS-DEV and the
+                     * remaining work is child-process startup. If it still does
+                     * not, the renderer itself is blocked on something and the
+                     * child processes were never the reason. */
+                    app_set_next_env("MOZ_FORCE_DISABLE_E10S=1");
+                    app_set_next_env("MOZ_DISABLE_CONTENT_SANDBOX=1");
+                    kprintf("[ff] spawning FIREFOX against our compositor "
+                            "(content in the PARENT process: MOZ_FORCE_DISABLE_E10S)...\n");
+                    int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 4);
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
                     /* A HEARTBEAT, because silence is ambiguous (M1996).
                      * Firefox spends minutes relocating an 83-library closure
@@ -1529,7 +1636,27 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                          * chrome around an empty content area
                                          * satisfies it exactly as well as a
                                          * loaded page does. (M2106) */
-                                        wl_page_probe(0x101820);
+                                        /* A PAGE ARRIVES AFTER THE CHROME
+                                         * DOES (M2107). Both probes so far
+                                         * fired within seconds of the first
+                                         * >=640x480 window -- which is the
+                                         * CHROME appearing -- and then the
+                                         * loop broke and handed over, so
+                                         * nothing ever looked again. "The
+                                         * content area is blank" was
+                                         * therefore a statement about the
+                                         * first few seconds of a browser's
+                                         * life, which is blank on any
+                                         * machine. Sample a time series. */
+                                        for (int k = 0; k < 8; k++) {
+                                            task_sleep_ms(8000);
+                                            kprintf("[page] --- sample %d, %ds after the first paint ---\n",
+                                                    k + 1, (k + 1) * 8);
+                                            wl_page_probe(0x101820);
+                                            {   int cp2 = 0, cs2 = lx_fatal_signal(&cp2);
+                                                if (cs2) { kprintf("[page] pid %d CRASHED with signal %d "
+                                                                   "during the page wait\n", cp2, cs2); break; } }
+                                        }
                                         break;
                                     }
                                 }

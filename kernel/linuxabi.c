@@ -279,6 +279,7 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_pipe_         22
 #define LXS_pipe2_       293
 #define LXS_dup2_         33
+#define LXS_dup3_        292
 #define LXS_dup_          32
 #define LXS_getppid_     110
 #define LXS_fcntl_        72
@@ -374,7 +375,29 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
  * garbage, so the offsets are spelled out rather than mirrored in a C struct. */
 #define LXST_SIZE     144
 #define LXST_O_DEV      0
-#define LX_FAKE_DEV 0x0801ull      /* one device for everything; st_ino is what distinguishes files (M1955) */
+/* ONE DEVICE NUMBER, IN ONE PLACE, IN BOTH SPELLINGS (M2107).
+ *
+ * st_dev was 0x0801 from the stat family and ZERO from statx, because statx
+ * zeroes its 256-byte buffer and then never writes stx_dev_major/stx_dev_minor
+ * at all. Both calls "worked"; they simply disagreed about which filesystem the
+ * file was on.
+ *
+ * Claude Code's Bun/Zig runtime reaches both spellings in one process and
+ * compares (dev, ino) to decide whether the directory it is about to run a
+ * command in is still the directory it checked -- a TOCTOU guard written for
+ * hostile Linux filesystems. One path said device 0x0801, the other said device
+ * 0, so the guard concluded the directory had been swapped underneath it and
+ * refused. That is why the Bash tool has never worked inside OS-DEV, and the
+ * guest Claude diagnosed it itself from the inside: "two stats of one path
+ * disagree".
+ *
+ * The encoding is glibc's: makedev(8,1) == (1 & 0xff) | (8 << 8) == 0x801, so
+ * a caller that builds a dev_t out of the statx halves gets exactly the number
+ * the stat family reports. Derived from the same two constants here so the two
+ * cannot drift apart again -- which is the entire defect, not the values. */
+#define LX_FAKE_DEV_MAJOR 8u
+#define LX_FAKE_DEV_MINOR 1u
+#define LX_FAKE_DEV (((uint64_t)LX_FAKE_DEV_MAJOR << 8) | (uint64_t)LX_FAKE_DEV_MINOR)
 #define LXST_O_INO      8
 #define LXST_O_NLINK   16
 #define LXST_O_MODE    24
@@ -1093,6 +1116,7 @@ const char *lx_syscall_name(unsigned long nr) {
     case 28: return "madvise";
     case 32: return "dup";
     case 33: return "dup2";
+    case 292: return "dup3";
     case 34: return "pause";
     case 35: return "nanosleep";
     case 39: return "getpid";
@@ -1780,6 +1804,14 @@ static void lx_dispatch_body(struct registers *r) {
         *(uint64_t *)(o + 48) = (sx.stx_size + 511) / 512; /* stx_blocks */
         for (int t = 64; t <= 112; t += 16)                /* atime/btime/ctime/mtime */
             *(uint64_t *)(o + t) = sx.stx_mtime;
+        /* THE DEVICE, which this call never reported (M2107). Offsets 136/140,
+         * taken from the host's own linux/stat.h rather than remembered -- the
+         * last time this struct was written from memory every field after
+         * stx_attributes was eight bytes out and a 26-byte file measured 2675
+         * bytes. stx_rdev_major/minor (128/132) stay zero: that is the device a
+         * device NODE refers to, and nothing here is one. */
+        *(uint32_t *)(o + 136) = LX_FAKE_DEV_MAJOR;        /* stx_dev_major */
+        *(uint32_t *)(o + 140) = LX_FAKE_DEV_MINOR;        /* stx_dev_minor */
         r->rax = 0;
         break;
     }
@@ -3806,7 +3838,23 @@ static void lx_dispatch_body(struct registers *r) {
         if (lf & LXO_TRUNC)  nf |= O_TRUNC;
         if (lf & LXO_APPEND) nf |= O_APPEND;
         int fd = app_open(path, (int)nf);
-        if (fd >= 0) { r->rax = (uint64_t)fd; break; }
+        if (fd >= 0) {
+            /* DID THE BROWSER EVER ASK FOR THE PAGE? (M2107)
+             *
+             * Only FAILED opens are logged here, which is right for a dynamic
+             * linker probing paths that are meant to be absent -- and useless
+             * for the one question that matters now. The content area renders
+             * a blank document, and "the page did not load" and "the page
+             * loaded and painted nothing" need opposite investigations. A
+             * successful open of an .html file separates them, and there is
+             * exactly one such file in this image. */
+            { int e = 0; while (path[e]) e++;
+              if (e > 5 && path[e-5]=='.' && path[e-4]=='h' && path[e-3]=='t'
+                         && path[e-2]=='m' && path[e-1]=='l')
+                  kprintf("[linuxabi] OPENED AN HTML FILE: %s -> fd %d "
+                          "(so the document loader did reach it)\n", path, fd); }
+            r->rax = (uint64_t)fd; break;
+        }
         /* WHY it failed matters. Reporting ENOENT for everything told `ld`
          * that an object file it had just been handed did not exist, when in
          * fact we were out of descriptors -- and EMFILE is a condition BFD
@@ -4399,6 +4447,30 @@ static void lx_dispatch_body(struct registers *r) {
     case LXS_dup2_: {
         int nf = app_dup2((int)a1, (int)r->rsi);
         r->rax = (nf < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)nf;
+        break;
+    }
+    case LXS_dup3_: {                       /* (oldfd, newfd, flags) */
+        /* dup3 HAD NO CASE AT ALL -- a bare ENOSYS (M2107). app_dup3 has
+         * existed since M1218 and is what app_pipe2 and fcntl's
+         * F_DUPFD_CLOEXEC already go through; only the Linux number was
+         * missing. glibc reaches for it whenever a caller wants the new
+         * descriptor to be close-on-exec, and a process launcher that remaps
+         * descriptors before an exec is exactly the code that wants that.
+         *
+         * THE FLAG VALUE IS NOT THE SAME NUMBER. Linux's O_CLOEXEC is
+         * 02000000; this kernel's is 0x10. Passing the caller's bits straight
+         * through would have set no flag at all while returning success --
+         * which is how a descriptor silently survives an exec it was meant to
+         * be closed by. The two other Linux-side callers already translate;
+         * this is the same translation.
+         *
+         * dup3 differs from dup2 in one documented way: equal descriptors are
+         * EINVAL rather than a no-op success, and app_dup3 already refuses
+         * them -- so the errno has to distinguish that from a bad fd. */
+        int of = (int)a1, nfd = (int)r->rsi;
+        if (of == nfd) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        int d3 = app_dup3(of, nfd, (r->rdx & LXO_CLOEXEC) ? O_CLOEXEC : 0);
+        r->rax = (d3 < 0) ? (uint64_t)-(long)LX_EBADF : (uint64_t)d3;
         break;
     }
     case LXS_flock_: {                       /* (fd, operation) */

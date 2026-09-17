@@ -48,6 +48,46 @@ static void probe(const char *path) {
     if (r == 0) printf("LXCWD: statx ok mode=%o\n", *(unsigned short *)(buf + 0x1c));
     else { printf("LXCWD: statx FAILED errno=%d\n", errno); fails++; }
 
+    /* DO THE TWO SPELLINGS AGREE? (M2107)
+     *
+     * This file has stat'd the same path three ways since M1998 and never once
+     * COMPARED the answers -- it printed `mode` from statx and nothing else, so
+     * st_dev was never read and the divergence it was written to find sat here
+     * in plain sight through every green run.
+     *
+     * The answers matter because a runtime uses them together: Bun's Zig
+     * standard library records (st_dev, st_ino) for a directory and re-checks
+     * it before running a command, so two handlers that disagree read as "the
+     * directory was swapped underneath you". st_dev came back 0x801 from stat
+     * and 0 from statx, and Claude Code's Bash tool refused for that reason.
+     *
+     * A kernel is free to choose any device number it likes. It is not free to
+     * report two. */
+    if (r == 0 && stat(path, &st) == 0) {
+        unsigned maj = *(unsigned *)(buf + 136), min = *(unsigned *)(buf + 140);
+        unsigned long long xdev = ((unsigned long long)(min & 0xff))
+                                | ((unsigned long long)(maj & 0xfff) << 8)
+                                | ((unsigned long long)(min & ~0xffu) << 12)
+                                | ((unsigned long long)(maj & ~0xfffu) << 32);
+        unsigned long long xino = *(unsigned long long *)(buf + 32);
+        if (xdev == (unsigned long long)st.st_dev)
+            printf("LXCWD: ok   stat and statx AGREE on st_dev (%llu, from major %u minor %u)\n",
+                   xdev, maj, min);
+        else {
+            printf("LXCWD: FAIL stat says dev=%llu but statx says dev=%llu (major %u minor %u) "
+                   "-- one path, two devices, so a (dev,ino) guard sees it move\n",
+                   (unsigned long long)st.st_dev, xdev, maj, min);
+            fails++;
+        }
+        if (xino == (unsigned long long)st.st_ino)
+            printf("LXCWD: ok   stat and statx AGREE on st_ino (%llu)\n", xino);
+        else {
+            printf("LXCWD: FAIL stat says ino=%llu but statx says ino=%llu\n",
+                   (unsigned long long)st.st_ino, xino);
+            fails++;
+        }
+    }
+
     if (access(path, F_OK) == 0) printf("LXCWD: access F_OK ok\n");
     else { printf("LXCWD: access F_OK FAILED errno=%d\n", errno); fails++; }
     if (access(path, R_OK | X_OK) == 0) printf("LXCWD: access R_OK|X_OK ok\n");

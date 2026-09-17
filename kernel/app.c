@@ -4794,10 +4794,28 @@ void app_cow_quarantine_flush(struct app *a) {
     if (app_tlb_sync(a)) for (int i = 0; i < n; i++) { poison_if_last(batch[i]); pmm_free_frame(batch[i]); }
 }
 
+unsigned long g_tlb_sync_fail;   /* shootdowns that did NOT get every ack (M2107) */
 static int app_tlb_sync(struct app *a) {
     if (!a) return 1;
     for (int i = 0; i < APP_MAXTHREAD; i++)
-        if (a->thr[i] && a->thr[i]->state != TASK_DEAD) return vmm_tlb_shootdown();
+        if (a->thr[i] && a->thr[i]->state != TASK_DEAD) {
+            int ok = vmm_tlb_shootdown();
+            /* A FAILED SHOOTDOWN IS A CORRECTNESS EVENT, NOT A SLOW PATH
+             * (M2107). Four call sites ignore this return value, and at two of
+             * them a pmm_free_frame follows immediately -- so a shootdown
+             * nobody acked used to be indistinguishable from one that
+             * succeeded, while handing a still-mapped page to the next
+             * allocation. Count them, and say so once. */
+            if (!ok) {
+                g_tlb_sync_fail++;
+                static int told;
+                if (!told) { told = 1;
+                    kprintf("[vmm] a TLB shootdown did not get every ack -- any caller that "
+                            "frees a frame without checking is handing away a page another "
+                            "core can still reach (M2107)\n"); }
+            }
+            return ok;
+        }
     return 1;                      /* single-threaded: this core's invlpg was enough */
 }
 
@@ -5379,9 +5397,28 @@ int app_madvise(uint64_t addr, uint64_t len, int advice) {
         }
         vma_unlock(a_, f_);
         if (nf) {
-            app_tlb_sync(a_);                         /* no core may still reach these frames */
-            for (int i = 0; i < nf; i++) { poison_if_last(frames[i]); pmm_free_frame(frames[i]); }
-            dropped += nf;
+            /* AND ONLY IF EVERY CORE ACTUALLY ACKED (M2107). This called
+             * app_tlb_sync and THREW THE ANSWER AWAY, then freed the frames
+             * regardless -- with the comment "no core may still reach these
+             * frames" standing directly above the call whose return value was
+             * the only thing that could establish it. These pages are
+             * writable anonymous heap, so a sibling holding a stale
+             * translation does not merely read stale data, it WRITES into a
+             * frame that has been handed to somebody else.
+             *
+             * M2043 learned this rule for the COW path and M2000's comment
+             * here quotes that reasoning without adopting the check. Leaking a
+             * few 4 KiB frames is the strictly better failure: bounded,
+             * harmless, and now counted. */
+            if (app_tlb_sync(a_)) {
+                for (int i = 0; i < nf; i++) { poison_if_last(frames[i]); pmm_free_frame(frames[i]); }
+                dropped += nf;
+            } else {
+                static int told_madv;
+                if (!told_madv) { told_madv = 1;
+                    kprintf("[madv] %d purged frame(s) LEAKED rather than freed: the shootdown "
+                            "did not complete, so another core may still write them\n", nf); }
+            }
         }
         start = chunk;
     }
@@ -6750,7 +6787,14 @@ int app_swap_out(uint64_t addr, uint64_t len) {
          * allocator here, so no core may still hold a translation for it. One
          * IPI per page is not the cost that matters on this path -- the page
          * was just written to DISK. */
-        app_tlb_sync(a);
+        /* ...and check it, for the same reason madvise now does (M2107). The
+         * page is on disk either way; reusing the frame while a core can still
+         * write it means the swap image and the frame's new owner both end up
+         * wrong. */
+        if (!app_tlb_sync(a)) {
+            vmm_set_raw(p, phys | PTE_PRESENT | PTE_USER | PTE_WRITABLE);  /* put it back */
+            break;
+        }
         pmm_free_frame(phys);
         n++;
     }

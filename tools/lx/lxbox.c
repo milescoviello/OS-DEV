@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* lxbox — a multi-call utility binary, in the shape busybox has: one
  * executable that behaves as a different tool depending on argv[1].
  *
@@ -19,6 +20,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
 
 static int do_echo(int argc, char **argv) {
     for (int i = 2; i < argc; i++) printf("%s\n", argv[i]);
@@ -40,9 +43,56 @@ static int do_wc(void) {
     return n;
 }
 
+/* dup3 HAD NO LINUX SYSCALL NUMBER AT ALL (M2107).
+ *
+ * It answered ENOSYS while app_dup3 had existed since M1218 -- and glibc
+ * reaches for dup3 whenever a caller wants the duplicate to be close-on-exec,
+ * which is precisely what a process launcher remapping descriptors before an
+ * exec wants. The second trap is that the FLAG IS A DIFFERENT NUMBER on the two
+ * sides (Linux O_CLOEXEC is 02000000, this kernel's is 0x10), so passing the
+ * bits through unchanged sets nothing and still returns success.
+ *
+ * So both halves are asserted here: the descriptor must be duplicated, it must
+ * come back with FD_CLOEXEC actually SET, plain dup2 must leave it CLEAR (that
+ * is M2037's fix and the reason the pipeline below works at all), and equal
+ * descriptors must be EINVAL rather than dup2's silent success. */
+static void do_dup3(int *fails) {
+    int a = dup(1);                                  /* something harmless to copy */
+    if (a < 0) { printf("LXBOX: FAIL dup(1)\n"); (*fails)++; return; }
+
+    int got = dup3(a, 30, O_CLOEXEC);
+    if (got != 30) { printf("LXBOX: FAIL dup3 -> %d errno %d\n", got, errno); (*fails)++; }
+    else {
+        int fl = fcntl(30, F_GETFD);
+        if (fl >= 0 && (fl & FD_CLOEXEC))
+            printf("LXBOX: ok   dup3(O_CLOEXEC) duplicated the fd AND set FD_CLOEXEC\n");
+        else {
+            printf("LXBOX: FAIL dup3 succeeded but FD_CLOEXEC is not set (F_GETFD -> %d) -- "
+                   "the flag was passed through untranslated\n", fl);
+            (*fails)++;
+        }
+        close(30);
+    }
+    if (dup2(a, 31) == 31) {
+        int fl = fcntl(31, F_GETFD);
+        if (fl >= 0 && !(fl & FD_CLOEXEC))
+            printf("LXBOX: ok   dup2 leaves FD_CLOEXEC CLEAR, as POSIX requires\n");
+        else { printf("LXBOX: FAIL dup2 set FD_CLOEXEC (F_GETFD -> %d)\n", fl); (*fails)++; }
+        close(31);
+    } else { printf("LXBOX: FAIL dup2(a,31)\n"); (*fails)++; }
+
+    if (dup3(a, a, 0) < 0 && errno == EINVAL)
+        printf("LXBOX: ok   dup3(fd, fd) is EINVAL, unlike dup2\n");
+    else { printf("LXBOX: FAIL dup3(fd,fd) should be EINVAL, errno %d\n", errno); (*fails)++; }
+    close(a);
+}
+
 static int do_pipe(const char *self) {
     int fds[2];
     if (pipe(fds) != 0) { printf("LXBOX: pipe failed\n"); return 1; }
+    { int f = 0; do_dup3(&f);
+      if (f) printf("LXBOX: %d dup3 failure(s)\n", f);
+      else   printf("LXBOX: DUP3 OK\n"); }
 
     pid_t a = fork();
     if (a < 0) { printf("LXBOX: fork 1 failed\n"); return 1; }

@@ -34,7 +34,16 @@ pref("media.rdd-process.enabled",    false);  // no audio/video decode here eith
 // is one trust domain running one test page.
 pref("fission.autostart",            false);
 pref("dom.ipc.processCount",         1);
-pref("browser.tabs.remote.autostart", true);
+// NO FORK SERVER. It adds a whole second mechanism to child startup -- a
+// process that receives descriptors over SCM_RIGHTS and forks on request --
+// and descriptor passing is the most fragile surface in this kernel's Linux
+// layer (M2083, M2084, M2104 were all in it). One way for a child to start is
+// enough while children are still dying silently.
+pref("dom.ipc.forkserver.enable",    false);
+// NOTE: `browser.tabs.remote.autostart` is NOT a pref in this build -- the
+// string does not appear in libxul at all, so setting it did nothing. Checked
+// rather than assumed, because a pref that does not exist fails silently and
+// looks exactly like a pref that did not help.
 
 // Nothing may open a second tab, phone home, or replace the URL we asked for.
 pref("browser.shell.checkDefaultBrowser", false);
