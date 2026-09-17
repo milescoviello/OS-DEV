@@ -51,11 +51,29 @@ echo "==> syncing to $PVE_HOST:$PVE_DIR (incremental)..."
 rsync -a --inplace --no-whole-file \
       build/kernel32.elf build/fat.img build/ext2.img "root@$PVE_HOST:$PVE_DIR/"
 
+# THE LINUX ROOT'S TRANSPORT (M2144).
+#
+# fat.img stays on IDE: it is the boot volume, it is tiny, and blockdev's mount
+# names are assigned in SCAN ORDER -- ATA registers before virtio, so keeping
+# the FAT disk on ATA is what keeps the ext2 volume as `disk2`, which is the
+# path LX_ROOT hardcodes. Moving both would silently rename the Linux root.
+#
+# ext2.img is where every byte Firefox and Claude Code touch lives, and IDE
+# emulation is the slowest transport QEMU offers. VIRTIO=0 forces the old IDE
+# attachment for A/B measurement.
+# DEFAULT OFF until the ext2 root is readable over virtio -- see M2144. IDE is
+# no longer the bottleneck it was (M2142 put writes on DMA, 108x per sector),
+# so this is opt-in with VIRTIO=1 rather than the default.
+if [ "${VIRTIO:-0}" = 1 ]; then
+    EXT2_DRIVE="-drive file=$PVE_DIR/ext2.img,format=raw,if=virtio"
+else
+    EXT2_DRIVE="-drive file=$PVE_DIR/ext2.img,format=raw,if=ide,index=1"
+fi
 echo "==> configuring VM $VMID ($CORES cores, ${MEM}M, -append \"$APPEND\")..."
 $SSH "qm set $VMID --memory $MEM --cores $CORES --args \
   \"-snapshot -kernel $PVE_DIR/kernel32.elf -append \\\"$APPEND\\\" \
     -drive file=$PVE_DIR/fat.img,format=raw,if=ide,index=0 \
-    -drive file=$PVE_DIR/ext2.img,format=raw,if=ide,index=1\"" >/dev/null
+    $EXT2_DRIVE\"" >/dev/null
 
 echo "==> booting; capture detaches and runs for up to ${CAP}s..."
 # setsid + nohup, NOT a background job in the ssh session (M2101). `socat &`

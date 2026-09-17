@@ -528,7 +528,7 @@ struct bd_mount {
     int is_loop; uint8_t *loopbuf; uint64_t looplen;   /* loop device: a file image held in RAM (M1107) */
 };
 static struct bd_mount g_mount[8];
-static int g_nmount, g_mount_scanned;
+static int g_nmount, g_mount_scanned_upto = -1;
 
 /* A blk_read_fn for a loop mount: serve 512-byte sectors from its in-RAM image.
  * ctx is the mount index (so we can reach g_mount[idx].loopbuf). */
@@ -558,10 +558,28 @@ static int loop_blk_write(void *ctx, uint64_t lba, uint32_t count, const void *b
 }
 
 static void blockdev_mount_scan(void) {
-    if (g_mount_scanned) return;
-    g_mount_scanned = 1;
+    /* A DEVICE THAT REGISTERS LATE WAS NEVER SCANNED (M2144).
+     *
+     * This was a one-shot: the first caller set a flag and every later call
+     * returned immediately. That is correct only if every block device exists
+     * before the first mount lookup, and virtio-blk does not -- it is brought
+     * up after the ATA disks. Moving the Linux root onto virtio-blk therefore
+     * produced a machine that could SEE the disk and read its ext2 superblock
+     * in a self-test, and had no /disk2 at all:
+     *
+     *   blockdev 1: virtio-blk, 6553600 sectors (3200 MiB)
+     *   [ ok ] blockdev browse: 1 volume(s) listed across 2 DEVICES
+     *   [lxabi] root /disk2: vfs_stat FAILED
+     *
+     * Scan forward from wherever the last scan stopped instead. Mount names
+     * are assigned in append order, so picking up new devices later cannot
+     * rename an existing mount -- which matters, because LX_ROOT hardcodes
+     * `disk2` and a silent renumbering would move the whole Linux root. */
     blockdev_init();                          /* make sure devices are registered */
-    for (int i = 0; i < g_ndev && g_nmount < 8; i++) {
+    if (g_mount_scanned_upto >= g_ndev) return;
+    int scan_from = g_mount_scanned_upto < 0 ? 0 : g_mount_scanned_upto;
+    g_mount_scanned_upto = g_ndev;
+    for (int i = scan_from; i < g_ndev && g_nmount < 8; i++) {
         uint64_t starts[17];
         int ns = collect_fat_starts(i, starts, 16);
         /* Also consider LBA 0 for a table-less volume (e.g. a raw `mke2fs` image,

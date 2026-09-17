@@ -499,6 +499,7 @@ int ata_read_drive_pio(int drive, uint32_t lba, uint32_t count, void *buf) {
  * is available and the request fits the bounce buffer, PIO otherwise, always.
  * `-append nodmawrite` forces the old path for A/B measurement. */
 int g_ata_dma_writes = 1;
+int g_ata_write_flush = 1;   /* -append noflush: measure what FLUSH CACHE costs (M2143) */
 
 static int ata_write_drive_impl(int drive, uint32_t lba, uint32_t count, const void *buf) {
     if (!drive_ok(drive) || count == 0) return -1;
@@ -526,8 +527,15 @@ static int ata_write_drive_impl(int drive, uint32_t lba, uint32_t count, const v
             write_data(io, p, SECTOR_SIZE / 2);
             p += SECTOR_SIZE;
         }
-        outb(io + REG_COMMAND, CMD_FLUSH);        /* flush the write cache */
-        wait_busy_clear(io);
+        /* FLUSH CACHE after every batch. Under emulation this is a host fsync,
+         * so it is not free -- ata_diskbench measures it as its own arm now.
+         * The knob exists so the cost can be stated as a number; it defaults
+         * ON because the journal's crash-consistency guarantee depends on
+         * writes actually reaching the platter. (M2143) */
+        if (g_ata_write_flush) {
+            outb(io + REG_COMMAND, CMD_FLUSH);    /* flush the write cache */
+            wait_busy_clear(io);
+        }
         lba += chunk;
         count -= chunk;
     }
@@ -557,12 +565,89 @@ int ata_write_drive(int drive, uint32_t lba, uint32_t count, const void *buf) {
  * written -- and then checked against a re-measurement afterwards.
  *
  * Reads only, and off the END of the disk where nothing structural lives. */
+/* WHAT A WRITE COSTS (M2143).
+ *
+ * This benchmark measured READS ONLY, and that is exactly how a pure-PIO write
+ * path survived a whole campaign of asking why the browser was slow: the
+ * slowest thing in the driver had no instrument pointed at it. Reads were
+ * chosen because the bench runs off the END of the disk and writing there
+ * looked unsafe -- but the DMA self-test already writes at sector 131071 and
+ * restores it, so the safe pattern existed too. Save, write, measure, restore.
+ *
+ * Arms, so each decision can be made from a number rather than a hunch:
+ * single-sector PIO, 8-sector PIO, 8-sector DMA, and 8-sector DMA with the
+ * per-batch FLUSH CACHE suppressed -- which is the only way to know what
+ * durability is costing per write. */
+static void ata_diskbench_writes(const struct ata_drive_info *info) {
+    enum { WN = 64 };
+    static uint8_t save[WN * SECTOR_SIZE];
+    static uint8_t wbuf[8 * SECTOR_SIZE];
+    uint32_t base = (uint32_t)(info->sectors - 1024);   /* past the read arms' region */
+
+    /* SAVE FIRST, and bail out entirely if it cannot be read back -- writing
+     * without a restorable copy is not a measurement, it is damage. */
+    for (uint32_t i = 0; i < WN; i++)
+        if (ata_read_drive(1, base + i, 1, save + (uint64_t)i * SECTOR_SIZE) < 0) {
+            kprintf("[diskbench] writes skipped: could not save the target sectors\n");
+            return;
+        }
+    for (unsigned k = 0; k < sizeof wbuf; k++) wbuf[k] = (uint8_t)(k * 7 + 1);
+
+    int saved_dma = g_ata_dma_writes, saved_flush = g_ata_write_flush;
+    uint64_t t0, pio1, pio8, dma8 = 0, dma8nf = 0;
+
+    g_ata_dma_writes = 0;
+    ata_lock_take();
+    t0 = ata_tsc();
+    for (uint32_t i = 0; i < WN; i++) ata_write_drive_impl(1, base + i, 1, wbuf);
+    pio1 = ata_tsc() - t0;
+    t0 = ata_tsc();
+    for (uint32_t i = 0; i < WN; i += 8) ata_write_drive_impl(1, base + i, 8, wbuf);
+    pio8 = ata_tsc() - t0;
+    ata_lock_give();
+
+    if (ata_dma_available() && ata_dma_max_sectors() >= 8) {
+        g_ata_dma_writes = 1;
+        ata_lock_take();
+        t0 = ata_tsc();
+        for (uint32_t i = 0; i < WN; i += 8) ata_write_drive_impl(1, base + i, 8, wbuf);
+        dma8 = ata_tsc() - t0;
+        g_ata_write_flush = 0;
+        t0 = ata_tsc();
+        for (uint32_t i = 0; i < WN; i += 8) ata_write_drive_impl(1, base + i, 8, wbuf);
+        dma8nf = ata_tsc() - t0;
+        ata_lock_give();
+    }
+    g_ata_dma_writes = saved_dma; g_ata_write_flush = saved_flush;
+
+    /* RESTORE, and say so: a benchmark that quietly leaves the disk different
+     * from how it found it is the kind of instrument this project distrusts. */
+    int rok = 1;
+    for (uint32_t i = 0; i < WN; i++)
+        if (ata_write_drive(1, base + i, 1, save + (uint64_t)i * SECTOR_SIZE) < 0) rok = 0;
+
+    kprintf("[diskbench] WRITE, cycles per 512-byte sector over %d sectors:\n", WN);
+    kprintf("[diskbench]   1-sector PIO        %lu\n", (unsigned long)(pio1 / WN));
+    kprintf("[diskbench]   8-sector PIO        %lu\n", (unsigned long)(pio8 / WN));
+    if (dma8) {
+        kprintf("[diskbench]   8-sector DMA        %lu   (%lux vs 1-sector PIO)\n",
+                (unsigned long)(dma8 / WN), (unsigned long)(pio1 / (dma8 ? dma8 : 1)));
+        kprintf("[diskbench]   8-sector DMA, no FLUSH  %lu   -- the FLUSH is %lu%% of a DMA write\n",
+                (unsigned long)(dma8nf / WN),
+                (unsigned long)(dma8 > dma8nf ? ((dma8 - dma8nf) * 100) / dma8 : 0));
+    } else {
+        kprintf("[diskbench]   (no DMA available: the DMA arms were skipped)\n");
+    }
+    kprintf("[diskbench]   target sectors restored: %s\n", rok ? "yes" : "NO -- THIS IS A PROBLEM");
+}
+
 void ata_diskbench(void) {
     const struct ata_drive_info *info = ata_drive(1);
     if (!info || !info->present || info->sectors < 4096) {
         kprintf("[diskbench] drive 1 absent or tiny; skipped\n");
         return;
     }
+    ata_diskbench_writes(info);
     static uint8_t buf[8 * SECTOR_SIZE];
     uint32_t base = (uint32_t)(info->sectors - 2048);
     const int N = 64;

@@ -273,6 +273,20 @@ uint64_t virtio_blk_capacity(void) { return vb.present ? vb.capacity : 0; }
  * transfer, publish it, notify the device, and poll the used ring to completion.
  * `write` selects VIRTIO_BLK_T_OUT and makes the data descriptor device-readable.
  * Returns 0 on success, -1 on bad-arg / device error / timeout. */
+/* Is [p, p+len) one contiguous run in physical memory? Walks page by page and
+ * requires each successive page to be physically adjacent to the last. (M2144) */
+static int virtio_phys_contiguous(const void *p, uint32_t len) {
+    uint64_t a0 = phys_of(p);
+    if (!a0) return 0;
+    uint64_t va = (uint64_t)p;
+    uint64_t end = va + len;
+    for (uint64_t v = (va & ~(uint64_t)(PAGE_SIZE - 1)) + PAGE_SIZE; v < end; v += PAGE_SIZE) {
+        uint64_t want = a0 + (v - va);
+        if (phys_of((const void *)v) != want) return 0;
+    }
+    return 1;
+}
+
 static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
     if (!vb.present || count == 0 || !buf)
         return -1;
@@ -302,6 +316,39 @@ static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
 
     uint32_t bytes = count * VIRTIO_BLK_SECTOR_SIZE;
 
+    /* ONE DESCRIPTOR DESCRIBES ONE PHYSICALLY CONTIGUOUS RUN (M2144).
+     *
+     * desc[1] below is a single (addr, len) pair, so pointing it at the
+     * caller's buffer is only correct while that buffer is contiguous in
+     * PHYSICAL memory. It was written against the self-test, whose buffer is a
+     * page-aligned array in identity-mapped BSS -- contiguous by construction
+     * -- and every caller was that self-test, so the assumption held and was
+     * never stated.
+     *
+     * It stops holding the moment a filesystem uses this device. ext2 with 4
+     * KiB blocks reads eight sectors into an arbitrary kernel buffer, which
+     * straddles pages that need not be physically adjacent; the device then
+     * DMAs the tail of the transfer into whatever happens to live after the
+     * first page. The symptom was a machine that could read the ext2
+     * superblock in a self-test and had no readable filesystem at all:
+     *
+     *   [ ok ] blockdev browse: 2 volume(s) listed across 2 device(s).
+     *   [lxabi] root /disk2: vfs_stat FAILED
+     *
+     * Bounce through a buffer that IS contiguous, exactly as ata.c's DMA path
+     * does. A scatter-gather chain -- one descriptor per physical run -- would
+     * avoid the copy and is the better answer eventually; a memcpy inside RAM
+     * is nothing against the transport win, and correctness comes first. */
+    static uint8_t bounce[256 * VIRTIO_BLK_SECTOR_SIZE] __attribute__((aligned(PAGE_SIZE)));
+    void *dma = buf;
+    int bounced = 0;
+    if (!virtio_phys_contiguous(buf, bytes)) {
+        if (bytes > sizeof bounce) return -1;   /* capped at 256 sectors above */
+        dma = bounce;
+        bounced = 1;
+        if (write) for (uint32_t k = 0; k < bytes; k++) bounce[k] = ((const uint8_t *)buf)[k];
+    }
+
     /* desc[0]: the header, device-readable, chains to the data descriptor. */
     vb.desc[0].addr  = phys_of(&hdr);
     vb.desc[0].len   = sizeof(hdr);
@@ -311,7 +358,7 @@ static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
     /* desc[1]: the data buffer. For a READ the device writes into it
      * (F_WRITE); for a WRITE the device reads from it (no F_WRITE). Chains to
      * the status descriptor. */
-    vb.desc[1].addr  = phys_of(buf);
+    vb.desc[1].addr  = phys_of(dma);
     vb.desc[1].len   = bytes;
     vb.desc[1].flags = VRING_DESC_F_NEXT | (write ? 0 : VRING_DESC_F_WRITE);
     vb.desc[1].next  = 2;
@@ -342,6 +389,9 @@ static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
     }
     if (!done)
         return -1;                           /* timeout */
+
+    if (bounced && !write)
+        for (uint32_t k = 0; k < bytes; k++) ((uint8_t *)buf)[k] = bounce[k];
 
     /* Consume exactly one used entry (the one we submitted). */
     vb.used_seen++;
