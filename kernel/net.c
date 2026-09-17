@@ -647,9 +647,38 @@ int net_dhcp(void) {
     if (!got) return -1;
 
     memcpy(OUR_IP, yiaddr, 4);                             /* commit the lease */
-    if (router[0] | router[1] | router[2] | router[3]) memcpy(GW_IP, router, 4);
+    if (router[0] | router[1] | router[2] | router[3]) {
+        memcpy(GW_IP, router, 4);
+    } else {
+        /* NO ROUTER OPTION, AND KEEPING THE OLD ONE IS THE WORST CHOICE (M2121).
+         *
+         * This network's DHCP server hands out an address and a nameserver and
+         * no option 3 -- which it is entitled to do, and our DISCOVER does ask
+         * for one (option 55 lists subnet, router and DNS). The old code then
+         * left GW_IP at the compiled-in SLIRP default 10.0.2.2, which is an
+         * address on a network this machine is not on. The result was a lease
+         * that looked perfect and no route off the subnet:
+         *
+         *   [net] e1000 up, IP = 192.168.1.224 (DHCP)
+         *   [lxabi] /etc/resolv.conf -> nameserver 1.1.1.1
+         *   [net] HTTP GET example.com failed (no internet route?)
+         *
+         * A guess is unavoidable here, so make the LEAST wrong one and say it
+         * is a guess: the .1 of our own /24, which is the gateway on very
+         * nearly every network that hands out addresses at all. Silently
+         * keeping an address from a different network is not a smaller guess,
+         * it is the same guess and a worse one. */
+        GW_IP[0] = yiaddr[0]; GW_IP[1] = yiaddr[1]; GW_IP[2] = yiaddr[2]; GW_IP[3] = 1;
+        kprintf("[net] the lease carried NO router option; GUESSING the gateway is "
+                "%u.%u.%u.1 (the .1 of our own /24) rather than keeping the SLIRP default\n",
+                yiaddr[0], yiaddr[1], yiaddr[2]);
+    }
     if (dns[0] | dns[1] | dns[2] | dns[3])             memcpy(DNS_IP, dns, 4);
     g_have_lease = 1;                                      /* a server really answered (M2120) */
+    kprintf("[net] lease: ip %u.%u.%u.%u  gw %u.%u.%u.%u  dns %u.%u.%u.%u\n",
+            OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3],
+            GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3],
+            DNS_IP[0], DNS_IP[1], DNS_IP[2], DNS_IP[3]);
     return 0;
 }
 
