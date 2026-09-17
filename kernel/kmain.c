@@ -1780,6 +1780,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                                         sc > psc ? sc - psc : 0,
                                                         pfn > ppf ? pfn - ppf : 0);
                                                 psc = sc; ppf = pfn; }
+                                            {   extern void lx_syscall_top(int);
+                                                lx_syscall_top(6); }
                                             wl_page_probe(0x101820);
                                             /* AND WHAT EVERY LINUX PROCESS IS
                                              * WAITING FOR (M2108). The page

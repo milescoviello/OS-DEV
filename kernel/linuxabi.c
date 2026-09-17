@@ -824,7 +824,31 @@ void lx_user_backtrace(struct registers *r) {
     }
 }
 
+const char *lx_syscall_name(unsigned long nr);   /* defined below (M2137) */
 unsigned long lx_syscalls_made(void) { return lx_syscall_count; }
+
+/* Per-syscall-number counts, and the top few since the previous call. Printed
+ * from the page sampler, so the plateau can be read off directly. */
+unsigned long g_syscnt[512];
+void lx_syscall_top(int howmany) {
+    static unsigned long prev[512];
+    unsigned long d[512]; unsigned long tot = 0;
+    for (int i = 0; i < 512; i++) {
+        d[i] = g_syscnt[i] > prev[i] ? g_syscnt[i] - prev[i] : 0;
+        prev[i] = g_syscnt[i];
+        tot += d[i];
+    }
+    if (!tot) { kprintf("[syswhat] no syscalls since the last sample\n"); return; }
+    kprintf("[syswhat] busiest syscalls since the last sample (of %lu):", tot);
+    for (int k = 0; k < howmany; k++) {
+        int best = -1; unsigned long bn = 0;
+        for (int i = 0; i < 512; i++) if (d[i] > bn) { bn = d[i]; best = i; }
+        if (best < 0 || !bn) break;
+        kprintf(" %s(%d)=%lu", lx_syscall_name((unsigned long)best), best, bn);
+        d[best] = 0;
+    }
+    kprintf("\n");
+}
 
 void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid);
 void lx_trace_dump_last(const char *why, unsigned long want) { lx_trace_dump_pid(why, want, 0); }
@@ -1469,6 +1493,14 @@ static void lx_dispatch_body(struct registers *r) {
      * worth grepping the whole file for. */
     unsigned long ring_slot;
     lx_thread_calls_bump();
+    /* WHICH SYSCALLS, NOT HOW MANY (M2137). The per-sample totals proved that
+     * Firefox spends ~100 seconds before the page in a flat plateau of about
+     * 26,000 syscalls per 15s -- a poll loop, not work. "A poll loop" is not
+     * yet an answer: two hypotheses about WHICH subsystem was waiting (the
+     * region lookup, then captive-portal detection) were both wrong, and each
+     * cost a seven-minute run. A per-number count answers it directly instead
+     * of by elimination. One increment on the dispatch path. */
+    { extern unsigned long g_syscnt[512]; if (r->rax < 512) g_syscnt[r->rax]++; }
     /* PAY ANY TLB DEBT BEFORE TOUCHING USER MEMORY (M2065). Almost every
      * handler below dereferences a user pointer directly after vmm_user_ok,
      * so a stale translation here reads the WRONG PAGE -- silently, with the

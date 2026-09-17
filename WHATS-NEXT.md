@@ -1,5 +1,53 @@
 # What's next
 
+> **(M2136-M2137) TIME TO PAGE IS 172 SECONDS, AND IT IS A WAIT, NOT WORK.**
+>
+> The page is on screen (M2135) but it is not *fast*, and "slow" and "stuck"
+> need opposite fixes, so the first job was to tell them apart. The `t=`
+> heartbeat stopped at first paint -- exactly where the interesting interval
+> begins -- so every page sample now carries the syscalls and faults since the
+> previous one, and the busiest syscall numbers with it:
+>
+>     [t] PAINTED at t=22s
+>     sample 1  (15s):  +373669 syscalls, +67370 faults   <- real work
+>     samples 3-9:      +26000  syscalls, ~4 faults       <- a flat plateau
+>     sample 10 (150s): +51403  syscalls, +3600 faults    <- and the page arrives
+>
+>     plateau, per 15s:  clock_gettime=17750  futex=1930
+>                        recvmsg=1512  sendmsg=1510  poll=947
+>     burst  (sample 10): epoll_ctl jumps from 0 to 10434
+>
+> So for about a hundred seconds the guest issues ~1750 syscalls a second and
+> takes **four page faults** -- no disk, no memory pressure, no work. It is
+> idle, waiting. Then `epoll_ctl` goes from nothing to ten thousand calls, which
+> is the signature sample 1 has for a process starting up, and the page appears.
+> No `exec` happens at that moment, so it is not a new process: an existing
+> content process suddenly begins registering descriptors, which is what
+> starting a document load looks like.
+>
+> **First paint is 22 seconds**, not the ~50s recorded in earlier notes.
+>
+> **Two hypotheses tested and both wrong**, recorded so they are not retried:
+> Mozilla's region lookup (`Region.sys.mjs` fails on an idle-dispatched fetch
+> right before the page appears -- suggestive, and not the cause: stating
+> `browser.search.region` changed nothing and the errors persist) and
+> captive-portal detection (`detectportal.firefox.com` over plain HTTP at
+> t=54s, followed by 142 seconds of no network activity at all -- disabling
+> both the captive-portal and connectivity services left the plateau exactly
+> as it was).
+>
+> **A real bug is left behind and is not papered over:** a small HTTP GET to a
+> live server took ~140 seconds over this stack and delivered an EMPTY body.
+> The Region failure carries the same signature -- `JSON.parse` of an empty
+> string -- so it is one defect showing up twice, and it will bite any guest
+> that fetches over HTTP. That is its own milestone, and it is separate from
+> the plateau, because disabling the fetch did not shorten the wait.
+>
+> **The sharp question this leaves**, which is a better starting point than
+> "the browser is slow": what fires at ~150 seconds that makes an already-idle
+> content process begin a document load, when nothing in the guest is doing
+> work in the meantime and no timer we control is involved?
+
 > **(M2132-M2135) FIREFOX RENDERS A REAL WEB PAGE ON SCREEN, IN AN OS-DEV
 > WINDOW, THROUGH OS-DEV'S OWN WAYLAND COMPOSITOR.**
 >
