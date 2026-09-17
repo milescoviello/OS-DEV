@@ -1158,8 +1158,19 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 rc_buf[n] = 0;
                 vfs_mkdir("/disk2/etc");
                 if (vfs_write("/disk2/etc/resolv.conf", rc_buf, (unsigned long)n) >= 0)
-                    kprintf("[lxabi] /etc/resolv.conf -> nameserver %u.%u.%u.%u (from the DHCP lease)\n",
-                            ns[0], ns[1], ns[2], ns[3]);
+                    /* "FROM THE DHCP LEASE" WAS NOT NECESSARILY TRUE (M2120).
+                     * net_dhcp() was never called on an ordinary boot, so this
+                     * printed that phrase over the SLIRP default 10.0.2.3 --
+                     * and a nameserver that came from a lease and one that came
+                     * from a compiled-in constant read identically. On a
+                     * bridged VM the constant is a machine that does not exist,
+                     * and the only symptom was EAI_AGAIN inside a guest program
+                     * an hour later. Say which it is. */
+                    kprintf("[lxabi] /etc/resolv.conf -> nameserver %u.%u.%u.%u (%s)\n",
+                            ns[0], ns[1], ns[2], ns[3],
+                            net_have_lease() ? "from the DHCP lease"
+                                             : "the compiled-in SLIRP default -- NO DHCP LEASE, so this "
+                                               "only resolves under QEMU user-mode networking");
                 else
                     kprintf("[lxabi] could not write /etc/resolv.conf -- getaddrinfo will report EAI_AGAIN\n");
             } else {

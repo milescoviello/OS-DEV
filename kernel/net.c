@@ -36,6 +36,11 @@ static uint8_t  GW_IP[4]   = {10, 0, 2, 2};
 static const uint8_t  BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 const uint8_t *net_ip(void)      { return OUR_IP; }
+/* DID A DHCP SERVER ACTUALLY ANSWER? (M2120) Without this, an address that
+ * came from a lease and one that came from a compiled-in constant are
+ * indistinguishable to every caller and to every log line. */
+static int g_have_lease;
+int net_have_lease(void)         { return g_have_lease; }
 const uint8_t *net_gateway(void) { return GW_IP; }
 const uint8_t *net_mac(void)     { return nic_mac(); }
 
@@ -644,6 +649,7 @@ int net_dhcp(void) {
     memcpy(OUR_IP, yiaddr, 4);                             /* commit the lease */
     if (router[0] | router[1] | router[2] | router[3]) memcpy(GW_IP, router, 4);
     if (dns[0] | dns[1] | dns[2] | dns[3])             memcpy(DNS_IP, dns, 4);
+    g_have_lease = 1;                                      /* a server really answered (M2120) */
     return 0;
 }
 
@@ -2886,11 +2892,37 @@ void net_demo(void) {
 
     kprintf("[net] %s up. our MAC = ", nic_name());
     print_mac(nic_mac());
-    kprintf(", IP = 10.0.2.15\n");
+    /* ASK FOR AN ADDRESS, AND PRINT THE ONE WE HAVE (M2120).
+     *
+     * Two things were wrong here and they hid each other.
+     *
+     * net_dhcp() was called from kernel/netcon.c and from one syscall, and
+     * from NOWHERE ELSE -- so an ordinary boot never requested a lease and the
+     * address stayed at the SLIRP default, 10.0.2.15. That is exactly right
+     * under QEMU's user-mode networking and useless anywhere else: on a
+     * bridged VM or real hardware the machine holds an address from a network
+     * it is not on, cannot ARP its gateway, and has no DNS. Claude Code said
+     * so from inside the guest -- "Can't reach the API server (EAI_AGAIN)" --
+     * on a VM whose bridge was working perfectly.
+     *
+     * And this line PRINTED THE ADDRESS AS A LITERAL STRING. So the log read
+     * "IP = 10.0.2.15" whatever the address actually was, which is why the
+     * first defect could sit here: a successful lease and no lease at all
+     * produced identical output. Print the real bytes. */
+    if (net_dhcp() == 0) {
+        const uint8_t *ip = net_ip();
+        kprintf(", IP = %u.%u.%u.%u (DHCP)\n", ip[0], ip[1], ip[2], ip[3]);
+    } else {
+        const uint8_t *ip = net_ip();
+        kprintf(", IP = %u.%u.%u.%u (NO DHCP LEASE -- this is the SLIRP default, "
+                "which only works under QEMU user-mode networking)\n",
+                ip[0], ip[1], ip[2], ip[3]);
+    }
 
     uint8_t gw_mac[6];
     if (!arp_resolve(GW_IP, gw_mac)) {
-        kprintf("[net] ARP for 10.0.2.2 timed out.\n\n");
+        const uint8_t *g = GW_IP;
+        kprintf("[net] ARP for %u.%u.%u.%u timed out.\n\n", g[0], g[1], g[2], g[3]);
         goto done;
     }
     kprintf("[net] ARP: 10.0.2.2 is at ");
