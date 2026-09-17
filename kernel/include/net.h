@@ -4,6 +4,8 @@
 /* Bring up the NIC, ARP-resolve the gateway, and ping it. Prints results.
  * No-op message if there's no NIC. */
 void net_demo(void);
+void net_rx_service(void);   /* kernel thread: answers ARP for this host whether or not anything is polling, and files what arrives (M2127) */
+unsigned long long net_arp_answered(void);  /* ARP requests for us answered since boot (M2127) */
 
 #include <stdint.h>
 /* Ping the gateway 3 times; returns the number of echo replies (-1 = no ARP). */

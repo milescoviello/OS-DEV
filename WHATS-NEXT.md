@@ -1,6 +1,6 @@
 # What's next
 
-> **(M2121-M2126) THIS MACHINE NEVER ANSWERED ARP, SO THE LAN FORGOT IT EXISTED.**
+> **(M2121-M2127) THIS MACHINE NEVER ANSWERED ARP, SO THE LAN FORGOT IT EXISTED.**
 >
 > A Linux program inside OS-DEV could send a DNS query to `1.1.1.1` and never
 > get an answer. It looked like a receive bug in the guest, and for a long time
@@ -92,13 +92,26 @@
 > not about the guest program that appeared to be failing. Both were found while
 > chasing a bug that turned out to be neither of them.
 >
-> **Still open, stated plainly:** answering ARP is still something only a
-> *polling* consumer does, so an idle OS-DEV -- the desktop up, no socket open
-> -- goes unreachable again about a minute after boot. Being reachable is not a
-> service any one consumer can provide, so it should not be one; that is the
-> next milestone, along with the fact that `nic_receive` pops a software queue
-> whose tail it assumes it alone owns, an assumption that stopped being true the
-> moment a guest polled sockets from more than one thread.
+> **And being reachable is not a service any one consumer can provide** (M2127),
+> so it is no longer one. Answering ARP from inside the polling loops still left
+> the case where no loop is running -- the desktop idle, no socket open, which is
+> most of this OS's uptime -- so the router's request sat unread in the software
+> queue and the machine dropped off its own LAN about a minute after boot. A
+> 100 ms kernel thread now answers for the machine and *files* whatever else
+> arrived, destroying nothing. An idle OS-DEV answers 4 of 4 ARP requests at
+> ~100 ms; with the thread removed it answers none, indefinitely. That is
+> `make lanreachabletest`, and it deliberately runs against the real bridged LAN
+> on the Proxmox node, because QEMU's user-mode networking proxies ARP and
+> therefore cannot ask the question at all. The Proxmox node has no `arping`, so
+> `tools/arp-probe.py` builds the 42-byte request on an AF_PACKET socket rather
+> than installing anything on somebody's infrastructure.
+>
+> M2127 also puts locks on `nic_send`/`nic_receive`. e1000's software receive
+> queue has a single-consumer tail, and "single" was an assumption that held only
+> while exactly one loop in the kernel ever polled -- it stopped being true the
+> moment a guest polled sockets from several threads, and the new service polls
+> too. Two consumers popping one tail hand the same buffer to both and then
+> advance it twice, which on a network looks like packet loss rather than a bug.
 
 > **(M2108-M2120) FIREFOX RENDERS A REAL WEB PAGE INSIDE OS-DEV.**
 >

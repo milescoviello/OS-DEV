@@ -129,7 +129,7 @@ OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
            $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 
 # --- rules ------------------------------------------------------------------
-.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest check check-all clean
+.PHONY: all nodetest selfhosttest linuxabitest run run-rtl8139 run-virtio-net run-hda test rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest usbkbdtest ehcitest xhcitest usbbottest layouttest layoutrendertest desktoptest ipctest hdatest httpdtest jstest lxinettest claudetest waylandtest firefoxtest firefoxpagetest lanreachabletest check check-all clean
 
 all: $(KERNEL) $(DISK)
 
@@ -1770,6 +1770,13 @@ firefoxtest: $(KERNEL) $(DISK) $(EXT2IMG)
 # minutes stops being run. (M2118)
 firefoxpagetest: $(KERNEL) $(DISK) $(EXT2IMG)
 	@tests/run-firefox-page-test.sh
+
+# OS-DEV IS REACHABLE FROM ITS OWN LAN WHILE IDLE. Not in check-all: this one
+# needs the real bridged LAN on the Proxmox node, which is the entire point --
+# QEMU's user-mode networking proxies ARP and so cannot ask the question. It
+# skips cleanly when the node is not there. (M2127)
+lanreachabletest: $(KERNEL) $(DISK) $(EXT2IMG)
+	@tests/run-lan-reachable-test.sh
 
 # PHASE 8: OS-DEV's own Wayland compositor, exercised by a REAL libwayland
 # client (the same library Firefox uses). In `make check`: one 2 GiB boot.

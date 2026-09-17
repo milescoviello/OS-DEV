@@ -942,6 +942,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                 bip[0], bip[1], bip[2], bip[3],
                 leased ? "DHCP" : "no lease -- SLIRP default, only valid under QEMU user-mode");
     }
+    /* BEING REACHABLE IS NOT A SERVICE ANY ONE CONSUMER CAN PROVIDE (M2127).
+     * M2126 made every loop that takes a frame off the card answer ARP for this
+     * host. That still leaves the case where no loop is running at all -- the
+     * desktop idle, no socket open -- and the router's ARP request sits unread
+     * in the software queue until its neighbour entry for us expires and the
+     * machine drops off its own LAN. So this runs for EVERY configuration,
+     * including netcon and nonetdemo: it is not a diagnostic. */
+    if (nic_name() && nic_name()[0])
+        task_create_stack(net_rx_service, 0, 0, 64 * 1024);
     if (!g_netcon && !g_nonetdemo)
         task_create_stack(net_demo, 0, 0, 512 * 1024);
     else if (g_nonetdemo) {

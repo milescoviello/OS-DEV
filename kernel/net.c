@@ -157,7 +157,39 @@ static int rx_next(uint8_t *buf, int max) {
     }
     return 0;
 }
-uint64_t net_arp_answered(void) { return g_arp_answered; }
+unsigned long long net_arp_answered(void) { return g_arp_answered; }
+
+static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp);  /* the demux, below */
+
+/* THIS MACHINE MUST ANSWER WHEN NOTHING IS LISTENING (M2127).
+ *
+ * rx_next fixes the frames that ARE taken off the card. It cannot fix the ones
+ * that are not: every path here is polled, so with no guest socket open and no
+ * kernel loop running -- the desktop sitting idle, which is most of this OS's
+ * uptime -- nobody calls nic_receive at all, the router's ARP request sits in
+ * the software queue unread, and the machine is unreachable from its own LAN
+ * within about a minute of booting. Under SLIRP that never showed, because
+ * SLIRP answers ARP on the guest's behalf and never asks.
+ *
+ * Being reachable is not a service any one consumer can provide, so it is not
+ * one: a 100 ms tick takes whatever has arrived, answers ARP for this host, and
+ * FILES the rest where its owner will find it -- TCP to the park ring, UDP to
+ * the datagram queue, everything else to the ICMP ring. It destroys nothing, so
+ * a socket that polls later still finds its mail (the queues hold 2-5 seconds,
+ * far longer than this interval), and a socket that is actively polling is
+ * unaffected because it still drains the card directly on its own thread. */
+void net_rx_service(void) {
+    static uint8_t rb[1600];
+    kprintf("[net] RX service up: this host answers ARP whether or not anything is polling (M2127)\n");
+    for (;;) {
+        for (int i = 0; i < 32; i++) {
+            int len = rx_next(rb, sizeof rb);
+            if (len < 14) break;
+            net_rx_file_foreign(rb, len, 1);       /* file for its owner; destroy nothing */
+        }
+        task_sleep_ms(100);
+    }
+}
 
 
 /* ---- ONE RX DEMUX: nothing is discarded because of who happened to poll ----

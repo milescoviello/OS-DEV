@@ -80,9 +80,37 @@ const uint8_t *nic_mac(void) {
 static uint64_t g_fw_out_drops;
 uint64_t nic_fw_out_drops(void) { return g_fw_out_drops; }
 
+/* ONE CARD, MANY CORES (M2127). Both of these functions walk driver-owned ring
+ * indices: e1000_send advances a TX tail, and e1000_receive pops a software RX
+ * queue whose tail it is the sole owner of -- "sole" being an assumption that
+ * held only while exactly one loop in the kernel ever polled. It is no longer
+ * true. A Linux guest with several sockets polls from several threads, the
+ * background RX service added alongside this polls too, and any two of them can
+ * be on different cores at the same instant; two consumers popping one tail
+ * hand the same 1600-byte buffer to both and then advance it twice, losing a
+ * frame and duplicating another. This is the same shared-hardware-state class
+ * as the CMOS and PCI config races (M1913-M1916), in the one device where the
+ * symptom would look like packet loss on the network rather than a bug.
+ *
+ * TX and RX get separate locks: the rings are independent, so one lock would be
+ * pure false contention, and neither is ever taken while holding the other --
+ * the ARP answer in net.c's rx_next sends AFTER nic_receive has returned. Plain
+ * spinlocks, per pci.c's reasoning: no interrupt handler calls either function
+ * (e1000's ISR drains the hardware ring into the software queue directly, and
+ * only ever advances the head this side does not touch). */
+static volatile int rx_lock, tx_lock;
+static inline void take(volatile int *l) {
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+}
+static inline void give(volatile int *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
+
 int nic_send(const void *frame, uint16_t len) {
     if (!fw_check(FW_OUT, frame, len)) { g_fw_out_drops++; return 0; }   /* firewall: dropped, reported as handled */
-    return drv_send ? drv_send(frame, len) : -1;
+    if (!drv_send) return -1;
+    take(&tx_lock);
+    int r = drv_send(frame, len);
+    give(&tx_lock);
+    return r;
 }
 
 /* EVERY FRAME THIS HANDS OUT (M2125). The stack has no single demux point --
@@ -93,8 +121,11 @@ static uint64_t g_nic_rx_total;
 uint64_t nic_rx_total(void) { return g_nic_rx_total; }
 
 int nic_receive(void *out, uint16_t max) {
-    int n = drv_receive ? drv_receive(out, max) : 0;
+    if (!drv_receive) return 0;
+    take(&rx_lock);
+    int n = drv_receive(out, max);
     if (n > 0) g_nic_rx_total++;
+    give(&rx_lock);
     if (n > 0 && !fw_check(FW_IN, out, n)) return 0;   /* firewall: drop -> "no packet" */
     return n;
 }
