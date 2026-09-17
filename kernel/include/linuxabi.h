@@ -43,3 +43,4 @@ unsigned long lx_syscalls_made(void);          /* 0 = nothing has used the Linux
 const char *lx_syscall_name(unsigned long nr);   /* a readable name for a syscall number, for the per-process histogram (M2066) */
 void lx_trace_dump_pid(const char *why, unsigned long want, int only_pid);   /* the ring, filtered to ONE process (M2069) */
 void lx_trace_dump_tid(const char *why, unsigned long want, int only_tid);   /* ...and to ONE THREAD, which is what a fault needs (M2086) */
+void lx_ring_top(void);   /* which syscall the ring is FULL of: a sample of what is spinning (M2102) */

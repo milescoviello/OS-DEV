@@ -817,6 +817,44 @@ void lx_trace_dump(const char *why) { lx_trace_dump_last(why, 0); }
  * Prints nothing if nothing overlapped, which is itself an answer -- it means
  * the program was handed this pointer without ever mapping it. */
 const char *lx_syscall_name(unsigned long nr);
+/* WHICH SYSCALL IS THE RING FULL OF, AND WHAT DID IT ANSWER (M2102).
+ *
+ * The one-second timeline showed Firefox making 790000 syscalls in a second
+ * with ZERO page faults -- three million across five seconds, doing no memory
+ * work at all. That is a spin, and at that rate the 4096-entry ring holds only
+ * the last few milliseconds of it, which makes the ring a perfect SAMPLE of
+ * what is spinning rather than a history that has been overwritten.
+ *
+ * The EAGAIN spin detector (M2087) cannot see this one: it only fires when the
+ * same fd answers EAGAIN over and over, and a loop that succeeds every time is
+ * invisible to it. A loop that succeeds is still a loop. */
+void lx_ring_top(void) {
+    unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
+    if (!have) return;
+    /* Count by syscall number over the ring. 512 buckets covers every number
+     * this ABI dispatches; anything higher lands in the last one, which is
+     * honest because it is labelled by the name lookup either way. */
+    static unsigned cnt[512];
+    for (int i = 0; i < 512; i++) cnt[i] = 0;
+    int tid0 = -1; uint64_t a1s = 0, rets = 0;
+    for (unsigned long k = 0; k < have; k++) {
+        struct lxring_ent *e = &g_lxring[(g_lxring_i - have + k) & (LXRING_N - 1)];
+        unsigned nr = e->nr < 512 ? e->nr : 511;
+        cnt[nr]++;
+    }
+    int best = 0;
+    for (int i = 1; i < 512; i++) if (cnt[i] > cnt[best]) best = i;
+    /* One representative call of the winner, so the report says what it was
+     * ASKED and what it ANSWERED -- a spin on a call that keeps succeeding
+     * needs the arguments to be diagnosable at all. */
+    for (unsigned long k = have; k-- > 0; ) {
+        struct lxring_ent *e = &g_lxring[(g_lxring_i - have + k) & (LXRING_N - 1)];
+        if ((int)(e->nr < 512 ? e->nr : 511) == best) { tid0 = e->tid; a1s = e->a1; rets = e->ret; break; }
+    }
+    kprintf("[t]    ring sample: %u of the last %lu calls are %s(%lx...) -- e.g. tid %d got %lx\n",
+            cnt[best], have, lx_syscall_name((unsigned long)best), a1s, tid0, rets);
+}
+
 void lx_trace_dump_addr(const char *why, unsigned long addr) {
     unsigned long have = g_lxring_i < LXRING_N ? g_lxring_i : LXRING_N;
     int shown = 0;
@@ -987,7 +1025,25 @@ static void lx_emit(const char *b, unsigned long n) {
  * 1 ms while something is plainly in flight, widening to 10 ms once the wait
  * is clearly idle. An event loop servicing I/O gets a hundredfold more
  * chances to see it; a loop parked on nothing costs what it did before. */
-static int lx_poll_nap(int spins) { return spins < 200 ? 1 : 10; }
+/* HOW MUCH OF THE BOOT IS SPENT IN THIS NAP (M2102).
+ *
+ * The boot budget says a Firefox first paint is twenty core-seconds of work
+ * across fifty-two seconds of wall time -- so the machine is idle 95% of it and
+ * the question is no longer "what costs cycles" but "what is it waiting for".
+ * A 1-to-10 ms polling nap is the obvious suspect: every readiness wait in this
+ * ABI is a sleep-and-look-again rather than a wait queue, so a startup that
+ * makes a few thousand poll round-trips pays milliseconds for each one.
+ *
+ * Suspect is not the same as cause. Count the naps and the milliseconds, and
+ * let the budget say what share of the wall clock they are. If it is small the
+ * wait is Firefox's own and a wait-queue rewrite would buy nothing. */
+unsigned long g_poll_naps, g_poll_nap_ms;
+static int lx_poll_nap(int spins) {
+    int ms = spins < 200 ? 1 : 10;
+    g_poll_naps++;
+    g_poll_nap_ms += (unsigned long)ms;
+    return ms;
+}
 
 /* A syscall NUMBER is not a name, and a histogram of numbers is unreadable
  * (M2066). Generated from the LXS_* table in this file, so it cannot drift
@@ -1156,9 +1212,29 @@ static void lx_dispatch_body(struct registers *r);
 /* A STOP AIMED AT A TASK IN THE KERNEL IS HONOURED HERE (M2093). Wrapped
  * rather than inlined so every `return` inside the dispatcher -- and there are
  * many -- passes through the leave. */
+/* WHAT A SYSCALL COSTS, AND HOW MANY THERE ARE (M2102).
+ *
+ * Firefox makes 3.3 MILLION syscalls in the first fifteen seconds of its
+ * startup. At that rate the per-call cost is not a detail: five microseconds
+ * each would be sixteen seconds of a fifty-second boot, and this session has
+ * added work to this path repeatedly -- the syscall ring with its path
+ * capture, the failure histogram, the EAGAIN spin detector, the EBADF fd
+ * dump. Every one of those was worth adding to find a bug and none was
+ * measured against three million calls.
+ *
+ * Measured here rather than guessed: total cycles in the dispatcher, and the
+ * count, so the budget can divide them. rdtsc twice per syscall is itself a
+ * cost, and a real one -- but it is the only way to know, and it is a constant
+ * that can be removed once the answer is in. */
+unsigned long g_lx_dispatch_cycles;
 void linux_syscall_dispatch(struct registers *r) {
+    uint32_t dlo, dhi;
+    __asm__ volatile("rdtsc" : "=a"(dlo), "=d"(dhi));
+    uint64_t dt0 = ((uint64_t)dhi << 32) | dlo;
     task_kernel_enter();
     lx_dispatch_body(r);
+    __asm__ volatile("rdtsc" : "=a"(dlo), "=d"(dhi));
+    g_lx_dispatch_cycles += (((uint64_t)dhi << 32) | dlo) - dt0;
     task_kernel_leave();               /* may not return: see task_t::in_kernel */
 }
 static void lx_dispatch_body(struct registers *r) {
@@ -4541,11 +4617,25 @@ static void lx_dispatch_body(struct registers *r) {
         }
     }
     if ((long)r->rax == -(long)LX_EAGAIN) {
+        /* KEYED ON (thread, fd), NOT ON THE SYSCALL NUMBER (M2103).
+         *
+         * It used to require the same NR too, and the real spin does not look
+         * like that: Firefox alternates read(fd 14) with clock_gettime, so the
+         * number changed on every call and this counter reset every time. The
+         * detector sat silent through 2.45 MILLION calls over four seconds --
+         * a spin so large that the ring SAMPLE found it (2048 of the last 4096
+         * calls) while the purpose-built detector did not.
+         *
+         * A loop is a loop whatever it interleaves. This only runs on an
+         * EAGAIN return, so an interleaved SUCCESSFUL call cannot reset it;
+         * only an EAGAIN from a different thread or fd can, which is the
+         * thing that genuinely means a different wait. */
         static struct { int tid; uint32_t nr; uint64_t fd; unsigned long n; } spin;
         uint32_t nr_s = g_lxring[ring_slot & (LXRING_N - 1)].seq == ring_slot
                       ? g_lxring[ring_slot & (LXRING_N - 1)].nr : 0xffffffffu;
         int tid_s = task_current_id();
-        if (spin.tid == tid_s && spin.nr == nr_s && spin.fd == a1) {
+        if (spin.tid == tid_s && spin.fd == a1) {
+            spin.nr = nr_s;
             spin.n++;
             if (spin.n == 1000 || spin.n == 10000 || spin.n == 100000) {
                 long nrd = -1; int rdy = app_fd_ready((app_t *)app_current(), (int)a1, POLLIN);
@@ -4558,6 +4648,12 @@ static void lx_dispatch_body(struct registers *r) {
                 (void)ty;
                 app_fd_print((int)a1);
                 kprintf("\n");
+                /* ...AND WHO IS SUPPOSED TO BE WRITING (M2103). For a pipe the
+                 * spin is about a byte that is not coming, so the reader's own
+                 * state is only half the picture -- the other half is in
+                 * whichever process holds the write end, which may not be this
+                 * one. */
+                if (app_fd_type((int)a1) == 1) app_pipe_peers(app_fd_obj((int)a1));
                 /* AND WHOSE LOOP IT IS (M2087). The fd's state says the pipe
                  * is genuinely empty and the poll agrees, so the remaining
                  * question is entirely about the CALLER: a thread that wants

@@ -7440,6 +7440,31 @@ void app_sys_exit(int code) {
     struct app *a = cur();
     a->exit_code = code; a->exited = 1;
     app_futex_forget(task_self());      /* never leave a waiter pointing at us (M1990) */
+    /* A ZOMBIE HOLDS AN EXIT STATUS, NOT FILE DESCRIPTORS (M2103).
+     *
+     * app_fd_release ran at REAP, and a process that has exited is not reaped
+     * until its parent wait4()s -- which may be seconds later or never. In
+     * between, every descriptor it held stayed open, and for a PIPE that is
+     * not a leak, it is a lie to the peer: the writer count never reaches
+     * zero, so the reader never sees EOF and read() keeps answering EAGAIN
+     * instead of 0.
+     *
+     * Measured on Firefox, which is how it was found. A four-second stretch of
+     * its startup is 2.45 MILLION read(fd 14) calls returning EAGAIN, and the
+     * pipe report names the reason outright:
+     *
+     *   [pipe]   pid 164 fd 14 = read end
+     *   [pipe]   pid 165 fd 15 = WRITE end (process EXITED)
+     *
+     * The writer had exited. On Linux its descriptors would have closed at
+     * exit_group, the pipe would have hung up, and the read would have
+     * returned 0 immediately. Here the peer spun until its own timeout.
+     *
+     * So: close them here. The apps[] slot, the exit code and the zombie
+     * state all survive for wait4 -- only the descriptors go, which is
+     * precisely the POSIX rule. app_fd_release is idempotent (it clears
+     * `used`), so the reap path calling it again is harmless. */
+    app_fd_release(a);
     app_stop_siblings(a);        /* exit_group(2) ends EVERY thread (M1998) */
     app_vfork_release((app_t *)a);   /* a vfork child that exits instead of exec'ing (M2006) */
     task_exit();
@@ -10722,6 +10747,53 @@ void app_fd_print(int fd) {
     case 14: kprintf("console alias, %d key(s) queued, nonblock=%d", iq_count(a->out_to ? a->out_to : a), nb); break;
     default: kprintf("fd type %d obj %d nonblock=%d cloexec=%d", ty, obj, nb, cx); break;
     }
+}
+
+/* WHO HOLDS THE OTHER END, AND WHAT ARE THEY DOING? (M2103)
+ *
+ * The question a spin on an empty pipe raises, and the one nothing could
+ * answer. Firefox spends five seconds of a forty-second startup making 3.7
+ * million read(fd 14) calls that all return EAGAIN on a pipe with one writer
+ * open and nothing queued -- so a byte is expected and is not coming, and the
+ * only useful next fact is which task is supposed to send it.
+ *
+ * Scans every process's table for the same pipe object, names the holder, its
+ * state, and what it last asked the kernel for. A pipe is an object shared
+ * across processes, so the writer may not be in the process that is waiting --
+ * which is exactly why looking only at the reader's own fd table (M2091) was
+ * not enough. */
+void app_pipe_peers(int idx) {
+    kprintf("[pipe] who else holds pipe object %d:\n", idx);
+    int found = 0;
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app *a = &apps[i];
+        if (!a->used) continue;
+        for (int f = 0; f < APP_NFD; f++) {
+            if (!a->fd[f].used || a->fd[f].type != 1 || a->fd[f].obj != idx) continue;
+            found++;
+            kprintf("[pipe]   pid %d fd %d = %s end%s%s\n",
+                    a->pid, f, a->fd[f].write_end ? "WRITE" : "read",
+                    a->exited ? " (process EXITED)" : "",
+                    a->zombie ? " (zombie)" : "");
+            /* And, for a write end, what the tasks of that process are doing:
+             * a writer that is blocked, dead or never scheduled is the answer,
+             * and each of those needs a different fix. */
+            if (a->fd[f].write_end) {
+                for (int t = 0; t < APP_MAXTHREAD; t++) {
+                    task_t *tk = a->thr[t];
+                    if (!tk) continue;
+                    kprintf("[pipe]     thread %d '%s' state=%d wchan=%p\n",
+                            tk->id, task_name_of(tk), (int)task_state_of(tk),
+                            (void *)tk->wchan);
+                }
+                if (a->task)
+                    kprintf("[pipe]     main %d '%s' state=%d wchan=%p\n",
+                            a->task->id, task_name_of(a->task),
+                            (int)task_state_of(a->task), (void *)a->task->wchan);
+            }
+        }
+    }
+    if (!found) kprintf("[pipe]   NOBODY -- the object has no descriptors at all, which cannot be\n");
 }
 
 /* WHAT IS ACTUALLY OPEN IN THIS PROCESS? (M2091)

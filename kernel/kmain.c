@@ -244,6 +244,16 @@ static volatile int g_smpthread_test;         /* -append smpthreadtest: prove re
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
 static volatile int g_journal_test;           /* -append journalguest: prove the write-ahead journal + crash recovery on REAL ata hardware (M1865) */
 static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a live FAT32 file create is crash-atomic (M1866) */
+/* -append noprobes: bring the Linux ABI up and skip the probe SUITE (M2103).
+ *
+ * Every Firefox run implies g_lxabi_test, so every measurement of a browser
+ * startup was preceded by twenty-two in-guest probes -- minutes of them, and
+ * at one point a single probe sat in app_run_linux_sync for sixty seconds
+ * while the thing being measured had not started. A loop whose iteration is
+ * dominated by work unrelated to the question is a loop that does not get run
+ * often enough. The probes still run in their own boots, which is where the
+ * test suites ask for them. */
+static volatile int g_noprobes;
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
@@ -572,6 +582,41 @@ void kmain_budget(const char *when) {
         if (cow > maj + min)
             kprintf("[budget]     COPY-ON-WRITE DOMINATES: the cost is fork, not the disk and not demand-zero\n");
     }
+    {   extern unsigned long g_poll_naps, g_poll_nap_ms;
+        /* WALL-CLOCK MILLISECONDS, not cycles, because a nap is time nobody
+         * spent -- and that is exactly the quantity the 95%-idle reading is
+         * asking about. Against the wall clock, not the busy total: sleeping
+         * does not consume the busy budget, it extends the wall one. (M2102) */
+        /* THREAD-milliseconds, and say so. The first version of this line
+         * divided by a made-up "wall in ms" and printed 90677%, which is the
+         * instrument describing the wrong quantity yet again: these naps are
+         * CONCURRENT across threads, so their sum is thread-time and has no
+         * business being compared to one wall clock. (M2102) */
+        kprintf("[budget]   polling  %7lu thread-ms slept across %lu naps in poll/epoll "
+                "(concurrent: NOT a share of the wall clock)\n",
+                g_poll_nap_ms, g_poll_naps);
+        {   extern unsigned long g_lx_dispatch_cycles;
+            unsigned long n = lx_syscalls_made();
+            /* ELAPSED, AND THEREFORE NOT A PER-SYSCALL COST (M2102). I wrapped
+             * the dispatcher in rdtsc to find out what a syscall costs, and it
+             * reported 9.4 MILLION cycles each -- a total forty times the wall
+             * clock. Of course: a syscall that blocks accumulates every
+             * millisecond it waits, and dozens of threads block at once, so
+             * this sum is thread-time and has no per-call meaning at all.
+             *
+             * Fifth instrument this session to describe the wrong quantity,
+             * and the same mistake each time: ELAPSED IS NOT COST WHENEVER THE
+             * CODE CAN BLOCK. Kept, because "threads spent 9.4 Tcycles inside
+             * syscalls" is a real statement about how much of this boot is
+             * spent waiting in the kernel -- which is the question. It is just
+             * not the statement I went looking for. Per-call CPU cost needs a
+             * microbenchmark of a syscall that cannot block. */
+            kprintf("[budget]   syscalls %7lu Mcycles of THREAD-TIME inside the Linux dispatcher "
+                    "across %lu calls\n", g_lx_dispatch_cycles / 1000000, n);
+            kprintf("[budget]            (elapsed, so it includes every block and overlaps itself "
+                    "across threads -- NOT a per-call cost)\n");
+        }
+    }
     kprintf("[budget]   console  %7lu Mcycles elapsed   %lu lines, %lu full-screen scrolls\n",
             con / 1000000, ln, sc);
     if (busy) {
@@ -620,6 +665,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * them faults, and five fault register-dumps over the slow serial
          * console dragged that boot past any sensible wait budget. They only do
          * useful work under -cpu max anyway, so only that boot launches them. */
+        if (cmdline_has(cl, "noprobes"))   g_noprobes = 1;                /* ABI up, probe suite skipped (M2103) */
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
@@ -880,6 +926,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * garbage collector reads every word it ever allocated, so it is the
          * most sensitive consumer of "anonymous memory arrives zero" in the
          * system and the least able to name the page that was wrong. */
+        /* -append noprobes: skip the SUITE, keep the ABI (M2103). Everything
+         * above this point is the ABI coming up and is not optional; from here
+         * to the stress block is the probe suite, which a Firefox measurement
+         * has no use for. */
+        if (g_noprobes) goto probes_done;
         kprintf("[lxabi] launching the zero-fill/COW probe...\n");
         {   int zrc = app_run_linux_sync("/disk2/lxzero", 0, 0, 180000);
             kprintf("[lxabi] LXZERO exit -> %d\n", zrc); }
@@ -943,6 +994,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * glib treats a config directory it cannot create as fatal rather than
          * as a reason to skip caching. Made here, not in the image, so a fresh
          * ext2 volume needs no special preparation to run one. */
+        probes_done:
         if (g_lxstress) {
             /* The reproducer for the corruption Firefox dies in, on its own
              * boot because it is deliberately the heaviest thing here and
@@ -1370,6 +1422,51 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     {
                         int fpid = app_last_spawn_pid();
                         unsigned long prev = lx_syscalls_made();
+                        /* A ONE-SECOND TIMELINE, NOT A FIFTEEN-SECOND ONE (M2102).
+                         * The budget says this boot is 95% idle -- twenty
+                         * core-seconds of work across fifty of wall -- so the
+                         * question is WHERE the wall time goes, and a
+                         * fifteen-second heartbeat cannot see a gap smaller
+                         * than fifteen seconds. Per second, with the syscall
+                         * and fault deltas, the log becomes a timeline and the
+                         * quiet stretch names itself. */
+                        {   unsigned long ps = lx_syscalls_made();
+                            extern uint64_t g_pf_count;
+                            uint64_t pf0 = g_pf_count;
+                            for (int q = 0; q < 90; q++) {
+                                task_sleep_ms(1000);
+                                unsigned long ns = lx_syscalls_made();
+                                uint64_t pf1 = g_pf_count;
+                                /* No width or flag specifiers: this kernel's
+                                 * kprintf does not implement them, and asking
+                                 * for %-8lu prints the format string itself.
+                                 * (M2102) */
+                                kprintf("[t] %ds syscalls +%lu faults +%lu\n",
+                                        q + 1, ns - ps, (unsigned long)(pf1 - pf0));
+                                /* Only when it is plainly spinning: a busy
+                                 * second is normal, 50000 calls in one is not,
+                                 * and sampling every second would bury the
+                                 * timeline in its own output. */
+                                /* Sample a BUSY second, and a QUIET one too:
+                                 * a stretch making fifty calls a second is
+                                 * waiting for something, and which fifty calls
+                                 * those are is the only clue to what. The
+                                 * middle -- ordinary progress -- is the part
+                                 * that needs no sample. (M2103) */
+                                if (ns - ps > 50000 || (ns - ps) < 400) lx_ring_top();
+                                ps = ns; pf0 = pf1;
+                                {   uint32_t pw = 0, ph = 0; wl_largest_window(&pw, &ph);
+                                    if (pw >= 640 && ph >= 480) {
+                                        kprintf("[t] PAINTED at t=%ds\n", q + 1);
+                                        break;
+                                    }
+                                }
+                                if (app_state_of(fpid) < 0) {
+                                    kprintf("[t] the process is GONE at t=%ds\n", q + 1);
+                                    break;
+                                }
+                            }
+                        }
                         for (int t = 0; t < 24; t++) {
                             task_sleep_ms(15000);
                             unsigned long now = lx_syscalls_made();
