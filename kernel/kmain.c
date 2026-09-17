@@ -664,6 +664,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
         if (cmdline_has(cl, "nodma")) { extern int g_ata_dma_reads; g_ata_dma_reads = 0; }   /* A/B the DMA read path (M2091) */
+        if (cmdline_has(cl, "nopathcache")) g_e2_path_cache = 0;          /* A/B the ext2 path cache (M2104) */
+        if (cmdline_has(cl, "noreadrun"))   g_e2_read_runs = 0;           /* A/B the ext2 run coalescing (M2104) */
         if (cmdline_has(cl, "diskbench")) g_diskbench = 1;                /* per-command disk cost (M2091) */
         if (cmdline_has(cl, "lxabitest"))  g_lxabi_test = 1;              /* run a host-built static-PIE LINUX binary (M1939) */
         if (cmdline_has(cl, "lxfaulttest")) { g_lxabi_test = 1; g_lxfault_test = 1; }   /* + ONE binary that FAULTS, to prove the fault is reported and does not wedge (M1941) */

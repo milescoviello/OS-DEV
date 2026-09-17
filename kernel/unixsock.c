@@ -373,8 +373,13 @@ int unix_close(int ep) {
      * return EPIPE instead of waiting for a reader that has gone (M2090). */
     if (c->a_wwaiter) { task_wake(c->a_wwaiter); c->a_wwaiter = 0; }
     if (c->b_wwaiter) { task_wake(c->b_wwaiter); c->b_wwaiter = 0; }
-    if (c->a_closed && c->b_closed) c->used = 0;                 /* both ends gone -> free the slot */
+    int freed_ci = -1;
+    if (c->a_closed && c->b_closed) { c->used = 0; freed_ci = ep >> 1; }   /* both ends gone -> free the slot */
     usock_irq_restore(fl);
+    /* ANY DESCRIPTOR STILL IN FLIGHT ON THIS CONNECTION IS NOW UNRECEIVABLE
+     * (M2104), and it holds a reference nobody will ever hand on. Released
+     * OUTSIDE this lock, because those teardowns take their own. */
+    if (freed_ci >= 0) app_scm_drop_conn(freed_ci);
     return 0;
 }
 

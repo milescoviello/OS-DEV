@@ -1210,8 +1210,37 @@ static void memfd_unref(int idx);
  * Keyed by the AF_UNIX connection index (unix_ep_conn), so a sendfd on one
  * endpoint is delivered to the other. */
 extern int unix_ep_conn(int ep);   /* kernel/unixsock.c */
-#define SCM_SLOTS 16
-#define SCM_QDEPTH 4
+/* A GLOBAL IN-FLIGHT POOL, NOT TWO INDEPENDENTLY-SIZED TABLES (M2104).
+ *
+ * SCM_SLOTS was 16 against U_CONN 128, so **only the first sixteen AF_UNIX
+ * connections in the system could pass a descriptor at all** -- and
+ * unix_socketpair draws from the same connection table, so Firefox's own IPC
+ * channels compete with its Wayland connection for those sixteen. SCM_QDEPTH
+ * was 4, and a ring of four with one slot kept empty is THREE descriptors in
+ * flight.
+ *
+ * Firefox's fork server passes a content process's whole descriptor set in one
+ * sendmsg. Four of them were dropped, the kernel said so and RETURNED THE BYTE
+ * COUNT ANYWAY, and the child then died on the first one it tried to use:
+ *
+ *   [sock] SCM_RIGHTS: could not pass fd 60
+ *   [sock] SCM_RIGHTS: could not pass fd 70
+ *   [sock] SCM_RIGHTS: could not pass fd 64
+ *   [sock] SCM_RIGHTS: could not pass fd 62
+ *   ...
+ *   t202 47(c, 50fff1a8, 0) = -9      recvmsg(fd 12) = EBADF
+ *   t202 1(2, 50ffedf0, 2d) = 45      its own error message
+ *
+ * That is why Firefox renders its chrome and never a page: every content
+ * process died before it could speak to its parent.
+ *
+ * So: one pool of in-flight descriptors for the whole system, with a free list
+ * and a per-(connection, direction) FIFO head. SCM_SLOTS stops existing as a
+ * second table that has to be kept in step with U_CONN, and the depth per
+ * connection is bounded only by the pool -- 1024 entries, which is 28 in one
+ * sendmsg (libwayland's MAX_FDS_OUT) for thirty-six connections at once. */
+#define NSCM_INFLIGHT 1024
+#define SCM_SLOTS 128          /* == U_CONN: every connection, not the first sixteen */
 /* DIRECTIONAL, and a queue (M1984).
  *
  * This was a single slot per connection, shared by both sides. Two bugs came
@@ -1228,10 +1257,38 @@ extern int unix_ep_conn(int ep);   /* kernel/unixsock.c */
  * descriptors to messages by ORDER -- libwayland pops the next fd when it
  * demarshals an argument declared as one, so a reordered queue attaches the
  * wrong file to the wrong message. */
-struct scmq { struct fdent fe[SCM_QDEPTH]; int head, tail; };
+/* One entry per descriptor in flight, anywhere in the system. `next` threads
+ * both the free list and each queue, so a queue costs two ints and no fixed
+ * depth. */
+static void epoll_ref(int idx);      /* defined below; SCM_RIGHTS needs it up here (M2104) */
+static void epoll_unref(int idx);
+struct scment { struct fdent fe; short next; };
+static struct scment g_scmpool[NSCM_INFLIGHT];
+static short g_scmfree = -1;                          /* head of the free list, -1 = uninitialised */
+struct scmq { short head, tail; };                    /* -1/-1 = empty */
 static struct scmq g_scm[SCM_SLOTS][2];
-static int scmq_empty(struct scmq *q) { return q->head == q->tail; }
-static int scmq_full(struct scmq *q)  { return (q->tail + 1) % SCM_QDEPTH == q->head; }
+static volatile int g_scm_lock;
+/* A REAL LOCK (M2104). head/tail were plain reads and writes with dozens of
+ * threads and the compositor on another core -- the M2000 shared-buffer shape,
+ * in the one structure whose ordering the whole protocol depends on. */
+static inline uint64_t scm_lock_take(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_scm_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static inline void scm_lock_give(uint64_t f) {
+    __atomic_store_n(&g_scm_lock, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+static void scm_pool_init(void) {                     /* called with the lock held */
+    if (g_scmfree != -1) return;
+    for (int i = 0; i < NSCM_INFLIGHT - 1; i++) g_scmpool[i].next = (short)(i + 1);
+    g_scmpool[NSCM_INFLIGHT - 1].next = -1;
+    g_scmfree = 0;
+    for (int c = 0; c < SCM_SLOTS; c++) { g_scm[c][0].head = g_scm[c][0].tail = -1;
+                                          g_scm[c][1].head = g_scm[c][1].tail = -1; }
+}
+static int scmq_empty(struct scmq *q) { return q->head < 0; }
 static struct scmq *scm_out(int ep) {                 /* where THIS endpoint sends */
     int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return 0;
     return &g_scm[ci][ep & 1];
@@ -1240,14 +1297,29 @@ static struct scmq *scm_in(int ep) {                  /* where THIS endpoint rec
     int ci = unix_ep_conn(ep); if (ci < 0 || ci >= SCM_SLOTS) return 0;
     return &g_scm[ci][(ep & 1) ^ 1];
 }
+/* How many entries the pool still has, so a caller can check capacity for a
+ * WHOLE cmsg before it commits to sending any of it. */
+int app_scm_capacity(void) {
+    uint64_t f = scm_lock_take();
+    scm_pool_init();
+    int n = 0;
+    for (short i = g_scmfree; i >= 0; i = g_scmpool[i].next) if (++n >= 64) break;
+    scm_lock_give(f);
+    return n;
+}
 
 int app_scm_send(int ep, int fd) {
     struct app *a = cur(); if (!a) return -1;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
     struct scmq *q = scm_out(ep); if (!q) return -1;
-    if (scmq_full(q)) return -1;               /* the peer has not drained its queue */
-    q->fe[q->tail] = a->fd[fd];                /* snapshot the descriptor (shares the underlying object) */
-    q->fe[q->tail].cloexec = 0;                /* a freshly-received fd is not close-on-exec */
+    uint64_t sfl = scm_lock_take();
+    scm_pool_init();
+    short e = g_scmfree;
+    if (e < 0) { scm_lock_give(sfl); return -1; }   /* the whole pool is in flight */
+    g_scmfree = g_scmpool[e].next;
+    g_scmpool[e].next = -1;
+    g_scmpool[e].fe = a->fd[fd];               /* snapshot the descriptor (shares the underlying object) */
+    g_scmpool[e].fe.cloexec = 0;               /* a freshly-received fd is not close-on-exec */
     /* A DESCRIPTOR IN FLIGHT MUST OWN ITS OBJECT (M2082).
      *
      * The queue held a COPY OF THE fdent and nothing else -- and for a memfd an
@@ -1267,21 +1339,98 @@ int app_scm_send(int ep, int fd) {
      * and app_scm_take_memfd_idx releases it after taking the compositor's
      * own -- so the count is unchanged for both, and the object simply cannot
      * die while it is in the queue. */
-    if (q->fe[q->tail].type == 3) memfd_ref(q->fe[q->tail].obj);
-    q->tail = (q->tail + 1) % SCM_QDEPTH;
+    /* A DESCRIPTOR IN FLIGHT IS A REFERENCE -- FOR EVERY TYPE, NOT JUST MEMFDS
+     * (M2104).
+     *
+     * M2082 gave this a memfd_ref and stopped there, so a memfd could not die
+     * in the queue and everything else could. The reference list that fork and
+     * dup2 both use is six types long, and SCM_RIGHTS had one of them.
+     *
+     * What it cost: Firefox's fork server passes a content process its IPC
+     * SOCKET. The sender closed its own copy the moment sendmsg returned --
+     * which is correct, the peer owns it now -- the connection's refcount hit
+     * zero, unixsock freed the slot, and the child was handed an endpoint id
+     * whose connection no longer existed:
+     *
+     *   [fd]   11 = AF_UNIX ep 9 queued=-1 readable=0
+     *   t232 47(b, ...) = -9        recvmsg(fd 11) = EBADF
+     *
+     * queued=-1 is app_fd_print saying ep_conn() found nothing -- a stale
+     * endpoint. Every content process died on it, which is why the browser
+     * rendered its chrome and never a page. */
+    switch (g_scmpool[e].fe.type) {
+    case 1:  pipe_open_end(g_scmpool[e].fe.obj, g_scmpool[e].fe.write_end); break;
+    case 3:  memfd_ref(g_scmpool[e].fe.obj); break;
+    case 6:  epoll_ref(g_scmpool[e].fe.obj); break;
+    case 8:  inotify_ref(g_scmpool[e].fe.obj); break;
+    case 10: net_tcp_sock_ref(g_scmpool[e].fe.obj); break;
+    case 12: if (g_scmpool[e].fe.obj >= 0) unix_ref(g_scmpool[e].fe.obj); break;
+    default: break;                      /* files and console aliases carry no count */
+    }
+    /* FIFO append, because the protocol matches descriptors to messages by
+     * ORDER -- libwayland pops the next fd when it demarshals an argument
+     * declared as one, so a reordered queue attaches the wrong file to the
+     * wrong message. */
+    if (q->tail < 0) { q->head = q->tail = e; }
+    else { g_scmpool[q->tail].next = e; q->tail = e; }
+    scm_lock_give(sfl);
     return 0;
 }
 
 int app_scm_recv(int ep) {
     struct app *a = cur(); if (!a) return -1;
     struct scmq *q = scm_in(ep); if (!q) return -1;
-    if (scmq_empty(q)) return -1;              /* nothing pending */
     int fd = -1;
     for (int i = 3 /*APP_FD_FIRST: 0-2 are stdio*/; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }
     if (fd < 0) return -1;                     /* receiver's fd table is full */
-    a->fd[fd] = q->fe[q->head];                /* install the passed descriptor */
-    q->head = (q->head + 1) % SCM_QDEPTH;
+    uint64_t sfl = scm_lock_take();
+    scm_pool_init();
+    if (scmq_empty(q)) { scm_lock_give(sfl); return -1; }   /* nothing pending */
+    short e = q->head;
+    q->head = g_scmpool[e].next;
+    if (q->head < 0) q->tail = -1;
+    a->fd[fd] = g_scmpool[e].fe;               /* install the passed descriptor */
+    g_scmpool[e].next = g_scmfree; g_scmfree = e;
+    scm_lock_give(sfl);
     return fd;
+}
+
+/* DROP AN IN-FLIGHT DESCRIPTOR NOBODY WILL EVER RECEIVE (M2104).
+ *
+ * The reference taken at send is handed to the fd that app_scm_recv installs.
+ * If the connection dies with descriptors still queued, nobody installs them
+ * and those references would be held for the rest of the boot -- which for a
+ * memfd is 4 KiB a time against NMEMFD 256, and for a socket is a connection
+ * slot that can never be reused. Called from unix_forget_conn. */
+void app_scm_drop_conn(int ci) {
+    if (ci < 0 || ci >= SCM_SLOTS) return;
+    struct fdent doomed[32]; int n = 0;
+    uint64_t f = scm_lock_take();
+    scm_pool_init();
+    for (int side = 0; side < 2; side++) {
+        struct scmq *q = &g_scm[ci][side];
+        while (q->head >= 0 && n < 32) {
+            short e = q->head;
+            q->head = g_scmpool[e].next;
+            doomed[n++] = g_scmpool[e].fe;
+            g_scmpool[e].next = g_scmfree; g_scmfree = e;
+        }
+        if (q->head < 0) q->tail = -1;
+    }
+    scm_lock_give(f);
+    /* Outside the lock: these teardowns take their own. */
+    for (int i = 0; i < n; i++) {
+        switch (doomed[i].type) {
+        case 1:  pipe_close_end(doomed[i].obj, doomed[i].write_end); break;
+        case 3:  memfd_unref(doomed[i].obj); break;
+        case 6:  epoll_unref(doomed[i].obj); break;
+        case 8:  inotify_free(doomed[i].obj); break;
+        case 10: net_tcp_sock_close(doomed[i].obj); break;
+        case 12: if (doomed[i].obj >= 0) unix_close(doomed[i].obj); break;
+        default: break;
+        }
+    }
+    if (n) kprintf("[scm] connection %d died with %d descriptor(s) still in flight; released them\n", ci, n);
 }
 
 /* IS THERE STILL A DESCRIPTOR QUEUED? (M2090) Non-consuming, because the
@@ -1289,7 +1438,11 @@ int app_scm_recv(int ep) {
  * -- and consuming one to find out would be the opposite of the answer. */
 int app_scm_peek(int ep) {
     struct scmq *q = scm_in(ep); if (!q) return -1;
-    return scmq_empty(q) ? -1 : 0;
+    uint64_t f = scm_lock_take();
+    scm_pool_init();
+    int r = scmq_empty(q) ? -1 : 0;
+    scm_lock_give(f);
+    return r;
 }
 
 /* getcwd (M1248): canonicalize an absolute-ish path (resolve "."/".."/"//") into
@@ -8574,13 +8727,13 @@ int app_scm_take_memfd_idx(int ep, void **base, unsigned long *size, int *idx_ou
                     "queued one or an earlier take consumed it\n", ep, unix_ep_conn(ep));
         return -1;
     }
-    if (q->fe[q->head].type != 3) {                  /* not a memfd: not ours to interpret */
+    if (g_scmpool[q->head].fe.type != 3) {           /* not a memfd: not ours to interpret */
         if (told++ < 8)
             kprintf("[scm] ep %d queue head is fd type %d, not a memfd\n",
-                    ep, q->fe[q->head].type);
+                    ep, g_scmpool[q->head].fe.type);
         return -1;
     }
-    int idx = q->fe[q->head].obj;
+    int idx = g_scmpool[q->head].fe.obj;
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used || !memfds[idx].buf) {
         if (told++ < 8)
             kprintf("[scm] ep %d queue head names memfd %d, which is %s\n", ep, idx,
@@ -8593,7 +8746,25 @@ int app_scm_take_memfd_idx(int ep, void **base, unsigned long *size, int *idx_ou
     if (idx_out) *idx_out = idx;
     memfd_ref(idx);                                  /* the compositor holds it now */
     memfd_unref(idx);                                /* ...and the in-flight reference is spent (M2082) */
-    q->head = (q->head + 1) % SCM_QDEPTH;
+    /* A REAL LIST DEQUEUE (M2104). This was `q->head = (q->head + 1) %
+     * SCM_QDEPTH` -- ring arithmetic on what is now a POOL INDEX, so it
+     * produced a garbage index, scrambled the queue and leaked every entry it
+     * skipped ("connection 1 died with 32 descriptor(s) still in flight").
+     *
+     * I changed the data structure and audited for uses of `q->fe`, which
+     * found five call sites. This line touches only `q->head`, so it was not
+     * in the grep -- and the cost of missing it was Firefox dying six seconds
+     * into a startup that had just been fixed. Audit the TYPE, not the field
+     * you happen to remember. */
+    {   uint64_t sfl = scm_lock_take();
+        short e = q->head;
+        if (e >= 0) {
+            q->head = g_scmpool[e].next;
+            if (q->head < 0) q->tail = -1;
+            g_scmpool[e].next = g_scmfree; g_scmfree = e;
+        }
+        scm_lock_give(sfl);
+    }
     return 0;
 }
 int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
@@ -8668,7 +8839,7 @@ int app_memfd_inuse(void) {
  * hand a process a page of kernel image. */
 int app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsigned long len) {
     struct scmq *q = scm_out(ep); if (!q) return -1;
-    if (scmq_full(q)) return -1;
+    if (app_scm_capacity() < 1) return -1;       /* the in-flight pool is exhausted (M2104) */
     int idx = memfd_alloc(name); if (idx < 0) return -1;
     struct memfd *m = &memfds[idx];
     if (memfd_grow(m, len) != 0) { memfd_unref(idx); return -1; }
@@ -8677,8 +8848,18 @@ int app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsign
     struct fdent fe;
     for (unsigned long i = 0; i < sizeof fe; i++) ((char *)&fe)[i] = 0;
     fe.used = 1; fe.type = 3 /* memfd */; fe.obj = idx; fe.off = 0;
-    q->fe[q->tail] = fe;
-    q->tail = (q->tail + 1) % SCM_QDEPTH;
+    /* Onto the pool's FIFO, like every other send (M2104). */
+    {   uint64_t sfl = scm_lock_take();
+        scm_pool_init();
+        short e = g_scmfree;
+        if (e < 0) { scm_lock_give(sfl); memfd_unref(idx); return -1; }
+        g_scmfree = g_scmpool[e].next;
+        g_scmpool[e].next = -1;
+        g_scmpool[e].fe = fe;
+        if (q->tail < 0) { q->head = q->tail = e; }
+        else { g_scmpool[q->tail].next = e; q->tail = e; }
+        scm_lock_give(sfl);
+    }
     return 0;
 }
 

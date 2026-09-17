@@ -78,3 +78,5 @@ long ext2_removexattr(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
 void ext2_path_cache_flush(void);
 void ext2_path_cache_stats(unsigned long *hits, unsigned long *misses,
                            unsigned long *neg, unsigned long *flushes);
+extern int g_e2_path_cache;   /* 0 = walk every path from the root, as before M2103 */
+extern int g_e2_read_runs;    /* 0 = one block per request, as before M2100 */

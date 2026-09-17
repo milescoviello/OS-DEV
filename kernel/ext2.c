@@ -306,7 +306,15 @@ static uint32_t walk(ext2_t *v, const char *path, uint8_t *inode_out, int *is_di
  * touching every return in fourteen functions. Having the readers cache and
  * the writers not is smaller, and it cannot be got wrong by adding a
  * fifteenth writer later. */
+/* -append nopathcache / noreadrun: turn each of this milestone's two read-path
+ * changes off, so a failure elsewhere can be attributed rather than argued
+ * about. A performance change that cannot be switched off is a change you
+ * cannot be acquitted of. (M2104) */
+int g_e2_path_cache = 1;
+int g_e2_read_runs  = 1;
+
 static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int *is_dir) {
+    if (!g_e2_path_cache) return walk(v, path, inode_out, is_dir);
     int plen = 0; while (path[plen]) plen++;
     int cacheable = (plen > 0 && plen < (int)sizeof g_e2pc[0].path);
     int slot = -1;
@@ -391,7 +399,7 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
          * The partial-block path below is unchanged and still bounces, because
          * it must: the caller's buffer has no room for the bytes either side
          * of the piece it asked for. */
-        if (db && bo == 0 && want - done >= v.block_size) {
+        if (g_e2_read_runs && db && bo == 0 && want - done >= v.block_size) {
             uint32_t run = 1;
             while (run < EXT2_MAX_RUN && (done + (unsigned long)(run + 1) * v.block_size) <= want) {
                 if (map_block(&v, inode, lb + run) != db + run) break;   /* not contiguous: stop the run */

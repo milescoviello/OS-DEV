@@ -2233,11 +2233,50 @@ static void lx_dispatch_body(struct registers *r) {
                     clen >= 16 && clen <= ctllen) {
                     int nfd = (int)((clen - 16) / sizeof(int));
                     const int *fds = (const int *)(cm + 16);
+                    /* ALL OF THEM, OR NONE, AND SAY SO (M2104).
+                     *
+                     * This loop passed what it could and printed a line for
+                     * each one it could not -- then fell through and returned
+                     * the BYTE COUNT, so the sender believed every descriptor
+                     * had gone. Firefox's fork server sends a content
+                     * process's whole set in one sendmsg; four were dropped,
+                     * the child died on the first one it tried to use, and
+                     * that is why the browser rendered its chrome and never a
+                     * page.
+                     *
+                     * A partial cmsg is not a partial write: the bytes and the
+                     * descriptors are one message. So check capacity for the
+                     * whole set FIRST, and if it will not fit return EAGAIN
+                     * having sent nothing -- which is correct backpressure and
+                     * what every caller of a non-blocking socket already
+                     * handles. */
+                    if (app_scm_capacity() < nfd) {
+                        static int told;
+                        if (told++ < 4)
+                            kprintf("[sock] SCM_RIGHTS: %d descriptors will not fit (capacity %d) "
+                                    "-- refusing the WHOLE message with EAGAIN rather than "
+                                    "delivering some of it\n", nfd, app_scm_capacity());
+                        kfree(gbuf);
+                        err = -(long)LX_EAGAIN;
+                        break;
+                    }
+                    int passed = 0;
                     for (int q = 0; q < nfd; q++) {
-                        if (app_unix_send_fd((int)a1, fds[q]) != 0)
-                            kprintf("[sock] SCM_RIGHTS: could not pass fd %d\n", fds[q]);
-                        else if (g_lx_systrace)
-                            kprintf("[sock] SCM_RIGHTS: passed fd %d\n", fds[q]);
+                        if (app_unix_send_fd((int)a1, fds[q]) != 0) {
+                            kprintf("[sock] SCM_RIGHTS: could not pass fd %d (%d of %d done)\n",
+                                    fds[q], passed, nfd);
+                            break;
+                        }
+                        passed++;
+                        if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: passed fd %d\n", fds[q]);
+                    }
+                    if (passed != nfd) {
+                        /* Capacity said yes and a send still failed -- a bad fd
+                         * in the caller's array, which is EBADF and not
+                         * something to paper over with a byte count. */
+                        kfree(gbuf);
+                        err = -(long)LX_EBADF;
+                        break;
                     }
                 }
             }

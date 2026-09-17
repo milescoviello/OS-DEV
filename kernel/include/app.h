@@ -140,6 +140,8 @@ int  app_sock_getopt(int fd, int level, int opt, void *out, int max);        /* 
 int  app_sock_setopt(int fd, int level, int opt, const void *in, int len);   /* 0, or -errno (M2088) */
 int  app_unix_peek_fd(int sockfd);        /* are MORE descriptors queued than were taken? for MSG_CTRUNC (M2090) */
 void app_wait_summary(int pid);            /* every thread's wchan, GROUPED: what are they all waiting for (M2103) */
+void app_scm_drop_conn(int ci);           /* a dead connection releases the descriptors still queued on it (M2104) */
+int  app_scm_capacity(void);              /* in-flight SCM_RIGHTS slots left: check BEFORE sending any of a cmsg (M2104) */
 void app_pipe_peers(int idx);             /* who holds the other end of a pipe, and what they are doing (M2103) */
 void app_fd_dump(const char *why);        /* every open descriptor and what it is -- the question an EBADF raises (M2091) */
 void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other);   /* every fault KIND, summed over all processes -- a split that adds up (M2093) */
