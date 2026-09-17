@@ -1,5 +1,89 @@
 # What's next
 
+> **(M2108-M2120) FIREFOX RENDERS A REAL WEB PAGE INSIDE OS-DEV.**
+>
+> `docs/img/firefox-page-in-osdev.png` is a document Gecko parsed, styled, laid
+> out, shaped, rasterised and encoded while running on this kernel. Decoded, the
+> pixels are:
+>
+>     #101820   105293  (87.7%)   the body background -- the CSS applied
+>     #4fd1c5     8391  ( 7.0%)   the h1 colour -- styled, shaped, anti-aliased
+>     #e8e8f0      384            the body text colour
+>
+> It reads *"Firefox is rendering a page inside OS-DEV."* and it is a green
+> checkpoint now: `make firefoxpagetest` boots the OS, renders the page, pulls
+> the PNG back out of the serial log as hex, decodes it and requires those
+> colours in proportion. It asserts the PIXELS because the file proves nothing
+> -- "a PNG exists and starts with 89 50 4e 47" was true for this entire
+> campaign while the on-screen content area was blank.
+>
+> **The on-screen content area is still blank, and that is now a narrow
+> question rather than a mystery.** What has been measured, not assumed:
+>
+> | fact | evidence |
+> |---|---|
+> | the document is loaded and ACTIVE | the window title is `"OS-DEV — Mozilla Firefox"`, taken from `<title>` |
+> | the file is read whole | `read(fd 62) -> 1068` then `-> 0`, twice |
+> | the compositor is faithful | the commit handler reads `mid 0xfff9f9fb` out of the client's OWN buffer |
+> | a content process CAN render our page | the headless run that produced the PNG spawned four `tab` processes |
+> | WebRender IS compositing | `gfx.webrender.debug.profiler` drew its own HUD into the window |
+> | descriptor passing is fine at Gecko's scale | `most descriptors in one sendmsg so far: 13 (capacity 64)` |
+> | it is not slowness | 27 samples over 7 minutes, every one 93% `#f9f9fb` |
+> | it is not a missing trigger | real motion, a click and a keypress leave the content byte-identical |
+>
+> `--screenshot` goes through `drawSnapshot`, which asks the content process to
+> paint synchronously and never builds a WebRender scene -- so the headless
+> success proves a content process can rasterise here, and says nothing about
+> the continuous scene-based path, which is the one that has never produced a
+> pixel.
+>
+> **Six real compositor defects were found on the way there, all fixed.** The
+> `xdg_toplevel.configure` states array was EMPTY, so the browser was never told
+> it was ACTIVATED and Gecko throttles a window it believes is in the
+> background. `set_maximized` was unhandled -- and Gecko had been sitting there
+> reporting `mIsFullyOccluded 1`, which is a window it will not paint at all.
+> `wl_keyboard.enter` was only ever sent from the INPUT path, so an unattended
+> boot never had focus (`gFocusWindow 0`). `xdg_activation_v1` did not exist, and
+> Firefox names it by name; it now runs the whole token handshake. Frame
+> callbacks were answered only on a commit of the SAME surface rather than on a
+> periodic tick, which is what vsync actually is. A subsurface's parent-relative
+> offset was written into a field the caller reads as window-relative, so only
+> the first generation of a four-generation walk ever had correct coordinates.
+> And the blit masked alpha off, painting GTK's transparent drop shadow BLACK.
+>
+> **Claude Code's Bash tool is unblocked.** `st_dev` came back `0x801` from
+> `stat` and **zero** from `statx`, because statx zeroes its buffer and never
+> wrote `stx_dev_*`. Bun's Zig standard library records `(st_dev, st_ino)` for
+> the working directory and re-checks it before spawning, so the two answers read
+> as the directory being swapped underneath it. The guest Claude diagnosed that
+> itself, from the inside: *"two stats of one path disagree."*
+>
+> **And the network was never asking for an address.** `net_dhcp()` was called
+> from netcon and one syscall and nowhere else, so an ordinary boot kept the
+> SLIRP default 10.0.2.15 -- right under QEMU user-mode networking and useless
+> on the bridged VM this project develops on. The log hid it twice: the address
+> was printed as a LITERAL STRING, and resolv.conf claimed "from the DHCP lease"
+> over a compiled-in constant. It now says `IP = 192.168.1.224 (DHCP)`.
+>
+> **Two things about time.** `CLOCK_MONOTONIC` advanced in **10 ms steps** --
+> the PIT runs at 100 Hz -- while `clock_getres` claimed 1 ms. Ten milliseconds
+> is coarser than a 60 Hz frame, so every duration Gecko measures quantised to 0
+> or 10. It is TSC-anchored now (`~1ns instead of 10ms`), and the test written
+> for it caught the first version going **backwards by 4.87 ms** on its first
+> full run -- three separate causes, ending in monotonicity being *enforced*
+> rather than argued, because every argument made about that clock had been
+> wrong once. And a first paint is **4.7 core-seconds of work in 40 seconds of
+> wall clock**: 88% of the boot is a core doing nothing, so the 5-second target
+> is roughly what the work costs and the gap is latency.
+>
+> **Instruments that lied, again, and this is the pattern worth keeping:** a
+> vsync counter that counted one of two answer paths and printed 0; a wait
+> summary that called STOPPED threads "runnable"; `wchan.sh` resolving every
+> address to one symbol because bash `printf` overflows on a higher-half address
+> *and* `kernel32.elf` truncates symbols to 32 bits; `timer_res_ns` claiming 1 ns
+> while the arithmetic quantised to 1024 cycles; and a marker the linuxabi suite
+> has waited 1700 iterations for since M2007 that nothing has ever printed.
+
 > **(M2096-M2107) THE BROWSER WAS NEVER HANGING. IT WAS CRASHING, AND EVERY
 > INSTRUMENT DESCRIBED THE CORPSE AS A HANG.**
 >
