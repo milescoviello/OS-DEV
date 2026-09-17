@@ -1650,10 +1650,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                          * measuring a browser that had not got
                                          * to the page yet and reporting it as
                                          * "only the chrome". */
-                                        for (int k = 0; k < 20; k++) {
-                                            task_sleep_ms(8000);
+                                        /* FORTY SAMPLES AT FIFTEEN SECONDS (M2117).
+                                         * The headless --screenshot run took
+                                         * the better part of ten minutes to
+                                         * produce its PNG on one core -- and
+                                         * that is the SAME engine doing the
+                                         * same layout. So a 160-second window
+                                         * after the chrome appears may simply
+                                         * be shorter than the work takes, and
+                                         * "the content area is blank" would be
+                                         * a statement about a browser that has
+                                         * not finished yet. Ten minutes. */
+                                        for (int k = 0; k < 40; k++) {
+                                            task_sleep_ms(15000);
                                             kprintf("[page] --- sample %d, %ds after the first paint ---\n",
-                                                    k + 1, (k + 1) * 8);
+                                                    k + 1, (k + 1) * 15);
                                             wl_page_probe(0x101820);
                                             /* AND WHAT EVERY LINUX PROCESS IS
                                              * WAITING FOR (M2108). The page
@@ -1666,8 +1677,37 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                              * browser PARENT. wchan is a
                                              * kernel PC; tools/wchan.sh turns
                                              * it into a function name. */
-                                            if (k == 9 || k == 19) wl_page_dump();
-                                            if (k == 2 || k == 10 || k == 18) {
+                                            if (k == 19 || k == 39) wl_page_dump();
+                                            /* POKE IT (M2117). An on-screen
+                                             * content paint is driven by the
+                                             * refresh driver; a headless
+                                             * --screenshot forces one
+                                             * synchronously, and that is the
+                                             * one that works. So give the
+                                             * browser a reason to repaint --
+                                             * real pointer motion, a click and
+                                             * a keypress, through the same
+                                             * path the desktop uses for a
+                                             * human. If the content area
+                                             * changes after this and not
+                                             * before, nothing was ever
+                                             * TRIGGERING a content paint, which
+                                             * is a different bug from one that
+                                             * cannot paint. */
+                                            if (k == 6 || k == 14 || k == 24) {
+                                                uint32_t pw2 = 0, ph2 = 0;
+                                                wl_largest_window(&pw2, &ph2);
+                                                int mx = (int)pw2 / 2, my = (int)ph2 / 2;
+                                                kprintf("[page] poking the browser: motion to %d,%d, a click and a key\n",
+                                                        mx, my);
+                                                wl_post_motion(mx, my);
+                                                wl_post_motion(mx + 3, my + 2);
+                                                wl_post_button(mx + 3, my + 2, 0x110 /*BTN_LEFT*/, 1);
+                                                wl_post_button(mx + 3, my + 2, 0x110, 0);
+                                                wl_post_key(31 /*evdev 's'*/, 1);
+                                                wl_post_key(31, 0);
+                                            }
+                                            if (k == 4 || k == 20 || k == 38) {
                                                 int pids[16];
                                                 int np = app_live_pids(pids, 16);
                                                 for (int j = 0; j < np; j++)

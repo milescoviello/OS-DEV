@@ -625,7 +625,7 @@ static void syscall_dispatch_body(struct registers *r) {
         n = sappend(b, n, max, " MiB free / ");
         n = snum(b, n, max, pmm_total_bytes() / (1024*1024));
         n = sappend(b, n, max, " MiB\nuptime: ");
-        n = snum(b, n, max, timer_ticks() / 100);
+        n = snum(b, n, max, timer_ticks() / timer_hz());
         n = sappend(b, n, max, " s\ntasks:  ");
         n = snum(b, n, max, (uint64_t)task_count());
         n = sappend(b, n, max, "\n");

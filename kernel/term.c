@@ -88,7 +88,7 @@ static void run(const char *cmd) {
         if (r < 0) print("no such file\n");
         else { buf[r] = 0; print(buf); if (r && buf[r - 1] != '\n') put('\n'); }
     } else if (eq(cmd, "time")) {
-        uint64_t s = timer_ticks() / 100;
+        uint64_t s = timer_ticks() / timer_hz();
         print("uptime "); print_uint(s); print("s\n");
     } else if (cmd[0]) {
         print("unknown: "); print(cmd); put('\n');

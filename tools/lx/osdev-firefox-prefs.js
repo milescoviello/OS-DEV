@@ -32,7 +32,14 @@ pref("webgl.disabled",               true);   // a page asking for WebGL must fa
 // what receives an out-of-process document's display list. With it disabled
 // the parent hosts the compositor, and remote content has never once appeared
 // that way here. `-append ffnogpu` puts it back off for the A/B.
-pref("layers.gpu-process.enabled",   false);  // one variable at a time: the frame_rate change above is the evidence-backed one
+// THE GPU PROCESS IS ON (M2117). It was disabled in M2107 because it died in a
+// respawn loop trying to create an EGL display -- but that was the EGL, and
+// software WebRender removes EGL from the path entirely. WebRender's own HUD
+// now draws into the window, so compositing works; what is missing is the
+// REMOTE DOCUMENT's pipeline, and the GPU process is where the cross-process
+// compositor normally lives. With it disabled the parent hosts the compositor,
+// and a remote document has never once appeared that way here.
+pref("layers.gpu-process.enabled",   false);  // it was never actually spawned with software WR, so this changes nothing either way
 pref("media.rdd-process.enabled",    false);  // no audio/video decode here either
 
 // FEWER PROCESSES, because every one of them costs a full fork of a 120 MB
@@ -122,7 +129,13 @@ pref("layout.frame_rate",            -1);
 // in pixels: if it appears in the framebuffer dump, WebRender is live and the
 // missing thing is the content pipeline specifically; if it does not, the
 // chrome is arriving by some other route and WebRender is not running.
-pref("gfx.webrender.debug.profiler", true);
+// ...AND IT ANSWERED, SO IT IS OFF AGAIN (M2116). With the HUD on, the content
+// area came back 57% #343434 with green and yellow pixels in it -- WebRender's
+// own overlay and its graphs, drawn into the window. That is WebRender saying
+// "I am compositing this window", which is the fact three runs were spent
+// trying to establish. It also covers the content, so it cannot stay on while
+// the question is what the content looks like.
+pref("gfx.webrender.debug.profiler", false);
 
 // Nothing may open a second tab, phone home, or replace the URL we asked for.
 pref("browser.shell.checkDefaultBrowser", false);

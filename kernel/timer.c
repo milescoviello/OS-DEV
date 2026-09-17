@@ -87,6 +87,17 @@ static void timer_handler(struct registers *r) {
 }
 
 uint32_t timer_tick_ms(void) { return tick_ms; }
+/* THE TICK RATE, so nothing has to assume it (M2117).
+ *
+ * Six places divided timer_ticks() by a literal 100 to get seconds, and
+ * kernel/net.c builds about ninety deadlines as `timer_ticks() + 200` with the
+ * constant meaning "two seconds at 100 Hz". That makes the PIT frequency
+ * un-raisable: 1000 Hz would give millisecond sleep granularity -- every
+ * task_sleep_ms(1) currently waits for the NEXT TICK, so a one-millisecond
+ * sleep really takes up to ten -- and it would also silently shorten every ARP,
+ * DNS and TCP timeout by a factor of ten. The literals are the blocker, not the
+ * rate, and this is the accessor that removes them. */
+uint32_t timer_hz(void) { return tick_hz ? tick_hz : 100; }
 
 void timer_init(uint32_t hz) {
     uint32_t divisor = PIT_FREQUENCY / hz;

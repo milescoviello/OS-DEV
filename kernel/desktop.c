@@ -748,7 +748,7 @@ static void draw_content(const window_t *w, int focused) {
                                    w->w, w->h - TITLEBAR_H);
         break;
     case KIND_CLOCK: {
-        uint64_t sec = timer_ticks() / 100;
+        uint64_t sec = timer_ticks() / timer_hz();
         char t[6]; u2(sec/60, t); t[2]=':'; u2(sec%60, t+3);
         fb_text(w->x + 28, by + 18, t, THEME_GREEN, 5);
         break;
@@ -780,7 +780,7 @@ static void draw_content(const window_t *w, int focused) {
 
         char up[40]; p = 0;
         const char *uh = "Uptime "; for (int i=0;uh[i];i++) up[p++]=uh[i];
-        p += unum(timer_ticks()/100, up+p); up[p++]='s'; up[p]=0;
+        p += unum(timer_ticks()/timer_hz(), up+p); up[p++]='s'; up[p]=0;
         draw_text(bx, yb + 72, up, THEME_TEXT);
 
         /* network: our IP + gateway (a connected, internet-capable OS) */
@@ -2807,7 +2807,7 @@ void desktop_run(void) {
             if (!owned && app_reap(a)) dirty = 1;
         }
 
-        uint64_t sec = timer_ticks() / 100;
+        uint64_t sec = timer_ticks() / timer_hz();
         int clock_tick = (sec != last_sec);
         if (clock_tick) last_sec = sec;
         if (wallpaper_repaint) { wallpaper_repaint = 0; dirty = 1; }   /* `wallpaper` builtin swapped the bg */

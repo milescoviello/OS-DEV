@@ -1886,7 +1886,7 @@ void app_render(app_t *a, int px, int py, int focused) {
         if (cr >= 0 && cr < a->rows && a->cx >= 0 && a->cx < a->cols) {
             char ch = a->grid[a->cy][a->cx];
             int cx = px + a->cx * font_width, cy = py + cr * font_height;
-            if ((timer_ticks() / 100) & 1)
+            if ((timer_ticks() / timer_hz()) & 1)
                 fb_glyph(cx, cy, (ch && ch != ' ') ? ch : ' ', 0x0A0A0A, 0x33FF66);
             else
                 fb_glyph(cx, cy, ch ? ch : ' ', 0x33FF66, term_bg_blend(desktop_wallpaper_sample(cx, cy)));
