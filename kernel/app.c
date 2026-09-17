@@ -3372,6 +3372,47 @@ static void fill_note(uint64_t va, unsigned char kind, uint64_t foff,
     f->want = want; f->got = got; f->tid = task_current_id(); f->used = 1;
 }
 
+/* WHO LAST SET THIS MAPPING'S PROTECTION (M2162).
+ *
+ * Same shape as the fill table above, and for the same reason: three runs in
+ * three now die with a WRITE to a page that is present, user, not writable and
+ * not COW, inside a VMA the report says is `prot=1 file libxul.so +9d3d000` --
+ * which is libxul's read-WRITE data segment. So either it was recorded
+ * read-only when it was created, or an mprotect made it read-only over a far
+ * wider range than ld.so's RELRO pass asks for. Those have different fixes and
+ * nothing in the log distinguishes them.
+ *
+ * Direct-mapped on the mapping's start address, last writer wins, checked back
+ * on lookup. */
+#define PROTN_SLOTS 2048
+static struct protnote {
+    uint64_t start, len;
+    uint64_t arg_addr, arg_len;
+    unsigned char prot, who, used;      /* who: 1 = mmap, 2 = mprotect, 3 = split */
+    int tid;
+} g_protn[PROTN_SLOTS];
+
+static void protnote(uint64_t start, uint64_t len, unsigned char prot, unsigned char who,
+                     uint64_t arg_addr, uint64_t arg_len) {
+    struct protnote *p = &g_protn[(start >> 12) & (PROTN_SLOTS - 1)];
+    p->start = start; p->len = len; p->prot = prot; p->who = who;
+    p->arg_addr = arg_addr; p->arg_len = arg_len; p->tid = task_current_id(); p->used = 1;
+}
+
+static void protnote_report(uint64_t start) {
+    struct protnote *p = &g_protn[(start >> 12) & (PROTN_SLOTS - 1)];
+    if (!p->used || p->start != start) {
+        kprintf("[fault]   no record of who set this mapping's protection\n");
+        return;
+    }
+    static const char *const who[] = { "?", "mmap", "mprotect", "a VMA split" };
+    kprintf("[fault]   its protection (%d) was last set by %s, tid %d, for the range "
+            "%lx+%lx (this mapping is %lx+%lx)\n",
+            p->prot, who[p->who < 4 ? p->who : 0], p->tid,
+            (unsigned long)p->arg_addr, (unsigned long)p->arg_len,
+            (unsigned long)p->start, (unsigned long)p->len);
+}
+
 /* Printed by the code check when memory and file disagree. */
 static void fill_report(uint64_t va) {
     struct fillrec *f = &g_fill[(va >> 12) & (FILL_SLOTS - 1)];
@@ -3467,6 +3508,18 @@ void app_describe_addr(uint64_t addr) {
         uint64_t vstart = a->vma[i].start, vend = a->vma[i].start + a->vma[i].len;
         int fb = a->vma[i].file_backed;
         vma_unlock(a, fl);                    /* elf_vaddr_of_file_off reads the DISK */
+        /* AND THE DISK NEEDS INTERRUPTS (M2163). Both reads below go through
+         * the VFS, and a fault can arrive with IF clear -- in which case the
+         * ATA wait never sees the timer advance and the read fails. The two
+         * best diagnostics in this file then degraded SILENTLY: the library
+         * vaddr fell back to printing a file offset, and the memory-vs-file
+         * code check printed nothing at all, so a fault that most needed them
+         * got neither and I read the absence as "the check did not apply".
+         * Safe here for the same reason the resolver is: a ring-3 fault holds
+         * no kernel lock, and the VMA lock was just released. */
+        uint64_t had_if = 0;
+        __asm__ volatile("pushfq; pop %0" : "=r"(had_if) :: "memory");
+        __asm__ volatile("sti");
         /* SAY WHICH NUMBER THIS IS (M2153). This printed `addr - start + foff`
          * and called it "+ %lx", and for two sessions I fed that straight to
          * `objdump --start-address` -- which takes a VIRTUAL address. A shared
@@ -3503,6 +3556,7 @@ void app_describe_addr(uint64_t addr) {
          * the next instrument to lie. vmm_pte_raw first, never a dereference:
          * a demand-zero fill here would manufacture its own answer, which is
          * exactly what M2152 had to undo. */
+        if (!(prot & 2)) protnote_report(vstart);
         if (fb && !(prot & 2)) {
             uint64_t p0 = addr & ~(uint64_t)0xFFF, p1 = (addr + 15) & ~(uint64_t)0xFFF;
             if ((vmm_pte_raw(p0) & PTE_PRESENT) && (vmm_pte_raw(p1) & PTE_PRESENT)) {
@@ -3529,6 +3583,7 @@ void app_describe_addr(uint64_t addr) {
                 }
             }
         }
+        if (!(had_if & 0x200)) __asm__ volatile("cli");   /* leave IF as we found it (M2163) */
         return;
     }
     vma_unlock(a, fl);
@@ -5862,11 +5917,33 @@ static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
      * (M1965) */
     {
         uint8_t np = (uint8_t)((prot & 0x7) ? (prot & 0x7) : VMA_PROT_READ);
-        if (a && app_vma_split_at(a, a0) == 0 && app_vma_split_at(a, end) == 0)
+        int s1ok = a ? app_vma_split_at(a, a0) : -1;
+        int s2ok = a ? app_vma_split_at(a, end) : -1;
+        if (a && s1ok == 0 && s2ok == 0) {
             for (int i = 0; i < a->nvma; i++) {
                 uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
-                if (s0 >= a0 && e0 <= end) a->vma[i].prot = np;
+                if (s0 >= a0 && e0 <= end) {
+                    a->vma[i].prot = np;
+                    protnote(s0, a->vma[i].len, np, 2, addr, len);
+                }
             }
+        } else if (a) {
+            /* A SPLIT THAT FAILED USED TO BE SILENT, AND SUCCEEDED ANYWAY
+             * (M2162). Without both boundaries the loop above cannot record
+             * the new protection on a partially-covered VMA, so it recorded
+             * NOTHING -- and returned success. Every page of that VMA faulted
+             * in afterwards with the OLD protection, which is the case the
+             * M1965 comment right above this says is fatal for a JIT. Linux
+             * returns ENOMEM when it cannot split; say so rather than lying. */
+            static int told;
+            if (told < 4) {
+                told++;
+                kprintf("[mprotect] could not split at %lx/%lx (%d/%d) -- the VMA table is full "
+                        "(%d entries). Reporting ENOMEM instead of recording the wrong "
+                        "protection.\n", (unsigned long)a0, (unsigned long)end, s1ok, s2ok, a->nvma);
+            }
+            return -1;
+        }
     }
     if (covered) {
         /* (the VMA prot was already recorded above, for both paths) */

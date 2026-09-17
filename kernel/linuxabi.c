@@ -3676,7 +3676,32 @@ static void lx_dispatch_body(struct registers *r) {
                         fpath, len, (long)r->r9, (flags & LX_MAP_FIXED) ? 1 : 0);
                 r->rax = (uint64_t)-(long)LX_ENOMEM; break;
             }
-            if (prot != (1 | 2)) app_mprotect(fbase, (uint64_t)len, (int)prot);
+            /* ALWAYS RECORD THE REQUESTED PROTECTION (M2162).
+             *
+             * This was `if (prot != (1|2))`, on the reasoning that READ|WRITE is
+             * already the default so there is nothing to apply. That holds for a
+             * fresh VMA -- VMA_NEW defaults to READ|WRITE -- and is FALSE for a
+             * MAP_FIXED mapping, which carves an existing VMA and inherits its
+             * protection. Which is precisely how ld.so lays out a shared
+             * library: one big PROT_READ reservation of the whole file, then
+             * MAP_FIXED per segment. The data segment's mapping is the
+             * remainder of that reservation, so it kept prot=1, every page of
+             * it faulted in READ-ONLY, and the first write to a global in
+             * libxul's .data died with
+             *
+             *   err=0x7 present=1 write=0 user=1 cow=0
+             *   inside vma[330] prot=1 file 'libxul.so' +9d3d000
+             *
+             * three runs in three, always at the same address. M1956 found this
+             * exact bug ("a freshly MAP_FIXED'd read-WRITE data segment
+             * inherited prot=1 from the read-only reservation it replaced") and
+             * fixed it by giving VMA_NEW a sane default; this shortcut let it
+             * back in through the other door. Fixed in one place and not the
+             * other, again.
+             *
+             * The cost of always applying it is one pass over the VMA table on
+             * a path that has just done a file mapping. */
+            app_mprotect(fbase, (uint64_t)len, (int)prot);
             r->rax = fbase;
             break;
         }
@@ -3731,7 +3756,9 @@ static void lx_dispatch_body(struct registers *r) {
             r->rax = (uint64_t)-(long)LX_ENOMEM; break;
         }
         /* our regions come back writable+NX; tighten to what was asked for */
-        if (prot != (1 | 2)) app_mprotect(base, (uint64_t)len, (int)prot);
+        /* Same reasoning as the file path above (M2162): an anonymous MAP_FIXED
+         * over a carved region inherits that region's protection too. */
+        app_mprotect(base, (uint64_t)len, (int)prot);
         r->rax = base;
         break;
     }
