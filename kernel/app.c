@@ -4778,26 +4778,60 @@ int app_msync(uint64_t addr, uint64_t len) {
             if (vmm_pte_in(a->cr3, page) & PTE_DIRTY) { any_dirty = 1; break; }
         if (!any_dirty) continue;
 
-        struct statx st; long sz = (vfs_stat(vma_path(a, i), &st) == 0) ? (long)st.stx_size : 0;
-        uint64_t need = a->vma[i].foff + a->vma[i].len;      /* the mapping's own span sets the ceiling */
+        /* SNAPSHOT THE MAPPING BEFORE BLOCKING ON THE DISK (M2161).
+         *
+         * THE PANIC THIS FIXES. `vfs_read` below goes to the disk and this
+         * function deliberately holds no VMA lock across it (see the comment on
+         * vma_lock). It then went back to `a->vma[i]` for `foff` -- after
+         * another thread could have carved, moved or replaced that entry. A
+         * larger `foff` makes `fileoff` exceed `need`, and then
+         *
+         *     uint64_t n = PAGE_SIZE; if (fileoff + n > need) n = need - fileoff;
+         *
+         * UNDERFLOWS: `need - fileoff` is unsigned, so `n` becomes ~2^64 and
+         * the copy runs off the end of both the heap buffer and the mapped
+         * page. That is a supervisor READ of an absent page with no handler:
+         *
+         *     *** KERNEL PANIC *** Page Fault err=0x0 rip=app_msync
+         *
+         * reachable by any process that calls msync() while another of its
+         * threads touches the same address space -- which is Firefox with
+         * SQLite on eight cores, every run.
+         *
+         * Three fixes, because each is independently necessary: take the
+         * fields ONCE, before the I/O; clamp with a comparison that cannot
+         * underflow; and do the page copy under the VMA lock, which is safe
+         * here precisely because the copy does no I/O -- the reads and writes
+         * are outside it. */
+        uint64_t v_foff = a->vma[i].foff, v_len = a->vma[i].len, v_start = a->vma[i].start;
+        char vpath[VFS_PATH_MAX];
+        {   const char *sp = vma_path(a, i); unsigned k = 0;
+            for (; sp && sp[k] && k < sizeof(vpath) - 1; k++) vpath[k] = sp[k];
+            vpath[k] = 0; }
+        struct statx st; long sz = (vfs_stat(vpath, &st) == 0) ? (long)st.stx_size : 0;
+        uint64_t need = v_foff + v_len;                      /* the mapping's own span sets the ceiling */
         if ((uint64_t)sz > need) need = (uint64_t)sz;        /* preserve any bytes past the mapping */
         if (need == 0 || need > (16u << 20)) continue;       /* refuse to RMW something absurd (16 MiB cap) */
         char *tmp = kmalloc((size_t)need);
         if (!tmp) continue;
-        long got = vfs_read(vma_path(a, i), tmp, need);
+        long got = vfs_read(vpath, tmp, need);
         if (got < 0) got = 0;
         for (long b = got; b < (long)need; b++) tmp[b] = 0;  /* zero-fill any gap, mirrors app_fd_write */
 
+        uint64_t mfl = vma_lock(a);
         for (uint64_t page = lo & ~(uint64_t)(PAGE_SIZE - 1); page < hi; page += PAGE_SIZE) {
             uint64_t pte = vmm_pte_in(a->cr3, page);
             if (!(pte & PTE_PRESENT) || !(pte & PTE_DIRTY)) continue;
-            uint64_t fileoff = a->vma[i].foff + (page - vstart);
-            uint64_t n = PAGE_SIZE; if (fileoff + n > need) n = need - fileoff;
+            if (page < v_start) continue;
+            uint64_t fileoff = v_foff + (page - v_start);
+            if (fileoff >= need) continue;                   /* never underflow the clamp */
+            uint64_t n = need - fileoff; if (n > PAGE_SIZE) n = PAGE_SIZE;
             for (uint64_t b = 0; b < n; b++) tmp[fileoff + b] = ((const char *)page)[b];
             vmm_set_pte_in(a->cr3, page, pte & ~PTE_DIRTY);
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         }
-        vfs_write(vma_path(a, i), tmp, need);
+        vma_unlock(a, mfl);
+        vfs_write(vpath, tmp, need);
         kfree(tmp);
     }
     return 0;
