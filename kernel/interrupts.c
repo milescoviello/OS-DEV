@@ -479,6 +479,27 @@ void isr_dispatch(struct registers *r) {
                     kprintf("[fault] that is `mov %%fs:0x28,%%rax` -- the stack-protector canary, "
                             "read with a ZERO FS BASE (saved=%p live=%p cached=%p core=%d)\n",
                             (void *)task_fs_base(), (void *)live, (void *)cached, core);
+                    /* ...AND WHO WROTE THE ZERO (M2098).
+                     *
+                     * M2093 added this provenance and added it to the CAUGHT
+                     * fault path only -- and this bug takes the TERMINATE path,
+                     * because the threads that hit it have no SIGSEGV handler.
+                     * So the one diagnostic built for this exact failure was
+                     * missing from the only path it ever fires on. Second time
+                     * this session: M2088's address tracer went to one of two
+                     * fault paths too, and MOZ_CRASH takes the other one.
+                     *
+                     * saved-good / live-zero / cached-zero says the last write
+                     * to this core's MSR was a zero. The remaining question is
+                     * by WHICH task, and whether anything has run since -- and
+                     * that is what names the bug rather than describing it. */
+                    {   int who = -1; uint64_t seq = 0, now = 0;
+                        task_fs_base_last(&who, &seq, &now);
+                        kprintf("[fault]   this core's FS_BASE was last written by tid %d "
+                                "(write #%lu of %lu; %lu FS_BASE load(s) elsewhere since), and this "
+                                "thread has been switched in %lu time(s)\n",
+                                who, seq, now, now - seq, task_nswitch_of(task_self()));
+                    }
                 }
             }
             /* The last few syscalls, not the last 256: on a fault the tail is
