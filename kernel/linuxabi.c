@@ -830,6 +830,36 @@ unsigned long lx_syscalls_made(void) { return lx_syscall_count; }
 /* Per-syscall-number counts, and the top few since the previous call. Printed
  * from the page sampler, so the plateau can be read off directly. */
 unsigned long g_syscnt[512];
+uint64_t g_syscycles[512];
+/* Where the WALL TIME went since the last call, per syscall number. Cycles are
+ * reported as milliseconds against the calibrated TSC so the number can be
+ * compared against the 15 seconds between samples directly. */
+void lx_syscall_time_top(int howmany) {
+    static uint64_t prev[512];
+    uint64_t d[512], tot = 0;
+    for (int i = 0; i < 512; i++) {
+        d[i] = g_syscycles[i] > prev[i] ? g_syscycles[i] - prev[i] : 0;
+        prev[i] = g_syscycles[i];
+        tot += d[i];
+    }
+    if (!tot) { kprintf("[syscost] no time accounted since the last sample\n"); return; }
+    /* Cycles -> ms via the calibrated clock: timer_ns() is ns-per-cycle scaled,
+     * so one ms is timer_cycles_per_ms(). Reported in ms so it can be compared
+     * against the 15 seconds between samples without arithmetic. */
+    uint64_t cpm = timer_cycles_per_ms();
+    if (!cpm) cpm = 1;
+    kprintf("[syscost] thread-time in syscalls since the last sample: %lums total, worst:",
+            (unsigned long)(tot / cpm));
+    for (int k = 0; k < howmany; k++) {
+        int best = -1; uint64_t bn = 0;
+        for (int i = 0; i < 512; i++) if (d[i] > bn) { bn = d[i]; best = i; }
+        if (best < 0 || !bn) break;
+        kprintf(" %s(%d)=%lums", lx_syscall_name((unsigned long)best), best,
+                (unsigned long)(bn / cpm));
+        d[best] = 0;
+    }
+    kprintf("\n");
+}
 void lx_syscall_top(int howmany) {
     static unsigned long prev[512];
     unsigned long d[512]; unsigned long tot = 0;
@@ -1497,14 +1527,27 @@ static void lx_dispatch_body(struct registers *r);
  * cost, and a real one -- but it is the only way to know, and it is a constant
  * that can be removed once the answer is in. */
 unsigned long g_lx_dispatch_cycles;
+extern uint64_t g_syscycles[512];
 void linux_syscall_dispatch(struct registers *r) {
     uint32_t dlo, dhi;
     __asm__ volatile("rdtsc" : "=a"(dlo), "=d"(dhi));
     uint64_t dt0 = ((uint64_t)dhi << 32) | dlo;
+    /* WHICH call this is, read BEFORE the body runs: rax holds the return value
+     * afterwards, and attributing every syscall's cost to whatever number its
+     * result happened to equal is the exact mistake M2070 made with the failure
+     * histogram's names. (M2139) */
+    unsigned long sc_nr = (unsigned long)r->rax;
     task_kernel_enter();
     lx_dispatch_body(r);
     __asm__ volatile("rdtsc" : "=a"(dlo), "=d"(dhi));
-    g_lx_dispatch_cycles += (((uint64_t)dhi << 32) | dlo) - dt0;
+    uint64_t dd = (((uint64_t)dhi << 32) | dlo) - dt0;
+    g_lx_dispatch_cycles += dd;
+    /* AND PER NUMBER (M2139). A count cannot find a cost: the plateau before
+     * Firefox's page is 14000 syscalls per 15s of which clock_gettime is more
+     * than half, and clock_gettime is not what anybody is waiting for. Where
+     * the SECONDS go is a different question and it is the one that matters.
+     * This rides the rdtsc pair that is already here, so it costs two adds. */
+    if (sc_nr < 512) g_syscycles[sc_nr] += dd;
     task_kernel_leave();               /* may not return: see task_t::in_kernel */
 }
 static void lx_dispatch_body(struct registers *r) {

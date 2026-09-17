@@ -9,6 +9,7 @@ uint64_t timer_ms(void);            /* milliseconds since boot (monotonic) */
  * monotonic clock stops advancing in 10 ms jumps. A 60 Hz frame interval is
  * 16.7 ms, so a 10 ms clock cannot express one. (M2114) */
 uint32_t timer_hz(void);            /* the tick rate: never assume 100 (M2117) */
+uint64_t timer_cycles_per_ms(void);   /* TSC cycles per ms, 0 if uncalibrated (M2139) */
 uint64_t timer_ns(void);
 uint64_t timer_res_ns(void);        /* what that clock's resolution ACTUALLY is */
 void     timer_calibrate_tsc(void); /* once, after the PIT is running */

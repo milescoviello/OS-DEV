@@ -477,10 +477,39 @@ int ata_read_drive_pio(int drive, uint32_t lba, uint32_t count, void *buf) {
     return r;
 }
 
+/* WRITES WERE PURE PIO, AND IT COST THE WHOLE OF FIREFOX'S TIME-TO-PAGE
+ * (M2142).
+ *
+ * M2091/M2101 moved READS onto DMA and measured an 11x win per sector. Writes
+ * were left on the port loop below, and nothing measured them -- because
+ * ata_diskbench benchmarks reads only, off the end of the disk where writing
+ * would be unsafe. So the slowest path in the driver was the one with no
+ * instrument pointed at it.
+ *
+ * What it costs, measured per syscall rather than guessed: during Firefox's
+ * pre-page plateau, pwrite64 accounted for ~13.8 SECONDS of thread time in
+ * every 15 seconds of wall clock -- one thread inside write() 92% of the time,
+ * about 37 ms for a single write, against ~5 ATA commands and ~35 sectors per
+ * write. A 35-sector PIO write is 35 * 256 = ~9000 `outw` instructions, and
+ * every one of them is a port trap out to the hypervisor.
+ *
+ * The DMA write path already existed (ata_write_dma) and already had a
+ * byte-correctness round-trip self-test -- it was simply never wired to the
+ * real write. Same gate as the read path so the two cannot drift: DMA when it
+ * is available and the request fits the bounce buffer, PIO otherwise, always.
+ * `-append nodmawrite` forces the old path for A/B measurement. */
+int g_ata_dma_writes = 1;
+
 static int ata_write_drive_impl(int drive, uint32_t lba, uint32_t count, const void *buf) {
     if (!drive_ok(drive) || count == 0) return -1;
     if ((uint64_t)lba + count > (1u << 28))
         return ata_write_drive_impl_lba48(drive, lba, count, buf);
+    if (g_ata_dma_writes && count <= ATA_DMA_BOUNCE_SECTORS && ata_dma_setup()) {
+        int dr = ata_dma_xfer_impl(drive, lba, count, (void *)buf, 1);
+        if (dr >= 0) { io_dma_cmds++; return 0; }
+        /* Fall through to PIO: a controller that misbehaves costs speed, not
+         * correctness -- the same rule the read path states. */
+    }
     uint16_t io = ATA_DRIVES[drive].io;
     uint8_t slave = ATA_DRIVES[drive].slave;
 

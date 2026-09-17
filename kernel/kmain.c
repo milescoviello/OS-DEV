@@ -673,6 +673,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "journalguest"))  g_journal_test = 1;        /* on-ata write-ahead-journal crash-recovery test (M1865) */
         if (cmdline_has(cl, "fatjournaltest")) g_fatjournal_test = 1;    /* live FAT32 create crash-atomicity test (M1866) */
         if (cmdline_has(cl, "nodma")) { extern int g_ata_dma_reads; g_ata_dma_reads = 0; }   /* A/B the DMA read path (M2091) */
+        if (cmdline_has(cl, "nodmawrite")) { extern int g_ata_dma_writes; g_ata_dma_writes = 0; }   /* A/B the DMA write path (M2142) */
         if (cmdline_has(cl, "ffshot")) { g_lxabi_test = 1; g_ffshot = 1; }   /* Gecko's renderer, no compositor (M2107) */
         if (cmdline_has(cl, "ffdata")) g_ffdata = 1;   /* a data: URL: take the filesystem out of it (M2107) */
         if (cmdline_has(cl, "freepoison")) { extern int g_freepoison; g_freepoison = 1;
@@ -1781,7 +1782,25 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                                         pfn > ppf ? pfn - ppf : 0);
                                                 psc = sc; ppf = pfn; }
                                             {   extern void lx_syscall_top(int);
-                                                lx_syscall_top(6); }
+                                                extern void lx_syscall_time_top(int);
+                                                lx_syscall_top(6);
+                                                lx_syscall_time_top(6); }
+                                            /* AND WHAT THE DISK DID (M2141).
+                                             * pwrite64 costs ~37ms a call and
+                                             * that is not the write: it is
+                                             * whatever the write has to read
+                                             * first. Commands per call is the
+                                             * number that says so, and it can
+                                             * only be had by counting both. */
+                                            {   static uint64_t pc, ps, ph;
+                                                uint64_t c = 0, se = 0, h = 0, cx = 0, chh = 0;
+                                                ata_io_stats(&c, &se, &h, &cx, &chh);
+                                                kprintf("[diskrate] +%lu command(s), +%lu sector(s), "
+                                                        "+%lu cache hit(s) since the last sample\n",
+                                                        (unsigned long)(c > pc ? c - pc : 0),
+                                                        (unsigned long)(se > ps ? se - ps : 0),
+                                                        (unsigned long)(h > ph ? h - ph : 0));
+                                                pc = c; ps = se; ph = h; }
                                             wl_page_probe(0x101820);
                                             /* AND WHAT EVERY LINUX PROCESS IS
                                              * WAITING FOR (M2108). The page

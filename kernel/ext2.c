@@ -1621,7 +1621,7 @@ long ext2_seek_data_hole(blk_read_fn read, void *ctx, uint64_t start_lba,
  * free of syscall.h). i_ctime is bumped to "now" since metadata changed. */
 long ext2_utimes_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, long atime, long mtime) {
-    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
+    /* No flush: mode, owner and times are not in the path cache (M2140). */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1639,7 +1639,7 @@ long ext2_utimes_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
  * bumped since metadata changed. Files and directories both. Returns 0/-1. */
 long ext2_chmod_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, uint32_t mode) {
-    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
+    /* No flush: mode, owner and times are not in the path cache (M2140). */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1657,7 +1657,7 @@ long ext2_chmod_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
  * syscall.h). i_ctime is bumped. Files and directories both. Returns 0/-1. */
 long ext2_chown_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, long uid, long gid) {
-    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
+    /* No flush: mode, owner and times are not in the path cache (M2140). */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1710,9 +1710,28 @@ static int extent_to_indirect(ext2_t *v, uint8_t *inode, uint32_t *charged) {
  *
  * A write starting past EOF leaves a genuine sparse hole: unmapped blocks read
  * back as zeroes via map_block, which is what ext2 semantics call for. */
+/* WHY THIS ONE DOES NOT FLUSH THE PATH CACHE (M2140).
+ *
+ * M2103's rule -- every mutating entry point drops the whole cache -- is right
+ * for anything that changes the NAMESPACE, because selective invalidation of a
+ * path cache has to know every path a rename or an unlink can affect and being
+ * wrong once means answering "no such file" about a file that exists.
+ *
+ * It is the wrong rule here, and the reason is in what the cache actually
+ * stores: `{ path, ino, used, isdir, negative }`. No inode bytes, no size, no
+ * timestamps. Writing a file's DATA, or changing its mode, owner or times,
+ * cannot falsify any of those fields -- the path still names the same inode
+ * and it is still not a directory. Only CREATING a name can, by falsifying a
+ * negative entry, and that case still flushes below.
+ *
+ * The cost of getting this wrong was the whole of Firefox's time-to-page.
+ * Firefox writes ~25 times a second during startup; each write dropped 256
+ * cached path resolutions, so every subsequent lookup in the system re-walked
+ * from the volume root. Measured per-syscall thread time: pwrite64 cost about
+ * 13.8 SECONDS in every 15 seconds of wall clock -- one thread inside write()
+ * 92% of the time, ~37 ms for a single write -- and none of it was the write. */
 long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, uint64_t off, const void *buf, unsigned long len) {
-    ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -1734,6 +1753,10 @@ long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
     int cd = 0;
     uint32_t existing = dir_lookup(&v, pin, base, &cd);
     if (existing && cd) return -1;                         /* it's a directory */
+    /* Creating a name DOES change the namespace: a negative entry for this
+     * path would now be a lie. Overwriting an existing one changes nothing the
+     * cache holds -- see the note above this function. (M2140) */
+    if (!existing) ext2_path_cache_flush();
 
     uint8_t inode[256]; uint32_t ino; uint32_t charged = 0;
     if (existing) {

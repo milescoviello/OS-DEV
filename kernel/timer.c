@@ -185,6 +185,15 @@ uint64_t timer_res_ns(void) {
     return r ? r : 1;
 }
 
+/* TSC cycles in one millisecond, or 0 if the clock is not calibrated yet.
+ * Exported so a caller that has measured something in cycles can report it in
+ * a unit a human can compare against a wall-clock interval. (M2139) */
+uint64_t timer_cycles_per_ms(void) {
+    if (!g_tsc_per_tick) return 0;
+    uint32_t hz = tick_hz ? tick_hz : 100;
+    return (g_tsc_per_tick * hz) / 1000;          /* per-tick * ticks/s / 1000 */
+}
+
 /* CALIBRATE AGAINST THE CLOCK WE ALREADY TRUST. Called once, after the PIT is
  * running and before anything measures anything: sit on two tick edges and
  * count cycles between them. Four ticks (40 ms) rather than one, because a
