@@ -150,4 +150,33 @@ printf 'hosts:\tfiles dns\npasswd:\tfiles\ngroup:\tfiles\n' > "$ROOT/etc/nsswitc
 printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > "$ROOT/etc/hosts"
 printf 'multi on\n' > "$ROOT/etc/host.conf"
 
+# THE XDG USER DIRECTORIES (M2133).
+#
+# Firefox's BackupService asks the XPCOM directory service for the user's
+# Documents folder during startup. With no XDG configuration and no such
+# directory, the service returns NS_ERROR_FAILURE, the JS gets an empty string,
+# and PathUtils.join throws -- an UNCAUGHT exception in chrome startup:
+#
+#   console.warn: BackupService: "There was an error while trying to get the
+#     Document's directory" [nsIProperties.get] NS_ERROR_FAILURE
+#   JavaScript error: BackupService.sys.mjs, line 4380:
+#     NotAllowedError: PathUtils.join: PathUtils does not support empty paths
+#
+# These are directories every desktop Linux install has, and their absence is
+# not something a browser is written to survive.
+for d in Desktop Documents Downloads Music Pictures Public Templates Videos; do
+    mkdir -p "$ROOT/root/$d"
+done
+mkdir -p "$ROOT/root/.config"
+cat > "$ROOT/root/.config/user-dirs.dirs" <<'XDG'
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+XDG_VIDEOS_DIR="$HOME/Videos"
+XDG
+
 echo "  STAGE   $NAME <- $BIN (+ $n shared libs)"

@@ -144,3 +144,21 @@ pref("datareporting.policy.dataSubmissionEnabled", false);
 pref("toolkit.telemetry.enabled",         false);
 pref("app.update.enabled",                false);
 pref("extensions.autoDisableScopes",      0);
+
+// WHY IS THE FIRST TAB NEVER NAVIGATED? (M2133)
+//
+// M2132 established that Gecko opens a document channel for browser.xhtml, for
+// six extension background pages, and for NOTHING ELSE -- the initial
+// browsing context gets `about:blank` and is never navigated, neither from
+// argv nor from browser.startup.homepage above. Creating and navigating that
+// first tab is chrome JavaScript (gBrowserInit), so an exception partway
+// through startup would leave exactly this: some chrome painted, no tab strip,
+// no document, and the default window title.
+//
+// Chrome console messages -- including uncaught errors -- do not reach stderr
+// by default; they go to the Browser Console, which there is no way to open
+// here. This pref routes them to stdout, which is our serial console. The pref
+// name is checked against libxul rather than assumed, because a pref that does
+// not exist fails silently and looks exactly like a pref that did not help.
+pref("devtools.console.stdout.chrome", true);
+pref("browser.dom.window.dump.enabled", true);
