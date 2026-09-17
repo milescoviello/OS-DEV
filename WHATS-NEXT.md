@@ -1,5 +1,111 @@
 # What's next
 
+> **(M2156-M2159) AN ABANDONED DMA HANDED ITS SECTOR TO THE NEXT READ, AND A
+> GIGABYTE OF RAM WAS ALLOCATABLE BUT UNMAPPED.**
+>
+> M2155 proved the 8-core Firefox corruption was a **failed read mapped as a
+> success**, and could get no further than "a device error". Four instruments
+> later, here is the entire sequence, each step turning a smaller wrong answer
+> into a larger one:
+>
+> 1. A DMA read exceeds the driver's own wall-clock deadline while the drive is
+>    still streaming. The recorded task-file status is **0x58 -- DRDY, DSC and
+>    DRQ SET**: the drive is fine and is holding a sector for us.
+> 2. The driver gives up, and falls through to its PIO fallback. That does
+>    `wait_busy_clear` (passes -- BSY is clear), selects the new LBA, issues READ
+>    SECTORS, and calls `wait_drq` -- **which returns immediately, because DRQ
+>    was already set by the abandoned command.** The first 512 bytes read back
+>    are the OLD transfer's data, at the NEW command's address, returned as a
+>    success. And installed in the block cache, so one abandoned DMA poisons
+>    that sector for the rest of the boot.
+> 3. Those bytes were an ext2 indirect block, so `map_block` returned block
+>    **91513156** in a filesystem that has **819200** blocks, and nothing checked
+>    it.
+> 4. `raw_read` refused the resulting LBA -- 732105248 against a 6553600-sector
+>    disk -- correctly, and with no way to say why.
+> 5. ext2's path walk reported that refusal as **"file not found"** (`walk_d`
+>    returns 0 for both), and the path cache wrote it down as a NEGATIVE entry.
+> 6. The page-fault fill took the `-1`, left the frame as `memset` zeros, and
+>    **mapped it and reported the fault RESOLVED**.
+> 7. Execution fell into the hole; `00 00` decoded as `add %al,(%rax)`, a STORE,
+>    and surfaced as "write to a read-only mapping" half a megabyte away.
+>
+> **Both ext2 images are clean** -- `e2fsck -fn` reports no errors on the build
+> host's copy and on the node's. The disk was right the whole time and the
+> driver handed back someone else's bytes.
+>
+> **Correction to my own first measurement.** Three 300-second runs after the
+> drain landed reported 0 fill failures twice, and I wrote that down as the
+> chain being closed. Longer 420-second runs brought failures back -- and
+> looking at them properly, they are a DIFFERENT bug with an identical
+> headline: `ext2 says: the PATH was not found`, no device error, no bad
+> pointer, no ATA failure. A mapping of SQLite's `-shm` file, **unlinked while
+> mapped**. On Linux a mapping holds the inode, so that stays readable; this
+> VFS is path-based, so the read fails -- and the silent-zero behaviour M2155
+> removed was accidentally RIGHT there, because an shm file is zero-initialised
+> shared memory. Refusing the fault turned it into a SIGSEGV: a regression I
+> introduced, fixed in M2160 by asking whether the path still exists (gone =>
+> zeros are the only available answer and the correct one; still there => the
+> device refused, and zero-filling it is the corruption M2155 was about).
+>
+> The summary line I read those runs off was also wrong: it counted the
+> *presence* of a "block pointers rejected: 0" line as a rejection. An
+> instrument that counts the label instead of the value, for the fifth time in
+> this campaign.
+>
+> Fixed at every step, because every one of them was independently wrong: the
+> drive is **drained** before any command and on the way out of a failed
+> transfer (`ata_drain`, counted, because a drain that happens constantly is a
+> driver problem that must not hide inside a success); a block pointer past the
+> end of the filesystem is **corruption, not a hole**, and fails the read rather
+> than zero-filling it; `ATA_TIMEOUT_MS` goes 300 -> 2000, since the comment
+> above it already called a too-tight deadline "a real, observed source of
+> transient read failures" and the cost on the far side had never been measured;
+> a short read is **completed** rather than zero-padded; and `raw_read` names
+> which of its seven refusals it took, with the operands.
+>
+> **Two more instruments caught lying on the way.** `app_describe_fault_addr`
+> re-read the **CR2 register** instead of the snapshot -- CR2 holds the most
+> recent fault on the core, and the fault path itself faults -- so the report's
+> header said `CR2=0x1bf200000` while the next two lines described page
+> `0x1a613e000` in a VMA containing neither, and I spent a stretch reasoning
+> about a read-only heap reservation that had nothing to do with it. And
+> `tools/pve-run.sh`'s rsync quick-check is **size + mtime**, so a rebuild that
+> landed on the same size deployed NOTHING: two full 8-core runs came back
+> byte-identical, including the line the newest fix had changed, and I read that
+> as "the fix did not work". The script now compares digests and REFUSES TO RUN
+> on a mismatch.
+>
+> **And then the same run panicked the kernel.** With the storage chain closed,
+> Firefox got far enough to commit real 1280x960 surfaces -- and took the
+> machine down:
+>
+>     *** KERNEL PANIC: CPU EXCEPTION ***
+>       faulting address (CR2) = 0xffff800200000000    <- HHDM + exactly 8 GiB
+>       rdx=0000000000001000                            <- PAGE_SIZE
+>       call trace: memset+0xb0 <- app_fault_handle+0x68
+>
+> `vmm_init` sized the higher-half direct map from `pmm_total_bytes()`. M1970
+> changed that function for a real and correct reason -- it used to report the
+> address SPAN, so a 4 GiB box announced "5120 MiB RAM" to sysinfo and to every
+> Linux program, and "a runtime that sizes its heap from that number is being
+> lied to". But with a PCI hole the RAM **above** the hole lives at physical
+> addresses past `ram_frames * PAGE_SIZE`, and those frames are perfectly
+> allocatable. So since M1970 the direct map has stopped short of them:
+>
+>     HHDMSELF: span 9216 MiB, RAM 8191 MiB, 1024 MiB of frames live above the
+>               reported total
+>
+> **A full gigabyte of real memory that the allocator hands out and the kernel
+> cannot touch**, on every 8 GiB run, latent for 189 milestones because it takes
+> eight cores and Firefox's several 2 GiB anonymous reservations to push the
+> allocator that high. Two functions, two meanings, one name between them --
+> "fixed in one place and not the other" for the fourth time in this campaign.
+> `pmm_span_bytes()` now serves anything that must REACH a frame and
+> `pmm_total_bytes()` anything REPORTING memory. Asserted unconditionally by
+> three page-table walks; reverted, it names the exact addresses it cannot
+> reach.
+
 > **(M2151-M2155) THE 8-CORE "CORRUPTED LIBXUL PAGE" WAS A FAILED READ, MAPPED
 > AS A SUCCESS. THREE OF THE INSTRUMENTS AIMED AT IT WERE LYING.**
 >

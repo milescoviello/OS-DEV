@@ -3422,6 +3422,8 @@ static int elf_vaddr_of_file_off(const char *path, uint64_t fo, uint64_t *out) {
 }
 
 int g_fault_vaddr_test = 0;
+/* Pages filled with zeros because the mapping's file no longer exists (M2160). */
+unsigned long g_fill_unlinked;
 
 /* PROVE THE NUMBER IS THE ONE objdump WANTS (M2153). The oracle is OUTSIDE
  * this kernel: tests/run-fault-vaddr-test.sh reads the same library's program
@@ -6920,6 +6922,41 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      *
                      * Refuse the fault instead. The process dies either way;
                      * this way it dies AT the cause, with the cause named. */
+                    /* A MAPPING WHOSE FILE IS GONE IS NOT A FAILED READ (M2160).
+                     *
+                     * M2155 made a negative read refuse the fault, which is
+                     * right for a device error and WRONG for this: on Linux a
+                     * mapping holds the INODE, so a file unlinked while mapped
+                     * stays readable. This VFS is path-based, so the read fails
+                     * with "no such path" -- and SQLite does exactly that to
+                     * its `-shm` file, which Firefox uses for every WAL
+                     * database. The old silent-zero behaviour accidentally
+                     * produced the right answer there, because an shm file IS
+                     * zero-initialised shared memory; refusing the fault turned
+                     * it into a SIGSEGV, which is a regression I introduced.
+                     *
+                     * Tell the two apart by asking whether the path still
+                     * exists. Gone => zeros are the only answer available and
+                     * the correct one; still there => the device refused, and
+                     * mapping a zero page over it is the corruption M2155 was
+                     * about. Transport-independent, so it holds for tmpfs and
+                     * /proc as well as ext2. */
+                    if (got < 0) {
+                        struct statx probe;
+                        if (vfs_stat(fp, &probe) != 0) {
+                            static unsigned long gone_told;
+                            g_fill_unlinked++;
+                            if (gone_told < 4) {
+                                gone_told++;
+                                kprintf("[fault] %lx from %s+%lx: the FILE IS GONE (unlinked "
+                                        "while mapped -- Linux keeps the inode, this VFS is "
+                                        "path-based). Filling with zeros, which is what an "
+                                        "unlinked shm mapping legitimately contains.\n",
+                                        page, fp, (unsigned long)fileoff);
+                            }
+                            got = (long)want;         /* the memset already did the work */
+                        }
+                    }
                     if (got < 0) {
                         extern const char *ext2_pread_why(void);
                         extern unsigned long g_e2pc_races, g_e2pc_neg_hits, g_e2pc_hits, g_e2pc_ioerrs;
