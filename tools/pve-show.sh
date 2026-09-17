@@ -54,9 +54,23 @@ $SSH "qm set $VMID --memory $MEM --cores $CORES --args \
    -drive file=$PVE_DIR/fat.img,format=raw,if=ide,index=0 \
    -drive file=$PVE_DIR/ext2.img,format=raw,if=ide,index=1' >/dev/null"
 $SSH "qm start $VMID"
+
+# DRAIN THE SERIAL PORT, OR THE BOOT STALLS (M2163).
+#
+# The kernel mirrors every console line to COM1, and Proxmox gives serial0 a
+# UNIX socket. With nothing reading that socket the buffer fills and the GUEST
+# BLOCKS ON ITS OWN LOG -- the screen freezes mid-boot, a few lines after the
+# AC97 probe, and it looks exactly like a hang in whatever came next. The first
+# version of this script had no drainer and produced precisely that.
+#
+# pve-run.sh has always had one (it IS the capture). setsid + nohup so it
+# survives this ssh session closing.
+$SSH "setsid nohup socat -u UNIX-CONNECT:/var/run/qemu-server/$VMID.serial0 \
+        OPEN:$PVE_DIR/boot.log,creat,trunc >/dev/null 2>&1 < /dev/null &" \
+     >/dev/null 2>&1 || true
 echo
 echo "It is up. Watch it here:"
 echo "    https://$PVE_HOST:8006   ->  122 (osdev)  ->  Console"
 echo
-echo "First paint ~9 s, the page on screen ~24 s. The serial log is"
-echo "    ssh root@$PVE_HOST 'tail -f $PVE_DIR/boot.log'   (if a capture is attached)"
+echo "First paint ~9 s, the page on screen ~24 s. Follow the log with"
+echo "    ssh root@$PVE_HOST 'tail -f $PVE_DIR/boot.log'"

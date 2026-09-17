@@ -3440,9 +3440,38 @@ static void fill_report(uint64_t va) {
  * an ELF, cannot be read, or has no LOAD segment covering the offset -- in
  * which case the caller prints the raw file offset and SAYS that is what it
  * is. */
+/* THE INSTRUMENT MUST BE ABLE TO DO ITS I/O (M2163).
+ *
+ * Both of the file-reading diagnostics below run on the fault path with
+ * INTERRUPTS OFF, and the ATA driver bounds its waits with `timer_ms()` -- a
+ * clock the PIT advances. With IF clear that clock never moves, so the deadline
+ * never expires, the driver burns its 100-million-iteration backstop, and the
+ * read fails. Silently: the vaddr resolver fell back to printing the raw file
+ * offset and the code check printed nothing at all.
+ *
+ * So the two diagnostics that were built to end this hunt were themselves
+ * disabled, on exactly the faults that mattered, and the fallback text made it
+ * look like a deliberate choice -- "(FILE offset, not a vaddr)". The fill path
+ * has done `sti` around its own vfs_pread since M1136 for this very reason.
+ *
+ * Safe here for the same reason it is safe there: a ring-3 fault arrives in a
+ * normal task context holding no kernel lock. */
+static inline uint64_t flt_io_begin(void) {
+    uint64_t fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl) :: "memory");
+    __asm__ volatile("sti");
+    return fl;
+}
+static inline void flt_io_end(uint64_t fl) {
+    __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
+}
+
 static int elf_vaddr_of_file_off(const char *path, uint64_t fo, uint64_t *out) {
     unsigned char eh[64];
-    if (!path || vfs_pread(path, eh, sizeof(eh), 0) != (long)sizeof(eh)) return 0;
+    if (!path) return 0;
+    uint64_t iofl = flt_io_begin();
+    int rc = (vfs_pread(path, eh, sizeof(eh), 0) == (long)sizeof(eh));
+    flt_io_end(iofl);
+    if (!rc) return 0;
     if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F' || eh[4] != 2)
         return 0;
     uint64_t phoff = *(uint64_t *)(eh + 0x20);
@@ -3451,8 +3480,10 @@ static int elf_vaddr_of_file_off(const char *path, uint64_t fo, uint64_t *out) {
     if (phentsize < 56 || phnum > 64) return 0;
     for (unsigned n = 0; n < phnum; n++) {
         unsigned char ph[56];
-        if (vfs_pread(path, ph, sizeof(ph), phoff + (uint64_t)n * phentsize) !=
-            (long)sizeof(ph)) return 0;
+        iofl = flt_io_begin();
+        rc = (vfs_pread(path, ph, sizeof(ph), phoff + (uint64_t)n * phentsize) == (long)sizeof(ph));
+        flt_io_end(iofl);
+        if (!rc) return 0;
         if (*(uint32_t *)(ph + 0) != 1) continue;            /* PT_LOAD */
         uint64_t off = *(uint64_t *)(ph + 0x08);
         uint64_t vad = *(uint64_t *)(ph + 0x10);
@@ -3561,7 +3592,10 @@ void app_describe_addr(uint64_t addr) {
             uint64_t p0 = addr & ~(uint64_t)0xFFF, p1 = (addr + 15) & ~(uint64_t)0xFFF;
             if ((vmm_pte_raw(p0) & PTE_PRESENT) && (vmm_pte_raw(p1) & PTE_PRESENT)) {
                 unsigned char disk[16];
-                if (vfs_pread(path, disk, sizeof(disk), fo) == (long)sizeof(disk)) {
+                uint64_t ckfl = flt_io_begin();
+                long ckn = vfs_pread(path, disk, sizeof(disk), fo);
+                flt_io_end(ckfl);
+                if (ckn == (long)sizeof(disk)) {
                     const unsigned char *mem = (const unsigned char *)addr;
                     static const char hx[] = "0123456789abcdef";
                     char ml[16 * 3 + 1], dl[16 * 3 + 1];
