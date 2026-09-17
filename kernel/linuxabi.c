@@ -485,9 +485,68 @@ static int lx_is_synth(const char *p) {
     return 0;
 }
 
+static const char *lx_proc_self_tail(const char *p);   /* defined below */
+
+/* /proc/self/fd/<N>/<more> IS A PATH, NOT JUST A LINK (M2129).
+ *
+ * readlink("/proc/self/fd/N") has answered correctly since M1998, because that
+ * is how Zig -- and therefore Bun, and therefore Claude Code -- does what other
+ * runtimes do with realpath(3): open O_PATH, read back the magic link. But the
+ * same idiom is also used to ADDRESS things relative to a held descriptor, by
+ * building "/proc/self/fd/31/-src" and handing that to mkdir or openat. Linux
+ * resolves that through the fd's target directory; we did not, because the
+ * readlink case required the number to be the END of the path. So:
+ *
+ *   [linuxabi] mkdir(/proc/self/fd/31/-src) failed
+ *
+ * ...six times, and Claude Code's Bash tool refused to run a command at all --
+ * "task output swap refused (tasks dir moved or linked)" -- having correctly
+ * concluded that a directory it was holding open could not be reached by name.
+ * It had already spawned /bin/bash twice successfully; this is what stopped it.
+ *
+ * Rewriting the prefix here means every path-bearing syscall gets it at once,
+ * rather than the three or four that would have been noticed one at a time. */
+static const char *lx_fd_prefix_rewrite(const char *p, char *out, int max) {
+    const char *pp = lx_proc_self_tail(p);
+    if (!pp || pp[0] != 'f' || pp[1] != 'd' || pp[2] != '/') return 0;
+    int fd = 0, k = 3, any = 0;
+    while (pp[k] >= '0' && pp[k] <= '9') { fd = fd * 10 + (pp[k] - '0'); k++; any = 1; }
+    if (!any || pp[k] != '/') return 0;            /* bare .../fd/N: the readlink case */
+    /* app_fd_path_of, NOT app_fd_path: the latter is FILE fds only, and the fd
+     * in this idiom is a DIRECTORY opened O_PATH -- which is the only kind
+     * worth rewriting a prefix against. */
+    const char *base = app_fd_path_of(fd);
+    if (!base || !base[0]) return 0;               /* not a path-bearing fd: leave it alone */
+    int n = 0;
+    while (base[n] && n < max - 1) { out[n] = base[n]; n++; }
+    if (n && out[n - 1] == '/') n--;               /* base "/" + "/x" must not become "//x" */
+    for (const char *t = pp + k; *t && n < max - 1; t++) out[n++] = *t;
+    out[n] = 0;
+    return out;
+}
+
 static const char *lx_xlate(const char *p, char *out, int max) {
     if (!p) return p;
     int n = 0;
+    /* Resolve a /proc/self/fd/<N>/... prefix into the real path FIRST, then
+     * translate the result like any other absolute path (M2129). */
+    if (p[0] == '/') {
+        const char *rw = lx_fd_prefix_rewrite(p, out, max);
+        if (rw) {
+            /* ALREADY TRANSLATED, DO NOT TRANSLATE AGAIN. app_fd_path_of hands
+             * back the path this kernel uses -- "/disk2/tmp/..." -- not the
+             * one the process believes in, so running it through lx_xlate a
+             * second time produced "/disk2/disk2/tmp/...". That resolved to
+             * nothing, and Claude Code's guard correctly reported that the
+             * directory it was holding open could not be found by name. The
+             * first version of this fix replaced one wrong answer with
+             * another, which is the bug class this whole campaign is about. */
+            static int told;
+            if (++told <= 3)
+                kprintf("[linuxabi] \"%s\" names a held descriptor -- it is \"%s\"\n", p, rw);
+            return rw;
+        }
+    }
     if (p[0] == '/') {
         /* /proc and /dev are the KERNEL'S OWN synthetic filesystems and must
          * not be rewritten into the ext2 root -- there is nothing there. This
@@ -4789,6 +4848,15 @@ static void lx_dispatch_body(struct registers *r) {
         }
         r->rax = (uint64_t)lx_realtime_sec();
         break;
+    case 111: {                             /* getpgrp(): no args, == getpgid(0) */
+        /* ENOSYS here showed up as `[linuxabi] ENOSYS: unimplemented Linux
+         * syscall 111` from /bin/bash on every single Bash-tool invocation --
+         * a shell asks which process group it is in before it does job
+         * control, and a shell that cannot find out has to assume it is not a
+         * session leader. (M2129) */
+        r->rax = (uint64_t)app_getpgid(0);
+        break;
+    }
     case LXS_getppid_:
         r->rax = (uint64_t)app_sys_getppid();
         break;
