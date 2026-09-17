@@ -42,6 +42,8 @@ const uint8_t *net_ip(void)      { return OUR_IP; }
  * indistinguishable to every caller and to every log line. */
 static int g_have_lease;
 int net_have_lease(void)         { return g_have_lease; }
+const uint8_t *net_gw(void)      { return GW_IP; }     /* the next hop off our segment (M2124) */
+const uint8_t *net_mask(void)    { return NETMASK; }
 const uint8_t *net_gateway(void) { return GW_IP; }
 const uint8_t *net_mac(void)     { return nic_mac(); }
 
@@ -133,6 +135,8 @@ static int arp_maybe_reply(const uint8_t *buf, int len) {
  * (M2017) */
 static void park_put(const uint8_t *f, int len);   /* the TCP park ring, defined with the TCP demux below */
 static void udpq_put(const uint8_t *f, int len);   /* the UDP datagram queue */
+static uint64_t g_udpq_foreign;   /* datagrams addressed to some other host, dropped rather than queued (M2124) */
+uint64_t net_udp_foreign(void) { return g_udpq_foreign; }
 /* 16 -> 48 (M2022): same reasoning as PARK_N. This ring holds the protocols
  * that have nowhere else to go, and it is written by every drain site. */
 #define ORING_N   48
@@ -825,6 +829,47 @@ static void park_put(const uint8_t *f, int len);   /* defined with the TCP demux
 static void udpq_put(const uint8_t *f, int len) {
     int ihl = (f[14] & 0x0F) * 4;
     if (ihl < 20 || len < 14 + ihl + 8) return;
+    /* IS THIS DATAGRAM EVEN FOR US? (M2124)
+     *
+     * It did not ask. Every UDP datagram the NIC handed up was filed into a
+     * fixed-size queue that EVICTS THE OLDEST when full -- so on a real LAN the
+     * queue filled with other machines' broadcast traffic and threw away the
+     * replies this machine was waiting for. Captured on the bridge while a
+     * guest program waited five seconds for a DNS answer that had already
+     * arrived:
+     *
+     *   [udpq] filed 21 bytes from 192.168.1.148:57292 for local port 32412
+     *   [udpq] filed 300 bytes from 0.0.0.0:68 for local port 67
+     *   [udpq] filed 389 bytes from 192.168.1.1:37371 for local port 20002
+     *
+     * -- Plex discovery, another host's DHCP request, and a router's chatter,
+     * none of it addressed here. Under QEMU's user-mode networking there is no
+     * other traffic on the segment at all, so a queue with no destination check
+     * behaved perfectly for years and collapsed the first time it met a real
+     * network.
+     *
+     * The rule: unicast to our own address, or a broadcast for the one
+     * broadcast protocol this stack consumes (DHCP, ports 67/68 -- and it must
+     * stay allowed, because a DHCP reply arrives before we have an address to
+     * match). Everything else is somebody else's mail. */
+    {
+        const uint8_t *dst = f + 14 + 16;
+        int mine = (dst[0] == OUR_IP[0] && dst[1] == OUR_IP[1] &&
+                    dst[2] == OUR_IP[2] && dst[3] == OUR_IP[3]);
+        if (!mine) {
+            int bcast_all = (dst[0] == 255 && dst[1] == 255 && dst[2] == 255 && dst[3] == 255);
+            int bcast_sub = 1;
+            for (int i = 0; i < 4; i++) {
+                uint8_t want = (uint8_t)((OUR_IP[i] & NETMASK[i]) | (uint8_t)~NETMASK[i]);
+                if (dst[i] != want) { bcast_sub = 0; break; }
+            }
+            uint16_t dp = get16(f + 14 + ihl + 2);
+            if (!((bcast_all || bcast_sub) && (dp == 67 || dp == 68))) {
+                g_udpq_foreign++;
+                return;
+            }
+        }
+    }
     const uint8_t *udp = f + 14 + ihl;
     int plen = (int)get16(udp + 4) - 8;
     int avail = len - (14 + ihl + 8);
@@ -924,8 +969,18 @@ int net_udp_readable(uint16_t sport) {
     for (int i = 0; i < UDPQ_N; i++)
         if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL && g_udpq[i].dport == sport) return 1;
     udp_pump_once(sport);
+    /* RE-READ THE CLOCK AFTER THE PUMP (M2124).
+     *
+     * The second pass reused the `now` taken before it, and udpq_put stamps a
+     * freshly-filed datagram with the CURRENT tick -- so if a tick landed
+     * during the pump, `at` was greater than `now`, and `now - at` on unsigned
+     * values wrapped to about 2^64 and failed the comparison. The datagram the
+     * pump had just collected was reported as not readable. The `+ 1` here was
+     * an attempt to absorb exactly that and only covered the case where the
+     * clock had not moved at all. */
+    now = timer_ticks();
     for (int i = 0; i < UDPQ_N; i++)
-        if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL + 1 && g_udpq[i].dport == sport) return 1;
+        if (g_udpq[i].len && now - g_udpq[i].at <= UDPQ_TTL && g_udpq[i].dport == sport) return 1;
     return 0;
 }
 

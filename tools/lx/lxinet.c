@@ -91,7 +91,41 @@ int main(void) {
     if (u < 0) { printf("LXINET: UDP socket failed\n"); fflush(stdout); return 1; }
     struct sockaddr_in ns; memset(&ns, 0, sizeof ns);
     ns.sin_family = AF_INET; ns.sin_port = htons(53);
-    ns.sin_addr.s_addr = inet_addr("10.0.2.3");        /* QEMU user-mode's DNS */
+    /* READ THE NAMESERVER, DO NOT ASSUME IT (M2124).
+     *
+     * This hardcoded 10.0.2.3 -- QEMU user-mode networking's DNS -- so the
+     * probe could only ever pass under the emulator. On the bridged VM this
+     * project develops on, the lease hands out a real resolver and 10.0.2.3 is
+     * a machine that does not exist, so the probe reported
+     *
+     *     LXINET: no DNS reply (poll revents=0)
+     *
+     * which is the correct answer to a question asked of nobody, and looks
+     * exactly like a broken socket layer. That is the same assumption the
+     * kernel itself carried in three places (M2120-M2122): the SLIRP defaults
+     * treated as facts about the network.
+     *
+     * /etc/resolv.conf is where a real program looks, and the kernel writes it
+     * from the lease at boot. */
+    char nsip[64] = "10.0.2.3";                       /* only if resolv.conf has nothing */
+    {
+        FILE *rc = fopen("/etc/resolv.conf", "r");
+        if (rc) {
+            char line[256];
+            while (fgets(line, sizeof line, rc)) {
+                if (strncmp(line, "nameserver", 10) != 0) continue;
+                char *p2 = line + 10;
+                while (*p2 == ' ' || *p2 == '\t') p2++;
+                int k = 0;
+                while (p2[k] && p2[k] != '\n' && p2[k] != '\r' && k < (int)sizeof nsip - 1) { nsip[k] = p2[k]; k++; }
+                nsip[k] = 0;
+                break;
+            }
+            fclose(rc);
+        }
+    }
+    printf("LXINET: resolver from /etc/resolv.conf is %s\n", nsip); fflush(stdout);
+    ns.sin_addr.s_addr = inet_addr(nsip);
     unsigned char q[512]; int qn = dns_query(q, "example.com", 0x1234);
     if (sendto(u, q, (size_t)qn, 0, (struct sockaddr *)&ns, sizeof ns) != qn) {
         printf("LXINET: DNS sendto failed\n"); fflush(stdout); return 2;

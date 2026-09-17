@@ -73,7 +73,9 @@ int  net_tcp_accept_ready(uint16_t port);   /* would accept() succeed? completes
 int  net_tcp_accept_readable(void);         /* has the accepted connection data (or EOF)? (M2020) */
 
 const uint8_t *net_ip(void);
-int net_have_lease(void);   /* 1 only if a DHCP server actually answered: a leased address and a compiled-in default are otherwise indistinguishable (M2120) */        /* our IPv4 address (4 bytes) */
+int net_have_lease(void);
+const uint8_t *net_gw(void);
+const uint8_t *net_mask(void);   /* 1 only if a DHCP server actually answered: a leased address and a compiled-in default are otherwise indistinguishable (M2120) */        /* our IPv4 address (4 bytes) */
 const uint8_t *net_gateway(void);   /* the gateway IPv4 address (4 bytes) */
 const uint8_t *net_mac(void);       /* our 6-byte hardware (MAC) address */
 const uint8_t *net_dns(void);       /* the DNS resolver IPv4 address (4 bytes) */

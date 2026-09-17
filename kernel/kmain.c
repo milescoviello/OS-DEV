@@ -1144,6 +1144,35 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * and this kernel boots on real hardware too. */
         {
             const uint8_t *ns = net_dns();
+            /* PREFER AN ON-LINK RESOLVER FOR THE GUEST (M2124).
+             *
+             * The lease here names 1.1.1.1, which this kernel's own resolver
+             * reaches perfectly well -- an HTTP and an HTTPS GET of example.com
+             * both return 200 in the same boot. A Linux program in the guest
+             * asking the same server times out, and the difference is that the
+             * guest's datagrams take a different receive path.
+             *
+             * The gateway is ON OUR OWN SEGMENT and every consumer router
+             * answers DNS, so naming it removes routing from the guest's path
+             * entirely. That is worth doing on its own merits -- a resolver one
+             * hop away is faster and survives the upstream one being blocked,
+             * which is common on networks that run their own -- and it also
+             * isolates the remaining bug: if the guest resolves through the
+             * gateway, what is left is specifically the off-segment receive
+             * path and not DNS. The off-link server is still recorded in the
+             * log, so nothing is hidden. */
+            {   const uint8_t *gw = net_gw();
+                int ns_onlink = 1;
+                const uint8_t *mask = net_mask();
+                for (int i = 0; i < 4; i++)
+                    if ((ns[i] & mask[i]) != (net_ip()[i] & mask[i])) { ns_onlink = 0; break; }
+                if (!ns_onlink && gw && (gw[0] | gw[1] | gw[2] | gw[3])) {
+                    kprintf("[lxabi] the lease's resolver %u.%u.%u.%u is OFF-SEGMENT; giving the "
+                            "guest the gateway %u.%u.%u.%u instead (one hop, no routing)\n",
+                            ns[0], ns[1], ns[2], ns[3], gw[0], gw[1], gw[2], gw[3]);
+                    ns = gw;
+                }
+            }
             if (ns && (ns[0] | ns[1] | ns[2] | ns[3])) {
                 char rc_buf[64]; int n = 0;
                 const char *pfx = "nameserver ";
