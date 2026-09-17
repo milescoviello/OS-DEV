@@ -1187,8 +1187,54 @@ int vmm_user_str_ok(uint64_t ptr, uint64_t max) {
  * cheap 2 MiB pages, so the kernel can touch any frame via hhdm(phys). */
 void vmm_init(void) {
     kernel_pml4 = read_cr3() & ADDR_MASK;   /* boot PML4: kernel-only mappings */
-    uint64_t total = pmm_total_bytes();
-    for (uint64_t phys = 0; phys < total; phys += 0x200000)
+    /* THE SPAN, NOT THE TOTAL (M2159). See pmm_span_bytes: with a PCI hole the
+     * RAM above the hole sits past `pmm_total_bytes()`, and mapping only up to
+     * the total left the top gigabyte of an 8 GiB machine allocatable and
+     * unreachable -- a kernel panic inside memset the first time the allocator
+     * got that high. Mapping the hole itself is intended and was the original
+     * behaviour: the frames are marked used so nothing allocates them, and
+     * do_map already splits a huge HHDM page when a fine-grained MMIO mapping
+     * is needed over it (M1875). */
+    uint64_t span = pmm_span_bytes();
+    for (uint64_t phys = 0; phys < span; phys += 0x200000)
         vmm_map_huge(HHDM_BASE + phys, phys, PTE_WRITABLE);
     g_hhdm_ready = 1;   /* HHDM now covers all RAM: reach page tables through it, not the 1 GiB boot identity map (M1875) */
+}
+
+/* EVERY FRAME THE ALLOCATOR CAN RETURN MUST BE REACHABLE (M2159).
+ *
+ * The invariant the panic broke, asserted where it is cheap: walk the HHDM's
+ * own page tables at the top of the allocatable span and at the first address
+ * past `pmm_total_bytes()`, which is exactly where the old mapping stopped.
+ *
+ * SKIPs when span == total, because on a machine with no PCI hole the two
+ * numbers are equal and the test cannot fail either way -- saying PASSED there
+ * would be an instrument reporting on a condition it never examined. The node
+ * runs at 8 GiB, where the hole is about a gigabyte wide. */
+void vmm_hhdm_selftest(void) {
+    uint64_t span = pmm_span_bytes(), total = pmm_total_bytes();
+    if (span <= total) {
+        kprintf("HHDMSELF: SKIP (no PCI hole on this machine: span %lu MiB == RAM %lu MiB, so "
+                "the bug this guards cannot be reproduced here)\n",
+                (unsigned long)(span >> 20), (unsigned long)(total >> 20));
+        return;
+    }
+    uint64_t probe[3];
+    probe[0] = total;                        /* the first byte the old map missed */
+    probe[1] = span - PAGE_SIZE;             /* the last allocatable frame */
+    probe[2] = total + ((span - total) / 2); /* the middle of the gap */
+    int bad = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!vmm_translate(HHDM_BASE + (probe[i] & ~(uint64_t)0xFFF))) {
+            kprintf("HHDMSELF: physical %lu MiB has NO HHDM mapping\n",
+                    (unsigned long)(probe[i] >> 20));
+            bad = 1;
+        }
+    }
+    kprintf("HHDMSELF: span %lu MiB, RAM %lu MiB, %lu MiB of frames live above the reported "
+            "total -- %s\n",
+            (unsigned long)(span >> 20), (unsigned long)(total >> 20),
+            (unsigned long)((span - total) >> 20),
+            bad ? "FAILED: the allocator can return a frame the kernel cannot touch"
+                : "PASSED: every frame in the span is reachable through the HHDM");
 }

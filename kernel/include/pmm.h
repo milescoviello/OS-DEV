@@ -15,3 +15,7 @@ int      pmm_refcountable(uint64_t phys); /* 1 if the frame is within the refcou
 
 uint64_t pmm_total_bytes(void);
 uint64_t pmm_free_bytes(void);
+/* The physical ADDRESS SPAN the allocator can return frames from -- larger than
+ * pmm_total_bytes whenever there is a PCI/MMIO hole. Anything that must REACH a
+ * frame (the HHDM) needs this; anything REPORTING memory needs total. (M2159) */
+uint64_t pmm_span_bytes(void);

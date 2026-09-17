@@ -6927,6 +6927,14 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                         extern void ata_last_failure(unsigned *stage, unsigned *status, unsigned *error);
                         extern const char *ata_fail_stage_name(void);
                         extern const char *blockdev_fail_why(void);
+                        extern unsigned long g_ata_drained_sectors, g_ata_drain_stuck;
+                        extern unsigned long g_e2_bad_ptrs;
+                        extern unsigned int  g_e2_bad_ptr_val;
+                        extern int           g_e2_bad_ptr_level;
+                        extern void blockdev_fail_operands(int *dev, uint64_t *lba,
+                                                           uint32_t *count, uint64_t *cap);
+                        int bdev = -1; uint64_t bdlba = 0, bdcap = 0; uint32_t bdcnt = 0;
+                        blockdev_fail_operands(&bdev, &bdlba, &bdcnt, &bdcap);
                         uint64_t artry = 0, afail = 0; ata_error_counts(&artry, &afail);
                         unsigned ast = 0, asr = 0, aer = 0; ata_last_failure(&ast, &asr, &aer);
                         kprintf("[fault] FILL FAILED at %lx from %s+%lx: wanted %lu, got %ld -- "
@@ -6937,11 +6945,22 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                                 "slot races %lu, lookups spoiled by a device error %lu; "
                                 "ATA read retries %lu, ATA reads that failed all retries %lu)\n"
                                 "[fault]   the last ATA failure: %s (status %x, error %x)\n"
-                                "[fault]   the last BLOCK read refusal: %s\n",
+                                "[fault]   the last BLOCK read refusal: %s\n"
+                                "[fault]     blockdev %d, lba %lu, count %u, device capacity %lu "
+                                "sectors (%lu MiB)\n"
+                                "[fault]   ext2 block pointers rejected as out of range: %lu "
+                                "(last was %lu at indirect level %d)\n"
+                                "[fault]   stale sectors drained off a drive after an abandoned "
+                                "transfer: %lu (%lu drive(s) refused to drain)\n",
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got,
                                 ext2_pread_why(), g_e2pc_hits, g_e2pc_neg_hits, g_e2pc_races,
                                 g_e2pc_ioerrs, (unsigned long)artry, (unsigned long)afail,
-                                ata_fail_stage_name(), asr, aer, blockdev_fail_why());
+                                ata_fail_stage_name(), asr, aer, blockdev_fail_why(),
+                                bdev, (unsigned long)bdlba, bdcnt, (unsigned long)bdcap,
+                                (unsigned long)(bdcap >> 11),
+                                g_e2_bad_ptrs, (unsigned long)g_e2_bad_ptr_val,
+                                g_e2_bad_ptr_level,
+                                g_ata_drained_sectors, g_ata_drain_stuck);
                         fill_note(page, FILL_FILE, fileoff, v.fvalid, (unsigned long)want, got);
                         pmm_free_frame(frame);
                         return 0;

@@ -270,4 +270,26 @@ int pmm_refcountable(uint64_t phys) {
  * back to the span only if the firmware gave us no usable map to count from,
  * which is the same answer as before and better than reporting zero. */
 uint64_t pmm_total_bytes(void) { return (ram_frames ? ram_frames : total_frames) * PAGE_SIZE; }
+/* THE ADDRESS SPAN, WHICH IS NOT THE SAME NUMBER (M2159).
+ *
+ * pmm_total_bytes reports REAL RAM, which is what sysinfo and every Linux
+ * program must be told. But anything that has to REACH a frame needs the span:
+ * with a PCI hole, the RAM above the hole lives at physical addresses beyond
+ * `ram_frames * PAGE_SIZE`, and those frames are perfectly allocatable.
+ *
+ * vmm_init sized the higher-half direct map from pmm_total_bytes, so since
+ * M1970 -- which changed that function, correctly, for the sysinfo reason --
+ * the HHDM has covered only the first `ram_frames` bytes. On an 8 GiB machine
+ * QEMU puts RAM at 0..3 GiB and 4..9 GiB, so roughly the top GIGABYTE of real
+ * memory was allocatable and NOT MAPPED. The first allocation up there
+ * panicked the kernel inside the demand-zero memset:
+ *
+ *   *** KERNEL PANIC: CPU EXCEPTION ***
+ *     faulting address (CR2) = 0xffff800200000000      <- HHDM + exactly 8 GiB
+ *     call trace: memset+0xb0 <- app_fault_handle+0x68
+ *
+ * It took eight cores and Firefox's several 2 GiB anonymous reservations to
+ * push the allocator that high, which is why it stayed latent for 189
+ * milestones. Two functions, two meanings, one name between them. */
+uint64_t pmm_span_bytes(void)  { return total_frames * PAGE_SIZE; }
 uint64_t pmm_free_bytes(void)  { return (total_frames - used_frames) * PAGE_SIZE; }

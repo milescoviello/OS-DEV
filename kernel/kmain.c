@@ -2770,6 +2770,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * nothing else in the tree would notice. Asserted by
      * tests/run-ipc-tests.sh, which already boots headless and greps COM1. */
     app_memfd_selftest();
+    /* UNCONDITIONAL: three page-table walks, and the invariant it guards is a
+     * kernel panic under memory pressure (M2159). */
+    { extern void vmm_hhdm_selftest(void); vmm_hhdm_selftest(); }
     { extern void app_fault_vaddr_selftest(void); app_fault_vaddr_selftest(); }
     if (g_e2pcrace_test) { extern void ext2_path_cache_race_test(void); ext2_path_cache_race_test(); }
     ipc_selftest();

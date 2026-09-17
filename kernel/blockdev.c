@@ -256,6 +256,25 @@ blockdev_t *blockdev_get(int i) {
  * page back to exactly this -1 and could get no further than "a device error",
  * which is not a diagnosis. Name it here, where the branch is taken. */
 int g_bd_fail_reason;
+/* THE NUMBERS, NOT JUST THE BRANCH (M2158). "at or past the device's reported
+ * capacity" names the branch and still leaves the two facts that decide it
+ * unstated: WHICH lba, and what the device says its capacity IS. Both runs of
+ * the 8-core Firefox failure refused the same file offset, so this is
+ * arithmetic, not a race, and arithmetic is only debuggable with the operands
+ * in hand. */
+static uint64_t g_bd_fail_lba, g_bd_fail_cap;
+static uint32_t g_bd_fail_count;
+static int      g_bd_fail_dev = -1;
+void blockdev_fail_operands(int *dev, uint64_t *lba, uint32_t *count, uint64_t *cap) {
+    if (dev)   *dev   = g_bd_fail_dev;
+    if (lba)   *lba   = g_bd_fail_lba;
+    if (count) *count = g_bd_fail_count;
+    if (cap)   *cap   = g_bd_fail_cap;
+}
+static void bd_fail(int reason, int i, uint64_t lba, uint32_t count, uint64_t cap) {
+    g_bd_fail_reason = reason; g_bd_fail_dev = i;
+    g_bd_fail_lba = lba; g_bd_fail_count = count; g_bd_fail_cap = cap;
+}
 const char *blockdev_fail_why(void) {
     switch (g_bd_fail_reason) {
     case 1: return "the device index was out of range";
@@ -270,17 +289,17 @@ const char *blockdev_fail_why(void) {
 }
 
 static int raw_read(int i, uint64_t lba, uint32_t count, void *buf) {
-    if (i < 0 || i >= g_ndev || !buf) { g_bd_fail_reason = 1; return -1; }
-    if (count == 0) { g_bd_fail_reason = 3; return -1; }
+    if (i < 0 || i >= g_ndev || !buf) { bd_fail(1, i, lba, count, 0); return -1; }
+    if (count == 0) { bd_fail(3, i, lba, count, 0); return -1; }
     blockdev_t *d = &g_dev[i];
-    if (!d->read) { g_bd_fail_reason = 2; return -1; }
+    if (!d->read) { bd_fail(2, i, lba, count, 0); return -1; }
     /* Range-check against the known capacity (0 = unknown -> defer to the driver). */
     if (d->sectors) {
-        if (lba >= d->sectors)       { g_bd_fail_reason = 4; return -1; }
-        if (lba + count < lba)       { g_bd_fail_reason = 5; return -1; }   /* 64-bit overflow */
-        if (lba + count > d->sectors){ g_bd_fail_reason = 6; return -1; }
+        if (lba >= d->sectors)       { bd_fail(4, i, lba, count, d->sectors); return -1; }
+        if (lba + count < lba)       { bd_fail(5, i, lba, count, d->sectors); return -1; }
+        if (lba + count > d->sectors){ bd_fail(6, i, lba, count, d->sectors); return -1; }
     }
-    if (d->read(d->ctx, lba, count, buf) < 0) { g_bd_fail_reason = 7; return -1; }
+    if (d->read(d->ctx, lba, count, buf) < 0) { bd_fail(7, i, lba, count, d->sectors); return -1; }
     return 0;
 }
 static int raw_write(int i, uint64_t lba, uint32_t count, const void *buf) {

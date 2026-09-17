@@ -207,12 +207,54 @@ static int wait_drq(uint16_t io) {
     return -1;
 }
 
+/* How much stale data an abandoned transfer left behind, and whether a drive
+ * ever refused to drain. A drain that happens constantly is a driver problem
+ * that must not hide inside a success. (M2158) */
+unsigned long g_ata_drained_sectors, g_ata_drain_stuck;
+
 /* Read `words` 16-bit words from the data port into `buf`. */
 static void read_data(uint16_t io, void *buf, int words) {
     __asm__ volatile("rep insw"
                      : "+D"(buf), "+c"(words)
                      : "d"((uint16_t)(io + REG_DATA))
                      : "memory");
+}
+
+/* DRAIN A DRIVE THAT STILL HAS DATA PENDING (M2158).
+ *
+ * THE BUG THIS FIXES, which is the last link in the M2155 chain. When a DMA
+ * read gives up -- our own wall-clock deadline expiring while the drive is
+ * still streaming -- the recorded task-file status is 0x58: DRDY, DSC, and
+ * **DRQ SET**. DRQ set means the drive has a sector sitting in its buffer
+ * waiting to be read. The code then fell straight through to the PIO fallback,
+ * which does `wait_busy_clear` (passes: BSY is clear), selects the LBA, issues
+ * READ SECTORS, and calls `wait_drq` -- which returns IMMEDIATELY, because DRQ
+ * was already set by the ABANDONED command. So the first 512 bytes read back
+ * are the old transfer's data, at the new command's LBA, returned as a SUCCESS.
+ *
+ * That is how a clean ext2 image (e2fsck reports no errors, on both the build
+ * host and the node) produced a garbage indirect block: block pointer 91513156
+ * in a filesystem with 819200 blocks, which became an LBA 112 times the size of
+ * the disk, which `raw_read` refused, which ext2 called "file not found", which
+ * the page-fault fill turned into a zero-filled page of executable code. The
+ * wrong bytes were installed in the block cache too, so one abandoned DMA
+ * poisons that sector for the rest of the boot.
+ *
+ * So: before issuing any command, make sure the drive is idle. Read and discard
+ * whole sectors while DRQ is set. Bounded -- a drive that will not drain is
+ * reported rather than spun on for ever. */
+static void ata_drain(uint16_t io) {
+    for (int sector = 0; sector < 512; sector++) {
+        /* BSY must be clear before the data register means anything. */
+        uint8_t st = inb(io + REG_STATUS);
+        for (int w = 0; (st & ST_BSY) && w < 100000; w++) st = inb(io + REG_STATUS);
+        if (st & ST_BSY) { g_ata_drain_stuck++; return; }
+        if (!(st & ST_DRQ)) return;                 /* idle: nothing to drain */
+        uint16_t sink[SECTOR_SIZE / 2];
+        read_data(io, sink, SECTOR_SIZE / 2);
+        g_ata_drained_sectors++;
+    }
+    g_ata_drain_stuck++;
 }
 
 static void write_data(uint16_t io, const void *buf, int words) {
@@ -252,6 +294,8 @@ static void select_lba48(uint16_t io, uint8_t slave, uint64_t lba, uint16_t coun
 /* LBA48 PIO read/write — the mirror of the LBA28 impls below, used only for
  * accesses that reach sector >= 2^28 (see the dispatch in those impls). Chunks
  * are still bounded at 256 sectors (count <= 256 fits the 16-bit EXT count). */
+static void ata_drain(uint16_t io);          /* M2158; defined below read_data */
+
 static int ata_read_drive_impl_lba48(int drive, uint32_t lba, uint32_t count, void *buf) {
     uint16_t io = ATA_DRIVES[drive].io;
     uint8_t slave = ATA_DRIVES[drive].slave;
@@ -312,6 +356,9 @@ static void ata_snap_fail(uint16_t io, unsigned stage) {
 
 static int ata_read_drive_impl(int drive, uint32_t lba, uint32_t count, void *buf) {
     if (!drive_ok(drive) || count == 0) return -1;
+    /* Never issue a command on top of an unfinished one (M2158). One `inb` in
+     * the common case; the whole of the correctness argument in the rare one. */
+    ata_drain(ATA_DRIVES[drive].io);
     /* Any access reaching sector 2^28 or beyond needs LBA48; low accesses (all of
      * the boot / FAT path) keep the proven LBA28 code below, byte-for-byte. */
     if ((uint64_t)lba + count > (1u << 28))
@@ -580,6 +627,7 @@ int g_ata_dma_writes = 1;
 int g_ata_write_flush = 1;   /* -append noflush: measure what FLUSH CACHE costs (M2143) */
 
 static int ata_write_drive_impl(int drive, uint32_t lba, uint32_t count, const void *buf) {
+    if (drive_ok(drive)) ata_drain(ATA_DRIVES[drive].io);   /* see ata_drain (M2158) */
     if (!drive_ok(drive) || count == 0) return -1;
     if ((uint64_t)lba + count > (1u << 28))
         return ata_write_drive_impl_lba48(drive, lba, count, buf);
@@ -1047,6 +1095,17 @@ static int ata_dma_setup(void) {
     g_bm.bounce     = (uint8_t *)hhdm(bnc_f);
     g_bm.bounce_phys = bnc_f;
     g_bm.bmide_base = (uint16_t)bar4;
+    /* PUBLISH `present` LAST, AND SAY SO TO THE COMPILER (M2158).
+     *
+     * `ata_dma_max_sectors()` reads `probed && present` and then returns
+     * `nbounce * 8`, and blockdev_read uses that as its batch size. If the
+     * store to `present` were hoisted above the stores that fill `nbounce`,
+     * another core would compute a batch of ZERO -- and a zero-sector request
+     * is refused, which becomes "a device error", which ext2 reports as "file
+     * not found", which the page-fault fill turned into a zero-filled page of
+     * executable code (M2155). The clamp in blockdev_read already makes that
+     * unreachable; this makes the ordering real rather than incidental. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     g_bm.present    = 1;
     return 1;
 }
@@ -1128,6 +1187,10 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
 
     /* Issue the ATA command with the standard PIO addressing sequence (this is
      * the only place the two paths share — drive-select + LBA28 + sector count). */
+    /* The DMA path issues a command through the same task-file registers PIO
+     * does, so it needs the same guarantee: the drive must not be holding data
+     * from something else. (M2158) */
+    ata_drain(io);
     if (wait_busy_clear(io) < 0)
         return -1;
     select_lba(io, slave, lba, (uint8_t)(count & 0xFF));   /* count<=8, never wraps to 0 */
@@ -1171,8 +1234,16 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
     if ((ata_st & ST_ERR) || (ata_st & ST_BSY))
         { ata_snap_fail(io, 3); return -1; }
 
-    if (err || !done)
-        { ata_snap_fail(io, 3); return -1; }   /* DMA error or timed out: clean failure */
+    if (err || !done) {
+        ata_snap_fail(io, 3);
+        /* Leave the drive idle, not holding a sector nobody asked for. Draining
+         * here as well as before the next command is deliberate: the next
+         * command may be issued by a different caller on a different path, and
+         * the invariant "this function leaves the drive idle" is the one worth
+         * having. (M2158) */
+        ata_drain(io);
+        return -1;                      /* DMA error or timed out */
+    }
 
     if (!write)
         {   uint32_t left = bytes, off = 0;

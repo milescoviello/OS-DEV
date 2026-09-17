@@ -169,26 +169,62 @@ static uint32_t extent_map(ext2_t *v, const uint8_t *ib, uint32_t fblk) {
     return 0;
 }
 
+/* A BLOCK POINTER PAST THE END OF THE FILESYSTEM IS NOT A BLOCK POINTER (M2158).
+ *
+ * This is the last link in the chain M2155 traced. `map_block` returned
+ * whatever 32-bit word it found in an indirect block and nothing checked it, so
+ * a corrupt or misread pointer went straight down to the block layer:
+ *
+ *     blockdev 1, lba 732105248, count 8, device capacity 6553600 sectors
+ *
+ * 91513156 as a block number, in a filesystem with 819200 of them -- 112 times
+ * the size of the disk. `raw_read` refused it (correctly), which ext2 reported
+ * as "file not found" (M2155 fixed that), which the page-fault fill turned into
+ * a zero-filled page of executable code (M2155 fixed that too). But the value
+ * was already provably wrong HERE, where the superblock's own block count is in
+ * hand, and passing it on was the first wrong answer in the sequence.
+ *
+ * Out of range is a CORRUPTION, so it sets `ioerr` rather than returning 0: a 0
+ * means "sparse hole, these bytes are legitimately zero", which is exactly the
+ * plausible-wrong-value this whole arc is about. The caller now fails the read.
+ *
+ * `blocks_count` of 0 means the superblock did not say, in which case there is
+ * nothing to check against and the old behaviour stands. */
+unsigned long g_e2_bad_ptrs;          /* out-of-range block pointers rejected */
+uint32_t      g_e2_bad_ptr_val;       /* the last one, and where it came from */
+int           g_e2_bad_ptr_level;     /* 1 = single indirect, 2 = double indirect, 0 = direct */
+static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level) {
+    if (!blk) return 0;                                    /* a real hole */
+    if (v->blocks_count && blk >= v->blocks_count) {
+        g_e2_bad_ptrs++;
+        g_e2_bad_ptr_val = blk;
+        g_e2_bad_ptr_level = level;
+        v->ioerr = 1;                                      /* corruption, NOT a hole */
+        return 0;
+    }
+    return blk;
+}
+
 static uint32_t map_block(ext2_t *v, const uint8_t *inode, uint32_t fblk) {
     if (e_rd32(inode + 32) & EXT4_EXTENTS_FL)              /* i_flags: ext4 extent-mapped (M1186) */
         return extent_map(v, inode + 40, fblk);
     const uint8_t *ib = inode + 40;                        /* i_block[15] */
     uint32_t ppb = v->block_size / 4;
-    if (fblk < 12) return e_rd32(ib + fblk * 4);           /* direct */
+    if (fblk < 12) return e2_ptr_ok(v, e_rd32(ib + fblk * 4), 0);   /* direct */
     fblk -= 12;
     uint8_t buf[4096];
     if (fblk < ppb) {                                      /* single-indirect */
-        uint32_t ind = e_rd32(ib + 12 * 4);
+        uint32_t ind = e2_ptr_ok(v, e_rd32(ib + 12 * 4), 0);
         if (!ind || rdblk(v, ind, buf) < 0) return 0;
-        return e_rd32(buf + fblk * 4);
+        return e2_ptr_ok(v, e_rd32(buf + fblk * 4), 1);
     }
     fblk -= ppb;
     if (fblk < ppb * ppb) {                                /* double-indirect */
-        uint32_t dind = e_rd32(ib + 13 * 4);
+        uint32_t dind = e2_ptr_ok(v, e_rd32(ib + 13 * 4), 0);
         if (!dind || rdblk(v, dind, buf) < 0) return 0;
-        uint32_t ind = e_rd32(buf + (fblk / ppb) * 4);
+        uint32_t ind = e2_ptr_ok(v, e_rd32(buf + (fblk / ppb) * 4), 1);
         if (!ind || rdblk(v, ind, buf) < 0) return 0;
-        return e_rd32(buf + (fblk % ppb) * 4);
+        return e2_ptr_ok(v, e_rd32(buf + (fblk % ppb) * 4), 2);
     }
     return 0;                                              /* triple-indirect unsupported */
 }
@@ -519,6 +555,7 @@ const char *ext2_pread_why(void) {
     case 3:  return "the path is a DIRECTORY";
     case 4:  return "a BLOCK READ FAILED during the path walk -- a device error, not a missing file";
     case 5:  return "a BLOCK READ FAILED while reading the file's data";
+    case 6:  return "a BLOCK POINTER was past the end of the filesystem (corruption, not a hole)";
     default: return "no recorded reason";
     }
 }
