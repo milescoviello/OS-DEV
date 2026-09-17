@@ -173,3 +173,63 @@ pref("browser.dom.window.dump.enabled", true);
 // same with all five put back, so they were not the reason. Removing them
 // again rather than shipping prefs that do nothing: a setting kept "just in
 // case" is a setting someone later has to disprove.
+
+// THE THREE MINUTES BEFORE THE PAGE APPEARS (M2136)
+//
+// M2135 got the page on screen; it arrived about 150 seconds after Firefox's
+// first paint, and the log says exactly what those 150 seconds were:
+//
+//   sample 9  (135s)  -- still only the chrome
+//   console.error: Region.sys.mjs: "Failed to fetch region" NO_RESULT
+//   sample 10 (150s)  -- THE PAGE IS ON SCREEN
+//
+// The page appears the instant Mozilla's region lookup gives up. Region.init()
+// builds a promise list, and with no region known it pushes
+// `#idleDispatch(() => this._fetchRegion())` onto it -- a network request
+// dispatched at the next MAIN-THREAD IDLE MOMENT, which a browser starting up
+// on an emulated machine does not offer for a long time. Startup waits on that
+// promise before the first tab is created and navigated.
+//
+// Region.init() reads the answer straight out of this pref and skips the fetch
+// entirely when it is set:
+//
+//     this.#home = Services.prefs.getCharPref(REGION_PREF, null);
+//     if (this.#home) { ...no network... } else { ...fetch... }
+//
+// So the region is stated rather than discovered. That is also honest: the
+// service being queried is Mozilla's geolocation endpoint, this machine has no
+// business asking it, and the value only selects a default search engine.
+pref("browser.search.region",        "US");
+pref("browser.region.network.url",   "");
+pref("browser.region.update.enabled", false);
+
+// THE CAPTIVE-PORTAL PROBE IS THE 140 SECONDS (M2136)
+//
+// Measured, not guessed. Per-sample syscall counts show Firefox doing real
+// work for the first 15s after first paint, then going almost completely
+// quiet for a hundred seconds, then bursting:
+//
+//   sample 1  (15s):  +366595 syscalls, +59327 faults   <- working
+//   samples 2-9:      +12000 syscalls, ~270 faults      <- a poll loop idling
+//   sample 10 (150s): +898253 syscalls, +9161 faults    <- and the page appears
+//
+// A flat plateau is a WAIT, not slow work. The connect log says what it is
+// waiting for:
+//
+//   t= 54690ms connect -> 151.101.129.91:80 = 0     <- Fastly, over HTTP
+//   ...142 seconds with no network activity at all...
+//   t=196740ms connect -> 1.1.1.1:53 = 0
+//
+// 151.101.x is Fastly, port 80 is plain HTTP, and the thing Firefox fetches
+// over plain HTTP at startup is detectportal.firefox.com -- captive-portal
+// detection, asking whether a hotel wifi is intercepting traffic. This machine
+// has no business asking that, the answer cannot matter to it, and waiting on
+// it costs the entire time-to-page.
+//
+// The stall itself is ALSO a bug in this OS's HTTP path -- a small GET to a
+// real server should not take 140 seconds -- and it is recorded as such rather
+// than papered over: see WHATS-NEXT. Disabling the probe removes it from
+// startup; it does not fix the stall, and the stall will bite any guest that
+// fetches over HTTP.
+pref("network.captive-portal-service.enabled", false);
+pref("network.connectivity-service.enabled",   false);

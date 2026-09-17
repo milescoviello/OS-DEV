@@ -1761,8 +1761,25 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                          * not finished yet. Ten minutes. */
                                         for (int k = 0; k < 40; k++) {
                                             task_sleep_ms(15000);
-                                            kprintf("[page] --- sample %d, %ds after the first paint ---\n",
-                                                    k + 1, (k + 1) * 15);
+                                            /* IS IT WORKING OR IS IT WAITING?
+                                             * (M2136) The page arrives about
+                                             * 150s after first paint, and the
+                                             * t= heartbeat stops AT first
+                                             * paint -- so the whole interval
+                                             * that matters had no activity
+                                             * data at all. Syscalls and faults
+                                             * per sample separate "grinding
+                                             * through work" from "parked on a
+                                             * timer", which decide completely
+                                             * different fixes. */
+                                            {   static unsigned long psc, ppf;
+                                                unsigned long sc = lx_syscalls_made(), pfn = g_pf_count;
+                                                kprintf("[page] --- sample %d, %ds after the first paint "
+                                                        "(+%lu syscalls, +%lu faults since the last) ---\n",
+                                                        k + 1, (k + 1) * 15,
+                                                        sc > psc ? sc - psc : 0,
+                                                        pfn > ppf ? pfn - ppf : 0);
+                                                psc = sc; ppf = pfn; }
                                             wl_page_probe(0x101820);
                                             /* AND WHAT EVERY LINUX PROCESS IS
                                              * WAITING FOR (M2108). The page
