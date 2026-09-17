@@ -1,5 +1,151 @@
 # What's next
 
+> **(M2151-M2155) THE 8-CORE "CORRUPTED LIBXUL PAGE" WAS A FAILED READ, MAPPED
+> AS A SUCCESS. THREE OF THE INSTRUMENTS AIMED AT IT WERE LYING.**
+>
+> An executable page of `libxul.so` read back as sixteen zero bytes where the
+> file on disk holds `f3 0f 1e fa c3` -- `endbr64; ret`. Execution fell into the
+> hole, `00 00` decoded as `add %al,(%rax)`, which is a STORE, and the fault
+> arrived as "write to a read-only mapping" at an address half a megabyte from
+> anything to do with the cause. Two runs in three, on eight cores, never on
+> one. It took most of three sessions, and almost all of that time went on
+> instruments rather than on the bug.
+>
+> **What actually happened.** `vfs_pread` returned **-1** while filling the
+> page, and the page-fault handler mapped the still-`memset`-zero frame anyway
+> and reported the fault RESOLVED. Nothing downstream can tell that page from
+> one the file genuinely zeroes. The one instrument aimed at this case could
+> not fire either: it was guarded by `v.fvalid && voff < v.fvalid`, and
+> `fvalid` is **0 for a whole-file mmap**, which is how every shared library in
+> the system is mapped.
+>
+> Three defects, all of the same shape -- **a mechanism answering with a
+> plausible wrong value instead of failing**:
+>
+> - The fill **published a page whose read had failed**. It now refuses, frees
+>   the frame and says so. The process still dies; it dies AT the cause.
+> - `ext2`'s path walk reported a **failed block read as "file not found"**
+>   (`walk_d` returns 0 for both), and `walk_cached` then wrote that down as a
+>   **negative cache entry** -- so one transient device error became permanent
+>   for the rest of the boot, and no retry could recover, because the retry hit
+>   the cache. A per-call `ioerr` flag now separates "absent" from "the device
+>   refused", and nothing a device error produced is ever cached.
+> - `ata_read_drive` **returned -1 without retrying**. Three retries, counted,
+>   plus the drive's own status and error bytes recorded so a failure names
+>   itself instead of arriving as a wrong answer six layers up.
+>
+> **Two more races found in the same pass**, both fixed, and neither claimed as
+> the observed cause -- their natural windows are far too narrow for two runs in
+> three:
+>
+> - The M2104 ext2 path cache was unlocked shared state. Two cores scan the same
+>   LRU array, pick the same victim slot, and interleave their field writes,
+>   leaving one path's NAME with another path's INODE -- and a read through that
+>   entry does not fail, it returns the WRONG FILE'S BYTES. Now a seqlock (odd
+>   generation = published and whole, re-read after copying the fields out) plus
+>   an atomic claim on the victim, where a writer that loses the claim simply
+>   DOES NOT CACHE -- a cache is allowed to miss; that is the whole of its
+>   contract, and it is far cheaper than a lock that would have to be held
+>   across the disk read this function performs. It also cannot be a spinlock:
+>   `ext2.c` is `#include`d and compiled on the HOST by
+>   `tests/ext2/ext2_test.c`, where `cli` is a #GP.
+> - `blockdev_mount_scan`'s one-shot guard had the whole scan between its test
+>   and its set, so two early readers could both build the mount table. Mount
+>   names here are POSITIONAL and the Linux root is hardcoded `/disk2`, so a
+>   duplicate or renumbered volume makes a path resolve against the wrong
+>   filesystem -- which comes back as "no such file", the same wrong answer
+>   again. One core scans now and the others wait for it.
+>
+> The path-cache test is worth describing, because its first two versions were
+> worthless in two different ways. The first asserted that the concurrent reads
+> SUCCEEDED -- and passed with the racy cache deliberately restored, because a
+> torn slot's dominant symptom is a successful read of the wrong file. The
+> second compared the first 16 bytes, which on this volume is not a signature at
+> all: every ELF shares its first 16 and 600 mime files share an XML
+> declaration, so 547 paths collapsed to 13 distinguishable ones -- under the
+> 256-entry table, so nothing was ever a victim and the collision could not
+> happen. The third hashes 512 bytes, keeps 528 distinct paths against 256
+> slots, and requires the exact hash back. And because the real window is a
+> few dozen cycles against millions between inserts, `-append e2pcwiden` puts
+> the same delay in BOTH arms so they differ only in whether the entry is
+> atomic:
+>
+>     racy  + widened window   123 of 32000 reads returned ANOTHER FILE'S BYTES
+>     fixed + widened window   0
+>
+> `/disk2/usr/lib64/libcairo-gobject.so.2 hashed to ca58be9c, not 54d79f94`.
+>
+> **The three instruments that were lying, because this is the recurring cost.**
+>
+> 1. `[fault] bytes at rip` **dereferenced the user rip**. If that page was
+>    absent, the read faulted again from inside the fault handler, this kernel
+>    serviced it as a demand-zero fault, and the dump printed back the zeros it
+>    had just created. It read `00 00 00 00 ...`, which decodes as
+>    `add %al,(%rax)`, which matched the recorded CR2 -- and I treated that
+>    agreement as proof of corrupted code. **A diagnostic that can cause the
+>    condition it reports is the worst instrument in the tree.**
+> 2. `app_describe_addr` printed `addr - vma.start + vma.foff` -- a **file
+>    offset** -- labelled as an address, and I fed it to
+>    `objdump --start-address` for two sessions. objdump takes a **vaddr**, and
+>    libxul's executable segment has `p_vaddr - p_offset == 0x1000`, so every
+>    instruction disassembled was one page early; one landed mid-`movabs` and
+>    read as further evidence of corruption. It now resolves the offset through
+>    the mapped file's own program headers and prints the objdump argument.
+>    Tested against the host's own `readelf` -- binutils, the same toolchain as
+>    the objdump it feeds, so the test cannot pass by agreeing with our phdr
+>    walk.
+> 3. The short-read warning fired **293-364 times a boot** on legitimate
+>    end-of-file reads, and one of those runs had no crash at all -- disproving
+>    the theory it was built for.
+>
+> **The instrument that actually cracked it, in two lines:** read sixteen bytes
+> from **memory** and the same sixteen from **the file on disk**, and print
+> both.
+>
+>     [fault] code check at 1156d18f0: memory 00 00 00 00 00 00 ...
+>     [fault]                  file f3 0f 1e fa c3 cc cc cc ...  *** DIFFER ***
+>     [fault]   this page was filled by: read from the file, tid 196,
+>               file offset 65fb000, fvalid 0, wanted 4096, got -1
+>
+> A read-only private file mapping MUST equal its file -- nothing may write it
+> and no relocation touches PIC text -- so the comparison is decidable, and the
+> oracle is outside the kernel. The second line is a direct-mapped table, one
+> slot per page, recording which branch of the fault handler filled it and with
+> what. Direct-mapped rather than a ring on purpose: a ring answers "what
+> happened lately", and the question is "what happened to THIS page".
+>
+> **And the block cache was exactly one readahead window.** 128 entries, 64 KiB
+> -- so a single 64 KiB prefetch evicted all of it. Measured earlier in this
+> campaign: one steady-state fault issued 588 ATA commands to deliver 68 KiB,
+> and 450 of those 588 sectors were re-reads of metadata the same prefetch had
+> just thrown out. It is now sized from physical memory (1/32, capped at 32
+> MiB), hash-indexed instead of linear-scanned, and CLOCK-replaced with a
+> second chance for any block read twice -- so demand-paging two gigabytes of
+> Firefox libraries, which is one enormous sequential scan, no longer evicts the
+> filesystem metadata that every one of those reads has to walk through.
+>
+>     block cache               128 entries (64 KiB)  ->  32768 (16 MiB)
+>     re-reading a 1 MiB span   ~6% hits              ->  100% hits
+>
+>
+> **What this did NOT fix, stated plainly.** Firefox still does not render on
+> eight cores. It now dies at an honest cause instead of a fabricated one: with
+> the fill refusing to publish a failed read, `code check` reports IDENTICAL
+> every time -- the executable pages are intact -- and the crash has moved to a
+> `rep movsb` in glibc's memcpy writing to a freshly `mmap(PROT_READ|WRITE)`ed
+> region with error code 0x7, "the page was PRESENT and not writable". That is
+> a different bug and it is next. The single-core path, which is the default,
+> renders the page.
+>
+> **And one more instrument caught lying while reading that very crash.**
+> `app_describe_fault_addr` re-read the CR2 REGISTER rather than taking the
+> snapshot, and CR2 holds the most recent fault on the core -- not the one being
+> reported. So the header said `CR2=0x1bf200000` and the next two lines
+> described page `0x1a613e000` inside a VMA that does not contain either. I
+> started reasoning about a read-only JS heap reservation that had nothing to do
+> with it. M2078 snapshotted the register frame for exactly this reason and
+> stopped one line short of CR2.
+
 > **(M2142) FIREFOX SHOWS ITS PAGE IN ~24 SECONDS. ATA WRITES WERE PURE PIO.**
 >
 >     first paint                       22s  ->   9s

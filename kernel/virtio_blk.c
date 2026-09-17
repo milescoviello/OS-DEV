@@ -451,9 +451,28 @@ static void vblk_take(void) {
 }
 static void vblk_give(void) { __atomic_store_n(&vblk_lock, 0, __ATOMIC_RELEASE); }
 
+/* Counted, so a retry that happens constantly cannot hide inside a success. */
+uint64_t g_vblk_retries, g_vblk_failures;
+
 static int virtio_blk_xfer(uint64_t lba, uint32_t count, void *buf, int write) {
     vblk_take();
     int r = virtio_blk_xfer_locked(lba, count, buf, write);
+    /* ASK AGAIN BEFORE REPORTING A FAILURE (M2155).
+     *
+     * The same reasoning as ata_read_drive's retry, and for the same reason it
+     * matters here: every layer above turns a -1 from a block device into
+     * something worse. ext2's path walk called it "file not found", the path
+     * cache made that permanent, and the page-fault fill mapped a zero page
+     * over executable code and called the fault resolved -- which is exactly
+     * the shape of "Firefox dies inside fontconfig on the virtio root with the
+     * browser process gone", the open failure this device has had since M2146.
+     * The refusals this driver names (vblk_why) include a poll timeout, which
+     * is precisely the kind of thing a second attempt survives. */
+    for (int t = 0; t < 3 && r < 0; t++) {
+        g_vblk_retries++;
+        r = virtio_blk_xfer_locked(lba, count, buf, write);
+    }
+    if (r < 0) g_vblk_failures++;
     vblk_give();
     return r;
 }

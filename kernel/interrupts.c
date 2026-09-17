@@ -376,7 +376,7 @@ void isr_dispatch(struct registers *r) {
                      * a protection the program asked for -- and the error code
                      * alone cannot tell them apart. The terminate path has
                      * printed this since M2005; the caught path had nothing. */
-                    if (r->int_no == 14) app_describe_fault_addr();
+                    if (r->int_no == 14) app_describe_fault_addr(cr2);
                     /* AND THE REGISTERS. A caught fault on `mov (%rax),%edx`
                      * says nothing without rax: a #GP there means the address
                      * is NON-CANONICAL, which is a different bug from a page
@@ -419,7 +419,7 @@ void isr_dispatch(struct registers *r) {
                     exception_names[r->int_no], r->int_no, r->err_code, (void *)r->rip, (void *)cr2,
                     task_current_id(), task_name_of(task_self()));
             app_describe_addr(r->rip);   /* which library, and where inside it (M2003) */
-            if (r->int_no == 14) app_describe_fault_addr();   /* ...and what the FAULTING page is (M2005) */
+            if (r->int_no == 14) app_describe_fault_addr(cr2);   /* ...and what the FAULTING page is (M2005) */
             /* Dump the registers for a ring-3 fault too (M1945). The panic path
              * has always done this, but a userspace fault printed a single line
              * -- which is exactly the case where you most need to know WHICH

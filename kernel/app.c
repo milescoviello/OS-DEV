@@ -3284,9 +3284,28 @@ void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur
     if (other) *other = g_flt_other;
 }
 
-void app_describe_fault_addr(void) {
+/* TAKE THE ADDRESS, DO NOT RE-READ THE REGISTER (M2156).
+ *
+ * This read CR2 itself, and CR2 holds the address of the MOST RECENT fault on
+ * this core -- not the one being reported. Anything between the fault and this
+ * call that touches a not-present page overwrites it, and the fault path is
+ * full of such things (it walks the user stack, reads the syscall ring, and on
+ * the delivered-signal path it has already built a signal frame). So the report
+ * printed one address in its header and described a DIFFERENT PAGE two lines
+ * below it:
+ *
+ *   Page Fault err=0x7 at rip=... (CR2=0x1bf200000) -- DELIVERED
+ *   the faulting page 1a613e000: pte=0 ...
+ *   inside vma[1185] 12a540000-1aa000000 prot=1 'anon'
+ *
+ * 0x1bf200000 is not inside that VMA and never was. I read the VMA line as
+ * describing the fault and started reasoning about a read-only JS heap
+ * reservation that had nothing to do with it. Same defect as M2078 (which
+ * snapshotted the register FRAME for exactly this reason and stopped one line
+ * short of CR2) and the same class as everything else in this hunt: an
+ * instrument answering truthfully about the wrong thing. */
+void app_describe_fault_addr(uint64_t cr2) {
     struct app *a = cur();
-    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
     uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t pte = vmm_pte_raw(page);
     kprintf("[fault] the faulting page %lx: pte=%lx (present=%d write=%d user=%d cow=%d) phys=%lx refs=%d\n",

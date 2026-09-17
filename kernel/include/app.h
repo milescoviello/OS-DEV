@@ -313,7 +313,7 @@ void app_set_next_env(const char *e);                          /* one extra env 
 void app_set_next_cwd(const char *p);                          /* working directory for the NEXT Linux spawn only (M2056) */
 void app_term_selftest(void);                                  /* -append termtest: assert on the terminal's CELLS, not a screenshot (M2057) */
 int  app_current_pid(void);                                    /* the calling process's pid, or -1 (M1998) */
-void app_describe_fault_addr(void);                             /* describe the page CR2 points at: VMA, prot, PTE bits (M2005) */
+void app_describe_fault_addr(uint64_t cr2);                     /* describe the page `cr2` points at: VMA, prot, PTE bits (M2005; takes the SNAPSHOT, not the register -- M2156) */
 void app_describe_addr(uint64_t addr);                          /* print the file+offset an address maps to, for a fault report (M2003) */
 void app_epoll_dump(int epfd);                                 /* print an epoll instance's registered fds + readiness (M1998) */                                      /* fd-table type, or -1 if not open (M1965) */
 int  app_fd_set_cloexec(int fd, int on);                       /* FD_CLOEXEC, for MFD_CLOEXEC/SOCK_CLOEXEC (M1977) */

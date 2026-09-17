@@ -51,6 +51,32 @@ echo "==> syncing to $PVE_HOST:$PVE_DIR (incremental)..."
 rsync -a --inplace --no-whole-file \
       build/kernel32.elf build/fat.img build/ext2.img "root@$PVE_HOST:$PVE_DIR/"
 
+# PROVE THE NODE IS RUNNING WHAT WAS JUST BUILT (M2156).
+#
+# rsync's quick check is size + mtime, and a kernel rebuild can land on the
+# same size -- so a deploy can silently transfer nothing. That happened, and
+# the cost was two full 8-core Firefox runs whose logs were BYTE-IDENTICAL,
+# including a line my newest fix had specifically changed. I read that
+# identical output as "the fix did not work" and started looking for a second
+# bug. A measurement against an unknown binary is not a measurement.
+#
+# So compare the digests and stop if they differ. This is the same trap as the
+# stale boot.log, one layer down.
+echo "==> verifying the node has the kernel that was just built..."
+LOCAL_MD5=$(md5sum build/kernel32.elf | cut -d' ' -f1)
+REMOTE_MD5=$($SSH "md5sum $PVE_DIR/kernel32.elf 2>/dev/null | cut -d' ' -f1")
+if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
+    echo "    digests differ ($LOCAL_MD5 local, $REMOTE_MD5 remote) -- forcing a whole-file copy"
+    rsync -a --whole-file build/kernel32.elf "root@$PVE_HOST:$PVE_DIR/"
+    REMOTE_MD5=$($SSH "md5sum $PVE_DIR/kernel32.elf 2>/dev/null | cut -d' ' -f1")
+fi
+if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
+    echo "FATAL: $PVE_HOST:$PVE_DIR/kernel32.elf is still not the local build." >&2
+    echo "       Refusing to run: whatever this measured would not be this code." >&2
+    exit 1
+fi
+echo "    ok: $LOCAL_MD5"
+
 # THE LINUX ROOT'S TRANSPORT (M2144).
 #
 # fat.img stays on IDE: it is the boot volume, it is tiny, and blockdev's mount
