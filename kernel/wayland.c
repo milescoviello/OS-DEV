@@ -1542,12 +1542,25 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                  * much of it is non-transparent, plus the middle pixel. Rate-
                  * limited hard, because a browser commits at 60 Hz and this
                  * reads a megabyte. */
+                /* RATE-LIMIT THE SCAN, NOT THE LINE (M2094).
+                 *
+                 * M2089 put the whole report behind `nth % 64` because the
+                 * buffer scan reads a megabyte and a browser commits at 60 Hz.
+                 * That also silenced 63 of every 64 COMMIT LINES -- and the
+                 * Wayland suite asserts on lxwl's commit, which is number one.
+                 * So a test that had passed for five milestones began failing
+                 * on a fact that was still perfectly true, and the compositor
+                 * looked as though it had stopped seeing commits.
+                 *
+                 * The line is cheap: four numbers already in hand. Only the
+                 * strided walk over the client's pixels is not. Print always,
+                 * scan occasionally. */
                 {   static unsigned nth;
                     int loud = (nth++ % 64) == 0;
-                    if (loud) {
+                    {
                         unsigned long need2 = (unsigned long)b->stride * b->height;
                         unsigned nz = 0, seen = 0;
-                        if (need2 <= o->size) {
+                        if (loud && need2 <= o->size) {
                             for (unsigned y = 0; y < b->height; y += 16)
                                 for (unsigned x = 0; x < b->width; x += 16) {
                                     uint32_t px = rd32(o->base + (unsigned long)y * b->stride + (unsigned long)x * 4);
@@ -1558,10 +1571,16 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                         uint32_t mid = 0;
                         if (need2 <= o->size && b->height && b->width)
                             mid = rd32(o->base + (unsigned long)(b->height / 2) * b->stride + (unsigned long)(b->width / 2) * 4);
-                        kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
-                                "%u/%u sampled pixels have colour (surface %u, %s)\n",
-                                b->width, b->height, b->stride, b->format, rd32(o->base), mid,
-                                nz, seen, o->id, wl_role_name(o->role));
+                        if (loud)
+                            kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
+                                    "%u/%u sampled pixels have colour (surface %u, %s)\n",
+                                    b->width, b->height, b->stride, b->format, rd32(o->base), mid,
+                                    nz, seen, o->id, wl_role_name(o->role));
+                        else
+                            kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
+                                    "(surface %u, %s)\n",
+                                    b->width, b->height, b->stride, b->format, rd32(o->base),
+                                    o->id, wl_role_name(o->role));
                     }
                 }
             } else {

@@ -809,6 +809,28 @@ void task_yield(void) {
 void task_block(void) {
     uint64_t f = irq_save();
     rq_lock_take();
+    /* A DEFERRED STOP IS HONOURED HERE TOO, AND IT HAS TO BE (M2094).
+     *
+     * M2093 deferred a stop aimed at a task RUNNING in the kernel, so it could
+     * release its locks and exit at the syscall boundary. That left a hole I
+     * did not see until the Wayland suite hung: the task is RUNNING when the
+     * stop arrives, takes stop_pending, and then BLOCKS -- in a futex, in
+     * unix_recv, in poll. Nothing stops it again, it never reaches the syscall
+     * exit, and app_reap waits for a thread that will never finish. The whole
+     * suite sat at [runsync] t=240s with three threads parked in exit().
+     *
+     * About to block is the same safe point as the syscall exit, and for the
+     * same reason: every blocking path in this tree releases its irq-spinlock
+     * before getting here, because an irq-spinlock held across a context
+     * switch deadlocks the next core to take it. So exiting here holds nothing
+     * back either, and it closes the gap between the two states -- a stopped
+     * task now either runs to the syscall exit or dies at its next block. */
+    if (current && current->stop_pending) {
+        current->stop_pending = 0;
+        rq_lock_give();
+        irq_restore(f);
+        task_exit();                    /* does not return */
+    }
     if (current->wake_pending) {        /* a wake raced us here: consume it, don't sleep (M1959) */
         current->wake_pending = 0;
         rq_lock_give();
@@ -838,6 +860,13 @@ void task_block(void) {
 void task_block_timeout(uint64_t deadline_ms) {
     uint64_t f = irq_save();
     rq_lock_take();
+    /* Same deferred-stop check as task_block -- see the comment there (M2094). */
+    if (current && current->stop_pending) {
+        current->stop_pending = 0;
+        rq_lock_give();
+        irq_restore(f);
+        task_exit();
+    }
     if (current->wake_pending) {        /* same lost-wakeup guard as task_block (M1959) */
         current->wake_pending = 0;
         rq_lock_give();

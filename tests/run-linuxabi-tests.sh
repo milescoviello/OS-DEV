@@ -149,7 +149,15 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # nonetdemo: -cpu max under TCG has to EMULATE AVX and is far slower, and the
     # boot network self-test does a real TLS handshake (bignum RSA/ECDSA) on top
     # of that. Skipping it keeps this boot to the part being tested.
-    timeout -s KILL 300 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+    # 900, NOT 300 (M2094). This boot runs every lxabitest probe as well as the
+    # glibc/XSAVE ones it is named for, and M2086-M2090 added four more --
+    # lxnread, lxsockopt, lxmsg, and lxtlsmany, which alone spawns 120 threads
+    # and makes 36000 checks under TCG. The timeout did not grow with them, so
+    # the VM was KILLED partway through and eleven assertions failed on markers
+    # that were simply never going to be printed. A suite whose budget does not
+    # grow with what it runs reports "the ABI is broken" when the truth is
+    # "I hung up on it".
+    timeout -s KILL 900 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
         -append "lxfulltest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \
@@ -204,7 +212,7 @@ LXTLSMANY: OK
 LXWAIT: reaped 40/40 children
 [lxabi] LXTHREAD exit -> 17"
     i=0
-    while [ $i -lt 560 ]; do
+    while [ $i -lt 1700 ]; do
         grep -aqE "Invalid Opcode|KERNEL PANIC" "$SLOG3" 2>/dev/null && break
         missing=0
         IFS='

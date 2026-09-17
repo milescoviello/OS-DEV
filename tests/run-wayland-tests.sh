@@ -48,12 +48,27 @@ timeout -s KILL 900 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 2G -sm
     -device piix3-usb-uhci,id=uhci -device usb-tablet,bus=uhci.0 >/dev/null 2>&1 &
 QPID=$!
 i=0
-while [ $i -lt 760 ]; do
-    grep -aqE "LXWL-SURFACE|LXWL: |KERNEL PANIC" "$SLOG" 2>/dev/null && break
+# WAIT FOR THE MARKER THAT MEANS THE CLIENT IS FINISHED, not one that means it
+# has started. This used to break on the pattern "LXWL: ", which matches the
+# client's FIRST line -- "LXWL: connected, 7 globals" -- and then slept half a
+# second before checking every assertion. That passed only because the rest of
+# the client's work happened to fit in 500 ms. M2087 added a 300-cycle
+# shm-pool create/destroy loop to lxwl and it does not, so eleven assertions
+# began failing on work that had simply not happened yet. A suite that depends
+# on the program being fast enough is a suite that reports the wrong thing the
+# first time anything gets slower. LXWL-SURFACE is the commit, which is the
+# last thing the non-interactive part does. (M2094)
+i=0
+while [ $i -lt 1200 ]; do
+    # LXWL-INPUT's second line is the LAST thing the client prints before it
+    # starts waiting for events, so it is the only marker that means "every
+    # assertion below now has something to assert on". Waiting for
+    # LXWL-SURFACE was not enough either: M2094 added LXWL-SUB after it.
+    grep -aqE "LXWL-INPUT: keyboard=|LXWL: [a-z_]* failed|LXWL: never|LXWL: wl_|KERNEL PANIC" "$SLOG" 2>/dev/null && break
     kill -0 "$QPID" 2>/dev/null || break
     sleep 0.5; i=$((i+1))
 done
-sleep 0.5
+sleep 1
 
 f=0
 if grep -aq "KERNEL PANIC" "$SLOG"; then
@@ -162,7 +177,11 @@ fi
 # a toplevel that has no buffer of its own (which is what GTK does), while the
 # 64x32 test client -- which commits two minutes earlier -- held the only
 # window. Both had to be fixed before anything could appear.
-if grep -aqE "\[wl\] subsurface [0-9]+: surface [0-9]+ is now a child of surface [0-9]+" "$SLOG"; then
+# Asserted against lxwl's OWN subsurface, added in M2094. The first version of
+# this check ran in a suite whose client never created one -- a test written for
+# a path only Firefox took, in a suite that does not run Firefox.
+if grep -aqE "\[wl\] subsurface [0-9]+: surface [0-9]+ is now a child of surface [0-9]+" "$SLOG" \
+   && grep -aqF "LXWL-SUB: a 16x8 subsurface committed at +8,+4 inside the toplevel" "$SLOG"; then
     echo "  ok: a subsurface records the PARENT it was given, not just the surface it wraps (M2089)"
 else
     echo "  FAIL: get_subsurface is still discarding its parent argument:"; grep -a "subsurface" "$SLOG" | tail -3; f=1
@@ -188,7 +207,13 @@ fi
 # buffer geometry was parsed correctly. A wrong stride or offset would give a
 # different pixel; a copy would still give the right one, which is why the
 # SIZE is checked too.
-if grep -aq "first pixel 0xff3366cc" "$SLOG"; then
+# The commit line's wording changed in M2089 -- it reports "first 0x... mid
+# 0x..., N/M sampled pixels have colour" instead of "first pixel 0x..." --
+# because one pixel could not distinguish a blank window from a transparent
+# corner. This assertion kept looking for the old text and started failing on a
+# fact that was still true. Changing a log line that a test greps for is a
+# test-breaking change, and it belongs in the same commit as the line. (M2094)
+if grep -aq "first 0xff3366cc" "$SLOG"; then
     # ...from the line that actually carries the client's colour. `head -1` on a
     # bare "commit:" pattern would find the surface-selection self-test's own
     # commit, which is a different surface and a different size.

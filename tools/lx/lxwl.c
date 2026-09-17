@@ -30,6 +30,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 static int n_globals;
+static struct wl_subcompositor *subcomp;
 static struct wl_compositor *comp;
 static struct wl_shm *shm;
 static struct xdg_wm_base *wm_base;
@@ -151,6 +152,8 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
         seat = wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5);
     else if (!strcmp(iface, "xdg_wm_base"))
         wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, version < 3 ? version : 3);
+    else if (!strcmp(iface, "wl_subcompositor"))
+        subcomp = wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
 }
 static void on_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
     (void)data; (void)reg; (void)name;
@@ -326,6 +329,55 @@ int main(void) {
 
     printf("LXWL-SURFACE: committed %dx%d ARGB8888, %d KiB pool, pixel 0x%08X\n",
            W, H, SZ / 1024, px[0]);
+    fflush(stdout);
+
+    /* A SUBSURFACE, BECAUSE THAT IS WHERE GTK PUTS ITS PIXELS (M2094).
+     *
+     * M2089 taught the compositor that a window is a TREE -- get_subsurface
+     * was discarding its PARENT argument and set_position was falling through
+     * to wl_unhandled, so a child could be neither located nor placed -- and
+     * that is the entire reason Firefox committed 768 full-size frames with
+     * nothing appearing on screen. Then I asserted the fix in the Wayland
+     * suite and the assertion failed, because THIS client had no subsurface:
+     * I had written a test for a path the test client never takes, and the
+     * only thing exercising it was Firefox, which the suite does not run.
+     *
+     * So: a real child surface, given a real parent, placed at a real offset,
+     * with its own buffer in a colour the compositor cannot produce by
+     * accident. Now the compositor's tree walk is covered by something that
+     * runs in twenty seconds rather than by a browser that takes minutes. */
+    if (subcomp) {
+        const int CW = 16, CH = 8, CSTRIDE = CW * 4, CSZ = CSTRIDE * CH;
+        int cfd = memfd_create("lxwl-child", 0);
+        if (cfd >= 0 && ftruncate(cfd, CSZ) == 0) {
+            uint32_t *cpx = mmap(NULL, CSZ, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+            if (cpx != MAP_FAILED) {
+                for (int i = 0; i < CW * CH; i++) cpx[i] = 0xFF22DD55;
+                struct wl_shm_pool *cpool = wl_shm_create_pool(shm, cfd, CSZ);
+                struct wl_buffer *cbuf = cpool ? wl_shm_pool_create_buffer(
+                        cpool, 0, CW, CH, CSTRIDE, WL_SHM_FORMAT_ARGB8888) : NULL;
+                struct wl_surface *csurf = wl_compositor_create_surface(comp);
+                if (cbuf && csurf) {
+                    struct wl_subsurface *ss =
+                        wl_subcompositor_get_subsurface(subcomp, csurf, surf);
+                    if (ss) {
+                        wl_subsurface_set_position(ss, 8, 4);
+                        wl_subsurface_set_desync(ss);
+                        wl_surface_attach(csurf, cbuf, 0, 0);
+                        wl_surface_damage(csurf, 0, 0, CW, CH);
+                        wl_surface_commit(csurf);
+                        wl_surface_commit(surf);          /* parent commit applies the child's state */
+                        wl_display_roundtrip(dpy);
+                        printf("LXWL-SUB: a %dx%d subsurface committed at +8,+4 inside the toplevel\n",
+                               CW, CH);
+                        fflush(stdout);
+                    } else printf("LXWL-SUB: get_subsurface returned NULL\n");
+                } else printf("LXWL-SUB: could not make the child's buffer/surface\n");
+            }
+        }
+    } else {
+        printf("LXWL-SUB: wl_subcompositor was not advertised\n");
+    }
     fflush(stdout);
 
     /* --- INPUT ------------------------------------------------------------ *
