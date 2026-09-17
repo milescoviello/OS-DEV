@@ -917,7 +917,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         /* ...and the same invariant at FIREFOX'S SCALE. Eight threads never
          * reproduced the FS_BASE loss; a hundred and twenty might. (M2089) */
         kprintf("[lxabi] launching the 120-thread TLS probe...\n");
-        {   int tmrc = app_run_linux_sync("/disk2/lxtlsmany", 0, 0, 300000);
+        {   int tmrc = app_run_linux_sync("/disk2/lxtlsmany", 0, 0, 600000);   /* -cpu max emulates AVX-512: 120 threads take a while (M2095) */
             kprintf("[lxabi] LXTLSMANY exit -> %d\n", tmrc); }
         /* getsockopt answered a confident ZERO to every option ever asked, so
          * Firefox's IPC channel was told its send buffer was nought bytes and

@@ -157,7 +157,19 @@ if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     # that were simply never going to be printed. A suite whose budget does not
     # grow with what it runs reports "the ABI is broken" when the truth is
     # "I hung up on it".
-    timeout -s KILL 900 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 256M -smp 4 -kernel "$KERNEL" \
+    # 1G, NOT 256M (M2095). 256 MiB was chosen when this boot ran a handful of
+    # small glibc demos. It now also runs every lxabitest probe, and two of
+    # those are deliberately memory-hungry: lxtlsmany makes 120 threads, and
+    # lxcow forks 40 children across 16 MiB to break COW pages concurrently.
+    # At 256M lxcow SIGSEGVs on a frame shortage -- and because a crashed
+    # probe's children are not reaped instantly, the process table stays full
+    # and the ELEVEN probes after it never start at all. Eleven assertions
+    # then fail on markers that were never going to be printed.
+    #
+    # The kernel now says so out loud ("[runsync] ... WOULD NOT START: N of M
+    # process slots in use"), but the right answer is to give the boot the
+    # memory its workload needs rather than to read the cascade correctly.
+    timeout -s KILL 900 "$QEMU" -cpu max -snapshot -no-reboot -no-shutdown -m 1G -smp 4 -kernel "$KERNEL" \
         -append "lxfulltest nonetdemo" \
         -drive file="$DISK",format=raw,if=ide \
         -drive file="$EXT2",format=raw,if=ide \

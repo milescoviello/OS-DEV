@@ -11860,7 +11860,26 @@ int app_run_linux_sync(const char *path, const char *const *args, int n, int tim
     unsigned long prev_maj = (unsigned long)-1, prev_min = (unsigned long)-1;   /* the previous heartbeat's fault counts (M2004) */
     int stall_told = 0;
     g_last_spawn_pid = 0;
-    if (app_spawn_linux_from_file_argv(path, args, n) < 0 || !g_last_spawn_pid) return -1;
+    if (app_spawn_linux_from_file_argv(path, args, n) < 0 || !g_last_spawn_pid) {
+        /* SAY WHY IT WOULD NOT START (M2095). This returned a bare -1, and a
+         * bare -1 from a launcher is indistinguishable from the program having
+         * failed -- which is exactly how one probe crashing at -m 256M
+         * presented as ELEVEN later probes "failing the ABI". They never ran.
+         *
+         * The two causes that actually happen are a full process table (a
+         * crashed probe's forked children not yet reaped) and a missing or
+         * unloadable file, and they need opposite fixes. Count the table so
+         * the difference is in the log rather than in a guess. */
+        int used = 0, zomb = 0;
+        uint64_t df = irq_save();
+        for (int i = 0; i < MAX_APPS; i++) { if (apps[i].used) used++; if (apps[i].used && apps[i].zombie) zomb++; }
+        irq_restore(df);
+        kprintf("[runsync] %s WOULD NOT START: %d of %d process slots in use (%d zombie), "
+                "free=%luK -- the probe never ran, so any marker it prints is missing for "
+                "that reason and not because the thing it tests is broken\n",
+                path, used, MAX_APPS, zomb, (unsigned long)(pmm_free_bytes() >> 10));
+        return -1;
+    }
     int pid = g_last_spawn_pid;
     for (int waited = 0; waited < timeout_ms; waited += 5) {
         uint64_t f = irq_save();

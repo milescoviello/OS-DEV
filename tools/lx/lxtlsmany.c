@@ -35,7 +35,14 @@
 #include <stdint.h>
 
 #define NT     120              /* APP_MAXTHREAD is 192; Firefox reaches ~140 */
-#define ROUNDS 150
+/* 40, NOT 150 (M2095). The property under test is THREAD COUNT and migration
+ * -- does a thread's own TLS survive being descheduled among 119 others -- and
+ * the round count is not what establishes it. At 150 the probe took longer
+ * than its 300-second budget under -cpu max, where TCG is emulating AVX-512,
+ * and timed out with every one of its checks passing. A test that is killed
+ * for being slow reports a failure it did not find. 40 rounds is still 9600
+ * checks across 120 threads, with two deschedules each. */
+#define ROUNDS 40
 
 static __thread uint64_t mine;
 static __thread char     scratch[192];   /* guarantees a canary read in this frame */

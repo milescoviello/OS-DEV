@@ -1,5 +1,95 @@
 # What's next
 
+> **(M2086-M2095) FIREFOX RENDERS ITS OWN CHROME INSIDE OS-DEV, AND A BOOT
+> THAT TOOK MINUTES TAKES SECONDS.**
+>
+> Ten milestones. The visible half is a window titled **"Mozilla Firefox"** on
+> the OS-DEV desktop -- its own `xdg_toplevel.set_title` -- containing real
+> Gecko chrome: the New Tab tab with its close button, the back/forward/reload
+> buttons, the search bar with its magnifier and placeholder, and Firefox's own
+> notification strip reading *"The security sandbox is disabled."* Gecko
+> rendered that into a `wl_shm` buffer; our compositor blitted the client's own
+> memory straight to the framebuffer, with no intermediate copy in the path.
+>
+> The other half is speed. First paint went from minutes to **65 seconds**, and
+> the whole Linux-ABI probe suite -- 22 programs -- from minutes to **21
+> seconds**.
+>
+> **Every one of these ten was the same bug shape, and it is the shape this
+> whole campaign keeps finding: a mechanism that answers with a plausible WRONG
+> VALUE instead of failing.**
+>
+> | | the lie | what it cost |
+> |---|---|---|
+> | M2086 | `FIONREAD` answered "that descriptor is not a terminal" | a socket with 142 bytes waiting was told the question did not apply to it |
+> | M2087 | every shared-memory pool the compositor was given, it kept for ever | a 256-object table exhausted; and a client that merely disconnected handed back nothing at all |
+> | M2088 | **`getsockopt` answered a confident ZERO to every option ever asked** | Firefox asked how big its IPC send buffer was, was told **nought bytes**, and aborted |
+> | M2089 | a window is one surface, and there is one window | GTK puts the pixels in a *subsurface*; the 64x32 test client held the only window slot |
+> | M2090 | `sendmsg` reported **ENETUNREACH -- on a Unix socket** -- for six different failures | Firefox's **fork server** forked a content process and could not report it |
+> | M2091 | the boot budget divided by the wall clock, which runs through `hlt` | it read "91% UNATTRIBUTED" and meant nothing |
+> | M2092 | `blockdev_read` shredded every request into single sectors | 917022 commands to move 917022 sectors -- exactly one each |
+> | M2093 | `task_stop` froze a thread mid-syscall | it never released `ata_lock`, and the machine's disk never worked again |
+> | M2094 | the copy-on-write break copied 4 KiB **one byte at a time** | 377883 times a boot -- 1.5 GB, in the hottest path in the kernel |
+> | M2095 | five tests asserted on things I had changed | `make check` reported "the ABI is broken"; the truth was "I hung up on it" |
+>
+> **M2088 is the one worth reading.** The abort at `ipc_channel_posix.cc:128`
+> survived three sessions of hunting through SCM_RIGHTS, memfd growth, D-Bus
+> and FIONREAD. It was one handler that never reads its own `optname`:
+>
+>     case LXS_getsockopt_:
+>         if (r->r10 && vmm_user_ok(r->r10, 4)) *(uint32_t *)r->r10 = 0;
+>         r->rax = 0;
+>
+> Written for `SO_ERROR`, where zero means "this connection is fine". Every
+> other option inherited it. A socket you cannot send one byte through is not a
+> socket.
+>
+> ### What the measurements actually said, including where they said I was wrong
+>
+> Every value in the new tests was checked against a real Linux kernel first,
+> **and it corrected six of my guesses** -- a pipe's write end reports the ring
+> contents, an eventfd must *refuse* `FIONREAD`, a listening socket is `EINVAL`
+> not 0, a set `SO_SNDBUF` reads back *double*, an unknown option is
+> `ENOPROTOOPT` not `EINVAL`, and any of it on a non-socket is `ENOTSOCK`.
+>
+> The disk decomposition, per 512-byte sector, measured in isolation:
+>
+>     1-sector PIO    94 Kcycles     what blockdev_read did
+>     8-sector PIO    70 Kcycles     1.36x  -- nearly nothing
+>     1-sector DMA    41 Kcycles     2.26x
+>     8-sector DMA   8.3 Kcycles    11.39x
+>
+> I measured the first two, got 0.99x, and wrote in a commit that un-shredding
+> was a dead end. **Half right.** PIO's cost is the `insw` transfer, which
+> batching cannot reduce; on DMA the transfer is a memcpy and what is left is
+> per-command setup, so batching is worth 5x *on top of* DMA. One measurement of
+> one pair, generalised, pointed at exactly the wrong half. The fix was to add
+> the missing arm to the benchmark, not to think harder.
+>
+> And the fault census, which decided everything after it:
+>
+>     462065 ring-3 faults
+>       1158 MAJOR   filled from a file
+>      80057 MINOR   demand-zero anonymous
+>     ------
+>     380850 in no bucket at all -- 82% of the largest cost in the boot
+>
+> A split that does not add up is not a split. The missing bucket was
+> copy-on-write, at **79% of all faults** -- so the cost of a Firefox boot is
+> `fork`, not the disk and not demand-zero. That is what found the byte loop.
+>
+> **The honest limit, with the number:** the disk is about a fifth of a boot and
+> guest code under TCG is most of the rest. There is no KVM on this host. Every
+> remaining item in the disk plan competes for that fifth, and the 15-second bar
+> is not reachable from here -- which is better said with the measurement than
+> optimised toward for a week.
+>
+> ### Still open
+>
+> Firefox's content processes die at `recvmsg(fd 12) = EBADF` -- a descriptor
+> the child expected to inherit is not there. So the chrome renders and a
+> *page* does not. That is the next thing.
+
 > **(M2070-M2083) CLAUDE CODE ANSWERS A QUESTION FROM INSIDE OS-DEV, AND
 > FIREFOX CREATES ITS FIRST `wl_surface`.**
 >
