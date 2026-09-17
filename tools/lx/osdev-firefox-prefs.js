@@ -25,7 +25,14 @@ pref("gfx.webrender.software",       true);   // SWGL: rasterise on the CPU
 pref("gfx.webrender.all",            true);   // ...and use WebRender for everything
 pref("gfx.x11-egl.force-disabled",   true);   // never probe EGL; there is none
 pref("webgl.disabled",               true);   // a page asking for WebGL must fail fast, not hang
-pref("layers.gpu-process.enabled",   false);  // the process that was dying in a loop
+// THE GPU PROCESS IS BACK ON (M2115). It was disabled because it died in a
+// respawn loop trying to create an EGL display -- but that was the EGL, and
+// software WebRender above removes EGL from the path entirely. It matters
+// because the GPU process is where the COMPOSITOR lives, and the compositor is
+// what receives an out-of-process document's display list. With it disabled
+// the parent hosts the compositor, and remote content has never once appeared
+// that way here. `-append ffnogpu` puts it back off for the A/B.
+pref("layers.gpu-process.enabled",   false);  // one variable at a time: the frame_rate change above is the evidence-backed one
 pref("media.rdd-process.enabled",    false);  // no audio/video decode here either
 
 // FEWER PROCESSES, because every one of them costs a full fork of a 120 MB
@@ -90,7 +97,20 @@ pref("browser.newtabpage.enabled",   false);
 // separates "the compositor's vsync is wrong" from "the content never renders"
 // without changing a line of kernel code. 60 rather than something lower
 // because the target is a fast first paint, not a light one.
-pref("layout.frame_rate",            60);
+// VSYNC COMES FROM THE COMPOSITOR AGAIN (M2115).
+//
+// Setting layout.frame_rate to 60 made Gecko use its own timer, and the
+// compositor's counters then said what that cost:
+//
+//     [page] vsync: 892 tick(s) offered, 0 frame callback(s) answered, 52 commit(s)
+//
+// Zero. Firefox never requested a wl_surface.frame callback even once, because
+// it had been told not to need one -- so the periodic tick M2111 built had
+// nothing to answer, and the browser committed 52 frames in six minutes. -1 is
+// the default and means "use the display's vsync", which on Wayland is the
+// frame callback, which this compositor now delivers on a real 60 Hz tick
+// rather than only in reply to a commit of the same surface.
+pref("layout.frame_rate",            -1);
 
 // WEBRENDER'S OWN HUD, DRAWN INTO THE WINDOW (M2115).
 //

@@ -332,6 +332,15 @@ static struct wl_client g_cl[WL_MAXCLIENT];
 static int g_listener = -1;
 int g_wl_verbose;                 /* -append wlverbose: log every message both ways */
 static unsigned g_nconn, g_nmsg, g_nglobal, g_ncommit;
+/* THREE FRAME COUNTERS, BECAUSE ONE OF THEM WAS A TRAP (M2115).
+ *
+ * The first version counted only the answers sent by the periodic TICK. The
+ * commit handler answers callbacks too and incremented nothing -- so the probe
+ * printed "0 frame callback(s) answered" about a browser whose every callback
+ * had been answered promptly by the other path, and I spent a run concluding
+ * that Firefox never asks for vsync. It asks; the commit answered it first.
+ * Requests and the two answer paths are now separate numbers. */
+static unsigned g_frame_ticks, g_frame_done, g_frame_done_commit, g_frame_req;
 /* SURFACES AND ROLES (M2081). The headline question about a stalled toolkit is
  * "did it ever create a wl_surface", and nothing here could answer it: obj_add
  * is silent, and the exported counters covered commits, destroys, protocol
@@ -571,6 +580,7 @@ static int wl_layers_of(struct wl_client *c, struct wl_object *root, struct wl_l
         out[n].x = 0; out[n].y = 0;
         out[n].w = root->width; out[n].h = root->height;
         out[n].stride = root->stride;
+        out[n].format = root->format;
         out[n].px = (const uint32_t *)root->base;
         n++;
     }
@@ -603,6 +613,7 @@ static int wl_layers_of(struct wl_client *c, struct wl_object *root, struct wl_l
             out[n].x = ax; out[n].y = ay;
             out[n].w = o->width; out[n].h = o->height;
             out[n].stride = o->stride;
+            out[n].format = o->format;
             out[n].px = (const uint32_t *)o->base;
             n++;
         }
@@ -1632,6 +1643,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
      * so the tick clock is precise enough. */
     if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_FRAME && alen >= 4) {
         o->frame_cb = rd32(args + 0);
+        g_frame_req++;
         return;
     }
     if (o->kind == WLK_SURFACE && opcode == WL_SURFACE_COMMIT) {
@@ -1754,6 +1766,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             uint8_t dq[4]; wr32(dq, o->frame_cb);
             wl_send(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, dq, 4);
             o->frame_cb = 0;                       /* one done per request */
+            g_frame_done_commit++;
         }
         return;
     }
@@ -2041,13 +2054,19 @@ void wl_page_dump(void) {
         for (int gx = 0; gx < WL_DUMP_W; gx++) {
             uint32_t x = (uint32_t)((uint64_t)gx * ww / WL_DUMP_W);
             uint32_t y = (uint32_t)((uint64_t)gy * wh / WL_DUMP_H);
+            /* Topmost NON-TRANSPARENT pixel, which is what the desktop
+             * actually blits now that alpha is honoured (M2115). Taking the
+             * topmost pixel regardless made the instrument disagree with the
+             * screen wherever a toolkit's shadow overhangs. */
             uint32_t got = 0;
             for (int i = 0; i < nl; i++) {
                 if (!L[i].px) continue;
                 if ((int)x < L[i].x || (int)y < L[i].y) continue;
                 uint32_t lx = x - (uint32_t)L[i].x, ly = y - (uint32_t)L[i].y;
                 if (lx >= L[i].w || ly >= L[i].h) continue;
-                got = L[i].px[ly * (L[i].stride / 4) + lx];
+                uint32_t v = L[i].px[ly * (L[i].stride / 4) + lx];
+                if (L[i].format == 0 && !(v >> 24)) continue;      /* fully transparent */
+                got = v;
             }
             kprintf("%02x%02x%02x", (got >> 16) & 0xff, (got >> 8) & 0xff, got & 0xff);
         }
@@ -2086,7 +2105,9 @@ void wl_page_probe(uint32_t want) {
                 if ((int)x < L[i].x || (int)y < L[i].y) continue;
                 uint32_t lx = x - (uint32_t)L[i].x, ly = y - (uint32_t)L[i].y;
                 if (lx >= L[i].w || ly >= L[i].h) continue;
-                px = L[i].px; got = px[ly * (L[i].stride / 4) + lx]; found = 1;
+                uint32_t v = L[i].px[ly * (L[i].stride / 4) + lx];
+                if (L[i].format == 0 && !(v >> 24)) continue;      /* transparent: not what is shown (M2115) */
+                px = L[i].px; got = v; found = 1;
             }
             sampled++;
             if (!found) { uncovered++; continue; }
@@ -2104,8 +2125,11 @@ void wl_page_probe(uint32_t want) {
      * (M2110). Callbacks SENT against ticks OFFERED: if the first is ~0 while
      * the second climbs, the client is not asking -- which is a different bug
      * from a compositor that is not answering. */
-    kprintf("[page]   vsync: %u tick(s) offered, %u frame callback(s) answered, %u commit(s)\n",
-            wl_frame_ticks(), wl_frame_callbacks_sent(), wl_commits());
+    kprintf("[page]   vsync: %u requested, %u answered (%u by the tick, %u by a commit), "
+            "%u tick(s) offered, %u commit(s)\n",
+            wl_frame_requests(), wl_frame_callbacks_sent(),
+            wl_frame_callbacks_sent() - wl_frame_by_commit(), wl_frame_by_commit(),
+            wl_frame_ticks(), wl_commits());
     /* NAME THE LAYERS (M2107). "2 layer(s)" cannot distinguish a window whose
      * content surface is present and blank from one whose content surface was
      * never created -- and those are opposite bugs. A toolkit puts the page in
@@ -2160,9 +2184,10 @@ void wl_page_probe(uint32_t want) {
  * surface the client has not committed is correct and is the point -- it means
  * "draw again now". Each is cleared as it fires, so nothing is answered twice,
  * and the id is released with delete_id exactly as before. */
-static unsigned g_frame_ticks, g_frame_done;
 unsigned wl_frame_ticks(void) { return g_frame_ticks; }
-unsigned wl_frame_callbacks_sent(void) { return g_frame_done; }
+unsigned wl_frame_callbacks_sent(void) { return g_frame_done + g_frame_done_commit; }
+unsigned wl_frame_requests(void) { return g_frame_req; }
+unsigned wl_frame_by_commit(void) { return g_frame_done_commit; }
 void wl_frame_tick(void) {
     g_frame_ticks++;
     /* GIVE THE WINDOW KEYBOARD FOCUS (M2113).

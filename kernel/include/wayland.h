@@ -26,6 +26,8 @@ void wl_server_task(void);      /* the display server's own task (M1978) */
 void wl_frame_tick(void);
 unsigned wl_frame_ticks(void);
 unsigned wl_frame_callbacks_sent(void);
+unsigned wl_frame_requests(void);   /* wl_surface.frame requests RECEIVED -- "never asked" and "answered by the other path" are different things (M2115) */
+unsigned wl_frame_by_commit(void);
 /* Counters for the boot self-test to assert against, rather than inferring
  * success from output that could have come from anywhere. */
 unsigned wl_clients_connected(void);
@@ -49,7 +51,11 @@ const uint32_t *wl_surface_pixels(uint32_t *w, uint32_t *h, uint32_t *stride);
  * one surface draws nothing at all for Firefox. `x`/`y` are relative to the
  * window's origin and MAY be negative -- a subsurface is allowed to overhang,
  * and the caller clips. */
-struct wl_layer { int x, y; uint32_t w, h, stride; const uint32_t *px; };
+struct wl_layer { int x, y; uint32_t w, h, stride, format; const uint32_t *px; };
+/* `format` is the wl_shm format: 0 = ARGB8888 with PREMULTIPLIED alpha,
+ * 1 = XRGB8888 whose alpha byte is undefined and must be read as opaque. A
+ * compositor that ignores it paints a toolkit's transparent drop shadow as a
+ * black border. (M2115) */
 int  wl_layers(struct wl_layer *out, int max);       /* how many were written, parents first */
 void wl_window_extent(uint32_t *w, uint32_t *h);     /* the bounding box of all of them */
 /* ...AND PER CLIENT (M2089). A compositor serves clients, plural. One global

@@ -706,7 +706,35 @@ static void draw_content(const window_t *w, int focused) {
                     for (uint32_t xx = 0; xx < ly[i].w; xx++) {
                         int dx = ly[i].x + (int)xx;
                         if (dx < 0 || dx >= maxw) continue;
-                        fb_pixel(bx - 2 + dx, by - 2 + dy, row[xx] & 0x00FFFFFF);
+                        /* HONOUR THE ALPHA (M2115).
+                         *
+                         * This masked the alpha off and wrote the RGB
+                         * opaquely, so a FULLY TRANSPARENT pixel -- 0x00000000
+                         * -- was painted black. GTK draws its client-side
+                         * decoration shadow in exactly those pixels, which is
+                         * why Firefox's window has a black border around it in
+                         * a framebuffer dump instead of the desktop showing
+                         * through.
+                         *
+                         * wl_shm ARGB8888 is PREMULTIPLIED, so the composite
+                         * is dst = src + dst*(1-a) with no divide. XRGB8888's
+                         * alpha byte is undefined and must be read as opaque,
+                         * which is what `format` is carried for. */
+                        uint32_t src = row[xx];
+                        uint32_t a = (ly[i].format == 0) ? (src >> 24) : 255u;
+                        if (!a) continue;                       /* transparent: leave what is under it */
+                        uint32_t out;
+                        if (a == 255u) out = src & 0x00FFFFFFu;
+                        else {
+                            uint32_t d = fb_get_pixel(bx - 2 + dx, by - 2 + dy);
+                            uint32_t inv = 255u - a;
+                            uint32_t r = ((src >> 16) & 0xff) + (((d >> 16) & 0xff) * inv) / 255u;
+                            uint32_t g = ((src >>  8) & 0xff) + (((d >>  8) & 0xff) * inv) / 255u;
+                            uint32_t b = ( src        & 0xff) + (( d        & 0xff) * inv) / 255u;
+                            if (r > 255u) r = 255u; if (g > 255u) g = 255u; if (b > 255u) b = 255u;
+                            out = (r << 16) | (g << 8) | b;
+                        }
+                        fb_pixel(bx - 2 + dx, by - 2 + dy, out);
                     }
                 }
             }
