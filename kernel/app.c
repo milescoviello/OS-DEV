@@ -3316,6 +3316,64 @@ void app_describe_fault_addr(void) {
     if (!found) kprintf("[fault]   in NO VMA of this process (%d vmas)\n", a->nvma);
 }
 
+/* ELF FILE OFFSET -> LIBRARY VADDR (M2153). The fault report knows which
+ * file a faulting address came from and at what offset INTO THAT FILE; what a
+ * human needs is the address `objdump -d` uses, which for a PT_LOAD whose
+ * p_vaddr and p_offset are not congruent mod the page size is a different
+ * number. Read the file's own program headers and convert.
+ *
+ * One 56-byte vfs_pread per phdr rather than slurping the table: this runs on
+ * the fault path, the block cache makes the reads nearly free after the first,
+ * and 56 bytes of stack cannot overflow anything. Returns 0 if the file is not
+ * an ELF, cannot be read, or has no LOAD segment covering the offset -- in
+ * which case the caller prints the raw file offset and SAYS that is what it
+ * is. */
+static int elf_vaddr_of_file_off(const char *path, uint64_t fo, uint64_t *out) {
+    unsigned char eh[64];
+    if (!path || vfs_pread(path, eh, sizeof(eh), 0) != (long)sizeof(eh)) return 0;
+    if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F' || eh[4] != 2)
+        return 0;
+    uint64_t phoff = *(uint64_t *)(eh + 0x20);
+    unsigned phentsize = *(uint16_t *)(eh + 0x36);
+    unsigned phnum = *(uint16_t *)(eh + 0x38);
+    if (phentsize < 56 || phnum > 64) return 0;
+    for (unsigned n = 0; n < phnum; n++) {
+        unsigned char ph[56];
+        if (vfs_pread(path, ph, sizeof(ph), phoff + (uint64_t)n * phentsize) !=
+            (long)sizeof(ph)) return 0;
+        if (*(uint32_t *)(ph + 0) != 1) continue;            /* PT_LOAD */
+        uint64_t off = *(uint64_t *)(ph + 0x08);
+        uint64_t vad = *(uint64_t *)(ph + 0x10);
+        uint64_t fsz = *(uint64_t *)(ph + 0x20);
+        if (fo >= off && fo < off + fsz) { *out = vad + (fo - off); return 1; }
+    }
+    return 0;
+}
+
+int g_fault_vaddr_test = 0;
+
+/* PROVE THE NUMBER IS THE ONE objdump WANTS (M2153). The oracle is OUTSIDE
+ * this kernel: tests/run-fault-vaddr-test.sh reads the same library's program
+ * headers with the host's readelf and requires the exact vaddr printed here.
+ * That is what makes the test non-circular -- it cannot pass by agreeing with
+ * my own phdr walk, only by agreeing with binutils.
+ *
+ * The offset is the real one from the 8-core Firefox hunt: libxul file offset
+ * 0x8cbc3a0, whose exec segment is mapped from `p_offset & ~0xfff` at
+ * `p_vaddr & ~0xfff` with those two differing by a page. Reverting to printing
+ * the file offset makes this print a number 0x1000 too low and the test
+ * fails. */
+void app_fault_vaddr_selftest(void) {
+    if (!g_fault_vaddr_test) return;
+    static const char *lib = "/disk2/usr/lib64/firefox/libxul.so";
+    uint64_t fo = 0x8cbc3a0, va = 0;
+    if (!elf_vaddr_of_file_off(lib, fo, &va)) {
+        kprintf("FAULTVADDR: FAILED -- could not resolve %s file offset %lx\n", lib, fo);
+        return;
+    }
+    kprintf("FAULTVADDR: %s fileoff=%lx vaddr=%lx\n", lib, fo, va);
+}
+
 void app_describe_addr(uint64_t addr) {
     struct app *a = cur();
     if (!a) return;
@@ -3323,10 +3381,41 @@ void app_describe_addr(uint64_t addr) {
     for (int i = 0; i < a->nvma; i++) {
         if (!a->vma[i].len) continue;
         if (addr < a->vma[i].start || addr >= a->vma[i].start + a->vma[i].len) continue;
-        kprintf("[fault] %lx is in %s + %lx (mapping %lx-%lx prot=%d)\n",
-                addr, vma_path(a, i), addr - a->vma[i].start + a->vma[i].foff,
-                a->vma[i].start, a->vma[i].start + a->vma[i].len, a->vma[i].prot);
-        vma_unlock(a, fl);
+        uint64_t fo = addr - a->vma[i].start + a->vma[i].foff;
+        char pbuf[VFS_PATH_MAX];              /* copy: the vma table moves (M1988) */
+        {
+            const char *sp = a->vma[i].file_backed ? vma_path(a, i) : "anon";
+            unsigned k = 0;
+            for (; sp && sp[k] && k < sizeof(pbuf) - 1; k++) pbuf[k] = sp[k];
+            pbuf[k] = 0;
+        }
+        const char *path = pbuf;
+        int prot = a->vma[i].prot;
+        uint64_t vstart = a->vma[i].start, vend = a->vma[i].start + a->vma[i].len;
+        int fb = a->vma[i].file_backed;
+        vma_unlock(a, fl);                    /* elf_vaddr_of_file_off reads the DISK */
+        /* SAY WHICH NUMBER THIS IS (M2153). This printed `addr - start + foff`
+         * and called it "+ %lx", and for two sessions I fed that straight to
+         * `objdump --start-address` -- which takes a VIRTUAL address. A shared
+         * object's exec segment is mapped at `p_vaddr & ~0xfff` from file
+         * offset `p_offset & ~0xfff`, and libxul's differ by exactly 0x1000,
+         * so every instruction I disassembled from this line was one page
+         * early. It landed me mid-instruction inside a `movabs`, which I then
+         * read as evidence of corrupted code. The offset was right; the LABEL
+         * was wrong, which is the same defect as a wrong value.
+         *
+         * So resolve the file offset back through the file's own program
+         * headers and print the address objdump wants. Only for a ring-3
+         * fault, where the faulting task provably holds no kernel lock. */
+        uint64_t va = 0;
+        if (fb && elf_vaddr_of_file_off(path, fo, &va))
+            kprintf("[fault] %lx is in %s, file offset %lx = library vaddr %lx "
+                    "(objdump --start-address=0x%lx) (mapping %lx-%lx prot=%d)\n",
+                    addr, path, fo, va, va, vstart, vend, prot);
+        else
+            kprintf("[fault] %lx is in %s + %lx (FILE offset, not a vaddr) "
+                    "(mapping %lx-%lx prot=%d)\n",
+                    addr, path, fo, vstart, vend, prot);
         return;
     }
     vma_unlock(a, fl);
@@ -6667,6 +6756,59 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                     if (got <= 0 && v.fvalid && voff < v.fvalid)
                         kprintf("[fault] EMPTY READ filling %lx from %s+%lx: wanted %lu, got %ld -- the page is a HOLE\n",
                                 page, fp, (unsigned long)fileoff, (unsigned long)want, got);
+                    /* A SHORT READ IS A HOLE TOO, AND IT SAID NOTHING (M2151).
+                     *
+                     * The check above only fires for got <= 0. A read that
+                     * returns SOME bytes leaves the rest of the page zero, and
+                     * the reasoning for letting that pass -- "a partial read is
+                     * normal at end-of-file" -- is true only for the LAST page
+                     * of a mapping. For a page in the middle, every byte we
+                     * asked for is file-backed by construction, so a short read
+                     * is a hole in the middle of a shared library.
+                     *
+                     * That is exactly the shape of the 8-core corruption: an
+                     * executable page of libxul.so read as zeros, execution
+                     * fell into it, and `00 00` decoded as `add [rax], al` --
+                     * a STORE, which then faulted as a write to a read-only
+                     * mapping and was reported as a segfault half a megabyte
+                     * from the real cause:
+                     *
+                     *   [fault] bytes at rip: 00 00 00 00 00 00 00 00 ...
+                     *   rip is in libxul.so + 674f9d0 (mapping prot=5)
+                     *   err=0x7 CR2=rax=0x115be98b8 -- "write to a read-only
+                     *   mapping"
+                     *
+                     * Two of three 8-core runs died that way and one-core runs
+                     * do not, so whatever shortens the read is concurrency. It
+                     * is named here rather than inferred from a corpse. */
+                    /* ONLY WHEN THE BYTES WERE DECLARED TO BE THERE (M2151).
+                     *
+                     * The first version of this fired 293-364 times a boot, on
+                     * lines like
+                     *
+                     *   libwayland-client.so.0+f000: wanted 4096, got 2808
+                     *
+                     * which is the LAST page of a 64248-byte file -- a short
+                     * read at end-of-file, exactly the legitimate case the
+                     * comment above describes. An instrument that reports 300
+                     * false positives a boot is worse than none, and it also
+                     * disproved my own theory: those runs included one with no
+                     * crash at all, so short reads do not correlate with the
+                     * corruption.
+                     *
+                     * `fvalid` is the mapping's file-backed length, so when it
+                     * is set and the whole page lies inside it, every byte we
+                     * asked for was declared present and a short read IS a
+                     * hole. A whole-file mmap (fvalid == 0) cannot be judged
+                     * here without the file size, and its last page is short
+                     * by construction. */
+                    if (got > 0 && (unsigned long)got < want &&
+                        v.fvalid && voff + want <= v.fvalid)
+                        kprintf("[fault] SHORT READ filling %lx from %s+%lx: wanted %lu, got %ld -- "
+                                "%lu byte(s) of this page are ZERO and nothing downstream can tell "
+                                "that from a page the file genuinely zeroes\n",
+                                page, fp, (unsigned long)fileoff, (unsigned long)want, got,
+                                want - (unsigned long)got);
                 }
                 a->majflt++; g_flt_major++;             /* page filled from disk => major fault (M1150) */
             } else {

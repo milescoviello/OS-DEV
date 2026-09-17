@@ -682,6 +682,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "cowbatch")) { extern int g_cow_batch; g_cow_batch = 1;
             kprintf("[boot] cowbatch: M2102's batched COW free re-enabled -- this CORRUPTS the "
                     "guest on more than one core (M2106), for bisection only\n"); }
+        if (cmdline_has(cl, "faultvaddr")) { extern int g_fault_vaddr_test; g_fault_vaddr_test = 1; }
+                                                                          /* prove the fault report's offset is objdump-able (M2153) */
         if (cmdline_has(cl, "nopathcache")) g_e2_path_cache = 0;          /* A/B the ext2 path cache (M2104) */
         if (cmdline_has(cl, "noreadrun"))   g_e2_read_runs = 0;           /* A/B the ext2 run coalescing (M2104) */
         if (cmdline_has(cl, "diskbench")) g_diskbench = 1;                /* per-command disk cost (M2091) */
@@ -2756,6 +2758,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * nothing else in the tree would notice. Asserted by
      * tests/run-ipc-tests.sh, which already boots headless and greps COM1. */
     app_memfd_selftest();
+    { extern void app_fault_vaddr_selftest(void); app_fault_vaddr_selftest(); }
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).
      * Opt-in for the same reason as the block above: boot-to-desktop under a
