@@ -2199,6 +2199,21 @@ void wl_page_probe(uint32_t want) {
         kprintf("[page] VERDICT: the PAGE is on screen -- %d%% of the content area is %06x\n",
                 pct, want & 0x00ffffffu);
     } else
+        /* SAY WHAT THE DOCUMENT DID, IN THIS LINE (M2174). "Only the chrome" on
+         * its own sends the reader to the renderer. Whether the document was
+         * FETCHED is what decides between "the page did not load" and "the page
+         * loaded and painted nothing", and those need opposite investigations.
+         * Measured across a failing and a passing boot, the reads are
+         * byte-identical -- so this line saying so is what stops the next
+         * person re-deriving it from two log copies. */
+        {   unsigned long ho = 0, hr = 0, hb = 0;
+            extern void lx_html_stats(unsigned long *, unsigned long *, unsigned long *);
+            lx_html_stats(&ho, &hr, &hb);
+            kprintf("[page]   the document was OPENED %lu time(s) and %lu read(s) delivered %lu "
+                    "byte(s) -- %s\n", ho, hr, hb,
+                    hb ? "so it was fetched and the content area is still blank: look at "
+                         "navigation, not at paint"
+                       : "so it was never fetched: look at the load, not at the renderer"); }
         kprintf("[page] VERDICT: only the CHROME -- %d%% of the content area is the page's %06x, "
                 "so the content area is showing something else\n", pct, want & 0x00ffffffu);
 }

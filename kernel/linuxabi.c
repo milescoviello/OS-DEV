@@ -977,8 +977,30 @@ static int lx_watched(int fd) {
     for (int i = 0; i < g_watch_n; i++) if (g_watch_fd[i] == fd) return 1;
     return 0;
 }
+/* COUNT IT, DO NOT ONLY PRINT IT (M2174).
+ *
+ * `[html] read(fd N) -> 1068` is the right fact and it is in the wrong place:
+ * forty lines earlier in the log than the page probe's verdict, and capped at
+ * forty lines so a busy run loses it. Diffing a failing boot against a passing
+ * one to establish "the document WAS fetched, byte-identically, and the content
+ * area is still blank" took a local copy of two logs and a by-hand comparison.
+ *
+ * That sentence is the whole diagnosis of the 1-in-4 blank page -- it clears
+ * the file path, the document loader and the storage stack in one go -- so the
+ * probe should be able to say it itself, in the line where the verdict is. */
+unsigned long g_html_opens, g_html_bytes, g_html_reads;
+void lx_html_stats(unsigned long *opens, unsigned long *reads, unsigned long *bytes) {
+    if (opens) *opens = g_html_opens;
+    if (reads) *reads = g_html_reads;
+    if (bytes) *bytes = g_html_bytes;
+}
+
 static void lx_watch_report(const char *what, int fd, long off, long n) {
     static int lines;
+    /* Counted BEFORE the line cap, so the totals survive a boot noisy enough
+     * to hit it -- which is exactly the boot worth diagnosing. */
+    g_html_reads++;
+    if (n > 0) g_html_bytes += (unsigned long)n;
     if (lines++ > 40) return;
     if (off >= 0) kprintf("[html] %s(fd %d, off %ld) -> %ld\n", what, fd, off, n);
     else          kprintf("[html] %s(fd %d) -> %ld\n", what, fd, n);
@@ -4229,6 +4251,7 @@ static void lx_dispatch_body(struct registers *r) {
             { int e = 0; while (path[e]) e++;
               if (e > 5 && path[e-5]=='.' && path[e-4]=='h' && path[e-3]=='t'
                          && path[e-2]=='m' && path[e-1]=='l') {
+                  g_html_opens++;
                   kprintf("[linuxabi] OPENED AN HTML FILE: %s -> fd %d "
                           "(so the document loader did reach it)\n", path, fd);
                   /* ...AND WATCH WHAT IT ACTUALLY GETS BACK (M2107). A
