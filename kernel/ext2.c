@@ -193,8 +193,10 @@ static uint32_t extent_map(ext2_t *v, const uint8_t *ib, uint32_t fblk) {
 unsigned long g_e2_bad_ptrs;          /* out-of-range block pointers rejected */
 uint32_t      g_e2_bad_ptr_val;       /* the last one, and where it came from */
 int           g_e2_bad_ptr_level;     /* 1 = single indirect, 2 = double indirect, 0 = direct */
+unsigned int  g_e2_blocks_count;      /* what the superblock says, so a bogus BOUND is visible too */
 static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level) {
     if (!blk) return 0;                                    /* a real hole */
+    g_e2_blocks_count = v->blocks_count;
     if (v->blocks_count && blk >= v->blocks_count) {
         g_e2_bad_ptrs++;
         g_e2_bad_ptr_val = blk;

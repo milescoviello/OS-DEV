@@ -240,6 +240,7 @@ static volatile int g_kstack_overflow_test;
 static volatile int g_ustack_overflow_test;   /* -append ustackover: spawn a ring-3 app that overflows its USER stack (M1500) */
 static volatile int g_wx_test;                /* -append wxtest: prove W^X is enforced -- executing a no-execute data page must fault (M1501) */
 static volatile int g_smep_test;              /* -append smeptest: prove SMEP -- the kernel executing a ring-3 (user) page must fault (M1502) */
+static volatile int g_e2big_test;             /* -append e2big: concurrent reads of one 171 MB library (M2166) */
 static volatile int g_e2pcrace_test;          /* -append e2pcrace: hammer the ext2 path cache from every core (M2155) */
 static volatile int g_smpthread_test;         /* -append smpthreadtest: prove real cross-core kernel threads work (M1530) */
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
@@ -683,6 +684,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "cowbatch")) { extern int g_cow_batch; g_cow_batch = 1;
             kprintf("[boot] cowbatch: M2102's batched COW free re-enabled -- this CORRUPTS the "
                     "guest on more than one core (M2106), for bisection only\n"); }
+        if (cmdline_has(cl, "e2big")) g_e2big_test = 1;               /* hammer ONE big file from every core (M2166) */
         if (cmdline_has(cl, "e2pcwiden")) { extern int g_e2pc_widen; g_e2pc_widen = 1; }  /* widen the insert window in BOTH arms (M2155) */
         if (cmdline_has(cl, "e2pcracy")) { extern int g_e2pc_racy; g_e2pc_racy = 1; }   /* the pre-M2155 racy insert (M2155) */
         if (cmdline_has(cl, "e2pcrace")) g_e2pcrace_test = 1;         /* concurrent ext2 path-cache test (M2155) */
@@ -2775,6 +2777,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     { extern void vmm_hhdm_selftest(void); vmm_hhdm_selftest(); }
     { extern void app_fault_vaddr_selftest(void); app_fault_vaddr_selftest(); }
     if (g_e2pcrace_test) { extern void ext2_path_cache_race_test(void); ext2_path_cache_race_test(); }
+    if (g_e2big_test) { extern void ext2_bigfile_race_test(void); ext2_bigfile_race_test(); }
     ipc_selftest();
     /* The terminal, asserted on CELLS rather than on a screenshot (M2057).
      * Opt-in for the same reason as the block above: boot-to-desktop under a

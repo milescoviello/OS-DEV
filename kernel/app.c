@@ -3305,6 +3305,10 @@ void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur
  * short of CR2) and the same class as everything else in this hunt: an
  * instrument answering truthfully about the wrong thing. */
 static void protnote_report(uint64_t start);          /* M2165; defined below */
+static uint64_t flt_io_begin(void);
+static void flt_io_end(uint64_t fl);
+static int  fault_file_compare(const char *path, uint64_t fo, uint64_t addr, const char *what);
+                                                      /* M2166; defined below */
 
 void app_describe_fault_addr(uint64_t cr2) {
     struct app *a = cur();
@@ -3337,6 +3341,25 @@ void app_describe_fault_addr(uint64_t cr2) {
          * executable segment while the access was refused by a completely
          * different VMA. Print it where the refusing mapping is identified. */
         protnote_report(a->vma[i].start);
+        /* THE QUESTION THAT DECIDES THIS (M2166). A read-only file mapping the
+         * program is WRITING to: has anything modified it since it was mapped?
+         * If it still matches the file, ld.so's relocations into it were lost,
+         * and an unrelocated GOT slot is exactly how a call lands inside a
+         * read-only LOAD. Copy the path first -- vma_path points into a table
+         * the compare's disk read can outlive. */
+        if (a->vma[i].file_backed && !(a->vma[i].prot & VMA_PROT_WRITE)) {
+            char fp2[VFS_PATH_MAX];
+            const char *sp = vma_path(a, i); unsigned k = 0;
+            for (; sp && sp[k] && k < sizeof(fp2) - 1; k++) fp2[k] = sp[k];
+            fp2[k] = 0;
+            uint64_t fo2 = (cr2 & ~(uint64_t)0xF) - a->vma[i].start + a->vma[i].foff;
+            int r = fault_file_compare(fp2, fo2, cr2 & ~(uint64_t)0xF, "RELRO/data");
+            if (r == 1)
+                kprintf("[fault]   ** THE RELOCATIONS INTO THIS PAGE ARE MISSING: it is byte "
+                        "identical to the file, so ld.so's writes here were LOST. An "
+                        "unrelocated GOT slot holds a link-time value, which is how a call "
+                        "lands inside a read-only segment. **\n");
+        }
         found = 1; break;
     }
     vma_unlock(a, fl);
@@ -3407,6 +3430,83 @@ static void protnote(uint64_t start, uint64_t len, unsigned char prot, unsigned 
     p->arg_addr = arg_addr; p->arg_len = arg_len; p->tid = task_current_id(); p->used = 1;
 }
 
+/* MEMORY VERSUS THE FILE, AT AN ARBITRARY ADDRESS (M2166).
+ *
+ * M2154's code check compares the bytes at a faulting RIP against the file it
+ * came from. The same comparison at the faulting DATA address answers a
+ * different and now more important question.
+ *
+ * A write fault inside libxul's RELRO segment is either the program writing
+ * where it must not -- RELRO is read-only by the time ld.so is done, correctly,
+ * as the provenance line proved -- or it is ld.so's relocation pass having had
+ * its writes LOST, because an unrelocated GOT slot holds a link-time value and
+ * calling through one lands exactly where these faults land: an address inside
+ * a read-only LOAD.
+ *
+ * Those two have opposite fixes and the file decides between them. A RELRO page
+ * that has been relocated CANNOT still match the file; if it does, the writes
+ * are gone and the bug is ours.
+ *
+ * Returns 1 if it printed a verdict. */
+static int fault_file_compare(const char *path, uint64_t fo, uint64_t addr, const char *what) {
+    /* SAY WHY IT DECLINED (M2166). The first cut of this returned 0 on either
+     * refusal and printed nothing, so a run with the check in it was
+     * indistinguishable from a run without -- which is the same defect as every
+     * other silent instrument in this hunt. */
+    uint64_t p0 = addr & ~(uint64_t)0xFFF, p1 = (addr + 15) & ~(uint64_t)0xFFF;
+    if (!(vmm_pte_raw(p0) & PTE_PRESENT) || !(vmm_pte_raw(p1) & PTE_PRESENT)) {
+        kprintf("[fault] %s check at %lx: SKIPPED -- the page is not present, so there are no "
+                "bytes in memory to compare\n", what, addr);
+        return 0;
+    }
+    unsigned char disk[16];
+    uint64_t fl = flt_io_begin();
+    long got = vfs_pread(path, disk, sizeof(disk), fo);
+    flt_io_end(fl);
+    if (got != (long)sizeof(disk)) {
+        /* A READ OF A LIBRARY FAILING IS THE WHOLE M2155 CHAIN, STILL LIVE
+         * (M2166). The fill path retries and completes short reads now, so
+         * `FILL FAILED` reads zero -- but the underlying read still fails under
+         * eight-core load, and this is the one place left that says so. Print
+         * the same reason chain the fill does, so the next run names it. */
+        extern const char *ext2_pread_why(void);
+        extern const char *blockdev_fail_why(void);
+        extern const char *ata_fail_stage_name(void);
+        extern void blockdev_fail_operands(int *dev, uint64_t *lba, uint32_t *count, uint64_t *cap);
+        extern unsigned long g_e2_bad_ptrs, g_ata_drained_sectors;
+        extern unsigned int  g_e2_bad_ptr_val, g_e2_blocks_count;
+        extern int           g_e2_bad_ptr_level;
+        int bdev = -1; uint64_t bdlba = 0, bdcap = 0; uint32_t bdcnt = 0;
+        blockdev_fail_operands(&bdev, &bdlba, &bdcnt, &bdcap);
+        kprintf("[fault] %s check at %lx: THE READ FAILED -- %s at offset %lx returned %ld.\n"
+                "[fault]   ext2: %s | block: %s (dev %d lba %lu count %u cap %lu) | ata: %s\n"
+                "[fault]   bad block pointers rejected %lu (last %lu at indirect level %d; the "
+                "filesystem has %lu blocks), stale sectors drained %lu\n",
+                what, addr, path, (unsigned long)fo, got,
+                ext2_pread_why(), blockdev_fail_why(), bdev, (unsigned long)bdlba, bdcnt,
+                (unsigned long)bdcap, ata_fail_stage_name(),
+                g_e2_bad_ptrs, (unsigned long)g_e2_bad_ptr_val, g_e2_bad_ptr_level,
+                (unsigned long)g_e2_blocks_count, g_ata_drained_sectors);
+        return 0;
+    }
+    const unsigned char *mem = (const unsigned char *)addr;
+    static const char hx[] = "0123456789abcdef";
+    char ml[16 * 3 + 1], dl[16 * 3 + 1];
+    int same = 1;
+    for (int b = 0; b < 16; b++) {
+        ml[b*3] = ' '; ml[b*3+1] = hx[mem[b] >> 4];  ml[b*3+2] = hx[mem[b] & 15];
+        dl[b*3] = ' '; dl[b*3+1] = hx[disk[b] >> 4]; dl[b*3+2] = hx[disk[b] & 15];
+        if (mem[b] != disk[b]) same = 0;
+    }
+    ml[48] = dl[48] = 0;
+    kprintf("[fault] %s check at %lx: memory%s\n"
+            "[fault]   (same page)          file%s   -- %s\n",
+            what, addr, ml, dl,
+            same ? "IDENTICAL to the file"
+                 : "DIFFERS from the file (it has been written since it was mapped)");
+    return same ? 1 : 2;
+}
+
 /* Called by the Linux mmap translation right after a file mapping lands. */
 void app_protnote_mmap(uint64_t start, uint64_t len, int prot) {
     protnote(start, len, (unsigned char)(prot & 0x7), 1, start, len);
@@ -3469,12 +3569,15 @@ static void fill_report(uint64_t va) {
  *
  * Safe here for the same reason it is safe there: a ring-3 fault arrives in a
  * normal task context holding no kernel lock. */
-static inline uint64_t flt_io_begin(void) {
+static uint64_t flt_io_begin(void);
+static void flt_io_end(uint64_t fl);
+
+static uint64_t flt_io_begin(void) {
     uint64_t fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl) :: "memory");
     __asm__ volatile("sti");
     return fl;
 }
-static inline void flt_io_end(uint64_t fl) {
+static void flt_io_end(uint64_t fl) {
     __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
 }
 

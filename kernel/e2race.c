@@ -199,3 +199,112 @@ void ext2_path_cache_race_test(void) {
                   "page became zeros");
     kfree(g_e2r_path); kfree(g_e2r_sig);
 }
+
+/* ===================== ONE BIG FILE, EVERY CORE (M2166) =====================
+ *
+ * WHY THIS EXISTS. The 8-core Firefox failure now presents as `vfs_pread` on
+ * libxul.so returning -1 from inside the fault handler, intermittently, with
+ * ext2 reporting "a BLOCK READ FAILED during the path walk" and the block layer
+ * reporting an LBA of 18962972664 against a 6553600-sector disk. Each Firefox
+ * run costs seven minutes and produces at most one such line, which is a
+ * hopeless iteration loop for a concurrency bug.
+ *
+ * The failing OPERATION, though, is simply "read a large file from several
+ * cores at once". That needs no browser. This hammers exactly it: sample
+ * offsets spread across a 171 MB library, hash each one single-threaded first
+ * (so every expected value is established with no concurrency at all), then
+ * have one thread per core read random samples and require the exact hash back.
+ *
+ * It distinguishes the three outcomes that matter, because they have different
+ * fixes: a read that FAILS (-1) is the storage chain; a read that comes back
+ * SHORT is the fill/readahead path; a read that succeeds with the WRONG BYTES
+ * is a cache or transfer bug. Reporting them as one number would hide which.
+ */
+#define E2B_SAMPLES  96
+#define E2B_CHUNK    4096
+#define E2B_ITERS    1500
+
+static const char *g_e2b_path = "/disk2/usr/lib64/firefox/libxul.so";
+static unsigned long g_e2b_off[E2B_SAMPLES];
+static unsigned      g_e2b_sig[E2B_SAMPLES];
+static int           g_e2b_n;
+static volatile unsigned long g_e2b_reads, g_e2b_fail, g_e2b_short, g_e2b_wrong;
+static volatile int  g_e2b_told, g_e2b_done;
+
+static void e2b_worker(void *arg) {
+    unsigned seed = (unsigned)(uintptr_t)arg * 2246822519u + 7u;
+    unsigned char *buf = (unsigned char *)kmalloc(E2B_CHUNK);
+    if (!buf) { __atomic_add_fetch(&g_e2b_done, 1, __ATOMIC_RELAXED); return; }
+    for (int it = 0; it < E2B_ITERS; it++) {
+        seed = seed * 1103515245u + 12345u;
+        int k = (int)((seed >> 9) % (unsigned)g_e2b_n);
+        long got = vfs_pread(g_e2b_path, buf, E2B_CHUNK, g_e2b_off[k]);
+        __atomic_add_fetch(&g_e2b_reads, 1, __ATOMIC_RELAXED);
+        if (got < 0) {
+            __atomic_add_fetch(&g_e2b_fail, 1, __ATOMIC_RELAXED);
+            if (!__atomic_exchange_n(&g_e2b_told, 1, __ATOMIC_ACQ_REL)) {
+                extern const char *ext2_pread_why(void);
+                extern const char *blockdev_fail_why(void);
+                extern unsigned long g_e2_bad_ptrs;
+                extern unsigned int  g_e2_bad_ptr_val, g_e2_blocks_count;
+                extern int           g_e2_bad_ptr_level;
+                kprintf("E2BIG: read at offset %lu FAILED (-1)\n"
+                        "E2BIG:   ext2: %s | block: %s\n"
+                        "E2BIG:   bad block pointers rejected %lu (last %lu at level %d; "
+                        "the filesystem has %lu blocks)\n",
+                        g_e2b_off[k], ext2_pread_why(), blockdev_fail_why(),
+                        g_e2_bad_ptrs, (unsigned long)g_e2_bad_ptr_val, g_e2_bad_ptr_level,
+                        (unsigned long)g_e2_blocks_count);
+            }
+        } else if (got < E2B_CHUNK) {
+            __atomic_add_fetch(&g_e2b_short, 1, __ATOMIC_RELAXED);
+            if (!__atomic_exchange_n(&g_e2b_told, 1, __ATOMIC_ACQ_REL))
+                kprintf("E2BIG: read at offset %lu came back SHORT: %ld of %d\n",
+                        g_e2b_off[k], got, E2B_CHUNK);
+        } else if (e2r_hash(buf, got) != g_e2b_sig[k]) {
+            __atomic_add_fetch(&g_e2b_wrong, 1, __ATOMIC_RELAXED);
+            if (!__atomic_exchange_n(&g_e2b_told, 1, __ATOMIC_ACQ_REL))
+                kprintf("E2BIG: read at offset %lu returned the WRONG BYTES (hash %x, not %x)\n",
+                        g_e2b_off[k], e2r_hash(buf, got), g_e2b_sig[k]);
+        }
+        if ((it & 31) == 0) smp_thread_yield();
+    }
+    kfree(buf);
+    __atomic_add_fetch(&g_e2b_done, 1, __ATOMIC_RELAXED);
+}
+
+void ext2_bigfile_race_test(void) {
+    unsigned char *probe = (unsigned char *)kmalloc(E2B_CHUNK);
+    if (!probe) { kprintf("E2BIG: SKIP (no heap)\n"); return; }
+    /* Spread the samples over the whole file, including deep in the
+     * double-indirect region, which is where every observed failure landed. */
+    g_e2b_n = 0;
+    for (int i = 0; i < E2B_SAMPLES; i++) {
+        unsigned long off = (unsigned long)i * 1777 * 1024;      /* ~1.7 MB apart */
+        long got = vfs_pread(g_e2b_path, probe, E2B_CHUNK, off);
+        if (got != E2B_CHUNK) continue;                          /* past EOF, or unreadable */
+        g_e2b_off[g_e2b_n] = off;
+        g_e2b_sig[g_e2b_n] = e2r_hash(probe, got);
+        g_e2b_n++;
+    }
+    kfree(probe);
+    if (g_e2b_n < 8) {
+        kprintf("E2BIG: SKIP (only %d readable samples of %s)\n", g_e2b_n, g_e2b_path);
+        return;
+    }
+    kprintf("E2BIG: %d samples of %d bytes across %s, established single-threaded; "
+            "hammering from %d threads, %d reads each...\n",
+            g_e2b_n, E2B_CHUNK, g_e2b_path, E2R_THREADS, E2B_ITERS);
+    smp_thread_t *t[E2R_THREADS];
+    int spawned = 0;
+    for (int i = 0; i < E2R_THREADS; i++) {
+        t[i] = smp_thread_spawn(e2b_worker, (void *)(uintptr_t)(i + 1));
+        if (t[i]) spawned++;
+    }
+    for (int i = 0; i < E2R_THREADS; i++) if (t[i]) smp_thread_join(t[i]);
+    kprintf("E2BIG: %lu reads across %d thread(s): %lu FAILED, %lu short, %lu WRONG BYTES -- %s\n",
+            g_e2b_reads, spawned, g_e2b_fail, g_e2b_short, g_e2b_wrong,
+            (g_e2b_fail == 0 && g_e2b_short == 0 && g_e2b_wrong == 0)
+                ? "PASSED"
+                : "FAILED: reading one large file from several cores does not return the file");
+}
