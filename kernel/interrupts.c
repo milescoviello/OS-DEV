@@ -201,6 +201,13 @@ void isr_dispatch(struct registers *r) {
      * the LAPIC spurious vector needs no EOI. Both just acknowledge + return. */
     if (r->int_no == 0x40) { lapic_eoi(); return; }
     if (r->int_no == 0x41) { vmm_tlb_shootdown_ack(); lapic_eoi(); return; }   /* TLB shootdown (M1963) */
+    /* RESCHEDULE (M2216). A core halted in the idle task comes back only on an
+     * interrupt, and its own timer tick is 100 Hz -- so a task woken onto an
+     * idle core waited up to ten milliseconds for a scheduler that already had
+     * work for it. This is the interrupt that says "look again now". EOI, clear
+     * the in-flight flag, then sched_tick(), which is exactly what the timer
+     * interrupt does with the same stack shape. */
+    if (r->int_no == 0x42) { lapic_eoi(); smp_resched_ack(smp_current_cpu()); sched_tick(); return; }
     /* This core's own local LAPIC timer (M1532): the real per-core preemption
      * source, armed by lapic_timer_start_this_cpu() on every AP (never the
      * BSP, which keeps its own working PIT-driven tick_handler). EOI FIRST,

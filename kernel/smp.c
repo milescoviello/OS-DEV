@@ -163,6 +163,10 @@ void lapic_eoi(void) { if (lapic) lapic_wr(0x0B0, 0); }   /* ack an interrupt */
  * other unsynchronised kernel state (the rest of the kernel is still BSP-only).
  */
 #define SMP_MAXJOB 64
+/* Indexed by APIC ID, which every per-core array in this tree already masks to
+ * 16 (kernel/app.c's fault chain, ecdsa.c's per-core state, task.c's `cur[]`).
+ * Same bound here so the convention stays one number. (M2216) */
+#define SMP_MAXCPU 16
 struct smp_job { smp_fn fn; int lo, hi; void *ctx; };
 static struct smp_job sj[SMP_MAXJOB];
 static volatile int sj_n, sj_next, sj_done, sj_lock;
@@ -224,6 +228,53 @@ void smp_tlb_shootdown_selftest(void) {
     unsigned long after = vmm_tlb_shootdown_count();
     kprintf("[ ok ] TLB shootdown IPI: %lu core(s) acked in %lums (count %lu -> %lu)\n",
             (unsigned long)(smp_cpu_count - 1), (unsigned long)took, before, after);
+}
+
+/* A RESCHEDULE IPI, so a woken task does not wait for a timer tick (M2216).
+ *
+ * THE COST THIS REMOVES. `task_wake` makes a task READY and puts it in the run
+ * queue, and that is all it does. A core sitting in the idle task is halted --
+ * `sti; hlt` -- and comes back only on an interrupt, which in practice means
+ * ITS OWN TIMER TICK. The tick is 100 Hz. So a task woken while its core is
+ * idle waits 0-10 ms for a scheduler that has had work for it the whole time,
+ * and the idle loop's own comment ("so the timer can preempt it the instant any
+ * real task becomes runnable") is off by up to ten milliseconds.
+ *
+ * It is worst exactly where it should be best: a Firefox first paint is 89%
+ * idle, so most wakes land on halted cores, and EIGHT cores are therefore
+ * SLOWER than one -- 156 s against 36 s to the same page. On one core the woken
+ * task is on this core and the very next reschedule picks it up.
+ *
+ * TARGETED, AND ONLY AT A CORE THAT IS ACTUALLY IDLE. Broadcasting on every
+ * wake would be thousands of IPIs a second now that pipe and eventfd writes
+ * wake pollers (M2208) -- each one a VM exit under KVM, which is how a latency
+ * fix becomes a throughput regression. The idle loop publishes a flag; this
+ * picks one core that has it set, and a second wake while the first IPI is
+ * still unhandled is skipped.
+ *
+ * Vector 0x42, beside the job-pool wake (0x40) and the TLB shootdown (0x41).
+ * Its handler EOIs and calls sched_tick(), which is exactly what the timer
+ * interrupt does -- so this runs in a context the scheduler is already entered
+ * from, rather than a new one. */
+volatile unsigned char smp_core_idle[SMP_MAXCPU];
+static volatile unsigned char smp_resched_sent[SMP_MAXCPU];
+void smp_resched_ack(int apic) {
+    smp_resched_sent[apic & (SMP_MAXCPU - 1)] = 0;
+}
+void smp_send_resched_ipi(void) {
+    if (!lapic) return;
+    int me = smp_current_cpu() & (SMP_MAXCPU - 1);
+    int n = __atomic_load_n(&smp_cpu_count, __ATOMIC_RELAXED);
+    if (n <= 1) return;
+    for (int i = 0; i < SMP_MAXCPU; i++) {
+        if (i == me || !smp_core_idle[i]) continue;
+        if (__atomic_exchange_n(&smp_resched_sent[i], 1, __ATOMIC_ACQ_REL)) continue;  /* one in flight already */
+        lapic_wr(LAPIC_ICRHI, (uint32_t)i << 24);
+        lapic_wr(LAPIC_ICRLO, 0x42 | (1u << 14));            /* fixed, assert, that core */
+        for (uint32_t g = 0; g < 1000000u && (lapic_rd(LAPIC_ICRLO) & ICR_PENDING); g++)
+            __asm__ volatile("pause");
+        return;                                              /* one idle core is enough for one task */
+    }
 }
 
 void smp_wake_aps(void) {

@@ -458,7 +458,16 @@ static inline uint64_t idle_tsc(void) {
 static void idle_loop(void) {
     for (;;) {
         uint64_t t0 = idle_tsc();
+        /* PUBLISH THAT THIS CORE IS PARKED (M2216), so task_wake can send it a
+         * reschedule IPI instead of leaving a runnable task to wait for this
+         * core's next timer tick. The comment above -- "so the timer can
+         * preempt it the instant any real task becomes runnable" -- was off by
+         * up to ten milliseconds, every time, and on eight mostly-idle cores
+         * that is why eight were slower than one. */
+        int me = smp_current_cpu() & 15;
+        smp_core_idle[me] = 1;
         __asm__ volatile("sti; hlt");
+        smp_core_idle[me] = 0;
         g_idle_cycles += idle_tsc() - t0;
     }
 }
@@ -996,6 +1005,16 @@ void task_wake(task_t *t) {
     }
     rq_lock_give();
     irq_restore(f);
+    /* AND TELL AN IDLE CORE TO LOOK (M2216). Making a task READY is not the
+     * same as getting it RUN: a core halted in the idle task comes back only on
+     * an interrupt, and its own timer tick is 100 Hz -- so without this the
+     * woken task waits 0-10 ms for a scheduler that already had work for it.
+     * Sent AFTER the run-queue lock is released, so the core we poke does not
+     * arrive and immediately spin on a lock we still hold; targeted at one core
+     * that is actually parked, and skipped when an IPI to it is still in
+     * flight, because a broadcast on every wake would be thousands of VM exits
+     * a second now that pipe and eventfd writes wake pollers (M2208). */
+    smp_send_resched_ipi();
 }
 
 /* Sleep the current task for `ms`, off-CPU, until the timer wakes it (M1079) —
