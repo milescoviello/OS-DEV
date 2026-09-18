@@ -1,5 +1,75 @@
 # What's next
 
+> **(M2186-M2187) WHAT IS NOW RULED OUT, WHICH IS WORTH MORE THAN THE FIXES: THE
+> FIREFOX FAILURE IS NOT THE LIBRARY, NOT THE PAGES, AND NOT THE RELOCATIONS.**
+>
+> Five hypotheses were killed by measurement today, each with an instrument
+> built for it. Listing them because the next session's first instinct will be
+> to re-open one:
+>
+> 1. **The pages are not corrupted after RELRO.** M2177 hashes the RELRO range
+>    when ld.so makes it read-only and re-hashes at the fault, with no disk I/O
+>    -- because the fault-path file read fails under exactly the conditions the
+>    fault occurs in. Verdict: `this page is UNCHANGED since the range was made
+>    read-only`. A read-only page whose contents had changed could only have
+>    been us; it had not changed.
+> 2. **The library bytes are the file's bytes.** A whole-library comparison
+>    against host-computed hashes baked into the image -- so the oracle is
+>    outside this kernel entirely -- passes for libxul, libgtk-3 and libc.
+> 3. **Private mappings are private across processes**, by a probe that
+>    `execve`s an independent process rather than forking, since fork may
+>    legitimately share copy-on-write and so cannot answer the question.
+> 4. **The relocations are not being skipped.** M2187 counts the zero 8-byte
+>    words in the RELRO range at protect time, and the number is *identical* in
+>    failing and passing boots: `134 of 1488 pages resident, 7560 of 68608
+>    words ZERO`, three boots, two blank and one rendering. And 134 resident
+>    pages is normal rather than a truncated pass -- libxul has ~3600 dynamic
+>    relocations and no DT_RELR, scattered over roughly forty pages of `.got`
+>    and `.got.plt`.
+> 5. **The static inputs are byte-correct.** `ffpage.html` and the staged prefs
+>    match host hashes on every boot, checked before Firefox is spawned.
+>
+> **Two real bugs were found on the way, both proven by reverting.**
+>
+> `mprotect` over a page inherited by `fork` **wrote into the parent's memory**:
+>
+>     LXCOWPROT: FAIL byte 0 of the PARENT's private mapping is 187, not 170.
+>     LXCOWPROT: FAIL the file has 262144 bytes and byte 0 is 0, not 92 -- an
+>       mprotect cleared PTE_DIRTY and msync skipped a page the program wrote
+>
+> 187 is the child's marker, 170 the parent's. `vmm_protect` replaced the PTE
+> flags wholesale, discarding PTE_COW -- so granting write handed out a frame
+> still shared with the parent -- and PTE_DIRTY, which is how msync decides what
+> to flush. The tree had no probe that mprotects a page it inherited by fork.
+>
+> And **`mprotect` was gated on the pages already being accessible**, which is
+> what it exists to change. `vmm_user_ok` returns false when PTE_USER is clear;
+> harmless until M2179 started clearing it for PROT_NONE, at which point an
+> mprotect GRANTING access back to a PROT_NONE range returned -1 having changed
+> nothing. Firefox went to 0 of 4 boots; with the gate fixed, back to 2 of 4 and
+> one boot completely clean. A correct change that makes things worse is
+> pointing at a second bug rather than at itself.
+>
+> **Also: a SIGSEGV handler could catch exactly one fault.** `sig_in` is cleared
+> only by `sigreturn`, and `siglongjmp` out of a handler -- the standard
+> fault-recovery idiom, used by sandboxes, guard-page handlers and
+> JavaScriptCore -- never calls it. So every later signal was refused delivery
+> and the process was killed for a signal it had a handler for.
+>
+> **The honest state of the goal.** Kernel panics: **0** in every boot since
+> M2159. Phase 7's Claude Code demo: **met**, on one core and on eight, with
+> Write creating a file in OS-DEV's own source tree and Read reading it back.
+> Firefox on 8 cores: **page in about 2 of 4, a child process dying in about 3
+> of 4.** The rate has not materially moved today. Averaging the good runs would
+> be the easy report and it would be false.
+>
+> **What the next session should NOT do:** re-measure a rate while another
+> session is booting VMs on the same node (host contention drives the
+> wall-clock ATA deadline and changed every timing taken before this was
+> noticed), trust a `CAP` short enough to cut the capture before the page
+> appears, or grep `boot.log` after the run rather than in the same command --
+> the next boot truncates it.
+
 > **(M2180-M2183) PHASE 7'S DEMO IS MET, AND CLAUDE CODE'S TOOLS WORK ON EIGHT
 > CORES. THE BLOCKER WAS A STALE TOKEN IN THE IMAGE, NOT THE LOGIN.**
 >

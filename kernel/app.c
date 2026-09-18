@@ -3553,22 +3553,44 @@ static unsigned relro_hash_page(const unsigned char *p) {
     return h ? h : 1u;
 }
 
+/* HOW MANY WORDS ARE STILL ZERO WHEN RELRO CLOSES (M2187).
+ *
+ * M2177 established that a RELRO page is UNCHANGED between ld.so protecting it
+ * and the fault -- so the bad value was already there, and the remaining
+ * candidate is a relocation that was never applied. That has a signature: an
+ * unrelocated slot in a position-independent object is ZERO, and a pointer read
+ * from a zero slot faults at a small offset from null. Which is what the crash
+ * reports show -- `CR2=0xe8`, `CR2=0x98`, `CR2=0x80`: field offsets from a null
+ * base, not wild addresses.
+ *
+ * A GOT legitimately contains some zeros, so an absolute count proves nothing.
+ * A count COMPARED between a boot that renders and one that does not is
+ * evidence, and it costs one pass over a range we are already hashing. */
 static void relro_watch(uint64_t start, uint64_t len) {
     if (len < (64u << 10)) return;
     int n = (int)(len / PAGE_SIZE);
     if (n > RELRO_WATCH_PAGES) n = RELRO_WATCH_PAGES;
     g_rw.start = start; g_rw.len = (uint64_t)n * PAGE_SIZE;
     g_rw.npages = n; g_rw.tid = task_current_id();
+    unsigned long zero = 0, total = 0, resident = 0;
     for (int i = 0; i < n; i++) {
         uint64_t va = start + (uint64_t)i * PAGE_SIZE;
         if (vmm_pte_raw(va) & PTE_PRESENT) {
             g_rw.present[i] = 1;
             g_rw.h[i] = relro_hash_page((const unsigned char *)va);
+            resident++;
+            const uint64_t *w = (const uint64_t *)va;
+            for (int k = 0; k < (int)(PAGE_SIZE / 8); k++) { total++; if (!w[k]) zero++; }
         } else {
             g_rw.present[i] = 0;
             g_rw.h[i] = 0;
         }
     }
+    /* Printed every time, because the comparison is between BOOTS and a line
+     * that only appears on failure cannot be compared with a success. */
+    kprintf("[relro] %lx+%lx made read-only by tid %d: %lu of %d pages resident, %lu of %lu "
+            "8-byte words are ZERO\n",
+            (unsigned long)start, (unsigned long)g_rw.len, g_rw.tid, resident, n, zero, total);
 }
 
 /* Printed at a fault inside the watched range. */
