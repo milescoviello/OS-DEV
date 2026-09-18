@@ -68,6 +68,12 @@ static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level);   /* M2176; defin
  * off the end of the filesystem means the descriptor block we read was not a
  * descriptor block, and every inode in that group would come back as data. */
 unsigned long g_e2_bad_itable, g_e2_bad_groups;
+/* THE RE-READ EXPERIMENT (M2219): how often a rejected inode-table pointer
+ * reads back DIFFERENTLY, and how often the second read is valid. A difference
+ * means the storage path handed back bytes that were not the sector asked for;
+ * agreement means the block number itself was wrong. */
+unsigned long g_e2_itable_reread, g_e2_itable_differed, g_e2_itable_secondgood;
+unsigned int  g_e2_bad_itable_2nd;
 /* EVERY REASON THIS VOLUME COULD NOT BE BELIEVED, IN ONE COUNTER (M2213).
  *
  * A caller that has just had -1 out of a read needs to know whether the answer
@@ -205,8 +211,43 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
         if (rdsec(v, gdblk, gdbyte / SECSZ, sec) < 0) return -1;
         uint32_t inode_table = e_rd32(sec + (gdbyte % SECSZ) + 8);
         if (!inode_table || (v->blocks_count && inode_table >= v->blocks_count)) {
+            /* READ IT AGAIN, AND SAY WHETHER THE ANSWER CHANGES (M2219).
+             *
+             * This fires 88-204 times per boot on EIGHT cores and NEVER on
+             * one, so it is a concurrency bug -- but every layer under it is
+             * already serialised: ata_lock covers the whole transfer including
+             * DMA, and bcache copies in and out under its own lock. "Which
+             * layer corrupts it" has run out of suspects and needs an
+             * experiment rather than another theory.
+             *
+             * A second read of the SAME sector separates the two cases.
+             * DIFFERENT answer => the first read returned bytes that were not
+             * this sector's, and the fault is in the storage path. SAME answer
+             * => the bytes really are what we asked for and the block number
+             * we computed is wrong, which points at the volume struct or the
+             * arithmetic, not at the disk.
+             *
+             * On the failure path only: one extra sector read per rejection,
+             * and a rejection is already a disaster. */
+            uint8_t again[SECSZ];
+            uint32_t second = 0;
+            int rr = rdsec(v, gdblk, gdbyte / SECSZ, again);
+            if (rr >= 0) second = e_rd32(again + (gdbyte % SECSZ) + 8);
+            g_e2_itable_reread++;
+            if (rr >= 0 && second != inode_table) g_e2_itable_differed++;
+            if (rr >= 0 && second && (!v->blocks_count || second < v->blocks_count))
+                g_e2_itable_secondgood++;
+            g_e2_bad_itable_2nd = second;
             v->ioerr = 1;
             g_e2_bad_itable++;
+            /* AND IT COUNTS AS DISTRUST (M2219). M2213 added that counter so
+             * the fault handler could tell "this path does not exist" from
+             * "the filesystem does not believe itself" before zero-filling a
+             * page -- and this site, the one that actually fires, was the one
+             * it missed: the edit landed on the pre-M2212 text. Every crashing
+             * 8-core boot therefore reported `refused=0` while rejecting
+             * eighty-eight inode tables. */
+            g_e2_distrust++;
             g_e2_bad_itable_val = inode_table;
             return -1;
         }
