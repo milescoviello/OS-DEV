@@ -327,6 +327,9 @@ static void ffshow_watch_task(void) {
             }
         }
         ps = ns; pf0 = pf1;
+        /* THE FILESYSTEM, EVERY SAMPLE, WINDOW OR NOT (M2225). The boots that
+         * need this line are the ones where nothing ever appears. */
+        wl_fs_health_line();
         {   int cpid = 0, csig = lx_fatal_signal(&cpid);
             if (csig) kprintf("[ffshow] *** pid %d CRASHED with signal %d -- what is on the "
                               "screen from here is the corpse ***\n", cpid, csig); }

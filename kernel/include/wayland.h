@@ -73,6 +73,7 @@ void wl_largest_window(uint32_t *w, uint32_t *h);
  * dominates it. "Painted" has meant a >=640x480 extent, which chrome around an
  * empty page satisfies just as well as a page. (M2106) */
 int wl_page_probe(uint32_t want_rgb);   /* 1 = the page is on screen (M2200) */
+void wl_fs_health_line(void);           /* the filesystem's counters, printable with no window (M2225) */
 /* The composited window as a small PPM in hex, so it can be LOOKED at rather
  * than inferred from a colour histogram. (M2110) */
 void wl_page_dump(void);   /* has ANY client painted a real window? (M2089) */
