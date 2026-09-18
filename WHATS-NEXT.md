@@ -1,5 +1,72 @@
 # What's next
 
+> **(M2172-M2175) TWO BUG CLASSES WORTH MORE THAN THE FIXES: A CACHE TOO SMALL
+> HIDES CORRUPTION, AND A CHECK ONE LEVEL TOO LOW COSTS NINE MILLION WRONG
+> VALUES.**
+>
+> **A cache that is too small hides corruption.** M2154 grew the block cache
+> from 128 entries to 131072 and the ext2 block-pointer check started firing.
+> The A/B, two 8-core runs each:
+>
+>     128 entries (64 KiB)      0 rejected block pointers
+>     131072 entries (64 MiB)   2970 rejected block pointers
+>
+> The big cache does not CREATE wrong bytes -- it RETAINS them. A 128-sector
+> read into a 128-entry pool evicts its own stale sectors before anything reads
+> them back; against 131072 entries a stale sector survives the whole boot.
+> Same wrong bytes either way; one configuration simply forgot them fast enough
+> to look healthy. An enlargement that appears to introduce corruption has
+> almost certainly exposed it.
+>
+> That led to the driver bug. PIIX3 bus-master completion is ACTIVE **together
+> with** INTERRUPT: `ACTIVE=0, IRQ=1` is complete, and **`ACTIVE=0, IRQ=0` means
+> the PRD list ran out first -- a SHORT transfer.** The driver read ACTIVE
+> alone, on the strength of a comment asserting "active clear alone is also
+> complete", so a short transfer was returned as a SUCCESS with the tail of the
+> bounce buffer -- the previous transfer's data -- gathered into the caller's
+> buffer and installed in the cache. M2172 requires the unambiguous signal.
+>
+> **Reject a provably-invalid value where it is PRODUCED.** M2158's range check
+> on ext2 block pointers was right and one level too low:
+>
+>     bad block pointers rejected 8999698 (last 1768685824 at indirect level 0)
+>     stale sectors drained 1
+>
+> Level 0 is a DIRECT pointer out of an inode, and 1768685824 is ASCII bytes --
+> so the inode itself was file data. `read_inode` took `inode_table` out of a
+> group descriptor and never checked it, so ONE bad descriptor read made every
+> inode in that group resolve into whatever data block the arithmetic landed on.
+> Nine million garbage values, each politely rejected far downstream where the
+> cause is invisible and the count means nothing. M2174 checks it at the source:
+> **135 rejections instead of 8,999,698**, named at the descriptor.
+>
+> Note the second line. `stale sectors drained 1` against nine million bad
+> pointers is a clean retraction of M2172 as "the last link" -- the
+> abandoned-DMA path is real and rare, and was never the dominant cause. It
+> stands on the spec, not on that claim.
+>
+> **What none of this fixes.** The parent process still dies of SIGSEGV, and one
+> of the two runs that measured M2174 had ZERO bad inode tables and ZERO bad
+> block pointers -- so at least one remaining cause has no storage involvement
+> at all. Honest rate, nine 8-core runs on verified-identical binaries: **page
+> on screen 4/9, crash 5/9, kernel panic 0/9.** An earlier "crashes eliminated"
+> claim of mine was made off three clean boots and was wrong; three samples
+> cannot measure a rate.
+>
+> **And a confound to carry:** two sessions booting 8-core VMs on one physical
+> node changes the result, because host contention drives the wall-clock ATA
+> deadline M2157 raised. Every rate in this document from here on is labelled
+> with whether the measurement window was declared idle.
+>
+> **M2175** adds the guarantee a counter could not express: `tools/lx/lxnone.c`
+> takes SIGSEGV with sigsetjmp and requires that a read of a PROT_NONE page
+> faults, that a write faults, that restoring PROT_READ reveals the ORIGINAL
+> bytes (PROT_NONE protects, it does not discard), and that a mapping created
+> PROT_NONE faults rather than demand-zeroing -- the shape JavaScriptCore
+> reserves its 4 GiB structure heap with, so that StructureID 0 is an invalid
+> id. It passes on the host, which makes it a test of correct semantics rather
+> than of our behaviour.
+
 > **(M2167-M2171) "FAST" AND "CONSISTENT", MEASURED FOR THE FIRST TIME. THE PAGE
 > FAILS TO RENDER IN A QUARTER OF RUNS -- ON ONE CORE.**
 >
