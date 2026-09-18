@@ -7992,6 +7992,24 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                          * per-call reason code does when the mapping is on
                          * tmpfs or /proc, so sample it across the attempt. */
                         int gone = (vfs_stat(fp, &probe) != 0);
+                        /* AND WHY THE LOOKUP SAID SO (M2218). "The file is
+                         * gone" is a conclusion, and the log never recorded
+                         * the evidence for it -- so an ext2 layer answering
+                         * "absent" for a file that is plainly there was
+                         * indistinguishable from a genuinely unlinked one.
+                         * ext2_pread_why already separates "the PATH was not
+                         * found" from "a BLOCK READ FAILED", and the path
+                         * cache counts its own negative hits; both are free
+                         * to print at the moment the decision is made. */
+                        if (gone) {
+                            extern const char *ext2_pread_why(void);
+                            extern unsigned long g_e2pc_neg_hits, g_e2pc_hits, g_e2pc_races;
+                            static int whytold;
+                            if (whytold++ < 6)
+                                kprintf("[fault]   the lookup's reason: %s (path cache: %lu hit(s), "
+                                        "%lu NEGATIVE hit(s), %lu race(s))\n",
+                                        ext2_pread_why(), g_e2pc_hits, g_e2pc_neg_hits, g_e2pc_races);
+                        }
                         if (gone && ext2_distrust_events() != dt0) {
                             gone = 0;                     /* the device failed, not the path */
                             g_fill_distrust++;
