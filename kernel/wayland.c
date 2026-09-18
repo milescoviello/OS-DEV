@@ -32,6 +32,7 @@
  */
 #include "wayland.h"
 #include "unixsock.h"
+#include "ata.h"       /* the disk's own error counters, for the health line (M2225) */
 #include "console.h"
 #include "fb.h"      /* wl_output reports the real framebuffer geometry (M1986) */
 #include "string.h"
@@ -2246,14 +2247,20 @@ void wl_fs_health_line(void) {
         extern unsigned long g_e2_bad_itable, g_e2_bad_ptrs, g_e2_distrust;
         extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
         extern unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;
+        extern unsigned long g_memfd_remapped, g_memfd_unretired;
+        uint64_t atretr = 0, atfail = 0; ata_error_counts(&atretr, &atfail);
         kprintf("[fs] superblock: %lu readfail %lu BADMAGIC %lu badfield, %lu retried %lu "
                 "RETRY-OK | %lu itable %lu badptr %lu hole(s) | distrust %lu | refused: "
-                "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED\n",
+                "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED | "
+                "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
                 g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust,
-                g_fill_cachedrop, g_fill_cachedrop_ok); }
+                g_fill_cachedrop, g_fill_cachedrop_ok,
+                (unsigned long)atretr, (unsigned long)atfail,
+                (unsigned long)ata_dma_short_count(),
+                g_memfd_remapped, g_memfd_unretired); }
 }
 
 int wl_page_probe(uint32_t want) {
