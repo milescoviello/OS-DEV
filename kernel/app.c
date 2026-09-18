@@ -3322,6 +3322,7 @@ uint64_t g_flt_major, g_flt_minor, g_flt_cow, g_flt_other;
 unsigned long g_flt_cow_shared;   /* COW faults on a MAP_SHARED page, answered by restoring write access instead of copying (M2209) */
 unsigned long g_fill_distrust;     /* fills refused because the filesystem distrusted itself, not because the file was unlinked (M2213) */
 unsigned long g_fill_exec_refused; /* fills refused because the mapping is EXECUTABLE: zeros there are never right (M2218) */
+unsigned long g_fill_exec_hole;    /* exec pages refused because ext2 served them from a sparse hole (M2221) */
 void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other) {
     extern unsigned long g_spurious_faults;
     if (maj)   *maj   = g_flt_major;
@@ -7891,7 +7892,9 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * distrust itself during this attempt" test below covers
                      * the read as well as the stat. (M2213) */
                     extern unsigned long ext2_distrust_events(void);
+                    extern unsigned long ext2_hole_events(void);
                     unsigned long dt0 = ext2_distrust_events();
+                    unsigned long hole0 = ext2_hole_events();
                     long got = vfs_pread(fp, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
                     /* A NEGATIVE RETURN IS AN ERROR, NOT A SHORT FILE (M2155).
                      * Retry it before believing it: the failure this was built
@@ -7980,6 +7983,36 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * mapping a zero page over it is the corruption M2155 was
                      * about. Transport-independent, so it holds for tmpfs and
                      * /proc as well as ext2. */
+                    /* A HOLE IN EXECUTABLE TEXT IS NOT A HOLE (M2221).
+                     *
+                     * A zero block pointer is a sparse hole and zeros are the
+                     * right answer for one -- and it is also exactly what a
+                     * corrupted inode produces, with no error anywhere. A page
+                     * of libstdc++'s TEXT came back that way and the process
+                     * jumped into it; the fault report even said "code check:
+                     * memory ... file ... IDENTICAL", because the verification
+                     * read came back from the same hole.
+                     *
+                     * ext2 cannot tell the two apart. The caller can: no
+                     * linker produces a sparse hole in the middle of a PROT_EXEC
+                     * segment. Refuse, and say so, rather than mapping zeros
+                     * over code -- the same rule as M2218, reached from the
+                     * success path instead of the failure path. */
+                    if (got > 0 && (v.prot & VMA_PROT_EXEC) &&
+                        ext2_hole_events() != hole0) {
+                        g_fill_exec_hole++;
+                        static int htold;
+                        if (htold++ < 4)
+                            kprintf("[fault] %lx from %s+%lx: the filesystem served this "
+                                    "EXECUTABLE page from a sparse HOLE (%lu hole block(s) during "
+                                    "the read). No linker leaves a hole in text -- this is a "
+                                    "corrupted block pointer reading as zero. Refusing rather "
+                                    "than mapping zeros over code. (M2221)\n",
+                                    page, fp, (unsigned long)fileoff,
+                                    ext2_hole_events() - hole0);
+                        pmm_free_frame(frame);
+                        return 0;
+                    }
                     if (got < 0) {
                         struct statx probe;
                         /* AND ONLY IF NOTHING DISTRUSTED THE VOLUME (M2213).

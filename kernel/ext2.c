@@ -88,6 +88,11 @@ unsigned int  g_e2_bad_itable_2nd;
  * and a value that moved means something in this transport distrusted itself
  * during THIS read, whatever transport it was. */
 unsigned long g_e2_distrust;
+/* Blocks served as a sparse HOLE (M2221). Legitimate for a sparse file and
+ * indistinguishable, from inside ext2, from an inode whose block pointer was
+ * read as zero -- so the count is exported and the caller decides. */
+unsigned long g_e2_holes;
+unsigned long ext2_hole_events(void) { return g_e2_holes; }
 unsigned long ext2_distrust_events(void) { return g_e2_distrust; }
 unsigned int  g_e2_bad_itable_val;
 
@@ -804,7 +809,31 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
             done += (unsigned long)run * v.block_size;
             continue;
         }
-        if (!db) { memset((uint8_t *)buf + done, 0, chunk); }   /* hole */
+        if (!db) {
+            /* A HOLE, AND SOMEBODY HAS TO BE ABLE TO KNOW (M2221).
+             *
+             * A zero block pointer means a sparse hole, and zeros are the
+             * correct answer for one. They are also what a CORRUPTED inode
+             * produces: read the inode wrong, get a zero where a block number
+             * belongs, and this returns a page of zeros with no error, no
+             * ioerr and nothing in the log. That is the worst form of the bug
+             * class this tree keeps paying for -- a plausible wrong value
+             * instead of a failure -- and it is how a page of libstdc++'s TEXT
+             * came back as zeros and the process jumped into it:
+             *
+             *   [fault] Page Fault at rip=0x102b59ba0 ... [tid 94]
+             *   [fault] code check: memory 00 00 00 ... file 00 00 00 ...
+             *           IDENTICAL, so the mapping is intact
+             *
+             * "Identical to the file" because the verification read came back
+             * from the same hole. ext2 cannot tell a real hole from a
+             * corrupted pointer on its own -- but the CALLER can: a hole in
+             * the middle of an executable mapping is not a hole. Count them so
+             * the fault handler can sample the counter across its read, the
+             * same way it samples g_e2_distrust (M2213). */
+            g_e2_holes++;
+            memset((uint8_t *)buf + done, 0, chunk);
+        }
         else { if (rdblk(&v, db, blk) < 0) break; memcpy((uint8_t *)buf + done, blk + bo, chunk); }
         done += chunk;
     }
