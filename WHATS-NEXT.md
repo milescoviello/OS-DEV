@@ -12,6 +12,16 @@
 >     64 MiB cache   39280   39770   (no page)   35800 ms
 >     64 KiB cache   36650   (no page)   41110   38000 ms
 >
+> **CAVEAT ADDED AFTER THE FACT, and it applies to every rate on this page.**
+> A concurrent session was booting 8-core VMs on the same physical node while
+> these eight runs were taken. Host CPU contention is precisely what drives the
+> wall-clock DMA deadline `ATA_TIMEOUT_MS` bounds -- whose own comment has
+> always called a too-tight deadline "a real, observed source of transient read
+> failures" -- so this rate, and the other session's 4-of-9, are properties of a
+> loaded machine and not of the kernel. Neither is a baseline. The two sessions
+> now declare exclusive windows before measuring a rate, and every rate gets
+> labelled with whether the window was idle.
+>
 > **Six of eight runs rendered the page. Two did not.** That is a 25% failure
 > rate on ONE core -- the configuration this project has been calling the one
 > that works -- and the previous claim that the page "renders in essentially
