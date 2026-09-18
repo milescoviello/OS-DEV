@@ -10164,6 +10164,7 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
  * freed memory. wl_shm sizes a pool once and then maps it, so refusing is
  * both correct and sufficient. */
 unsigned long g_memfd_remapped;   /* pages re-pointed after a mapped memfd grew (M2200) */
+unsigned long g_memfd_unretired;  /* retired buffers freed again because nothing aliased them (M2226) */
 
 /* RETIRED BUFFERS: how a MAPPED memfd is allowed to grow at all (M2082).
  *
@@ -10375,8 +10376,9 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
     char *nb = (char *)(((uintptr_t)nr + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
     for (unsigned long i = 0; i < m->size; i++) nb[i] = m->buf[i];
     for (unsigned long i = m->size; i < nc; i++) nb[i] = 0;        /* never hand stale kernel bytes to a mapping */
+    char *retiring = 0;
     if (m->raw) {
-        if (m->mapped) m->retired[m->nretired++] = m->raw;   /* still aliased into a process */
+        if (m->mapped) { retiring = m->raw; m->retired[m->nretired++] = m->raw; }  /* still aliased */
         else           kfree(m->raw);
     }
     char *oldbuf = m->buf;
@@ -10462,6 +10464,31 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
             app_tlb_sync(a);   /* another core may still cache the old frame */
         }
         g_memfd_remapped += fixed;
+        /* AND IF NOTHING ALIASES IT ANY MORE, GIVE IT BACK (M2226).
+         *
+         * M2082 retired the outgoing buffer because live mmaps still pointed
+         * at it. M2200 re-points them -- so once every page has been moved,
+         * the retired buffer has no aliases left and holding it is pure waste.
+         * It is not only waste: MEMFD_RETIRED_N is a small array, and
+         * memfd_grow REFUSES outright when it fills, which is what produced
+         *
+         *   [wl] shm pool 10: resize to 1048576 but the backing memfd owns
+         *        only 65536 bytes -- the client's own ftruncate must have
+         *        failed
+         *
+         * in a failing boot: a Wayland client whose pool could not grow past
+         * 64 KiB, killed by an accounting limit rather than by memory.
+         *
+         * Only when EVERY page moved. `unshareable` counts the ones that could
+         * not be refcounted and therefore still alias the old buffer; if any
+         * remain, retiring is still the only safe answer. */
+        if (!unshareable && retiring && m->nretired > 0 &&
+            m->retired[m->nretired - 1] == retiring) {
+            m->nretired--;
+            m->retired[m->nretired] = 0;
+            kfree(retiring);
+            g_memfd_unretired++;
+        }
         if (unshareable)
             kprintf("[memfd] %lu page(s) of the grown buffer are not refcountable, so the "
                     "mappings still alias the RETIRED pages there and the object is unshared "
