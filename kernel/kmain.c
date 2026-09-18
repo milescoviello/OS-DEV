@@ -1072,6 +1072,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the PROT_NONE probe...\n");
         {   int nrc = app_run_linux_sync("/disk2/lxnone", 0, 0, 120000);
             kprintf("[lxabi] LXNONE exit -> %d\n", nrc); }
+        /* ...and whether an mprotect over a COW page keeps it copy-on-write
+         * (M2178). vmm_protect replaced the PTE flags wholesale, so granting
+         * write dropped the bit that makes the copy happen -- two processes
+         * writing one physical frame, neither told. Firefox forks its content
+         * processes; a JIT mprotecting a region it has just forked over is the
+         * ordinary case. */
+        kprintf("[lxabi] launching the mprotect-over-COW probe...\n");
+        {   int cprc = app_run_linux_sync("/disk2/lxcowprot", 0, 0, 120000);
+            kprintf("[lxabi] LXCOWPROT exit -> %d\n", cprc); }
         /* ...and whether a thread can find its own stack, for the same
          * reason: a conservative collector scans between the stack pointer
          * and the base it was told, so the bounds are a correctness input. */
