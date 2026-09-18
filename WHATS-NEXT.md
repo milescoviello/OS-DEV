@@ -1,5 +1,99 @@
 # What's next
 
+> **(M2204-M2209) SIX REAL DEFECTS, ONE OF THEM THE SHAPE OF THE BLANK PAGE: A
+> fork() COPY-ON-WROTE MAP_SHARED PAGES.**
+>
+> `vmm_fork_cow` write-protects **every** page of the parent, because it walks
+> the page tables and the page tables do not record which mappings are shared.
+> Nothing afterwards undid that for the shared ones. So the first write to a
+> MAP_SHARED page -- by the parent or the child -- took the copy-on-write path
+> and was given a **private copy**, and from that moment the mapping was not
+> the object any more. Both sides keep working and quietly stop agreeing.
+>
+> M2203's audit caught it, in a boot that rendered the page:
+>
+>     ** memfd 44 ('org.mozilla.ipc.166.45') is NOT SHARED with pid 166:
+>     object offset 0 is phys 2be76000, but the process's mapping at
+>     1bed00000 resolves to 27030000 **
+>
+> pid 166 is the Firefox parent and that is **its own mapping of its own IPC
+> buffer**. Firefox forks per content process, so every shared buffer it held
+> across a fork was one write away from being unshared -- including its
+> `wl_shm` pool. Read that against the failure: chrome painted before the fork
+> stays on screen because the compositor still reads the object's buffer, and
+> everything painted after it goes into a copy nobody else can see. Commits
+> keep arriving, vsync keeps being answered, the document loads, and the
+> content area never changes. That is the 1-core failure, described from the
+> mechanism.
+>
+> Linux never copy-on-writes a shared mapping: the page **is** the object, so
+> the only correct answer is to restore write access to the frame already
+> there -- and only if the mapping's `prot` allows writing, because
+> `vmm_fork_cow` write-protects a MAP_SHARED PROT_READ page too and granting
+> write there would turn a correct SIGSEGV into corruption of memory somebody
+> else is reading. `tools/lx/lxshcow.c` is the test that was missing: 5
+> assertions, both directions, a second mapping in one process, and the file
+> read through the descriptor as the arbiter.
+>
+> **And the audit that found it, plus the offset bug that ran through four
+> instruments.** M2203 added `app_memfd_share_audit`: for every VMA naming a
+> memfd, sample 16 pages and require the frame behind each to be the frame
+> behind the same offset of the object. A memfd mapping is eager, so the
+> invariant is total -- everything that can break it shows up in one place
+> instead of needing an instrument each. Except that `mmap`'s `offset`
+> argument was accepted, honoured when the pages were mapped, and then
+> **discarded**: `vma[].foff` was never set for a memfd mapping. So the audit
+> compared the object's offset 0 against the mapping's first page, and M2200's
+> commit-time check and M2200's own remap-on-grow had the identical bug. Three
+> instruments and one fix, all comparing two different offsets, inside four
+> days. `/proc/self/maps` printed a hardcoded `00000000` for the offset field
+> of every mapping in the process, which is why none of it was visible from
+> userspace -- a field the kernel hardcodes cannot disagree with the kernel.
+> M2205 prints it, fixes the three trim/split sites that tested `file_backed`
+> where they meant "has an offset", and `lxmemfd` asserts all of it.
+>
+> **poll told a thread it could write, then the write refused. A thousand times
+> in a row.** `app_fd_ready` answered `POLLOUT` unconditionally for every
+> AF_UNIX endpoint, with the assumption in the comment: *"the ring drains
+> quickly; a blocked send is brief."* Every Firefox boot disproved it, and on
+> one core that spinner starves the peer whose read is the only thing that can
+> drain the ring. Fixed with `unix_writable`; ring 16 KiB -> 64 KiB; and the
+> same omission turned up four fd types along in the **pty**, where a full one
+> also *reported bytes it had dropped* -- `pty_write`'s master path returned
+> the full length while the line discipline discarded the overflow. While there:
+> **no Linux binary could get a pty at all**, because `openpty()` asks the
+> master for its slave number (`TIOCGPTN`) and unlocks it (`TIOCSPTLCK`) and
+> both answered ENOTTY, over a pty that has been complete since M1274.
+>
+> **A pipe write could not wake the thread waiting for it, and that is what the
+> self-pipe trick IS.** M2138 gave AF_UNIX the wake that removes a timer tick
+> from every round trip and stopped there. GLib's main context, Firefox's
+> MessagePump and libuv's async handle all wake a sleeping main thread through
+> a pipe; an eventfd is a thread pool's post-work primitive. Both re-armed the
+> epoll edge and left the thread asleep. The budget for a first paint says the
+> machine is **89% idle** with 27958 poll naps in it.
+>
+> And the instrument reporting those naps was printing its own input: it summed
+> the milliseconds **requested** (1 or 5), when the tick is 100 Hz and
+> `task_sleep_ms(1)` parks until the next one -- 0-10 ms, averaging five. The
+> budget now prints ASKED FOR and ACTUALLY SLEPT side by side.
+>
+> **Two more:** seven ways a memfd mapping can fail were all silent (the Linux
+> layer turned them into one ENOMEM it printed only under a trace flag, in the
+> one path whose failure mode *is* the symptom being chased), and a fault report
+> could not name which code made the mapping that refused the access -- so
+> `VMA_NEW` captures its own `__LINE__`, which identifies all fourteen creation
+> sites with no label to get wrong.
+>
+> **The honest headline: five of these six separated a blank boot from a
+> rendering one until the fourth log arrived.** The memfd mismatch, the
+> `/proc/<pid>/smaps` read failure, the spinning `sendmsg`, the client
+> disconnect, and the audit's own first reading all had 3-of-4 correlations.
+> A 3-of-4 correlation is not a discriminator. Every one of them is a real
+> defect, proven from the code and fixed; the fork-COW one is the first whose
+> *mechanism* predicts the symptom rather than merely coinciding with it, and
+> the measurement that decides it is a four-boot series, not this paragraph.
+
 > **(M2200-M2202) FIREFOX IS ON THE SCREEN, AND THE WINDOW MANAGER WAS NOT
 > ALLOWED TO DRAW IT FOR TEN MINUTES.**
 >
