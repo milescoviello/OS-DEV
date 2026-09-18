@@ -1743,10 +1743,43 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * the run rather than one module. Both of these appear
                          * as exact standalone strings in libxul, which is the
                          * check `webrender` and `ipcmessages` failed. */
-                        app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,nsDocShell:5");
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }
+                    /* NAVIGATION LOGGING IS NOT OPT-IN ANY MORE (M2185).
+                     *
+                     * The remaining Firefox defect is a blank page in roughly
+                     * one run in four: the parent alive, compositing normally,
+                     * the document fetched byte-for-byte as in a passing run,
+                     * and the content area showing Firefox's own blank-canvas
+                     * grey instead of the page. The document is retrieved and
+                     * then never becomes the DISPLAYED document, which makes
+                     * this a navigation question -- and `DocumentChannel` plus
+                     * `nsDocShell` is the pair that answers it.
+                     *
+                     * It was behind `-append ffmozlog`, so catching a failure
+                     * meant guessing in advance which boot would fail. Four
+                     * boots with the flag set all rendered; the failures all
+                     * happened in boots without it. That is not bad luck, it is
+                     * the same mistake as the static-input check being
+                     * opt-in: an instrument you have to predict the bug to
+                     * enable is an instrument you do not have.
+                     *
+                     * It costs 209 lines in a passing run -- measured, not
+                     * guessed -- which is nothing against the serial traffic
+                     * this boot already produces. In a PASSING run
+                     * `uri=file:///ffpage.html` gets five DocumentChannel
+                     * records; a failing run either shows them (the navigation
+                     * happened and something later discarded it) or does not
+                     * (the initial browsing context was never navigated, which
+                     * is what M2133 suspected and could not confirm). Either
+                     * answer is worth more than a rate.
+                     *
+                     * M2114's rule still applies: one unrecognised module name
+                     * appears to void the whole spec, and both of these appear
+                     * as exact standalone strings in libxul -- the check that
+                     * `webrender` and `ipcmessages` failed. */
+                    app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,nsDocShell:5");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per
