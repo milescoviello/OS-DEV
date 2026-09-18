@@ -1,5 +1,64 @@
 # What's next
 
+> **(M2167-M2171) "FAST" AND "CONSISTENT", MEASURED FOR THE FIRST TIME. THE PAGE
+> FAILS TO RENDER IN A QUARTER OF RUNS -- ON ONE CORE.**
+>
+> The goal driving this work is "fast and consistent, all the time". Neither word
+> was measurable. The page-probe sampler fires every FIFTEEN SECONDS, so it could
+> not tell 9 seconds from 24, and nothing counted how often the page appeared at
+> all. Two `timer_ms()` calls and an eight-run A/B later, here is the state, and
+> it is worse than the docs said:
+>
+>     64 MiB cache   39280   39770   (no page)   35800 ms
+>     64 KiB cache   36650   (no page)   41110   38000 ms
+>
+> **Six of eight runs rendered the page. Two did not.** That is a 25% failure
+> rate on ONE core -- the configuration this project has been calling the one
+> that works -- and the previous claim that the page "renders in essentially
+> every sample" was made without ever counting.
+>
+> **The block cache makes no measurable difference to it.** M2154 enlarged the
+> pool 512x, from 128 entries (64 KiB, exactly one readahead window) to 131072,
+> on the strength of a read-amplification measurement. It does exactly what it
+> was built to do -- 60401 disk commands to reach the page against 101999, and
+> 1127630 sectors against 1503940, so 41% fewer commands and 25% fewer sectors --
+> and the two arms' times overlap completely. A first single pair suggested the
+> big cache was 2.6 seconds SLOWER; three more pairs show that was noise. The
+> honest summary is that 41% less disk work bought nothing a human would notice,
+> which is worth knowing before the next round of storage optimisation is
+> justified on the same reasoning.
+>
+> **The failure mode is precise, and it is not the renderer.** In a failing run
+> Firefox is alive and compositing normally -- same window, two layers, 129
+> vsyncs requested and 129 answered against the passing run's 132/132, 130
+> commits against 140 -- and the document is fetched correctly, `[html] read(fd
+> N) -> 1068` then `-> 0` for EOF, twice, byte-identical to a passing run. What
+> differs is only what the content area contains:
+>
+>     failing   layer 1 content: 0/1024 samples are 101820 -- fff9f9fb  960 (93%)
+>     passing   layer 1 content: 766/1024 samples are 101820 -- ff101820  895 (87%)
+>
+> `f9f9fb` is Firefox's own blank-canvas grey. So the document is retrieved and
+> then never becomes the DISPLAYED document. That rules out the compositor, the
+> file path, the document loader and the storage stack in one measurement, and
+> points at navigation or browsing-context selection inside Gecko.
+>
+> Also landed: `-append lxedit` asks Claude Code to create a file in OS-DEV's own
+> source tree and read it back -- Phase 7's actual demo, and a different path
+> from the Bash tool demo M2130 met, since Write/Edit go through
+> openat(O_CREAT|O_TRUNC)/write/close against ext2 rather than fork and a pipe.
+> It cannot run yet: `Failed to authenticate: OAuth session expired and could
+> not be refreshed`. The in-guest login is a human's to renew.
+>
+> And two probes that found nothing, committed because a negative result is
+> worth keeping: `lxpriv` proves a MAP_PRIVATE file mapping is private ACROSS
+> PROCESSES (four assertions; passes on the host too, which is what makes it a
+> test of correct semantics rather than of ours), and `lxmapcmp` compared
+> 171910680 bytes of libxul plus libgtk-3 and libc against their own files, both
+> directions -- byte-identical. Together they clear the whole "one process is
+> seeing another's relocations" family, and confirm the M2155-M2158 storage chain
+> is genuinely fixed, since that comparison would have been overwhelmingly
+> likely to fail before it.
 > **(M2160-M2165) THE STORAGE AND MEMORY BUGS ARE CLOSED. 8-CORE FIREFOX IS
 > STILL 1-IN-4, AND WHAT IS LEFT IS NOT A PROTECTION BUG.**
 >

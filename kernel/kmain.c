@@ -241,6 +241,7 @@ static volatile int g_ustack_overflow_test;   /* -append ustackover: spawn a rin
 static volatile int g_wx_test;                /* -append wxtest: prove W^X is enforced -- executing a no-execute data page must fault (M1501) */
 static volatile int g_smep_test;              /* -append smeptest: prove SMEP -- the kernel executing a ring-3 (user) page must fault (M1502) */
 static volatile int g_e2big_test;             /* -append e2big: concurrent reads of one 171 MB library (M2166) */
+static volatile int g_lxmapcmp;               /* -append lxmapcmp: compare whole mapped libraries against their files (M2168) */
 static volatile int g_e2pcrace_test;          /* -append e2pcrace: hammer the ext2 path cache from every core (M2155) */
 static volatile int g_smpthread_test;         /* -append smpthreadtest: prove real cross-core kernel threads work (M1530) */
 static volatile int g_smpsched_test;          /* -append smpschedtest: prove the GENERAL (M1531) scheduler runs ordinary pin_core=-1 tasks across cores */
@@ -283,6 +284,7 @@ static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claud
  * what it said. */
 static volatile int g_lxask;
 static volatile int g_lxbash;      /* -append lxbash: ask Claude Code to RUN A COMMAND, which is the Bash-tool demo (M2118) */
+static volatile int g_lxedit;      /* -append lxedit: ask Claude Code to EDIT A FILE in OS-DEV's own tree (M2170) */
 static volatile int g_termtest;               /* -append termtest: the VT/ANSI terminal self-test (M2057) */
 /* -append lxhist: every 15 s, print the top syscall numbers each live Linux
  * process has made SINCE THE LAST SAMPLE (M2066). The one instrument that
@@ -687,6 +689,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "e2big")) g_e2big_test = 1;               /* hammer ONE big file from every core (M2166) */
         if (cmdline_has(cl, "e2pcwiden")) { extern int g_e2pc_widen; g_e2pc_widen = 1; }  /* widen the insert window in BOTH arms (M2155) */
         if (cmdline_has(cl, "e2pcracy")) { extern int g_e2pc_racy; g_e2pc_racy = 1; }   /* the pre-M2155 racy insert (M2155) */
+        if (cmdline_has(cl, "lxmapcmp")) { g_lxabi_test = 1; g_lxmapcmp = 1; }   /* whole-library mapping integrity (M2168) */
         if (cmdline_has(cl, "e2pcrace")) g_e2pcrace_test = 1;         /* concurrent ext2 path-cache test (M2155) */
         if (cmdline_has(cl, "bcachesmall")) { extern int g_bcache_small; g_bcache_small = 1; }
                                                                           /* A/B the block cache back to 64 KiB (M2154) */
@@ -736,6 +739,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnogc"))   g_lx_env_cmdline[1] = "BUN_JSC_useConcurrentGC=0";
         if (cmdline_has(cl, "lxnogen"))  g_lx_env_cmdline[2] = "BUN_JSC_useGenerationalGC=0";   /* what each Linux process is actually doing (M2066) */
         if (cmdline_has(cl, "lxbash")) { g_lxabi_test = 1; g_lxask = 1; g_lxbash = 1; }   /* the Bash-tool demo (M2118) */
+        if (cmdline_has(cl, "lxedit")) { g_lxabi_test = 1; g_lxask = 1; g_lxedit = 1; }   /* the file-EDIT demo (M2170) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
@@ -1121,6 +1125,32 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the concurrent-COW probe...\n");
         {   int cwrc = app_run_linux_sync("/disk2/lxcow", 0, 0, 300000);
             kprintf("[lxabi] LXCOW exit -> %d\n", cwrc); }
+        /* ...and whether a MAP_PRIVATE FILE mapping is private ACROSS
+         * PROCESSES, which is the shape ld.so relies on for every PT_LOAD
+         * (M2167). Two Firefox failures on eight cores are both a bad POINTER
+         * rather than a bad protection -- a write into libxul's RELRO, which
+         * readelf confirms ld.so is right to have made read-only, and an
+         * instruction fetch at the exact base of libgtk's read-only segment.
+         * One process seeing another's relocations produces both, because each
+         * process loads a library at its own ASLR base. lxcow covers ANONYMOUS
+         * memory after fork and lxfmap covers a non-zero offset; neither asks
+         * this. */
+        kprintf("[lxabi] launching the private-file-mapping probe...\n");
+        {   int pvrc = app_run_linux_sync("/disk2/lxpriv", 0, 0, 180000);
+            kprintf("[lxabi] LXPRIV exit -> %d\n", pvrc); }
+        /* ...and whether a WHOLE mapped library equals its own file (M2168).
+         * The in-kernel `code check` compares sixteen bytes at a faulting rip;
+         * this compares tens of megabytes, from userspace, where it is cheap
+         * and needs no interrupts. It is the direct test of the class that
+         * produced this whole arc -- a page of a mapped library holding the
+         * wrong bytes -- and it is what decides whether ld.so's relocation
+         * INPUT is sound before anyone argues about its output. Opt-in
+         * (`lxmapcmp`), because reading 200 MB twice is not free. */
+        if (g_lxmapcmp) {
+            kprintf("[lxabi] comparing whole mapped libraries against their files...\n");
+            int mcrc = app_run_linux_sync("/disk2/lxmapcmp", 0, 0, 900000);
+            kprintf("[lxabi] LXMAPCMP exit -> %d\n", mcrc);
+        }
         /* HOME, and the XDG directories under it (M1985). A GTK program writes
          * before it draws -- a profile, a font cache, a dconf directory -- and
          * glib treats a config directory it cannot create as fatal rather than
@@ -2001,6 +2031,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                              * is what used to happen. */
                             {   uint32_t pw = 0, ph = 0; wl_largest_window(&pw, &ph);
                                 if (pw >= 640 && ph >= 480) {
+                                    kprintf("[time] FIRST PAINT at %lu ms since boot\n",
+                                            (unsigned long)timer_ms());
                                     kprintf("[ff] it has PAINTED: a %ux%u window is ready -- "
                                             "handing over to the desktop now rather than at t=360s\n", pw, ph);
                                     wl_page_probe(0x101820);      /* chrome, or a PAGE? (M2106) */
@@ -2238,7 +2270,29 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                             "Reply with exactly: OS-DEV" };
             static const char *av_bash[] = { "--dangerously-skip-permissions", "--debug", "-p",
                                              "Use the Bash tool to run exactly: echo OSDEV-BASH-OK" };
-            const char **av_use2 = g_lxbash ? av_bash : av_ask;
+            /* ...AND WITH -append lxedit, ASK IT TO EDIT A FILE (M2170).
+             *
+             * This is the phase's actual DEMO, in the plan's own words: "claude
+             * starts in a window, authenticates, and edits a file in the OS-DEV
+             * source tree -- inside OS-DEV." The Bash tool being met (M2130)
+             * proves a subprocess and a pipe; it does not prove a WRITE. Those
+             * are different paths -- Write/Edit go through the Linux ABI's
+             * openat(O_CREAT|O_TRUNC)/write/close against ext2, not through
+             * fork and a pipe -- and this OS-DEV's own source tree is what is
+             * mounted at /disk2/src, so the file it edits is the real thing.
+             *
+             * The prompt names a file OUTSIDE the tree's tracked content and a
+             * string that cannot appear by accident, so the marker can only
+             * reach the log by travelling: the API decided to call the tool,
+             * the tool opened and wrote a file on ext2 through this kernel, and
+             * the read-back came home. It asks for the read-back explicitly
+             * because "the tool reported success" is exactly the kind of claim
+             * this project has learned not to accept. */
+            static const char *av_edit[] = { "--dangerously-skip-permissions", "--debug", "-p",
+                                             "Create the file /disk2/src/OSDEV-EDIT.txt containing "
+                                             "exactly the line OSDEV-EDIT-OK, then read it back with "
+                                             "the Read tool and reply with its contents." };
+            const char **av_use2 = g_lxedit ? av_edit : (g_lxbash ? av_bash : av_ask);
             /* IS_SANDBOX=1, because we are uid 0 and Claude Code refuses
              * --dangerously-skip-permissions as root (M2119):
              *

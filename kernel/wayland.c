@@ -2183,10 +2183,22 @@ void wl_page_probe(uint32_t want) {
     /* State the verdict, and state it against a threshold, so a page that
      * painted a thin strip of itself cannot read as a page that loaded. */
     int pct = sampled ? hit * 100 / sampled : 0;
-    if (pct >= 50)
+    if (pct >= 50) {
+        /* WHEN, TO THE MILLISECOND (M2169). The goal for this work is the word
+         * "fast", and until now the only timing available was the page-probe
+         * sampler -- which fires every FIFTEEN SECONDS, so it cannot tell 9
+         * seconds from 24. A whole day's A/B of the block cache came back
+         * "both arms reached the page inside the first sample", which measures
+         * nothing. One `timer_ms()` makes the thing the goal names observable.
+         * Printed ONCE, from a flag, so the repeated per-sample verdicts do not
+         * each claim to be the first. */
+        {   static int said;
+            if (!said) { said = 1;
+                kprintf("[time] PAGE ON SCREEN at %lu ms since boot\n",
+                        (unsigned long)timer_ms()); } }
         kprintf("[page] VERDICT: the PAGE is on screen -- %d%% of the content area is %06x\n",
                 pct, want & 0x00ffffffu);
-    else
+    } else
         kprintf("[page] VERDICT: only the CHROME -- %d%% of the content area is the page's %06x, "
                 "so the content area is showing something else\n", pct, want & 0x00ffffffu);
 }
