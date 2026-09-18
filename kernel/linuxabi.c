@@ -3647,6 +3647,32 @@ static void lx_dispatch_body(struct registers *r) {
             r->rax = 0; break;
         }
         if (req == 0x5410 /*TIOCSPGRP*/) { r->rax = 0; break; }
+        /* THE TWO IOCTLS THAT MAKE A PTY REACHABLE FROM A LINUX BINARY (M2206).
+         *
+         * /dev/ptmx and /dev/pts/<n> have been openable since M1274, and the
+         * pty itself is complete -- line discipline, canonical editing,
+         * INTR->signal, window size. But glibc's openpty() asks the master for
+         * its slave NUMBER (TIOCGPTN) and unlocks it (TIOCSPTLCK) before it
+         * will hand anything back, and both answered ENOTTY -- so no Linux
+         * program could get a pty at all, and there was no way to know from
+         * outside that the reason was two missing ioctl numbers rather than a
+         * missing pty.
+         *
+         * app_pts_number already computes the index for a ptmx master fd. */
+        if (req == 0x80045430 /*TIOCGPTN*/) {
+            if (!vmm_user_ok(r->rdx, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            int n = (int)app_pts_number((int)a1);
+            if (n < 0) { r->rax = (uint64_t)-(long)LX_ENOTTY; break; }
+            *(uint32_t *)r->rdx = (uint32_t)n;
+            { static int told; if (!told) { told = 1;
+                kprintf("[tty] TIOCGPTN: fd %d is the master of /dev/pts/%d -- openpty() can "
+                        "complete now (M2206)\n", (int)a1, n); } }
+            r->rax = 0; break;
+        }
+        /* TIOCSPTLCK: the slave starts unlocked here -- there is no lock to
+         * clear -- so accept it. Refusing makes unlockpt() fail and openpty()
+         * gives up without saying why. */
+        if (req == 0x40045431 /*TIOCSPTLCK*/) { r->rax = 0; break; }
         r->rax = (uint64_t)-(long)LX_ENOTTY;
         break;
     }

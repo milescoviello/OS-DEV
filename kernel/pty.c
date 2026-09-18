@@ -16,6 +16,7 @@
 #include "task.h"
 #include "app.h"        /* app_killpg, app_sys_getpid */
 #include "syscall.h"    /* ICANON, ECHO, ISIG, VINTR/VEOF/VERASE/VKILL */
+#include "console.h"   /* kprintf: a lost line has to be able to say so (M2206) */
 
 #define SIGINT 2        /* matches app.c's local define (not in a shared header) */
 #define NPTY   8
@@ -76,37 +77,64 @@ static void emit(struct pty *p, unsigned char c) {
     pty_irq_restore(fl);
 }
 /* Commit the canonical line buffer to slave-readable input + wake a slave reader. */
+static unsigned long g_pty_lost;
+unsigned long pty_lost_bytes(void) { return g_pty_lost; }
 static void commit(struct pty *p) {
     uint64_t fl = pty_irq_save();
-    if (p->linelen > 0) pr_put(&p->in, p->line, p->linelen);
+    int took = 0;
+    if (p->linelen > 0) took = pr_put(&p->in, p->line, p->linelen);
+    /* A SHORT COMMIT IS LOST INPUT, AND IT USED TO BE SILENT (M2206). The
+     * slave's input ring can be full when a line is ready -- a program that
+     * has not read for a while -- and pr_put then takes what fits and drops
+     * the rest. The line is gone either way; saying so is the difference
+     * between a mystery and a known limit. */
+    if (took < p->linelen) {
+        g_pty_lost += (unsigned long)(p->linelen - took);
+        static int told;
+        if (told++ < 4)
+            kprintf("[pty] LOST %d byte(s) of a committed line: the slave's input ring is full "
+                    "(%d of %d bytes taken). The program on the other end has not read for a "
+                    "while and its input is now incomplete.\n",
+                    p->linelen - took, took, p->linelen);
+    }
     p->linelen = 0;
     if (p->in_waiter) { task_wake(p->in_waiter); p->in_waiter = 0; }
     pty_irq_restore(fl);
 }
 
-/* Process one master-written byte through the line discipline. */
-static void ldisc(struct pty *p, unsigned char c) {
+/* Process one master-written byte through the line discipline.
+ *
+ * RETURNS 1 IF THE BYTE WAS TAKEN, 0 IF THERE WAS NO ROOM FOR IT (M2206). It
+ * was void, and pty_write's master path returned the full length regardless --
+ * so a write into a pty whose input ring was full reported every byte as
+ * written and dropped them. That is the dominant bug class in this tree: a
+ * mechanism answering with a plausible wrong value instead of failing. A short
+ * write is what Linux does here, and every caller of a byte-count API already
+ * handles one; a full count for bytes that vanished corrupts whatever was
+ * being typed into the program, silently. */
+static int ldisc(struct pty *p, unsigned char c) {
     if ((p->lflag & ISIG) && c == p->cc[VINTR]) {            /* ^C: flush + signal */
         p->linelen = 0;
         if (p->lflag & ECHO) { emit(p, '^'); emit(p, 'C'); emit(p, '\n'); }
         if (p->fg_pgid > 0) app_killpg(p->fg_pgid, SIGINT);
-        return;
+        return 1;                                            /* consumed: it became a signal */
     }
     if (!(p->lflag & ICANON)) {                              /* raw: deliver immediately */
         uint64_t fl = pty_irq_save();
-        pr_put(&p->in, &c, 1);
+        int took = pr_put(&p->in, &c, 1);
         if (p->in_waiter) { task_wake(p->in_waiter); p->in_waiter = 0; }
         pty_irq_restore(fl);
+        if (!took) return 0;                                 /* ring full: the caller must retry */
         if (p->lflag & ECHO) emit(p, c);   /* after releasing above: emit() takes the same lock itself (non-reentrant) */
-        return;
+        return 1;
     }
     if (c == p->cc[VERASE] || c == 127) {                    /* backspace: rub out a char */
         if (p->linelen > 0) { p->linelen--; if (p->lflag & ECHO) { emit(p, '\b'); emit(p, ' '); emit(p, '\b'); } }
-        return;
+        return 1;
     }
     if (c == p->cc[VKILL]) {                                 /* ^U: erase the whole line */
         while (p->linelen > 0) { p->linelen--; if (p->lflag & ECHO) { emit(p, '\b'); emit(p, ' '); emit(p, '\b'); } }
-        return;
+        return 1;
     }
     if (c == p->cc[VEOF]) {                                  /* ^D: commit; empty line => EOF */
         if (p->linelen == 0) {
@@ -115,11 +143,16 @@ static void ldisc(struct pty *p, unsigned char c) {
             if (p->in_waiter) { task_wake(p->in_waiter); p->in_waiter = 0; }
             pty_irq_restore(fl);
         } else commit(p);
-        return;
+        return 1;
     }
+    /* THE LINE BUFFER FILLING UP IS ALSO A SHORT WRITE (M2206). This dropped
+     * the byte and said nothing; a canonical line longer than PBUF-1 lost its
+     * tail with the write reporting success. */
+    if (p->linelen >= (int)sizeof p->line - 1) return 0;     /* no room: retry after a read */
     if (p->lflag & ECHO) emit(p, c);
-    if (p->linelen < (int)sizeof p->line - 1) p->line[p->linelen++] = c;   /* cap at the ring's real usable capacity (PBUF-1, one slot always kept empty) -- a full PBUF-byte line silently lost its last char to commit()'s pr_put otherwise */
+    p->line[p->linelen++] = c;                               /* PBUF-1 usable: one slot stays empty */
     if (c == '\n') commit(p);                                /* newline ends the line */
+    return 1;
 }
 
 int pty_open(void) {
@@ -152,8 +185,11 @@ long pty_write(int id, const void *buf, unsigned long len) {
     int slave; struct pty *p = resolve(id, &slave); if (!p) return -1;
     const unsigned char *d = (const unsigned char *)buf;
     if (!slave) {                                            /* MASTER write -> line discipline */
-        for (unsigned long i = 0; i < len; i++) ldisc(p, d[i]);
-        return (long)len;
+        /* STOP AT THE FIRST BYTE THAT WOULD NOT FIT and report the count
+         * actually taken (M2206). This returned `len` unconditionally. */
+        unsigned long i = 0;
+        while (i < len && ldisc(p, d[i])) i++;
+        return (long)i;
     }
     uint64_t flw = pty_irq_save();
     int n = pr_put(&p->out, d, (int)len);                    /* SLAVE write -> program output */
@@ -201,6 +237,23 @@ int pty_ctl(int id, int cmd, int arg) {
     }
     if (cmd == 3) return (int)(((unsigned)p->ws_rows << 16) | p->ws_cols);           /* TIOCGWINSZ: rows<<16 | cols */
     return -1;
+}
+
+/* WOULD A WRITE TO THIS END BLOCK OR COME UP SHORT? (M2206)
+ *
+ * The other half of the pair, missing for the same reason AF_UNIX's was
+ * (M2202): app_fd_ready answered POLLOUT unconditionally for a pty. A pty is
+ * how a terminal program's input is delivered, and a poller told it can write
+ * into a full one writes, gets a short count, and comes straight back. */
+int pty_writable(int id) {
+    int slave; struct pty *p = resolve(id, &slave); if (!p) return 1;   /* gone: the write errors, it does not block */
+    uint64_t fl = pty_irq_save();
+    int room;
+    if (slave) room = pr_free(&p->out) > 0;                  /* program output -> master */
+    else if (!(p->lflag & ICANON)) room = pr_free(&p->in) > 0;
+    else room = p->linelen < (int)sizeof p->line - 1;        /* canonical: the line buffer is the limit */
+    pty_irq_restore(fl);
+    return room;
 }
 
 int pty_ready(int id) {                                      /* fswait peek */

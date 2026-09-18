@@ -1536,6 +1536,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the POLLOUT-honesty probe...\n");
         int porc = app_run_linux_sync("/disk2/lxpollout", 0, 0, 60000);
         kprintf("[lxabi] LXPOLLOUT exit -> %d\n", porc);
+        /* ...AND WHETHER A LINUX BINARY CAN GET A PTY AT ALL (M2206). The pty
+         * has been complete since M1274 and openpty() could not reach it,
+         * because glibc asks the master for its slave number (TIOCGPTN) and
+         * unlocks it (TIOCSPTLCK) and both answered ENOTTY. Same probe checks
+         * that a FULL pty reports what it actually took. */
+        kprintf("[lxabi] launching the pty probe...\n");
+        int ptrc = app_run_linux_sync("/disk2/lxpty", 0, 0, 60000);
+        kprintf("[lxabi] LXPTY exit -> %d\n", ptrc);
         /* ...and ABSOLUTE deadlines. FUTEX_WAIT_BITSET and
          * clock_nanosleep(TIMER_ABSTIME) both take a timestamp, and reading
          * one as a duration is a fifty-six-year wait while substituting a

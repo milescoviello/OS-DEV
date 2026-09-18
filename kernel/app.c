@@ -12466,9 +12466,14 @@ int app_fd_ready(app_t *ap, int fd, int events) {
         if ((events & POLLIN) && !app_pid_alive(a->fd[fd].obj)) re |= POLLIN;
     } else if (a->fd[fd].type == 8) {                      /* inotify: POLLIN when events are queued (M1266) */
         if ((events & POLLIN) && inotify_ready(a->fd[fd].obj)) re |= POLLIN;
-    } else if (a->fd[fd].type == 11) {                     /* pty: POLLIN when readable, always writable (M1274) */
+    } else if (a->fd[fd].type == 11) {                     /* pty (M1274) */
         if ((events & POLLIN) && pty_ready(a->fd[fd].obj)) re |= POLLIN;
-        if (events & POLLOUT) re |= POLLOUT;
+        /* ...and POLLOUT from the same kind of predicate (M2206). This said
+         * "always writable", and pty_write's master path returned the full
+         * length for bytes a full input ring had dropped -- so a poller was
+         * told it could write, wrote, and lost the bytes without a short count
+         * to notice. Same pair, same omission, as AF_UNIX in M2202. */
+        if ((events & POLLOUT) && pty_writable(a->fd[fd].obj)) re |= POLLOUT;
     } else if (a->fd[fd].type == 12) {                     /* AF_UNIX endpoint (M1965) */
         /* This is the whole point of putting AF_UNIX in the fd table: an event
          * loop has to be able to POLL a socket, and POLLNVAL made that

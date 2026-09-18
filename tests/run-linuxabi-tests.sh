@@ -787,6 +787,18 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: POLLOUT honesty:"; grep -a "LXPOLLOUT" "$SLOG3" | head -8; f3=1
     fi
+    # ...AND A PTY, WHICH NO LINUX BINARY COULD GET (M2206). /dev/ptmx and
+    # /dev/pts/<n> have been openable since M1274 and the line discipline is
+    # complete, but glibc's openpty() asks the master for its slave number
+    # (TIOCGPTN) and unlocks it (TIOCSPTLCK), and both answered ENOTTY -- so the
+    # whole subsystem was unreachable and nothing said why. The same probe
+    # checks that a full pty reports what it TOOK: pty_write's master path
+    # returned the full length while the line discipline dropped the overflow.
+    if grep -aq "LXPTY: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: openpty() works from a Linux binary, and a full pty reports a short write (M2206)"
+    else
+        echo "  FAIL: pty from a Linux binary:"; grep -a "LXPTY" "$SLOG3" | head -8; f3=1
+    fi
     # ABSOLUTE DEADLINES (M2010). FUTEX_WAIT_BITSET's timeout is a timestamp,
     # not a duration -- that is the entire difference between it and
     # FUTEX_WAIT -- and reading it as a duration made every glibc
