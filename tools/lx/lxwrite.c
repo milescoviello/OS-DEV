@@ -37,6 +37,8 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* The guest's own view of OS-DEV's source tree. NOT /disk2/src: paths from a
+ * Linux program are relative to LX_ROOT and the kernel prepends /disk2. */
 #define DIR_DEFAULT "/src"
 
 static int fails;
@@ -70,8 +72,14 @@ int main(int argc, char **argv) {
     /* 1. The tree is readable at all -- if this fails the rest says nothing. */
     {   char probe[256];
         char mk[512]; snprintf(mk, sizeof mk, "%s/Makefile", dir);
-        if (slurp(mk, probe, sizeof probe) <= 0) {
-            printf("LXWRITE: SKIP (%s does not look like the source tree)\n", dir);
+        long got = slurp(mk, probe, sizeof probe);
+        if (got <= 0) {
+            /* SAY WHICH, because a SKIP that cannot distinguish "wrong path"
+             * from "no source tree here" is how this probe silently measured
+             * nothing on its first run: it was handed /disk2/src and opened
+             * /disk2/disk2/src/Makefile. (M2182) */
+            printf("LXWRITE: SKIP (%s unreadable: open/read gave %ld, errno %d -- "
+                   "is the path the GUEST's view of the tree?)\n", mk, got, errno);
             return 0;
         }
         printf("LXWRITE: %s is readable\n", mk);

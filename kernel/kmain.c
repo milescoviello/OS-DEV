@@ -1169,7 +1169,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * the write path against the real source tree, so when the login comes
          * back the only untested thing left should be Claude Code itself. */
         kprintf("[lxabi] launching the edit-tool write-path probe...\n");
-        {   static const char *av_w[] = { "/disk2/src" };
+        /* `/src`, NOT `/disk2/src`. A Linux program's paths are relative to
+         * LX_ROOT and the kernel prepends `/disk2` itself, so handing it the
+         * kernel-side path makes it open `/disk2/disk2/src/Makefile` and the
+         * probe SKIPPED with "does not look like the source tree" -- a clean
+         * miss that reads exactly like a legitimate skip. Same double-translation
+         * that cost two attempts at /proc/self/fd/N in M2129. (M2182) */
+        {   static const char *av_w[] = { "/src" };
             int wrc = app_run_linux_sync("/disk2/lxwrite", av_w, 1, 120000);
             kprintf("[lxabi] LXWRITE exit -> %d\n", wrc); }
         kprintf("[lxabi] launching the private-file-mapping probe...\n");
@@ -2348,7 +2354,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              * because "the tool reported success" is exactly the kind of claim
              * this project has learned not to accept. */
             static const char *av_edit[] = { "--dangerously-skip-permissions", "--debug", "-p",
-                                             "Create the file /disk2/src/OSDEV-EDIT.txt containing "
+                                             /* `/src`, the GUEST's view. The first run said
+                                              * `/disk2/src/...`, which the ABI translated to
+                                              * `/disk2/disk2/src/...`; the demo still passed
+                                              * because Claude Code probed, got ENOENT and wrote
+                                              * to the right place, but the log carries three
+                                              * misleading ENOENTs for a path nobody asked for.
+                                              * (M2182) */
+                                             "Create the file /src/OSDEV-EDIT.txt containing "
                                              "exactly the line OSDEV-EDIT-OK, then read it back with "
                                              "the Read tool and reply with its contents." };
             const char **av_use2 = g_lxedit ? av_edit : (g_lxbash ? av_bash : av_ask);
