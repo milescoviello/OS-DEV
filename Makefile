@@ -660,6 +660,20 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@if [ -d /usr/share/icons/Adwaita/cursors ]; then 	    mkdir -p $(LXROOT)/usr/share/icons/Adwaita/cursors && 	    cp -a /usr/share/icons/Adwaita/cursors/. $(LXROOT)/usr/share/icons/Adwaita/cursors/ && 	    cp -f /usr/share/icons/Adwaita/index.theme $(LXROOT)/usr/share/icons/Adwaita/ 2>/dev/null; 	    echo "  STAGE   Adwaita cursors"; fi
 	@if [ -d /usr/lib/locale ]; then mkdir -p $(LXROOT)/usr/lib/locale && 	    cp -a /usr/lib/locale/. $(LXROOT)/usr/lib/locale/ 2>/dev/null || true; fi
 	@for d in /usr/share/mime /usr/share/icons/hicolor /usr/share/X11/locale; do 	    if [ -d $$d ]; then mkdir -p $(LXROOT)$$d && cp -a $$d/. $(LXROOT)$$d/ 2>/dev/null || true; fi; done
+	@# A LIVE IN-GUEST LOGIN, NOT A SNAPSHOT OF ONE (M2181).
+	@# The guest's Claude Code authenticates from $(LXROOT)/root/.claude/.credentials.json,
+	@# which was placed by hand once and then went stale: its ACCESS token expired and
+	@# every run stopped at "OAuth session expired and could not be refreshed" -- with a
+	@# refresh token still valid for two weeks and no network attempt made. Meanwhile the
+	@# HOST's own copy is refreshed continuously by the host's Claude Code. Copying it at
+	@# image-build time is the difference between a demo that runs and a demo that cannot.
+	@# Local only: build/ is gitignored, the file never leaves this machine, and this is
+	@# the same use the image has always made of it. CLAUDE_CREDS= to opt out.
+	@if [ -z "$${CLAUDE_CREDS+x}" ] && [ -f $(HOME)/.claude/.credentials.json ]; then \
+	    mkdir -p $(LXROOT)/root/.claude && \
+	    cp -f $(HOME)/.claude/.credentials.json $(LXROOT)/root/.claude/.credentials.json && \
+	    chmod 600 $(LXROOT)/root/.claude/.credentials.json && \
+	    echo "  STAGE   in-guest Claude login (refreshed from the host's live session)"; fi
 	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
 	@# THE ORACLE FROM OUTSIDE THE GUEST (M2173). lxmapcmp's mapping-versus-read
 	@# comparison cannot see a sector that was WRONG WHEN INSTALLED, because both
