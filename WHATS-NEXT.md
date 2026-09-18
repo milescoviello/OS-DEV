@@ -1,5 +1,58 @@
 # What's next
 
+> **(M2193-M2195) A SYSCALL THAT RETURNED SUCCESS AND DESTROYED THE CALLER'S
+> DATA -- AND AN INSTRUMENT THAT MEASURED MY OWN TEST.**
+>
+> The blank page and a rendering run are indistinguishable in every view this
+> kernel has, so the search narrowed to the one class nothing above rules out:
+> a call that succeeds with a wrong effect. On a paint path the most dangerous
+> such call is `madvise`, and it was wrong:
+>
+> ```c
+> uint64_t start = addr & ~(uint64_t)(PAGE_SIZE - 1);   /* before M2194 */
+> ```
+>
+> `madvise(2)` **requires** a page-aligned address and returns `EINVAL`
+> otherwise -- it does not round -- and the only advice reaching that code is
+> `MADV_DONTNEED`, the destructive one. So an unaligned call **discarded the
+> page holding the bytes before `addr`**, memory the caller never asked to
+> drop, and returned 0. Worse at the far end: with `len` rounded up from an
+> unaligned start, a 4096-byte request spanned two pages and took ~4032 bytes
+> *past* the requested range as well. Revert-proven in-guest, and the assertion
+> that matters checks the **data**, not the return value, because a kernel that
+> returned `EINVAL` and discarded anyway would pass the cheap check.
+>
+> **It is not shown to be the blank page.** The measurement launched to ask
+> whether Firefox ever passes an unaligned address came back "yes, once" -- and
+> that one call was **the test probe written to prove the refusal works**. The
+> complaint line was a global `static int told`; `lxmadv` passes an unaligned
+> address on purpose, spent the one-shot before Firefox was spawned, and muted
+> the instrument for every later process in the boot. It answered "did
+> anything", not "does Firefox": the adjacent question, with the twist that the
+> only thing it observed was the instrument being validated against itself.
+>
+> M2195 makes it a count that cannot saturate, with a pid and a title on every
+> line and a **delta snapshotted at Firefox's spawn**, because the absolute
+> count starts at 2 in a healthy boot.
+>
+> **And the gate never covered the new checks.** `LXMADV: OK` was printed
+> *before* M2194's assertions, and `run-linuxabi-tests.sh` gates on that exact
+> string -- so both could have failed with the suite still green. The revert
+> proof had been read off the log by eye. A check the gate cannot see is not a
+> test. The summary now prints after the last assertion, and since the probe
+> makes two unaligned calls the suite requires two complaint lines, which is
+> the revert proof for the muting itself.
+>
+> **A correction to this document:** crashes are not an 8-core phenomenon. A
+> 1-core boot crashed with a user **write to NULL + 0x467** -- a struct field
+> off a null pointer, so something returned NULL unchecked -- at a rip inside a
+> one-page anonymous `read+exec` mapping, with 1448 VMAs against a cap of 4096,
+> so no table was full. That is the same "wrong value, not a failure" class,
+> one layer up.
+>
+> Also M2193: `kcmp`, `ioprio_get` and `ioprio_set`, the last syscalls this
+> workload makes that were not implemented at all.
+
 > **(M2184-M2192) THE FIRST TRUSTWORTHY RENDER RATE IS 1 IN 5. EVERY EARLIER
 > NUMBER WAS FLATTERED BY A BROKEN INSTRUMENT, AND MOST OF THEM WERE MINE.**
 >
