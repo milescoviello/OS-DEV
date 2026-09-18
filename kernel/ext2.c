@@ -63,6 +63,7 @@ typedef struct {
  * supposed to be 0. So record it and make it visible: `start + blk * spb` has
  * two operands and only one of them had ever been printed. */
 uint64_t g_e2_vstart;
+static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level);   /* M2176; defined below */
 /* Group descriptors that could not be believed (M2174). An inode table pointer
  * off the end of the filesystem means the descriptor block we read was not a
  * descriptor block, and every inode in that group would come back as data. */
@@ -148,6 +149,8 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
     uint8_t gd[4096];
     uint32_t gd_per_block = v->block_size / 32;
     if (v->groups && group >= v->groups) { v->ioerr = 1; g_e2_bad_groups++; return -1; }
+    /* The descriptor block itself is a produced block number too (M2176). */
+    if (!e2_ptr_ok(v, v->gdt_block + group / gd_per_block, 5)) { v->ioerr = 1; return -1; }
     if (rdblk(v, v->gdt_block + group / gd_per_block, gd) < 0) return -1;
     uint32_t inode_table = e_rd32(gd + (group % gd_per_block) * 32 + 8);
     if (!inode_table || (v->blocks_count && inode_table >= v->blocks_count)) {
@@ -173,6 +176,19 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
  * block are used (no 64bit feature); an uninitialized extent reads as a hole. */
 #define EXT4_EXTENTS_FL 0x80000u
 #define EXT4_EXT_MAGIC  0xF30Au
+/* EVERY BLOCK NUMBER THIS FUNCTION PRODUCES IS ALSO UNCHECKED (M2176).
+ *
+ * M2174 validated the indirect path and the inode table and left THIS one, on
+ * the assumption that a "classic ext2" image has no extent inodes. It does:
+ * ext2_write_path creates them (M1189), so every file the guest itself writes
+ * -- the whole Firefox profile, every cache -- is extent-mapped and reads back
+ * through here.
+ *
+ * The cost of the omission was visible in the very next measurement: a refused
+ * read at `lba 15630828400 cap 6553600`, which is block 1953853550 against a
+ * filesystem of 819200, with rejected-pointer and rejected-inode-table counts
+ * both at ZERO. A wild block number that passed every check there was, because
+ * the one path that produced it had none. */
 static uint32_t extent_map(ext2_t *v, const uint8_t *ib, uint32_t fblk) {
     uint8_t buf[4096];
     const uint8_t *node = ib;
@@ -191,7 +207,8 @@ static uint32_t extent_map(ext2_t *v, const uint8_t *ib, uint32_t fblk) {
                 uint32_t st = e_rd32(e + 8);               /* ee_start_lo (start_hi ignored: 32-bit) */
                 uint32_t len = raw > 32768 ? (uint32_t)(raw - 32768) : raw;
                 if (len && fblk >= eb && fblk - eb < len)
-                    return raw > 32768 ? 0 : st + (fblk - eb);   /* uninit -> hole (zeros) */
+                    return raw > 32768 ? 0
+                                       : e2_ptr_ok(v, st + (fblk - eb), 3);   /* uninit -> hole */
             }
             return 0;                                      /* fblk in no extent -> hole */
         }
@@ -201,6 +218,7 @@ static uint32_t extent_map(ext2_t *v, const uint8_t *ib, uint32_t fblk) {
             if (fblk >= e_rd32(e + 0)) child = e_rd32(e + 4);   /* last idx with ei_block <= fblk */
             else break;
         }
+        child = e2_ptr_ok(v, child, 4);                    /* an interior node off the fs is corruption */
         if (!child || rdblk(v, child, buf) < 0) return 0;
         node = buf; node_size = v->block_size;             /* descend */
     }
@@ -638,6 +656,9 @@ long ext2_pread(blk_read_fn read, void *ctx, uint64_t start_lba, const char *pat
                 if (map_block(&v, inode, lb + run) != db + run) break;   /* not contiguous: stop the run */
                 run++;
             }
+            /* The RUN's far end is produced arithmetic as well (M2176): `db` was
+             * checked, `db + run` never was. */
+            if (v.blocks_count && (uint64_t)db + run > v.blocks_count) { v.ioerr = 1; break; }
             if (rdblks(&v, db, run, (uint8_t *)buf + done) < 0) break;
             done += (unsigned long)run * v.block_size;
             continue;
