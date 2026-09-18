@@ -10282,39 +10282,47 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
         for (int pi = 0; pi < MAX_APPS; pi++) {
             struct app *a = &apps[pi];
             if (!a->used || !a->cr3) continue;
-            struct { uint64_t start, len, foff; } r[APP_MAXVMA];
-            int nr2 = 0;
-            uint64_t fl = vma_lock(a);
-            for (int i = 0; i < a->nvma && nr2 < APP_MAXVMA; i++)
+            /* ONE VMA AT A TIME, NOT A COPY OF THE TABLE (M2217).
+             *
+             * This collected the matching ranges into `r[APP_MAXVMA]` first.
+             * APP_MAXVMA is 4096 and the entry is 24 bytes, so that is a
+             * NINETY-SIX KILOBYTE local -- on a 16 KiB kernel stack in syscall
+             * context, and on the 64 KiB watcher thread once M2214 moved the
+             * page probe there. It double-faulted: "KERNEL STACK OVERFLOW: a
+             * task overran its kernel stack (its #PF escalated to a #DF)",
+             * with rbp-rsp = 0x10028. I wrote the array to avoid holding the
+             * VMA lock across vmm_map_to, and swapped one hazard for a worse
+             * one.
+             *
+             * The snapshot is unnecessary: since M1988 a VMA entry NEVER MOVES
+             * -- removal leaves a tombstone -- so an index is stable and the
+             * lock only has to cover the read of one entry. No array, no
+             * bound, and the same property that made tombstones worth having. */
+            int nmatched = 0;
+            for (int i = 0; i < a->nvma; i++) {
+                uint64_t vstart = 0, vlen = 0, vfoff = 0;
+                uint64_t fl = vma_lock(a);
                 if (a->vma[i].len && a->vma[i].mfd == idx) {
-                    r[nr2].start = a->vma[i].start; r[nr2].len = a->vma[i].len;
-                    /* WHICH BYTES OF THE OBJECT THIS MAPPING COVERS (M2205).
-                     * The first cut of this loop used `off` as both the
-                     * mapping offset and the object offset, so a mapping made
-                     * at a non-zero offset was re-pointed at the WRONG part of
-                     * the new buffer -- a fix introducing the corruption it
-                     * was written to prevent. foff did not even exist for a
-                     * memfd mapping until M2203, which is how it went
-                     * unnoticed: there was nothing to be wrong. */
-                    r[nr2].foff = a->vma[i].foff;
-                    nr2++;
+                    vstart = a->vma[i].start; vlen = a->vma[i].len; vfoff = a->vma[i].foff;
                 }
-            vma_unlock(a, fl);
-            if (!nr2) continue;
-            for (int i = 0; i < nr2; i++)
-                for (uint64_t off = 0; off < r[i].len; off += PAGE_SIZE) {
-                    uint64_t ooff = r[i].foff + off;        /* the OBJECT offset */
+                vma_unlock(a, fl);
+                if (!vlen) continue;
+                nmatched++;
+                for (uint64_t off = 0; off < vlen; off += PAGE_SIZE) {
+                    uint64_t ooff = vfoff + off;           /* the OBJECT offset */
                     if (ooff >= nc) break;                 /* past the new buffer */
                     uint64_t ph = vmm_translate((uint64_t)(nb + ooff));
                     if (!ph || !pmm_refcountable(ph)) { unshareable++; continue; }
-                    uint64_t oldph = vmm_translate_in(a->cr3, r[i].start + off);
+                    uint64_t oldph = vmm_translate_in(a->cr3, vstart + off);
                     if (oldph == ph) continue;             /* already the new frame */
                     pmm_addref(ph);                        /* THIS mapping's reference */
-                    vmm_map_to(a->cr3, r[i].start + off, ph,
+                    vmm_map_to(a->cr3, vstart + off, ph,
                                PTE_USER | PTE_WRITABLE | PTE_NX);
                     if (oldph) pmm_free_frame(oldph);      /* give up the retired one */
                     fixed++;
                 }
+            }
+            if (!nmatched) continue;
             app_tlb_sync(a);   /* another core may still cache the old frame */
         }
         g_memfd_remapped += fixed;
@@ -10650,27 +10658,28 @@ unsigned long app_memfd_share_audit(int verbose) {
         for (int pi = 0; pi < MAX_APPS; pi++) {
             struct app *a = &apps[pi];
             if (!a->used || !a->cr3) continue;
-            struct { uint64_t start, len, foff; } r[APP_MAXVMA];
-            int nr = 0;
-            uint64_t fl = vma_lock(a);
-            for (int i = 0; i < a->nvma && nr < APP_MAXVMA; i++)
+            /* ONE VMA AT A TIME (M2217), for the reason in memfd_grow above:
+             * `r[APP_MAXVMA]` is a 96 KiB local and this runs on a 64 KiB
+             * watcher stack since M2214. It double-faulted. A VMA index is
+             * stable (M1988's tombstones), so the lock covers one read. */
+            for (int i = 0; i < a->nvma; i++) {
+                uint64_t vstart = 0, vlen = 0, vfoff = 0;
+                uint64_t fl = vma_lock(a);
                 if (a->vma[i].len && a->vma[i].mfd == mi) {
-                    r[nr].start = a->vma[i].start; r[nr].len = a->vma[i].len;
-                    r[nr].foff = a->vma[i].foff;          /* which bytes of the object (M2203) */
-                    nr++;
+                    vstart = a->vma[i].start; vlen = a->vma[i].len; vfoff = a->vma[i].foff;
                 }
-            vma_unlock(a, fl);
-            for (int i = 0; i < nr; i++) {
+                vma_unlock(a, fl);
+                if (!vlen) continue;
                 maps++;
-                uint64_t npg = r[i].len / PAGE_SIZE;
+                uint64_t npg = vlen / PAGE_SIZE;
                 if (!npg) continue;
                 uint64_t stride = npg > 16 ? npg / 16 : 1;
                 for (uint64_t pg = 0; pg < npg; pg += stride) {
                     uint64_t off = pg * PAGE_SIZE;
-                    uint64_t ooff = r[i].foff + off;      /* the OBJECT offset this page covers */
+                    uint64_t ooff = vfoff + off;          /* the OBJECT offset this page covers */
                     if (ooff >= m->cap) break;
                     uint64_t want = vmm_translate((uint64_t)(uintptr_t)(m->buf + ooff));
-                    uint64_t got  = vmm_translate_in(a->cr3, r[i].start + off);
+                    uint64_t got  = vmm_translate_in(a->cr3, vstart + off);
                     if (!want) continue;                  /* the object's own page is unbacked: not a sharing fault */
                     if (got == want) { okc++; continue; }
                     bad++;
@@ -10686,7 +10695,7 @@ unsigned long app_memfd_share_audit(int verbose) {
                                 "%lu is phys %lx, but the process's mapping at %lx resolves to %lx "
                                 "-- %s **\n",
                                 mi, m->name[0] ? m->name : "?", a->pid, (unsigned long)ooff,
-                                (unsigned long)want, (unsigned long)(r[i].start + off),
+                                (unsigned long)want, (unsigned long)(vstart + off),
                                 (unsigned long)got,
                                 got ? "a DIFFERENT frame, so whatever that process writes there "
                                       "nobody else sees"
