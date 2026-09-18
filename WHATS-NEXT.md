@@ -1,5 +1,68 @@
 # What's next
 
+> **(M2184-M2192) THE FIRST TRUSTWORTHY RENDER RATE IS 1 IN 5. EVERY EARLIER
+> NUMBER WAS FLATTERED BY A BROKEN INSTRUMENT, AND MOST OF THEM WERE MINE.**
+>
+> Five 1-core boots, one binary (digest recorded and re-checked on every boot),
+> a 650-second window, three outcomes distinguished:
+>
+>     run 1  NO PAGE   layer 1 content 0/1024 are the page's 101820
+>     run 2  NO PAGE
+>     run 3  NO PAGE
+>     run 4  NO PAGE
+>     run 5  page on screen at 38230 ms, 40 probe samples
+>
+> Every blank has real probe samples, so none is a capture-window artifact. The
+> concurrent session's matched triple on their own binary is 1 of 3. Both of us
+> now measure **20-33% success where the docs claimed essentially 100%**.
+>
+> **Why every earlier number was wrong**, because the list is the lesson:
+>
+> | number | what was wrong with it |
+> |---|---|
+> | "renders in essentially every sample" | never counted |
+> | 6 of 8 | another session was loading the same host |
+> | 3 of 3 | capture window shorter than time-to-page |
+> | g/p series | an always-on log cost **26 s** and pushed boots past the window |
+> | L series | the kernel was **rebuilt mid-series**; boots 2-4 were a different binary |
+>
+> Each of those flattered the result. All five were mine.
+>
+> **The blank is a Gecko paint failure, and from the kernel's side it is
+> invisible.** In a blank run the document is fetched (1068 bytes, then EOF),
+> parsed, and made the ACTIVE document of the visible window -- its own
+> `<title>` is in the window title, `OS-DEV — Mozilla Firefox`. Our compositor
+> blits the surface Firefox commits, at the right size, 156-181 times. vsync is
+> identical to a rendering run (141-149 requested, all answered, ~18000 ticks
+> offered). The failed-syscall sets are identical, ENOSYS is syscall 179 forty
+> times either way, and the late-stage syscall profiles of one blank and the
+> render are byte-identical. Same two layers, same geometry, same roles.
+>
+> So Gecko has the document, has a surface, is committing frames, and those
+> frames contain its own blank canvas instead of the page. That bounds what this
+> kernel can do about it: the remaining candidates are the ones that leave no
+> trace in any of those views -- the contents of shared memory, or **a syscall
+> that returned successfully with a wrong value**, which is this project's
+> signature defect and the one thing none of the above rules out.
+>
+> **Instruments fixed on the way**, all of which had been reporting nothing:
+> `nettest` and `tcpreliabletest` had not LINKED since M2126 (my own commit) while
+> sitting in `check-all`; the block cache had no correctness test at all, and
+> writing one found `bc_find` walking a bucket chain unbounded -- a corrupted
+> chain would hang the kernel inside `cli` and a spinlock; three Gecko log
+> modules were guessed and all three were silent, so the presentation question
+> is now answered from **our own compositor's commits**, which cannot be silent;
+> and the consistency test now names three outcomes instead of collapsing
+> "never looked" into "did not render".
+>
+> **The rule this campaign earned:** an instrument validated only against a
+> passing case has never been tested. Every instrument either session trusted
+> without a known-bad case misled us -- the rip dump that demand-zeroed its own
+> evidence, a file offset printed as an address, CR2 re-read from the register,
+> provenance keyed on the wrong VMA, a `page=0` counter that meant three
+> different things, a line count reported as a cost. The ones that held were
+> checked against an external oracle or proven by a revert first.
+
 > **(M2190-M2191) mmap WAS HANDING OUT RANGES THAT WERE ALREADY MAPPED. AND THE
 > PAGE NEVER FAILS WITHOUT A CRASH -- 8 BOOTS, NO EXCEPTIONS.**
 >
