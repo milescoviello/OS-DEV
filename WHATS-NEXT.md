@@ -1,5 +1,67 @@
 # What's next
 
+> **(M2180-M2183) PHASE 7'S DEMO IS MET, AND CLAUDE CODE'S TOOLS WORK ON EIGHT
+> CORES. THE BLOCKER WAS A STALE TOKEN IN THE IMAGE, NOT THE LOGIN.**
+>
+> The plan's words for this phase: "claude starts in a window, authenticates,
+> and edits a file in the OS-DEV source tree -- inside OS-DEV." On the Proxmox
+> node, with `-append lxedit`:
+>
+>     OSDEV-EDIT-OK
+>     - The file has a trailing newline after `OSDEV-EDIT-OK`, which is why Read
+>       shows a line 2. That's the normal convention for a text file containing
+>       one line; if you need the 13 bytes with no terminating newline, I can
+>       rewrite it that way.
+>
+> Every clause there is load-bearing. Claude Code authenticated against the real
+> API over this kernel's TCP and TLS, called the **Write** tool to create a file
+> on the ext2 volume that holds OS-DEV's own source, called **Read** to read it
+> back, and remarked on the trailing newline -- which a tool reporting success
+> cannot produce, only reading the bytes can. A different kernel path from the
+> Bash-tool demo M2130 met: Write/Read are openat(O_CREAT|O_TRUNC)/write and
+> openat/read against ext2, where Bash is fork, execve and a pipe.
+>
+> **And then on EIGHT cores**, which is where this kernel's remaining defects
+> live and where neither demo had ever been run:
+>
+>     Done — output was `OSDEV-BASH-OK`.
+>     Created `/src/OSDEV-EDIT.txt` and read it back. Contents:
+>     OSDEV-EDIT-OK
+>         OSDEV-EDIT.txt  (14 bytes)
+>
+> 14 bytes is `OSDEV-EDIT-OK\n`, so the size it reports is the size it wrote.
+> Claude Code forks for every `git` it runs, which is the workload that provokes
+> the copy-on-write path being fixed elsewhere today; it survived, twice.
+>
+> **THE BLOCKER WAS OUR BUILD.** For several hours this was reported as "the
+> in-guest OAuth session expired and only a human can renew it". Wrong, and
+> instructively so. The image shipped a hand-placed credentials snapshot; the
+> host's own copy is refreshed continuously:
+>
+>     staged in the image   access token expired 16:45
+>     live on the host      access token valid to 00:40
+>
+> Same refresh token, valid for another two weeks. The failing log showed NO
+> network activity before the failure, which correctly ruled out our TLS and
+> HTTP stack failing a refresh POST -- and then that ruling-out was treated as
+> the answer, instead of asking why the token IN THE IMAGE was five hours older
+> than the one on the host. **Ruling out one cause is not finding the cause.**
+> `.tools-staged` now copies the host's live credentials at image-build time.
+>
+> **A path trap that cost three readings in one day**, recorded because it fails
+> in the most misleading way available: a Linux program's paths are relative to
+> LX_ROOT and the kernel prepends `/disk2` itself, so `/disk2/src/x` opens
+> `/disk2/disk2/src/x`. It cost three ENOENTs in the demo log for a path nobody
+> asked for, and it made the `lxwrite` probe print
+> `SKIP (/disk2/src does not look like the source tree)` -- a clean miss that
+> reads exactly like a legitimate skip. A SKIP that cannot tell "wrong path"
+> from "nothing to test" reports success while measuring nothing; that message
+> now prints the path, the return value and errno.
+>
+> **What is NOT claimed:** three tools (Bash, Write, Read), two core counts, one
+> prompt each. Not "all features". And the 1-in-4 Firefox blank page is
+> untouched by any of it.
+
 > **(M2172-M2175) TWO BUG CLASSES WORTH MORE THAN THE FIXES: A CACHE TOO SMALL
 > HIDES CORRUPTION, AND A CHECK ONE LEVEL TOO LOW COSTS NINE MILLION WRONG
 > VALUES.**
