@@ -18,12 +18,30 @@
  * This compares a WHOLE LIBRARY, tens of megabytes, from userspace, where the
  * comparison is cheap and needs no interrupts.
  *
- * THE METHOD. mmap the library MAP_PRIVATE PROT_READ -- the same way ld.so does
- * -- and compare every byte against `pread` of the same file. Two independent
- * routes to the same bytes: the demand-fault path on one side, the ordinary
- * read path on the other. A mismatch names the offset, both values, and whether
- * the mapped page is all zeros (a fill that never happened) or merely different
- * (a fill that read the wrong thing) -- which are different bugs.
+ * THE METHOD, AND THE HOLE THE FIRST VERSION HAD. mmap the library MAP_PRIVATE
+ * PROT_READ -- the same way ld.so does -- and compare every byte against
+ * `pread` of the same file. Two routes to the same bytes: the demand-fault path
+ * on one side, the ordinary read path on the other.
+ *
+ * They are not INDEPENDENT routes, and the first version of this claimed they
+ * were. Both go through the kernel's block cache, so a sector that was already
+ * WRONG WHEN IT WAS INSTALLED yields the same wrong bytes to both sides and
+ * this comparison passes. That is exactly the bug that was live while I ran it
+ * (M2172: a DMA read that stopped early was reported as a success and its stale
+ * tail was cached), so "171910680 bytes identical" was a weaker statement than
+ * I made of it -- it ruled out the mapping DIVERGING from a read, not the bytes
+ * being wrong.
+ *
+ * So the real oracle has to come from outside the guest. `--gen` mode prints a
+ * length and a hash per file, and the image build runs the HOST-built binary
+ * over the host's own copies to bake a manifest into the image. Same code, same
+ * algorithm, no second implementation to drift -- and the numbers were computed
+ * where the bytes are not in question. Verify mode checks the mapping against
+ * THAT, which no cache in this kernel can satisfy with stale data.
+ *
+ * A mismatch names the offset, both values, and whether the mapped page is all
+ * zeros (a fill that never happened) or merely different (a fill that read the
+ * wrong thing) -- which are different bugs.
  *
  * Deliberately compares in a different ORDER than the faults arrive: forwards
  * for the first pass, then backwards, so a mismatch that only appears when a
@@ -42,6 +60,64 @@
 #include <sys/stat.h>
 
 #define CHUNK (1u << 20)
+
+/* FNV-1a over the whole file, length folded in. Deliberately the same few
+ * lines on both sides: a manifest generator that reimplements the hash is a
+ * manifest generator that can disagree with the checker. */
+static unsigned long long file_hash(const unsigned char *p, size_t n) {
+    unsigned long long h = 1469598103934665603ULL ^ (unsigned long long)n;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* `--gen`: print `<len> <hash> <path>` for each file, for the image build to
+ * bake in. Runs on the HOST, over the host's copies. */
+static int gen_one(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 1; }
+    unsigned char *m = mmap(0, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (m == MAP_FAILED) { close(fd); return 1; }
+    printf("%lld %llu %s\n", (long long)st.st_size, file_hash(m, (size_t)st.st_size), path);
+    munmap(m, (size_t)st.st_size); close(fd);
+    return 0;
+}
+
+/* Verify a mapping against the manifest the host wrote. Returns 0 = matched,
+ * 1 = mismatch, 2 = not testable. */
+static int verify_manifest(const char *mpath) {
+    FILE *f = fopen(mpath, "r");
+    if (!f) { printf("LXMAPCMP: SKIP manifest (%s absent -- rebuild the image)\n", mpath); return 2; }
+    char line[1024]; int bad = 0, n = 0;
+    while (fgets(line, sizeof line, f)) {
+        long long want_len = 0; unsigned long long want_hash = 0; char path[768];
+        if (sscanf(line, "%lld %llu %767s", &want_len, &want_hash, path) != 3) continue;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { printf("LXMAPCMP: manifest: %s is ABSENT in the guest\n", path); bad++; continue; }
+        struct stat st;
+        if (fstat(fd, &st) != 0) { close(fd); bad++; continue; }
+        if ((long long)st.st_size != want_len) {
+            printf("LXMAPCMP: *** %s is %lld bytes, the host recorded %lld ***\n",
+                   path, (long long)st.st_size, want_len);
+            close(fd); bad++; continue;
+        }
+        unsigned char *m = mmap(0, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m == MAP_FAILED) { close(fd); bad++; continue; }
+        unsigned long long got = file_hash(m, (size_t)st.st_size);
+        if (got != want_hash)
+            printf("LXMAPCMP: *** %s HASHES TO %llu, the host recorded %llu -- the bytes this "
+                   "kernel served are NOT the file's ***\n", path, got, want_hash);
+        else
+            printf("LXMAPCMP: %s matches the host's own hash of it (%lld bytes)\n", path, want_len);
+        if (got != want_hash) bad++;
+        n++;
+        munmap(m, (size_t)st.st_size); close(fd);
+    }
+    fclose(f);
+    if (!n && !bad) { printf("LXMAPCMP: SKIP manifest (no usable entries)\n"); return 2; }
+    return bad ? 1 : 0;
+}
 
 static int page_all_zero(const unsigned char *p) {
     for (int i = 0; i < 4096; i++) if (p[i]) return 0;
@@ -91,6 +167,11 @@ static int compare_one(const char *path, int backwards) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && !strcmp(argv[1], "--gen")) {
+        int bad = 0;
+        for (int i = 2; i < argc; i++) bad += gen_one(argv[i]);
+        return bad ? 1 : 0;
+    }
     static const char *const deflt[] = {
         "/usr/lib64/firefox/libxul.so",
         "/usr/lib64/libgtk-3.so.0",
@@ -111,6 +192,10 @@ int main(int argc, char **argv) {
                 if (r == 1) fails++; else if (r == 0) tested++;
             }
     }
+    /* THE ORACLE FROM OUTSIDE (see the header). Run last, so a mapping-versus-
+     * read difference is reported separately from a bytes-are-simply-wrong
+     * one -- they point at different subsystems. */
+    { int r = verify_manifest("/lxmapcmp.manifest"); if (r == 1) fails++; else if (r == 0) tested++; }
     if (!tested && !fails) { printf("LXMAPCMP: SKIP (nothing was testable)\n"); return 0; }
     printf(fails ? "LXMAPCMP: %d COMPARISON(S) FAILED\n" : "LXMAPCMP: ALL PASSED (%d comparisons)\n",
            fails ? fails : tested);

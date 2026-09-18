@@ -646,6 +646,11 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@if [ -d /usr/lib/locale ]; then mkdir -p $(LXROOT)/usr/lib/locale && 	    cp -a /usr/lib/locale/. $(LXROOT)/usr/lib/locale/ 2>/dev/null || true; fi
 	@for d in /usr/share/mime /usr/share/icons/hicolor /usr/share/X11/locale; do 	    if [ -d $$d ]; then mkdir -p $(LXROOT)$$d && cp -a $$d/. $(LXROOT)$$d/ 2>/dev/null || true; fi; done
 	@mkdir -p $(LXROOT)/bin && cp -f $(LXROOT)/usr/bin/bash $(LXROOT)/bin/sh
+	@# THE ORACLE FROM OUTSIDE THE GUEST (M2173). lxmapcmp's mapping-versus-read
+	@# comparison cannot see a sector that was WRONG WHEN INSTALLED, because both
+	@# of its sides read through the block cache. So bake in a length and a hash
+	@# per library, computed HERE, by the same binary, over the host's own copies.
+	@if [ -x $(LXROOT)/lxmapcmp ]; then 	    $(LXROOT)/lxmapcmp --gen /usr/lib64/firefox/libxul.so /usr/lib64/libgtk-3.so.0 	        /usr/lib64/libc.so.6 > $(LXROOT)/lxmapcmp.manifest 2>/dev/null || true; 	    echo "  STAGE   lxmapcmp.manifest ($$(wc -l < $(LXROOT)/lxmapcmp.manifest) host-computed hashes)"; fi
 	@touch $@
 
 
