@@ -7437,17 +7437,25 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
          * the PTE, because sharedness is a property of the MAPPING -- the same
          * reason madvise(MADV_DONTNEED) consults it (M2000). */
         {   struct app *ca = cur();
-            int shared_here = 0;
+            int shared_here = 0; uint8_t vprot = 0;
             if (ca) {
                 uint64_t vfl = vma_lock(ca);
                 for (int i = 0; i < ca->nvma; i++)
                     if (ca->vma[i].len && fpage >= ca->vma[i].start &&
                         fpage < ca->vma[i].start + ca->vma[i].len) {
-                        shared_here = ca->vma[i].shared; break;
+                        shared_here = ca->vma[i].shared; vprot = ca->vma[i].prot; break;
                     }
                 vma_unlock(ca, vfl);
             }
-            if (shared_here) {
+            /* AND ONLY IF THE MAPPING ALLOWS WRITING. vmm_fork_cow
+             * write-protects EVERY page, including a MAP_SHARED PROT_READ one,
+             * and setting PTE_WRITABLE here because the mapping is shared
+             * would grant write access the mapping never had -- turning a
+             * correct SIGSEGV into silent corruption of somebody else's
+             * memory. The `shared` flag says "do not copy"; the `prot` field
+             * says "may write". Both are needed and they are different
+             * questions. */
+            if (shared_here && (vprot & VMA_PROT_WRITE)) {
                 uint64_t keep = (pte & ~(uint64_t)PTE_COW) | PTE_WRITABLE | PTE_PRESENT;
                 vmm_set_raw(fpage, keep);
                 g_flt_cow_shared++;
@@ -10624,13 +10632,24 @@ unsigned long app_memfd_share_audit(int verbose) {
                     if (!want) continue;                  /* the object's own page is unbacked: not a sharing fault */
                     if (got == want) { okc++; continue; }
                     bad++;
+                    /* NAME WHICH OF THE TWO IT IS. "resolves to 0" is a
+                     * mapping that is not there at all -- a memfd mapping is
+                     * EAGER, so an absent page means something unmapped it
+                     * (a stale VMA after an exec, a carve that missed) -- and
+                     * "resolves to a different frame" is broken sharing. They
+                     * are different bugs and the first version of this line
+                     * printed them identically. (M2209) */
                     if (bad <= 4)
                         kprintf("[share] ** memfd %d ('%s') is NOT SHARED with pid %d: object offset "
-                                "%lu is phys %lx, but the process's mapping at %lx resolves to %lx. "
-                                "Whatever that process writes there, nobody else sees. **\n",
+                                "%lu is phys %lx, but the process's mapping at %lx resolves to %lx "
+                                "-- %s **\n",
                                 mi, m->name[0] ? m->name : "?", a->pid, (unsigned long)ooff,
                                 (unsigned long)want, (unsigned long)(r[i].start + off),
-                                (unsigned long)got);
+                                (unsigned long)got,
+                                got ? "a DIFFERENT frame, so whatever that process writes there "
+                                      "nobody else sees"
+                                    : "NOT MAPPED AT ALL, though a memfd mapping is eager: "
+                                      "something unmapped it and left the VMA behind");
                 }
             }
         }
