@@ -6270,9 +6270,31 @@ static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
         app_tlb_sync(a);                /* a tightened mapping another core still caches is a write-after-revoke (M1963) */
         return 0;
     }
-    if (!vmm_user_ok(a0, end - a0)) return -1;   /* must be the caller's mapped user pages */
+    /* A GATE THAT REQUIRES WHAT mprotect EXISTS TO CHANGE (M2186).
+     *
+     * `vmm_user_ok` was the gate here, and it returns false for a page whose
+     * PTE_USER is clear. That was harmless while nothing ever cleared PTE_USER
+     * -- and M2179 started clearing it, correctly, for PROT_NONE. So an
+     * mprotect GRANTING access back to a PROT_NONE range failed this check and
+     * returned -1 having changed nothing, leaving the region permanently
+     * inaccessible. A JS engine that reserves a large range PROT_NONE and then
+     * mprotects sub-ranges to read-write as it needs them is exactly that
+     * pattern, and it is what JavaScriptCore does with its structure heap.
+     *
+     * Measured, 8 cores: with M2179 in place Firefox rendered in 0 of 4 boots;
+     * with M2179 reverted, 2 of 2. The PROT_NONE fix was right and this gate
+     * turned it into a regression -- which is the most useful kind of A/B,
+     * because a correct change that makes things worse is pointing at a second
+     * bug rather than at itself.
+     *
+     * The gate was doing two jobs: keeping the range inside user space, and
+     * materialising lazily-mappable pages so the loop below could not fault.
+     * Only the first is wanted here, and it is a bounds test rather than a page
+     * walk -- so do that, and protect only the pages that have a translation,
+     * exactly as the covered path above already does. */
+    if (end > MMAP_TOP) return -1;              /* user space only */
     for (uint64_t p = a0; p < end; p += PAGE_SIZE)
-        if (vmm_protect(p, flags) < 0) return -1;
+        if (vmm_translate(p)) { if (vmm_protect(p, flags) < 0) return -1; }
     app_tlb_sync(a);                    /* same reason as the covered path above (M1963) */
     return 0;
 }
