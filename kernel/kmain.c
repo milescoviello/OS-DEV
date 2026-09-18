@@ -1798,7 +1798,31 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * appears to void the whole spec, and both of these appear
                      * as exact standalone strings in libxul -- the check that
                      * `webrender` and `ipcmessages` failed. */
-                    app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,nsDocShell:5");
+                    /* `nsDocShell` IS EFFECTIVELY SILENT, and that cost half the
+                     * spec (M2188). At level 5 it produced exactly ONE line in
+                     * a whole boot. The name is real -- it appears as an exact
+                     * standalone string in libxul, so M2114's void-the-spec
+                     * rule is satisfied and DocumentChannel logged fine -- it
+                     * simply has almost nothing at that level. A module that is
+                     * valid and silent looks identical to a module that is
+                     * answering "nothing happened".
+                     *
+                     * `DocLoader` and `PresShell` are what the remaining
+                     * question needs. The failing boot's navigation COMPLETES:
+                     * same destination browsing context as a passing one,
+                     * `RedirectToRealChannelFinished aRv=0`,
+                     * `FinishReplacementChannelSetup aResult=0`,
+                     * `ResumeSuspendedChannel`. So the document is fetched,
+                     * navigated and handed over, and the content area still
+                     * shows Firefox's blank-canvas grey -- which makes the next
+                     * question whether that document ever got a PRESENTATION,
+                     * and those two modules are where that is decided. Both
+                     * checked against libxul as exact strings.
+                     *
+                     * Level 3, not 5: PresShell logs paints, and a spec chatty
+                     * enough to change the boot's timing would perturb the very
+                     * intermittency being chased. */
+                    app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,DocLoader:3,PresShell:3");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per
