@@ -4780,6 +4780,74 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
     return slot;
 }
 
+/* IS THE GAP WE JUST CHOSE ACTUALLY EMPTY? (M2190)
+ *
+ * `vma_find_gap` proves the range overlaps no VMA. Nothing proves it overlaps
+ * no MAPPING. Those differ: elf_load, the initial stack, the vdso-ish bits and
+ * anything that mapped pages before a VMA existed for them leave PTEs with no
+ * table entry to collide with -- and `vma_audit` looks for VMA-versus-VMA
+ * overlap only, which is why it has been reporting zero while this went
+ * unchecked.
+ *
+ * If it ever happens the consequence is exactly the symptom left in the
+ * Firefox failure: two logical allocations sharing physical pages, so a pointer
+ * into one is a pointer into the other, and the fault lands far away as a write
+ * to an address computed from registers.
+ *
+ * Sampled rather than exhaustive: a 2 GiB reservation is half a million pages
+ * and this runs on every mmap. The first page, the last, and every 2 MiB
+ * boundary catches any overlap bigger than a hugepage and the overwhelming
+ * majority of smaller ones, for a bounded cost. Reports and REFUSES the range,
+ * because handing back an address that is already in use is the wrong answer
+ * however cheap it was to produce. */
+static unsigned long g_gap_collisions;
+/* WHERE THE ORPHAN SITS (M2191). The check fired -- a present, writable, user
+ * page with no VMA over it -- and "no VMA" alone does not say where it came
+ * from. A page immediately past the end of a VMA is a boundary leak (a
+ * readahead overrun, or a carve that left its tail); one in open space is a
+ * mapping whose VMA was dropped entirely. Different bugs, so name the
+ * neighbours. */
+static void gap_report_neighbours(struct app *a, uint64_t p) {
+    uint64_t below_end = 0, above_start = ~0ull;
+    int bi = -1, ai = -1;
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
+        if (e0 <= p && e0 > below_end) { below_end = e0; bi = i; }
+        if (s0 > p && s0 < above_start) { above_start = s0; ai = i; }
+    }
+    kprintf("[vma]    nearest VMA below ends at %lx (vma[%d], %lu page(s) below this one); "
+            "nearest above starts at %lx (vma[%d])\n",
+            (unsigned long)below_end, bi,
+            below_end ? (unsigned long)((p - below_end) / PAGE_SIZE) : 0,
+            (unsigned long)(above_start == ~0ull ? 0 : above_start), ai);
+}
+
+static int gap_is_clear(uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    for (uint64_t p = addr; p < end; p += HUGE_SIZE) {
+        if (vmm_pte_raw(p) & PTE_PRESENT) {
+            g_gap_collisions++;
+            if (g_gap_collisions <= 8)
+                kprintf("[vma] ** the gap chosen at %lx+%lx is NOT EMPTY: %lx is already mapped "
+                        "(pte %lx) with no VMA covering it. Two allocations would have shared "
+                        "pages. Refusing this range. **\n",
+                        (unsigned long)addr, (unsigned long)len, (unsigned long)p,
+                        (unsigned long)vmm_pte_raw(p));
+                { struct app *ca = cur(); if (ca) gap_report_neighbours(ca, p); }
+            return 0;
+        }
+    }
+    if (len > PAGE_SIZE && (vmm_pte_raw(end - PAGE_SIZE) & PTE_PRESENT)) {
+        g_gap_collisions++;
+        if (g_gap_collisions <= 8)
+            kprintf("[vma] ** the gap chosen at %lx+%lx is NOT EMPTY at its last page %lx **\n",
+                    (unsigned long)addr, (unsigned long)len, (unsigned long)(end - PAGE_SIZE));
+        return 0;
+    }
+    return 1;
+}
+
 static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align) {
     if (!len) return 0;
     for (int pass = 0; pass < 2; pass++) {
@@ -4799,7 +4867,14 @@ static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align) {
                     break;
                 }
             }
-            if (!clash) return cand;
+            if (!clash) {
+                if (gap_is_clear(cand, len)) return cand;
+                /* Occupied without a VMA: step past it and keep looking rather
+                 * than return an address that is already in use. */
+                cand += HUGE_SIZE;
+                if (align) cand = (cand + align - 1) & ~(align - 1);
+                continue;
+            }
         }
     }
     return 0;
