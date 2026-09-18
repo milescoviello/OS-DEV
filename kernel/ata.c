@@ -425,6 +425,8 @@ void ata_cache_flush(void) { bcache_flush(); }
  * that is worth knowing BEFORE writing any of it. */
 static uint64_t io_cmds, io_sectors, io_hits, io_cyc_xfer, io_cyc_hit;
 static uint64_t io_retries, io_read_failures;
+static uint64_t io_dma_short;      /* DMA transfers the PRD list ended early (M2167) */
+uint64_t ata_dma_short_count(void) { return io_dma_short; }
 void ata_error_counts(uint64_t *retries, uint64_t *failures) {
     if (retries)  *retries  = io_retries;
     if (failures) *failures = io_read_failures;
@@ -1211,10 +1213,42 @@ static int ata_dma_xfer_impl(int drive, uint32_t lba, uint32_t count, void *buf,
     for (uint32_t i = 0; i < ATA_SPIN_HARDCAP; i++) {
         uint8_t st = inb(ch + BMIDE_STATUS);
         if (st & BM_ST_ERR) { err = 1; break; }
-        /* Active clears when the data transfer has finished. The IRQ bit being
-         * set with active clear is the unambiguous "complete" signal; active
-         * clear alone is also complete (some controllers don't latch IRQ here). */
-        if (!(st & BM_ST_ACTIVE)) { done = 1; break; }
+        /* ACTIVE CLEAR ALONE IS NOT COMPLETION (M2167).
+         *
+         * The three states the PIIX3 bus master can be in are distinguished by
+         * ACTIVE together with INTERRUPT, and this code read ACTIVE alone:
+         *
+         *   ACTIVE=1              -- still transferring
+         *   ACTIVE=0, IRQ=1       -- the drive finished. COMPLETE.
+         *   ACTIVE=0, IRQ=0       -- THE PRD LIST RAN OUT FIRST. The transfer
+         *                            stopped early and part of the buffer still
+         *                            holds whatever was there before.
+         *
+         * The comment here said "active clear alone is also complete (some
+         * controllers don't latch IRQ here)", and on that basis a short
+         * transfer was returned as a SUCCESS with the tail of the bounce buffer
+         * -- the PREVIOUS transfer's data -- gathered into the caller's buffer
+         * and then installed in the block cache.
+         *
+         * That is the last link in the M2155 chain, and the block cache A/B is
+         * what exposed it: with the old 128-entry pool a 128-sector read
+         * evicted everything including its own stale sectors, so nothing read
+         * them back; with 131072 entries a stale sector survives the whole
+         * boot. Same wrong bytes either way -- one configuration just forgot
+         * them fast enough to look healthy. Measured across two runs each, 8
+         * cores: 0 rejected ext2 block pointers with the small pool, 2970 with
+         * the large one.
+         *
+         * So require the unambiguous signal, and treat ACTIVE=0 with IRQ=0 as
+         * the short transfer it is: fail, which sends the read down the PIO
+         * path that cannot be short. Counted, because a controller that
+         * genuinely never latches IRQ would fail every DMA and must be
+         * diagnosable rather than merely slow. */
+        if (!(st & BM_ST_ACTIVE)) {
+            if (st & BM_ST_IRQ) { done = 1; break; }
+            io_dma_short++;
+            break;                      /* done stays 0 -> the !done check below fails it */
+        }
         if (timer_ms() >= dma_deadline) break;               /* done/err both still 0 -> the !done check below fails it */
     }
 

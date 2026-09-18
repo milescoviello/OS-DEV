@@ -54,10 +54,20 @@ typedef struct {
 } ext2_t;
 
 /* read ext2 block `blk` (block_size bytes) into buf (>= block_size) */
+/* THE VOLUME'S START LBA, BECAUSE THE ARITHMETIC POINTS AT IT (M2167).
+ *
+ * A refused read reported `lba 18962972664 count 8 cap 6553600`. The block
+ * pointer had already PASSED the blocks_count check, so blk < 819200, so
+ * blk * 8 < 6553600 -- inside the disk. An LBA of 18.9 billion can therefore
+ * only come from `v->start`, the volume's start sector, which for /disk2 is
+ * supposed to be 0. So record it and make it visible: `start + blk * spb` has
+ * two operands and only one of them had ever been printed. */
+uint64_t g_e2_vstart;
+
 static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     int r = v->read(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
-    if (r < 0) v->ioerr = 1;                       /* see ext2_t.ioerr (M2155) */
+    if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
     return r;
 }
 /* `n` PHYSICALLY CONSECUTIVE blocks in one request (M2101).
@@ -76,7 +86,7 @@ static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
 static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     int r = v->read(v->ctx, v->start + (uint64_t)blk * spb, n * spb, buf);
-    if (r < 0) v->ioerr = 1;
+    if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }
     return r;
 }
 /* How many blocks a single request may cover: the block device's own transfer
@@ -194,6 +204,7 @@ unsigned long g_e2_bad_ptrs;          /* out-of-range block pointers rejected */
 uint32_t      g_e2_bad_ptr_val;       /* the last one, and where it came from */
 int           g_e2_bad_ptr_level;     /* 1 = single indirect, 2 = double indirect, 0 = direct */
 unsigned int  g_e2_blocks_count;      /* what the superblock says, so a bogus BOUND is visible too */
+
 static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level) {
     if (!blk) return 0;                                    /* a real hole */
     g_e2_blocks_count = v->blocks_count;

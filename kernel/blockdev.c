@@ -795,6 +795,27 @@ long blockdev_mount_read(int i, const char *path, void *buf, unsigned long max) 
 long blockdev_mount_pread(int i, const char *path, void *buf, unsigned long max, unsigned long offset) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
+    /* THE MOUNT'S START SECTOR MUST BE ON THE DEVICE (M2167). Every read this
+     * mount performs is `start + block * sectors_per_block`, so a corrupt
+     * `start` makes every one of them land off the end of the disk -- which is
+     * exactly what a refused read reporting `lba 18962972664 cap 6553600`
+     * looks like once you notice the block number itself was in range. The
+     * table is built once at boot and never changed after, so this can only
+     * fire if something wrote over it. Say so; do not read past the disk. */
+    {   blockdev_t *d = blockdev_get(g_mount[i].dev);
+        if (d && d->sectors && g_mount[i].start >= d->sectors) {
+            static int told;
+            if (told < 4) {
+                told++;
+                kprintf("[mount] CORRUPT: mount %d (%s) claims to start at LBA %lu on a device "
+                        "with %lu sectors. Every read through it would land off the end of the "
+                        "disk. The table is built once at boot, so this was OVERWRITTEN.\n",
+                        i, g_mount[i].name, (unsigned long)g_mount[i].start,
+                        (unsigned long)d->sectors);
+            }
+            return -1;
+        }
+    }
     if (g_mount[i].fstype == FS_EXT2)
         return ext2_pread(mount_rfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", buf, max, offset);
     /* ISO/FAT: read the prefix into a temp, slice the tail */

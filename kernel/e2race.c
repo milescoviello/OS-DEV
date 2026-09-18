@@ -248,13 +248,14 @@ static void e2b_worker(void *arg) {
                 extern unsigned long g_e2_bad_ptrs;
                 extern unsigned int  g_e2_bad_ptr_val, g_e2_blocks_count;
                 extern int           g_e2_bad_ptr_level;
+                extern unsigned long g_e2_vstart;
                 kprintf("E2BIG: read at offset %lu FAILED (-1)\n"
                         "E2BIG:   ext2: %s | block: %s\n"
                         "E2BIG:   bad block pointers rejected %lu (last %lu at level %d; "
-                        "the filesystem has %lu blocks)\n",
+                        "the filesystem has %lu blocks); the volume's start LBA was %lu\n",
                         g_e2b_off[k], ext2_pread_why(), blockdev_fail_why(),
                         g_e2_bad_ptrs, (unsigned long)g_e2_bad_ptr_val, g_e2_bad_ptr_level,
-                        (unsigned long)g_e2_blocks_count);
+                        (unsigned long)g_e2_blocks_count, g_e2_vstart);
             }
         } else if (got < E2B_CHUNK) {
             __atomic_add_fetch(&g_e2b_short, 1, __ATOMIC_RELAXED);
