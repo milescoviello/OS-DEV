@@ -10313,6 +10313,15 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     a->vma[vs11].start = base; a->vma[vs11].len = len;
     a->vma[vs11].shared = 1;
     a->vma[vs11].mfd = (short)a->fd[fd].obj;
+    /* AND WHERE IN THE OBJECT IT STARTS (M2203). `off` was accepted, honoured
+     * when the pages were mapped, and then thrown away -- so nothing could
+     * afterwards say which bytes of the memfd this mapping covers.
+     * /proc/<pid>/maps reported offset 0 for all of them, and the sharing audit
+     * added in this milestone compared the object's offset 0 against the
+     * mapping's FIRST page, which for a mapping made at a non-zero offset is a
+     * different page by construction -- an instrument that reports a
+     * difference it created itself, for the second time in two days. */
+    a->vma[vs11].foff = off;
     a->vma[vs11].prot = VMA_PROT_READ | VMA_PROT_WRITE;
     
     return base;
@@ -10453,12 +10462,14 @@ unsigned long app_memfd_share_audit(int verbose) {
         for (int pi = 0; pi < MAX_APPS; pi++) {
             struct app *a = &apps[pi];
             if (!a->used || !a->cr3) continue;
-            struct { uint64_t start, len; } r[APP_MAXVMA];
+            struct { uint64_t start, len, foff; } r[APP_MAXVMA];
             int nr = 0;
             uint64_t fl = vma_lock(a);
             for (int i = 0; i < a->nvma && nr < APP_MAXVMA; i++)
                 if (a->vma[i].len && a->vma[i].mfd == mi) {
-                    r[nr].start = a->vma[i].start; r[nr].len = a->vma[i].len; nr++;
+                    r[nr].start = a->vma[i].start; r[nr].len = a->vma[i].len;
+                    r[nr].foff = a->vma[i].foff;          /* which bytes of the object (M2203) */
+                    nr++;
                 }
             vma_unlock(a, fl);
             for (int i = 0; i < nr; i++) {
@@ -10468,8 +10479,9 @@ unsigned long app_memfd_share_audit(int verbose) {
                 uint64_t stride = npg > 16 ? npg / 16 : 1;
                 for (uint64_t pg = 0; pg < npg; pg += stride) {
                     uint64_t off = pg * PAGE_SIZE;
-                    if (off >= m->cap) break;
-                    uint64_t want = vmm_translate((uint64_t)(uintptr_t)(m->buf + off));
+                    uint64_t ooff = r[i].foff + off;      /* the OBJECT offset this page covers */
+                    if (ooff >= m->cap) break;
+                    uint64_t want = vmm_translate((uint64_t)(uintptr_t)(m->buf + ooff));
                     uint64_t got  = vmm_translate_in(a->cr3, r[i].start + off);
                     if (!want) continue;                  /* the object's own page is unbacked: not a sharing fault */
                     if (got == want) { okc++; continue; }
@@ -10478,7 +10490,7 @@ unsigned long app_memfd_share_audit(int verbose) {
                         kprintf("[share] ** memfd %d ('%s') is NOT SHARED with pid %d: object offset "
                                 "%lu is phys %lx, but the process's mapping at %lx resolves to %lx. "
                                 "Whatever that process writes there, nobody else sees. **\n",
-                                mi, m->name[0] ? m->name : "?", a->pid, (unsigned long)off,
+                                mi, m->name[0] ? m->name : "?", a->pid, (unsigned long)ooff,
                                 (unsigned long)want, (unsigned long)(r[i].start + off),
                                 (unsigned long)got);
                 }
@@ -10491,6 +10503,50 @@ unsigned long app_memfd_share_audit(int verbose) {
         kprintf("[share] %lu mapping(s) of mapped memfds, %lu sampled page(s) agree, %lu do NOT "
                 "(sampled 16 per mapping, so the pages between are not proven)\n",
                 maps, okc, bad);
+    /* WHO MAPS THE CONTENT PROCESS'S BUFFERS? (M2203)
+     *
+     * Firefox's IPC shared memory is a memfd named `org.mozilla.ipc.<pid>.<n>`
+     * -- about 43 of them per startup -- and that is the road the content
+     * process's rendering takes to the parent, which composites it. The blank
+     * content area is a window whose chrome is painted and whose content is the
+     * browser's background colour, so the question that separates "the content
+     * was never produced" from "the content never arrived" is whether the
+     * PARENT has those buffers mapped at all.
+     *
+     * Nothing could answer it. This lists each one with the pids that map it,
+     * which is a fact about the mechanism rather than about Firefox's insides,
+     * and it costs nothing to collect. */
+    if (verbose) {
+        int listed = 0;
+        for (int mi = 0; mi < NMEMFD && listed < 12; mi++) {
+            struct memfd *m = &memfds[mi];
+            if (!m->used || !m->buf) continue;
+            /* Only the IPC ones: the wl_shm pools already have the commit check. */
+            const char *n = m->name;
+            if (!(n[0]=='o' && n[1]=='r' && n[2]=='g' && n[3]=='.')) continue;
+            int pids[8], np2 = 0;
+            for (int pi = 0; pi < MAX_APPS && np2 < 8; pi++) {
+                struct app *a2 = &apps[pi];
+                if (!a2->used || !a2->cr3) continue;
+                int has = 0;
+                uint64_t fl2 = vma_lock(a2);
+                for (int i = 0; i < a2->nvma; i++)
+                    if (a2->vma[i].len && a2->vma[i].mfd == mi) { has = 1; break; }
+                vma_unlock(a2, fl2);
+                if (has) pids[np2++] = a2->pid;
+            }
+            listed++;
+            if (np2 == 0)
+                kprintf("[share]   '%s' (%lu bytes) is mapped by NOBODY -- whoever created it "
+                        "has not mmap'd it and no peer has either\n", n, m->size);
+            else {
+                kprintf("[share]   '%s' (%lu bytes) mapped by %d process(es):", n, m->size, np2);
+                for (int i = 0; i < np2; i++) kprintf(" pid %d", pids[i]);
+                kprintf("%s\n", np2 == 1 ? "  -- ONE side only, so nothing is being shared "
+                                            "through it" : "");
+            }
+        }
+    }
     return bad;
 }
 

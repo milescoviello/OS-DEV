@@ -2189,12 +2189,39 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                              * looked at, and the probe now says
                                              * whether there is anything to look
                                              * at. */
+                                            /* SAY IT, AND KEEP SAMPLING (M2203).
+                                             *
+                                             * M2201 broke out of this loop on
+                                             * the first page verdict, which was
+                                             * right for the demo and WRONG for
+                                             * the measurement it is part of: a
+                                             * rendering run then observed ~50
+                                             * seconds of the guest and a blank
+                                             * run observed 570, so every other
+                                             * per-run count in the series was
+                                             * being compared across unequal
+                                             * windows. It cost me a correlation
+                                             * -- `spin=0` in the one run that
+                                             * rendered and 2 in each blank one
+                                             * -- that is fully explained by the
+                                             * rendering run having been watched
+                                             * for a tenth as long.
+                                             *
+                                             * `ffwl` is the measuring path and
+                                             * keeps its whole window. `ffshow`
+                                             * is the looking-at path and hands
+                                             * the screen over immediately, so
+                                             * nothing needs this shortcut. */
                                             if (wl_page_probe(0x101820)) {
-                                                kprintf("[page] the page is on screen at sample %d -- "
-                                                        "handing the framebuffer to the desktop NOW "
-                                                        "instead of sampling for another %ds\n",
-                                                        k + 1, (40 - k - 1) * 15);
-                                                break;
+                                                static int said_page;
+                                                if (!said_page) {
+                                                    said_page = 1;
+                                                    kprintf("[page] the page is on screen at sample %d "
+                                                            "-- sampling on to the end of the window so "
+                                                            "this run is comparable with one that never "
+                                                            "renders (use ffshow to watch instead)\n",
+                                                            k + 1);
+                                                }
                                             }
                                             /* AND WHAT EVERY LINUX PROCESS IS
                                              * WAITING FOR (M2108). The page
