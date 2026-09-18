@@ -4821,6 +4821,24 @@ static void gap_report_neighbours(struct app *a, uint64_t p) {
             (unsigned long)below_end, bi,
             below_end ? (unsigned long)((p - below_end) / PAGE_SIZE) : 0,
             (unsigned long)(above_start == ~0ull ? 0 : above_start), ai);
+    /* WHICH NO-VMA MAPPING IS IT? (M2192) The mappings that legitimately exist
+     * without a VMA are few and known: the ELF image elf_load placed, the
+     * initial stack, and the kernel's own shared regions. If the orphan is one
+     * of those, this is a bounded class -- a region the allocator was never
+     * told about -- and fixable by registering it. If it is in open mmap space,
+     * it is a mapping whose VMA was dropped, which is a race. Different bugs,
+     * and the address says which without another run. */
+    if (p >= ELF_DYN_BASE && p < ELF_DYN_BASE + (256u << 20))
+        kprintf("[vma]    it is inside the ELF LOAD window (%lx+256M): a mapping elf_load made "
+                "that no VMA was ever created for -- a bounded class, not a race\n",
+                (unsigned long)ELF_DYN_BASE);
+    else if (p >= MMAP_BASE)
+        kprintf("[vma]    it is in open mmap space (>= %lx), so it is a mapping whose VMA was "
+                "DROPPED while its pages stayed mapped -- a race, not a missing registration\n",
+                (unsigned long)MMAP_BASE);
+    else
+        kprintf("[vma]    it is below the mmap region, so it belongs to the image or the "
+                "initial stack\n");
 }
 
 static int gap_is_clear(uint64_t addr, uint64_t len) {
