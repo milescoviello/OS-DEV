@@ -267,7 +267,53 @@ static volatile int g_wlraw;                  /* -append wlraw: also run the raw
 static volatile int g_lxstress;              /* -append lxstress: hammer mmap/threads/futexes/signals (M1987) */
 static volatile int g_lxcage;                /* -append lxcagetest: the huge-reservation probes, on demand (M2041) */
 static volatile int g_ffwl;                   /* -append ffwl: run Firefox against our compositor and hand over to the desktop (M1985) */
+/* -append ffshow: the same thing FOR LOOKING AT (M2200).
+ *
+ * `ffwl` is the measurement harness. It spawns Firefox and then holds the
+ * framebuffer for its own diagnostics -- ninety one-second heartbeats, then up
+ * to forty fifteen-second page samples -- so the window manager does not run
+ * for the first ten minutes and the SCREEN shows the log the whole time. That
+ * is the right trade when the output is a measurement and the wrong one when
+ * somebody is sitting in front of it: the boot renders the page and the person
+ * watching sees scrolling text.
+ *
+ * ffshow spawns Firefox exactly the same way and goes straight to the desktop.
+ * The diagnostics do not stop -- console output is serial-only once the window
+ * manager owns the screen (console_gfx_release), so the page probe keeps
+ * reporting into boot.log from a watcher thread while the screen shows the
+ * actual window. */
+static volatile int g_ffshow;
 static volatile int g_ffdata;                 /* -append ffdata: render a data: URL instead of the staged file, so the filesystem is not part of the question (M2107) */
+/* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
+ * still gets printed -- just to COM1, from a thread, while the framebuffer
+ * belongs to the window manager. It stops reporting once it has seen the page,
+ * because after that the screen is the report. */
+static void ffshow_watch_task(void) {
+    extern uint64_t g_pf_count;
+    unsigned long ps = lx_syscalls_made();
+    uint64_t pf0 = g_pf_count;
+    int seen = 0;
+    for (int k = 0; k < 80; k++) {
+        task_sleep_ms(15000);
+        unsigned long ns = lx_syscalls_made();
+        uint64_t pf1 = g_pf_count;
+        uint32_t pw = 0, ph = 0;
+        wl_largest_window(&pw, &ph);
+        kprintf("[ffshow] t=%ds: largest window %ux%u, %u Wayland client(s), "
+                "+%lu syscalls, +%lu faults\n", (k + 1) * 15, pw, ph,
+                wl_clients_connected(), ns - ps, (unsigned long)(pf1 - pf0));
+        ps = ns; pf0 = pf1;
+        {   int cpid = 0, csig = lx_fatal_signal(&cpid);
+            if (csig) kprintf("[ffshow] *** pid %d CRASHED with signal %d -- what is on the "
+                              "screen from here is the corpse ***\n", cpid, csig); }
+        if (pw >= 640 && ph >= 480 && !seen && wl_page_probe(0x101820)) {
+            seen = 1;
+            kprintf("[time] PAGE ON SCREEN (ffshow) at %lu ms since boot -- it is on the "
+                    "display right now; go and look at it\n", (unsigned long)timer_ms());
+        }
+    }
+}
+
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
 static volatile int g_ffmozlog;               /* -append ffmozlog: ask Firefox itself where it is, via MOZ_LOG (M2010) */
@@ -722,6 +768,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
+        if (cmdline_has(cl, "ffshow"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
+                                             g_ffshow = 1; g_noprobes = 1; }              /* ...and hand the screen over AT ONCE (M2200) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
         if (cmdline_has(cl, "ffmozlog"))   g_ffmozlog = 1;                /* + Firefox's OWN widget/Wayland logging, to stderr (M2010) */
         if (cmdline_has(cl, "ffshot"))     { g_lxabi_test = 1; g_ffshot = 1; }   /* Firefox HEADLESS, rendering a page to a PNG (M2003) */
@@ -1939,7 +1987,20 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * process is working, and if it is flat it is stuck or
                      * gone. Printed before handing over to the desktop, so it
                      * is not competing with the window manager for the log. */
-                    {
+                    if (g_ffshow) {
+                        /* THE VIEWING PATH (M2200): no diagnostic loop holds the
+                         * screen. Firefox is already spawned and starting; the
+                         * window manager takes the framebuffer now, and
+                         * wl_window_poll opens a desktop window for the browser
+                         * the moment it commits its first frame -- which is what
+                         * somebody sitting in front of the machine wants to
+                         * watch happen. A watcher thread keeps the page verdict
+                         * flowing to COM1, where it is not in the way. */
+                        kprintf("[ff] ffshow: Firefox is starting; handing the framebuffer to the "
+                                "desktop NOW. Its window appears when it commits its first frame; "
+                                "the page probe keeps reporting on the serial log.\n");
+                        task_create_stack(ffshow_watch_task, 0, 0, 64 * 1024);
+                    } else {
                         int fpid = app_last_spawn_pid();
                         unsigned long prev = lx_syscalls_made();
                         /* A ONE-SECOND TIMELINE, NOT A FIFTEEN-SECOND ONE (M2102).
@@ -2090,7 +2151,26 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                                         (unsigned long)(se > ps ? se - ps : 0),
                                                         (unsigned long)(h > ph ? h - ph : 0));
                                                 pc = c; ps = se; ph = h; }
-                                            wl_page_probe(0x101820);
+                                            /* STOP SAMPLING THE MOMENT THE
+                                             * PAGE IS THERE (M2200). Forty
+                                             * fifteen-second samples ran
+                                             * unconditionally, so a boot that
+                                             * rendered the page in the FIRST
+                                             * sample still held the framebuffer
+                                             * for another nine and a half
+                                             * minutes before the window manager
+                                             * was allowed to draw it. The whole
+                                             * point of the display is to be
+                                             * looked at, and the probe now says
+                                             * whether there is anything to look
+                                             * at. */
+                                            if (wl_page_probe(0x101820)) {
+                                                kprintf("[page] the page is on screen at sample %d -- "
+                                                        "handing the framebuffer to the desktop NOW "
+                                                        "instead of sampling for another %ds\n",
+                                                        k + 1, (40 - k - 1) * 15);
+                                                break;
+                                            }
                                             /* AND WHAT EVERY LINUX PROCESS IS
                                              * WAITING FOR (M2108). The page
                                              * area is blank while the content

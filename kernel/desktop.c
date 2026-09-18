@@ -1809,6 +1809,12 @@ static void wl_window_poll(void) {
         for (int i = 0; i < win_count; i++)
             if (windows[i].kind == KIND_WAYLAND && (int)(long)windows[i].app - 1 == ci) { taken = 1; break; }
         if (taken) continue;
+        /* AND IT HAS TO BE A WINDOW (M2200). A non-zero extent is not the
+         * same as "the client asked for a window": see
+         * wl_client_window_ready. Firefox's content processes each committed a
+         * roleless surface and each got a black desktop window opened over the
+         * browser. */
+        if (!wl_client_window_ready(ci)) continue;
         uint32_t sw2 = 0, sh2 = 0;
         wl_client_extent(ci, &sw2, &sh2);
         if (!sw2 || !sh2) continue;
