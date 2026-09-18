@@ -32,7 +32,6 @@
  */
 #include "wayland.h"
 #include "unixsock.h"
-#include "ata.h"       /* the disk's own error counters, for the health line (M2225) */
 #include "console.h"
 #include "fb.h"      /* wl_output reports the real framebuffer geometry (M1986) */
 #include "string.h"
@@ -2248,6 +2247,10 @@ void wl_fs_health_line(void) {
         extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
         extern unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;
         extern unsigned long g_memfd_remapped, g_memfd_unretired;
+        /* Declared here rather than in ata.h, the same way app.c's fault
+         * report reaches them: they are diagnostics, not driver API. */
+        extern void ata_error_counts(uint64_t *retries, uint64_t *failures);
+        extern uint64_t ata_dma_short_count(void);
         uint64_t atretr = 0, atfail = 0; ata_error_counts(&atretr, &atfail);
         kprintf("[fs] superblock: %lu readfail %lu BADMAGIC %lu badfield, %lu retried %lu "
                 "RETRY-OK | %lu itable %lu badptr %lu hole(s) | distrust %lu | refused: "
