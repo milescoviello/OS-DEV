@@ -216,6 +216,7 @@ struct app {
                         (slot) = vma_pick_slot(a);                                                 \
                         if ((slot) < 0) (slot) = 0;                 /* caller checked vma_full */  \
                         for (unsigned _b = 0; _b < sizeof (a)->vma[0]; _b++) ((char *)&(a)->vma[(slot)])[_b] = 0; \
+                        (a)->vma[(slot)].oline = (unsigned short)__LINE__;   /* WHO MADE THIS MAPPING (M2207) */ \
                         (a)->vma[(slot)].fidx = -1; (a)->vma[(slot)].mfd = -1;                     \
                         (a)->vma[(slot)].prot = VMA_PROT_READ | VMA_PROT_WRITE;                    \
                         (a)->vma[(slot)].len = 1;                   /* claimed: start is still 0 */ \
@@ -238,7 +239,7 @@ struct app {
 #define VMA_PROT_READ  0x1
 #define VMA_PROT_WRITE 0x2
 #define VMA_PROT_EXEC  0x4
-    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fidx indexes the global path table (M1962: an inline 256-byte path made the struct so big the TABLE was the limit, not the address space); prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956) */
+    struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared; uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid; unsigned short oline; } vma[APP_MAXVMA];  /* mmap'd demand-paged regions; sealed=mseal'd; uffd=userfault; file_backed=mmap'd file (M1136); locked=mlock'd (M1149); huge=2 MiB-backed (M1155); shared=MAP_SHARED, writes flow back to the file via msync/munmap/exit (M1544); fidx indexes the global path table (M1962: an inline 256-byte path made the struct so big the TABLE was the limit, not the address space); prot = Linux PROT_* bits honoured by the fault handler, fvalid = file bytes from foff before zero-fill begins (M1956); oline = the app.c line of the VMA_NEW that created it, captured for free by the macro so a fault report can name the creator without fourteen hand-written labels to get wrong (M2207) */
     int      nvma;
     /* THE VMA TABLE IS SHARED BY EVERY THREAD, and until M1987 it was mutated
      * with no serialisation at all. Two threads mmap()ing at once both wrote
@@ -3374,11 +3375,19 @@ void app_describe_fault_addr(uint64_t cr2) {
          * write is a bug in us, and the only thing that tells them apart is
          * WHICH file. Firefox faulted writing into a prot=1 file mapping three
          * runs in a row and this line could not say what it was. */
-        kprintf("[fault]   inside vma[%d] %lx-%lx prot=%d%s%s '%s' +%lx (%lu file bytes valid)\n",
+        /* ...AND WHICH CODE MADE IT (M2207). "prot=0 'anon'" with "no record of
+         * who set this mapping's protection" is where the 8-core crash hunt
+         * kept stopping: a refusal against a mapping whose creator could not be
+         * named. VMA_NEW captures its own __LINE__ for free, so every one of
+         * the fourteen creation sites is identified with no label to get wrong
+         * -- an anonymous mmap, a MAP_FIXED carve, a memfd, the stack and a
+         * shm region are different bugs and used to print the same line. */
+        kprintf("[fault]   inside vma[%d] %lx-%lx prot=%d%s%s '%s' +%lx (%lu file bytes valid), "
+                "created by app.c:%u\n",
                 i, a->vma[i].start, a->vma[i].start + a->vma[i].len, a->vma[i].prot,
                 a->vma[i].file_backed ? " file" : "", a->vma[i].shared ? " shared" : "",
                 a->vma[i].file_backed ? vma_path(a, i) : "anon",
-                a->vma[i].foff, a->vma[i].fvalid);
+                a->vma[i].foff, a->vma[i].fvalid, a->vma[i].oline);
         /* WHOSE PROTECTION REFUSED THE ACCESS (M2165). The provenance line was
          * printed from app_describe_addr, which describes the mapping the RIP is
          * in -- so for every one of these faults it reported on libxul's
@@ -7191,8 +7200,17 @@ unsigned long g_spurious_faults;   /* stale-TLB faults invalidated and retried (
  * re-reading the table here would race a concurrent munmap. */
 #define FAULT_READAHEAD_PAGES 16          /* 64 KiB: one disk request instead of sixteen */
 static void app_fault_readahead(struct app *a, const void *vcopy, uint64_t page) {
+    /* A SHADOW DECLARATION OF THE VMA STRUCT, which must match the real one
+     * FIELD FOR FIELD or every read through it is off by the difference. This
+     * is the struct-layout-lie class (statx, sysinfo and /proc/maps all
+     * "worked" while wrong), and it is here because the caller passes a private
+     * snapshot taken under the lock rather than an index. `oline` was added in
+     * M2207 and is trailing, so nothing above it moves -- but the copy's SIZE
+     * is taken from the real struct, so leaving it out would read one field
+     * short of the snapshot. */
     const struct { uint64_t start, len; int sealed, uffd, file_backed, locked, huge, shared;
-                   uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid; } *v = vcopy;
+                   uint64_t foff; short fidx; short mfd; uint8_t prot; uint64_t fvalid;
+                   unsigned short oline; } *v = vcopy;
     uint64_t first = page + PAGE_SIZE;
     uint64_t vend  = v->start + v->len;
     if (first >= vend) return;
@@ -12459,9 +12477,13 @@ int app_fd_ready(app_t *ap, int fd, int events) {
         }
     } else if (a->fd[fd].type == 4) {                      /* timerfd: POLLIN at/after expiry (M1217) */
         if ((events & POLLIN) && a->fd[fd].off != 0 && (uint64_t)timer_ms() >= (uint64_t)a->fd[fd].off) re |= POLLIN;
-    } else if (a->fd[fd].type == 5) {                      /* eventfd: POLLIN when counter>0, always writable (M1242) */
+    } else if (a->fd[fd].type == 5) {                      /* eventfd (M1242) */
         if ((events & POLLIN) && a->fd[fd].off > 0) re |= POLLIN;
-        if (events & POLLOUT) re |= POLLOUT;
+        /* Writable unless the counter is at its maximum, which is what an
+         * eventfd write blocks on. Unreachable in practice and stated as a
+         * predicate anyway, because "always writable" is the phrasing that was
+         * wrong for AF_UNIX (M2202) and for the pty (M2206). */
+        if ((events & POLLOUT) && (uint64_t)a->fd[fd].off < 0xfffffffffffffffeULL) re |= POLLOUT;
     } else if (a->fd[fd].type == 7) {                      /* pidfd: POLLIN once the target process has exited (M1222) */
         if ((events & POLLIN) && !app_pid_alive(a->fd[fd].obj)) re |= POLLIN;
     } else if (a->fd[fd].type == 8) {                      /* inotify: POLLIN when events are queued (M1266) */
