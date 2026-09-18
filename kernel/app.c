@@ -3323,6 +3323,7 @@ unsigned long g_flt_cow_shared;   /* COW faults on a MAP_SHARED page, answered b
 unsigned long g_fill_distrust;     /* fills refused because the filesystem distrusted itself, not because the file was unlinked (M2213) */
 unsigned long g_fill_exec_refused; /* fills refused because the mapping is EXECUTABLE: zeros there are never right (M2218) */
 unsigned long g_fill_exec_hole;    /* exec pages refused because ext2 served them from a sparse hole (M2221) */
+unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;   /* fills retried after dropping the volume's cache, and how many then worked (M2223) */
 void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other) {
     extern unsigned long g_spurious_faults;
     if (maj)   *maj   = g_flt_major;
@@ -8012,6 +8013,38 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                                     ext2_hole_events() - hole0);
                         pmm_free_frame(frame);
                         return 0;
+                    }
+                    /* ONE MORE ATTEMPT, WITH THE CACHE DROPPED (M2223).
+                     *
+                     * The two retries above re-read through the SAME cache, so
+                     * if the wrong bytes are cached they return the wrong bytes
+                     * again -- which is what the logs show: three attempts,
+                     * one answer. A corrupted read that survives a retry is
+                     * not necessarily a corrupted DISK.
+                     *
+                     * So when the filesystem says it distrusted itself, drop
+                     * everything cached for that volume and read once more. It
+                     * is blunt (the cache is write-through, so dropping it is
+                     * always safe and costs only re-reads) and it is the
+                     * difference between a transient corruption killing
+                     * Firefox and costing it a few milliseconds. If this one
+                     * succeeds, the cache was holding another sector's bytes,
+                     * and the counter says so. */
+                    if (got < 0 && ext2_distrust_events() != dt0 && fp && fp[0]) {
+                        g_fill_cachedrop++;
+                        vfs_drop_caches_for(fp);
+                        unsigned long dt1 = ext2_distrust_events();
+                        got = vfs_pread(fp, z, want, fileoff);
+                        if (got >= 0) {
+                            g_fill_cachedrop_ok++;
+                            static int cdtold;
+                            if (cdtold++ < 4)
+                                kprintf("[fault] %lx from %s+%lx: the read failed three times and "
+                                        "then SUCCEEDED after dropping this volume's block cache "
+                                        "-- the cache was holding another sector's bytes. (M2223)\n",
+                                        page, fp, (unsigned long)fileoff);
+                        }
+                        dt0 = dt1;   /* the drop+retry is not evidence about the ORIGINAL failure */
                     }
                     if (got < 0) {
                         struct statx probe;

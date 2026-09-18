@@ -316,6 +316,19 @@ static int synth_path(const char *name, char *out, int max) {
  * volume root if it targets /disk<N> (absolute) or we're cwd'd inside a mount
  * (relative, resolved against mount_sub); else 0 (use /proc·/dev·boot FS).
  * Subdirectory-aware (M1070): /diskN/a/b/file and relative names both resolve. */
+/* DROP THE BLOCK CACHE FOR THE VOLUME THIS PATH LIVES ON (M2223).
+ *
+ * For the page-fault fill, which is the one caller that knows a read came back
+ * wrong and cannot say which sectors were wrong -- the block numbers it would
+ * need are exactly the ones the filesystem got wrong. Path -> mount is the
+ * finest granularity available to it. */
+void vfs_drop_caches_for(const char *abs) {
+    if (!abs || abs[0] != '/') return;
+    int midx; char sub[VFS_PATH_MAX];
+    if (!mount_path(abs, &midx, sub, sizeof sub)) return;
+    blockdev_drop_mount_caches(midx);
+}
+
 static int mount_path(const char *name, int *midx, char *path, int max) {
     if (name[0] == '/') {
         char comp[12]; int c = 0; const char *p = name + 1;

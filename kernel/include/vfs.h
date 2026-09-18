@@ -100,3 +100,4 @@ long vfs_tree(char *out, int max);                       /* recursive listing */
 void vfs_df(uint64_t *freeb, uint64_t *totalb);          /* free + total bytes */
 long vfs_find(const char *want, char *out, int max);     /* recursive name search */
 long vfs_rename(const char *path, const char *newname);  /* rename in place (8.3 name field only) */
+void vfs_drop_caches_for(const char *abs);   /* drop the block cache for the volume holding this path (M2223) */

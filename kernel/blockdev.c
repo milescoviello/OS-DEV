@@ -652,6 +652,27 @@ static struct bd_mount g_mount[8];
 static int g_nmount, g_mount_scanned_upto = -1;
 static volatile int g_mount_scan_state;   /* 0 = never scanned, 1 = a core is scanning, 2 = done (M2155) */
 
+/* DROP EVERYTHING CACHED FOR THE VOLUME BEHIND A MOUNT (M2223).
+ *
+ * The blunt version of blockdev_drop_cache, for the one caller that cannot
+ * name the sectors it distrusts: a page fault whose file read came back wrong.
+ * It knows the PATH and therefore the mount, and nothing more -- the block
+ * numbers it would need are the ones the filesystem got wrong.
+ *
+ * Dropping a whole device's cache is always SAFE (the cache is write-through;
+ * every entry can be re-read) and costs a re-read of whatever was live. That
+ * is the right price for turning a corrupted read into a slow one instead of
+ * into a dead process. */
+void blockdev_drop_mount_caches(int midx) {
+    if (midx < 0 || midx >= g_nmount) return;
+    if (g_mount[midx].is_loop) return;             /* a RAM image: nothing below it is cached */
+    int d = g_mount[midx].dev;
+    if (d < 0 || d >= g_ndev) return;
+    if (is_ata_backed(d)) bcache_inval_owner(BCACHE_OWNER_ATA((int)(intptr_t)g_dev[d].ctx));
+    else                  bcache_inval_owner(BCACHE_OWNER_BLK(d));
+}
+
+
 /* A blk_read_fn for a loop mount: serve 512-byte sectors from its in-RAM image.
  * ctx is the mount index (so we can reach g_mount[idx].loopbuf). */
 static int loop_blk_read(void *ctx, uint64_t lba, uint32_t count, void *buf) {
