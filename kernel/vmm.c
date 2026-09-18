@@ -855,7 +855,33 @@ int vmm_protect(uint64_t virt, uint64_t flags) {
     uint64_t *pt = phys_to_table(pd[PD_IDX(virt)] & ADDR_MASK);
     uint64_t e = pt[PT_IDX(virt)];
     if (!(e & PTE_PRESENT)) { vmm_lock_give(f); return -1; }
-    pt[PT_IDX(virt)] = (e & ADDR_MASK) | PTE_PRESENT | flags;   /* keep the frame, replace the flags */
+    /* KEEP THE FRAME, AND KEEP THE BITS THAT ARE NOT PERMISSIONS (M2178).
+     *
+     * This replaced the flags wholesale, which throws away two bits that do not
+     * belong to the caller:
+     *
+     * PTE_COW. A copy-on-write page is present and write-protected ON PURPOSE,
+     * so that the next write traps and privatises it. Dropping COW while
+     * granting PTE_WRITABLE hands the writer a frame that is still SHARED with
+     * whoever it was forked from -- so two processes write the same physical
+     * page and neither is told. Firefox forks its content processes, and a JIT
+     * mprotecting a region it has just forked over is the ordinary case, not an
+     * exotic one. So carry COW across, and when it is set do NOT set WRITABLE:
+     * the permission is recorded on the VMA (app_mprotect does that), and the
+     * PTE must keep trapping until the copy is made. The COW handler then
+     * breaks it and the write lands in this process's own page.
+     *
+     * PTE_DIRTY. app_msync decides what to write back to a MAP_SHARED file by
+     * looking for dirty PTEs. An mprotect that clears DIRTY makes msync skip a
+     * page the program HAS written, and the write is lost at unmap with nothing
+     * reported. Carry it, and ACCESSED with it.
+     *
+     * Same class as the rest of this arc: a mechanism answering plausibly for
+     * the part it knows about while discarding state it did not know it held. */
+    uint64_t keep = e & (PTE_COW | PTE_DIRTY | PTE_ACCESSED);
+    uint64_t nf = flags;
+    if (keep & PTE_COW) nf &= ~PTE_WRITABLE;
+    pt[PT_IDX(virt)] = (e & ADDR_MASK) | PTE_PRESENT | nf | keep;
     invlpg(virt);
     vmm_lock_give(f);
     return 0;
