@@ -3702,6 +3702,13 @@ static void lx_dispatch_body(struct registers *r) {
              * The cost of always applying it is one pass over the VMA table on
              * a path that has just done a file mapping. */
             app_mprotect(fbase, (uint64_t)len, (int)prot);
+            /* Record that this protection came from an mmap, so a VMA that was
+             * CREATED read-only can be told from one an mprotect made read-only
+             * later -- the difference between "ld.so has not relocated yet" and
+             * "RELRO is in force", which is the whole question for a write into
+             * libxul's .data.rel.ro. (M2165) */
+            { extern void app_protnote_mmap(uint64_t start, uint64_t len, int prot);
+              app_protnote_mmap(fbase, (uint64_t)len, (int)prot); }
             r->rax = fbase;
             break;
         }

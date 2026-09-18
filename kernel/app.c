@@ -3304,6 +3304,8 @@ void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur
  * snapshotted the register FRAME for exactly this reason and stopped one line
  * short of CR2) and the same class as everything else in this hunt: an
  * instrument answering truthfully about the wrong thing. */
+static void protnote_report(uint64_t start);          /* M2165; defined below */
+
 void app_describe_fault_addr(uint64_t cr2) {
     struct app *a = cur();
     uint64_t page = cr2 & ~(uint64_t)(PAGE_SIZE - 1);
@@ -3329,6 +3331,12 @@ void app_describe_fault_addr(uint64_t cr2) {
                 a->vma[i].file_backed ? " file" : "", a->vma[i].shared ? " shared" : "",
                 a->vma[i].file_backed ? vma_path(a, i) : "anon",
                 a->vma[i].foff, a->vma[i].fvalid);
+        /* WHOSE PROTECTION REFUSED THE ACCESS (M2165). The provenance line was
+         * printed from app_describe_addr, which describes the mapping the RIP is
+         * in -- so for every one of these faults it reported on libxul's
+         * executable segment while the access was refused by a completely
+         * different VMA. Print it where the refusing mapping is identified. */
+        protnote_report(a->vma[i].start);
         found = 1; break;
     }
     vma_unlock(a, fl);
@@ -3397,6 +3405,11 @@ static void protnote(uint64_t start, uint64_t len, unsigned char prot, unsigned 
     struct protnote *p = &g_protn[(start >> 12) & (PROTN_SLOTS - 1)];
     p->start = start; p->len = len; p->prot = prot; p->who = who;
     p->arg_addr = arg_addr; p->arg_len = arg_len; p->tid = task_current_id(); p->used = 1;
+}
+
+/* Called by the Linux mmap translation right after a file mapping lands. */
+void app_protnote_mmap(uint64_t start, uint64_t len, int prot) {
+    protnote(start, len, (unsigned char)(prot & 0x7), 1, start, len);
 }
 
 static void protnote_report(uint64_t start) {
@@ -3587,7 +3600,6 @@ void app_describe_addr(uint64_t addr) {
          * the next instrument to lie. vmm_pte_raw first, never a dereference:
          * a demand-zero fill here would manufacture its own answer, which is
          * exactly what M2152 had to undo. */
-        if (!(prot & 2)) protnote_report(vstart);
         if (fb && !(prot & 2)) {
             uint64_t p0 = addr & ~(uint64_t)0xFFF, p1 = (addr + 15) & ~(uint64_t)0xFFF;
             if ((vmm_pte_raw(p0) & PTE_PRESENT) && (vmm_pte_raw(p1) & PTE_PRESENT)) {
