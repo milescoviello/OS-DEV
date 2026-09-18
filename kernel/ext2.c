@@ -63,6 +63,11 @@ typedef struct {
  * supposed to be 0. So record it and make it visible: `start + blk * spb` has
  * two operands and only one of them had ever been printed. */
 uint64_t g_e2_vstart;
+/* Group descriptors that could not be believed (M2174). An inode table pointer
+ * off the end of the filesystem means the descriptor block we read was not a
+ * descriptor block, and every inode in that group would come back as data. */
+unsigned long g_e2_bad_itable, g_e2_bad_groups;
+unsigned int  g_e2_bad_itable_val;
 
 static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
@@ -120,14 +125,37 @@ static int ext2_open(blk_read_fn read, void *ctx, uint64_t start, ext2_t *v) {
 }
 
 /* read inode `ino` (1-based) into out (>= inode_size bytes); 0/-1 */
+/* VALIDATE THE INODE TABLE POINTER, ONE LEVEL UP (M2174).
+ *
+ * M2158 rejected a block pointer past the end of the filesystem and that was
+ * right, but it was applied one level too low. The instrument then reported
+ * **8999698 rejected pointers at indirect level 0** in a single run, with the
+ * last value 1768685824 -- which is ASCII bytes, not a block number. Level 0 is
+ * a DIRECT pointer read straight out of an inode, so the inode itself was file
+ * data: `read_inode` had taken `inode_table` out of a group descriptor and
+ * never checked it, so one bad descriptor read makes every inode in that group
+ * come back as whatever data block the arithmetic lands on. Nine million wrong
+ * pointers from one wrong read, and each of them merely "rejected" downstream
+ * where the cause is invisible.
+ *
+ * So check it where the value is produced. An inode table that cannot be on
+ * the filesystem is corruption, not a hole -- `ioerr`, and the read fails
+ * honestly instead of walking data. */
 static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
     if (ino == 0) return -1;
     uint32_t group = (ino - 1) / v->inodes_per_group;
     uint32_t index = (ino - 1) % v->inodes_per_group;
     uint8_t gd[4096];
     uint32_t gd_per_block = v->block_size / 32;
+    if (v->groups && group >= v->groups) { v->ioerr = 1; g_e2_bad_groups++; return -1; }
     if (rdblk(v, v->gdt_block + group / gd_per_block, gd) < 0) return -1;
     uint32_t inode_table = e_rd32(gd + (group % gd_per_block) * 32 + 8);
+    if (!inode_table || (v->blocks_count && inode_table >= v->blocks_count)) {
+        v->ioerr = 1;
+        g_e2_bad_itable++;
+        g_e2_bad_itable_val = inode_table;
+        return -1;
+    }
     uint64_t byte_off = (uint64_t)index * v->inode_size;
     uint8_t b[4096];
     if (rdblk(v, inode_table + (uint32_t)(byte_off / v->block_size), b) < 0) return -1;

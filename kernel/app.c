@@ -3476,19 +3476,22 @@ static int fault_file_compare(const char *path, uint64_t fo, uint64_t addr, cons
         extern unsigned long g_e2_bad_ptrs, g_ata_drained_sectors;
         extern unsigned int  g_e2_bad_ptr_val, g_e2_blocks_count;
         extern int           g_e2_bad_ptr_level;
-        extern unsigned long g_e2_vstart;
+        extern unsigned long g_e2_vstart, g_e2_bad_itable, g_e2_bad_groups;
+        extern unsigned int  g_e2_bad_itable_val;
         int bdev = -1; uint64_t bdlba = 0, bdcap = 0; uint32_t bdcnt = 0;
         blockdev_fail_operands(&bdev, &bdlba, &bdcnt, &bdcap);
         kprintf("[fault] %s check at %lx: THE READ FAILED -- %s at offset %lx returned %ld.\n"
                 "[fault]   ext2: %s | block: %s (dev %d lba %lu count %u cap %lu) | ata: %s\n"
                 "[fault]   bad block pointers rejected %lu (last %lu at indirect level %d; the "
                 "filesystem has %lu blocks; the volume's start LBA was %lu), stale sectors "
-                "drained %lu\n",
+                "drained %lu\n"
+                "[fault]   inode tables rejected %lu (last %lu), out-of-range groups %lu\n",
                 what, addr, path, (unsigned long)fo, got,
                 ext2_pread_why(), blockdev_fail_why(), bdev, (unsigned long)bdlba, bdcnt,
                 (unsigned long)bdcap, ata_fail_stage_name(),
                 g_e2_bad_ptrs, (unsigned long)g_e2_bad_ptr_val, g_e2_bad_ptr_level,
-                (unsigned long)g_e2_blocks_count, g_e2_vstart, g_ata_drained_sectors);
+                (unsigned long)g_e2_blocks_count, g_e2_vstart, g_ata_drained_sectors,
+                g_e2_bad_itable, (unsigned long)g_e2_bad_itable_val, g_e2_bad_groups);
         return 0;
     }
     const unsigned char *mem = (const unsigned char *)addr;
