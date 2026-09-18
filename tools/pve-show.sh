@@ -10,9 +10,17 @@
 #   tools/pve-show.sh            # Firefox against our compositor
 #   APPEND=... tools/pve-show.sh # anything else
 #
+# The default is `ffshow`, not `ffwl` (M2201). `ffwl` is the MEASUREMENT path:
+# it keeps the framebuffer for its own diagnostics -- ninety one-second
+# heartbeats and then up to forty fifteen-second page samples -- so the window
+# manager does not run for the first ten minutes and the screen shows the log
+# the whole time. On a boot that had already rendered the page. `ffshow` spawns
+# Firefox the same way and hands the screen over at once.
+#
 # Then open the Proxmox console:  https://192.168.1.5:8006  ->  122 (osdev)
 #                                 ->  Console
-# Firefox's first paint lands around 9 s and the page around 24 s.
+# Firefox's first paint lands around 9 s and the page around 29 s; the browser
+# window appears in the desktop the moment it commits its first frame.
 #
 # Leave it running as long as you like; `tools/pve-run.sh` will stop it when the
 # next measurement needs the VM.
@@ -21,9 +29,9 @@ cd "$(dirname "$0")/.."
 PVE_HOST=${PVE_HOST:-192.168.1.5}
 PVE_DIR=${PVE_DIR:-/root/osdev}
 VMID=${VMID:-122}
-CORES=${CORES:-1}
+CORES=${CORES:-8}
 MEM=${MEM:-8192}
-APPEND=${APPEND:-"ffwl nonetdemo"}
+APPEND=${APPEND:-"ffshow nonetdemo"}
 SSH="ssh -o BatchMode=yes root@$PVE_HOST"
 
 if [ "${NOBUILD:-0}" != 1 ]; then
