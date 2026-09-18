@@ -668,9 +668,16 @@ void kmain_budget(const char *when) {
              * adding the two together would inflate a figure this budget
              * reports as a share of the wall clock, which is exactly the
              * instrument mistake this campaign keeps making. */
-            kprintf("[budget]   polling  %7lu thread-ms slept across %lu naps, plus %lu yields, "
-                    "in poll/epoll (concurrent: NOT a share of the wall clock)\n",
-                    g_poll_nap_ms, g_poll_naps, g_poll_yields);
+            /* ASKED FOR vs ACTUALLY SLEPT (M2208). The first number is what
+             * the nap policy requested; the second is what the 100 Hz timer
+             * delivered, measured in TSC cycles. They differ by a factor of
+             * two or more, because task_sleep_ms(1) parks until the NEXT TICK
+             * -- 0-10 ms -- and the old line reported its own input. */
+            extern unsigned long g_poll_nap_real_ms;
+            kprintf("[budget]   polling  %7lu thread-ms ASKED FOR across %lu naps, %lu ACTUALLY "
+                    "SLEPT (the tick is 100 Hz, so a 1 ms nap lasts until the next one), plus "
+                    "%lu yields, in poll/epoll (concurrent: NOT a share of the wall clock)\n",
+                    g_poll_nap_ms, g_poll_naps, g_poll_nap_real_ms, g_poll_yields);
         }
         {   extern unsigned long g_lx_dispatch_cycles;
             unsigned long n = lx_syscalls_made();

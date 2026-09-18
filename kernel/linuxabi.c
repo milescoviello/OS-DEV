@@ -1383,11 +1383,33 @@ volatile unsigned char g_lx_pollnap[LX_NAPPERS];
  * every pty write, and when nobody is napping every one of those iterations is
  * wasted. One counter turns the common case into a load and a branch. */
 volatile int g_lx_nappers;
+/* AND HOW LONG THE NAP ACTUALLY LASTED (M2208).
+ *
+ * g_poll_nap_ms added the REQUESTED milliseconds -- 1 or 5 -- and the budget
+ * reported that as the cost of polling. It is not the cost. The timer tick is
+ * 100 Hz, `task_sleep_ms(1)` records a deadline of now+1ms, and the only thing
+ * that wakes a sleeper is the timer IRQ's scan -- so a "1 ms" nap lasts until
+ * the NEXT TICK, which is 0-10 ms and averages 5. The budget's "71802
+ * thread-ms across 27958 naps" (2.57 ms each) was therefore an underestimate of
+ * something closer to 140 seconds, and the instrument could not have told me:
+ * it was reporting its own input.
+ *
+ * Measured in TSC cycles, because timer_ms() has exactly the 10 ms granularity
+ * that is being measured -- asking a 10 ms clock how long a 0-10 ms sleep took
+ * is the same mistake one layer down. */
+unsigned long g_poll_nap_real_ms;
+static inline uint64_t nap_tsc(void) {
+    unsigned lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 void lx_poll_nap_sleep(int ms) {
     int slot = (int)(task_current_id() & (LX_NAPPERS - 1));
     g_lx_pollnap[slot] = 1;
     __atomic_add_fetch(&g_lx_nappers, 1, __ATOMIC_RELAXED);
+    uint64_t t0 = nap_tsc();
     task_sleep_ms((uint64_t)ms);
+    uint64_t cpm = timer_cycles_per_ms();
+    if (cpm) g_poll_nap_real_ms += (unsigned long)((nap_tsc() - t0) / cpm);
     __atomic_sub_fetch(&g_lx_nappers, 1, __ATOMIC_RELAXED);
     g_lx_pollnap[slot] = 0;
 }
