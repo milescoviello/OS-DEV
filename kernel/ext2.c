@@ -738,8 +738,32 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
 }
 
 int ext2_probe(blk_read_fn read, void *ctx, uint64_t start_lba) {
+    /* A PROBE IS A QUESTION, NOT A FAILURE (M2222).
+     *
+     * ext2_probe is how blockdev asks "is this volume ext2?", and it asks it of
+     * every volume on the machine -- including the FAT boot disk, whose
+     * superblock magic is of course not 0xEF53. M2220 made every ext2_open
+     * rejection count as distrust so the fault handler could stop zero-filling
+     * pages over a filesystem that disbelieved itself, and that turned each of
+     * those perfectly correct "no, not ext2" answers into evidence of
+     * corruption. The fault handler samples the counter as a DELTA across one
+     * read, so a probe racing a page fault would make it refuse a legitimate
+     * fill -- a false positive that looks exactly like the real bug it was
+     * added to catch.
+     *
+     * Snapshot and restore: whatever the probe learns, it leaves the counters
+     * where it found them. */
+    unsigned long d0 = g_e2_distrust, rf = g_e2_sb_readfail;
+    unsigned long bm = g_e2_sb_badmagic, bf = g_e2_sb_badfield;
+    unsigned long rt = g_e2_sb_retried, rk = g_e2_sb_retry_ok;
     ext2_t v;
-    return ext2_open(read, ctx, start_lba, &v);
+    int r = ext2_open(read, ctx, start_lba, &v);
+    if (r != 0) {
+        g_e2_distrust = d0; g_e2_sb_readfail = rf;
+        g_e2_sb_badmagic = bm; g_e2_sb_badfield = bf;
+        g_e2_sb_retried = rt; g_e2_sb_retry_ok = rk;
+    }
+    return r;
 }
 
 /* Positioned read: up to `max` bytes starting at byte `offset` (M1196). Walks
