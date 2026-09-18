@@ -43,6 +43,11 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$NODE" true 2>/dev/null \
 LOG=$(mktemp /tmp/osdev_ffcons.XXXXXX.log)
 trap 'rm -f "$LOG"' EXIT
 
+# FREEZE THE BUILD FOR THE WHOLE SERIES (M2191). Rebuilding mid-series split a
+# four-boot run across two kernels once already; the later boots lacked an
+# instrument the earlier ones had and the absence read as a finding. Record the
+# digest of the binary the first boot used and refuse to mix.
+SERIES_MD5=""
 ok=0; inconclusive=0; times=""
 i=1
 while [ "$i" -le "$RUNS" ]; do
@@ -50,6 +55,14 @@ while [ "$i" -le "$RUNS" ]; do
       APPEND="ffwl nonetdemo lxout noprobes" CORES=1 CAP="$CAP" \
       tools/pve-run.sh >/dev/null 2>&1 || true
     scp -q "root@$NODE:$PVE_DIR/boot.log" "$LOG" 2>/dev/null || true
+    m=$(md5sum build/kernel32.elf 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$SERIES_MD5" ]; then SERIES_MD5="$m"
+    elif [ "$m" != "$SERIES_MD5" ]; then
+        echo "FAIL: the kernel changed mid-series ($SERIES_MD5 -> $m)."
+        echo "      Runs 1..$((i-1)) and $i measured different binaries, so this is not a"
+        echo "      series. Rebuild, then start again."
+        exit 1
+    fi
     t=$(grep -ao 'PAGE ON SCREEN at [0-9]* ms' "$LOG" 2>/dev/null | head -1 | grep -o '[0-9]*' || true)
     ns=$(grep -ac 'page\] --- sample' "$LOG" 2>/dev/null || echo 0)
     if [ -n "$t" ]; then

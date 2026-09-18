@@ -77,6 +77,21 @@ if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
 fi
 echo "    ok: $LOCAL_MD5"
 
+# RECORD WHICH BINARY THIS RUN USED (M2191).
+#
+# A measurement series is only a series if every run used the SAME build, and
+# nothing enforced that. Rebuilding while a series was in flight -- which is the
+# obvious thing to do when the runs take ten minutes each and there is other
+# work to get on with -- silently split one four-boot series across two kernels.
+# The later boots then lacked an instrument the earlier ones had, their logs
+# showed no output from it, and I read that absence as a finding about Firefox.
+#
+# The digest guard above proves the NODE has what was just built. This proves
+# what "just built" WAS, in the log itself, so a series can be checked for
+# uniformity after the fact instead of trusted.
+$SSH "printf '[harness] kernel md5 %s appended %s\n' '$LOCAL_MD5' '$APPEND' >> $PVE_DIR/harness.log" >/dev/null 2>&1 || true
+export OSDEV_RUN_MD5="$LOCAL_MD5"
+
 # THE LINUX ROOT'S TRANSPORT (M2144).
 #
 # fat.img stays on IDE: it is the boot volume, it is tiny, and blockdev's mount
