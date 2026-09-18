@@ -2349,6 +2349,22 @@ int wl_page_probe(uint32_t want) {
      * area is what a broken one of THOSE looks like. */
     {   extern unsigned long app_memfd_share_audit(int verbose);
         app_memfd_share_audit(1); }
+    /* AND WHETHER THE FILESYSTEM BELIEVES ITSELF (M2221). These counters only
+     * ever appeared inside a fault report, so a boot that did not fault showed
+     * none of them -- and the ones that matter most describe reads that
+     * SUCCEEDED while returning the wrong bytes. Printed every sample, where a
+     * zero is as informative as a number. */
+    {   extern unsigned long g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield;
+        extern unsigned long g_e2_sb_retried, g_e2_sb_retry_ok, g_e2_holes;
+        extern unsigned long g_e2_bad_itable, g_e2_bad_ptrs, g_e2_distrust;
+        extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
+        kprintf("[fs] superblock: %lu readfail %lu BADMAGIC %lu badfield, %lu retried %lu "
+                "RETRY-OK | %lu itable %lu badptr %lu hole(s) | distrust %lu | refused: "
+                "%lu exec %lu exec-hole %lu device\n",
+                g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
+                g_e2_sb_retried, g_e2_sb_retry_ok,
+                g_e2_bad_itable, g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
+                g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust); }
     /* State the verdict, and state it against a threshold, so a page that
      * painted a thin strip of itself cannot read as a page that loaded. */
     int pct = sampled ? hit * 100 / sampled : 0;

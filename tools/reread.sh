@@ -24,6 +24,6 @@ while [ "$i" -le "$N" ]; do
       "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \
       "$(grep -ac 'DEVICE failure, not an\|mapping is EXECUTABLE' "$L")" \
       "$(grep -ao 'inode tables rejected [0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
-      "$(grep -a 'THE RE-READ' "$L" | tail -1 | sed -E 's/.*RE-READ \(M2219\): //')" | tee -a "$OUT"
+      "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //')" | tee -a "$OUT"
     i=$((i+1))
 done
