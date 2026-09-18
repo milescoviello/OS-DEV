@@ -3305,6 +3305,7 @@ void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur
  * short of CR2) and the same class as everything else in this hunt: an
  * instrument answering truthfully about the wrong thing. */
 static void protnote_report(uint64_t start);          /* M2165; defined below */
+static void relro_watch_report(uint64_t addr);       /* M2177; defined below */
 static uint64_t flt_io_begin(void);
 static void flt_io_end(uint64_t fl);
 static int  fault_file_compare(const char *path, uint64_t fo, uint64_t addr, const char *what);
@@ -3341,6 +3342,7 @@ void app_describe_fault_addr(uint64_t cr2) {
          * executable segment while the access was refused by a completely
          * different VMA. Print it where the refusing mapping is identified. */
         protnote_report(a->vma[i].start);
+        relro_watch_report(cr2);
         /* THE QUESTION THAT DECIDES THIS (M2166). A read-only file mapping the
          * program is WRITING to: has anything modified it since it was mapped?
          * If it still matches the file, ld.so's relocations into it were lost,
@@ -3510,6 +3512,89 @@ static int fault_file_compare(const char *path, uint64_t fo, uint64_t addr, cons
             same ? "IDENTICAL to the file"
                  : "DIFFERS from the file (it has been written since it was mapped)");
     return same ? 1 : 2;
+}
+
+/* WATCH A RANGE THAT WAS JUST MADE READ-ONLY (M2177).
+ *
+ * The question the fault-path file compare could not answer. It needs to read
+ * the library from disk at the moment of the fault, and that read fails under
+ * exactly the conditions the fault happens in -- so the one thing worth knowing
+ * about a write fault into libxul's RELRO segment stayed unknown:
+ *
+ *   did the garbage arrive BEFORE ld.so made the range read-only -- a
+ *   relocation computed wrong, or a slot never relocated at all -- or did this
+ *   kernel LOSE or REPLACE the page afterwards, discarding writes that had
+ *   already landed?
+ *
+ * Those have opposite fixes. And it is answerable with no I/O at all: hash the
+ * pages when the range becomes read-only, which happens while the process is
+ * healthy, and re-hash at the fault. A read-only page whose contents CHANGED
+ * cannot have been written by the program -- so it was us.
+ *
+ * Gated on file-backed, read-only and at least 64 KiB, which in practice is
+ * RELRO and nothing else. Only PRESENT pages are hashed; a page filled later
+ * is not covered, and the report says so rather than implying it is. One watch
+ * at a time: a second range replaces the first, because the interesting one is
+ * always the most recent and a table of them is a table to get wrong. */
+#define RELRO_WATCH_PAGES 4096
+static struct {
+    uint64_t start, len;
+    unsigned h[RELRO_WATCH_PAGES];
+    unsigned char present[RELRO_WATCH_PAGES];
+    int npages, tid;
+} g_rw;
+
+static unsigned relro_hash_page(const unsigned char *p) {
+    unsigned h = 2166136261u;
+    /* Every 8th byte: a GOT slot is 8 bytes and a changed pointer moves at
+     * least one of its bytes, so this cannot miss one, and it is 8x cheaper
+     * over 5.8 MB than hashing every byte. */
+    for (int i = 0; i < PAGE_SIZE; i += 8) { h ^= p[i]; h *= 16777619u; }
+    return h ? h : 1u;
+}
+
+static void relro_watch(uint64_t start, uint64_t len) {
+    if (len < (64u << 10)) return;
+    int n = (int)(len / PAGE_SIZE);
+    if (n > RELRO_WATCH_PAGES) n = RELRO_WATCH_PAGES;
+    g_rw.start = start; g_rw.len = (uint64_t)n * PAGE_SIZE;
+    g_rw.npages = n; g_rw.tid = task_current_id();
+    for (int i = 0; i < n; i++) {
+        uint64_t va = start + (uint64_t)i * PAGE_SIZE;
+        if (vmm_pte_raw(va) & PTE_PRESENT) {
+            g_rw.present[i] = 1;
+            g_rw.h[i] = relro_hash_page((const unsigned char *)va);
+        } else {
+            g_rw.present[i] = 0;
+            g_rw.h[i] = 0;
+        }
+    }
+}
+
+/* Printed at a fault inside the watched range. */
+static void relro_watch_report(uint64_t addr) {
+    if (!g_rw.npages || addr < g_rw.start || addr >= g_rw.start + g_rw.len) return;
+    int i = (int)((addr - g_rw.start) / PAGE_SIZE);
+    uint64_t va = g_rw.start + (uint64_t)i * PAGE_SIZE;
+    if (!g_rw.present[i]) {
+        kprintf("[fault]   this page was NOT RESIDENT when the range was made read-only, so its "
+                "contents are not being watched -- it was filled from the file afterwards\n");
+        return;
+    }
+    if (!(vmm_pte_raw(va) & PTE_PRESENT)) {
+        kprintf("[fault]   this page WAS resident when the range was made read-only and is NOT "
+                "resident now -- it has been unmapped from under a read-only mapping\n");
+        return;
+    }
+    unsigned now = relro_hash_page((const unsigned char *)va);
+    if (now == g_rw.h[i])
+        kprintf("[fault]   this page is UNCHANGED since the range was made read-only (tid %d). "
+                "Whatever is wrong in it was already wrong then, so it is a relocation that was "
+                "computed wrong or never applied -- not a lost write.\n", g_rw.tid);
+    else
+        kprintf("[fault]   ** THIS PAGE HAS CHANGED since the range was made READ-ONLY by tid %d "
+                "(hash %x, now %x). Nothing in the program can have written it. The kernel lost "
+                "or replaced the page. **\n", g_rw.tid, g_rw.h[i], now);
 }
 
 /* Called by the Linux mmap translation right after a file mapping lands. */
@@ -6124,6 +6209,9 @@ static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
                 if (s0 >= a0 && e0 <= end) {
                     a->vma[i].prot = np;
                     protnote(s0, a->vma[i].len, np, 2, addr, len);
+                    /* A file-backed range going read-only is RELRO (M2177). */
+                    if (a->vma[i].file_backed && !(np & VMA_PROT_WRITE))
+                        relro_watch(s0, a->vma[i].len);
                 }
             }
         } else if (a) {
