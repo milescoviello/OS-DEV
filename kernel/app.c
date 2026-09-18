@@ -5996,6 +5996,12 @@ static int app_madvise_nl(uint64_t addr, uint64_t len, int advice) {
  *
  * The lock must be dropped before the IPI: a core spinning for it with
  * interrupts off can never acknowledge, which is the deadlock M1993 fixed. */
+/* Unaligned MADV_DONTNEED calls refused (M2194) and complaint lines spent
+ * (M2195). Separate, because the log budget must never cap the count. */
+static unsigned long g_madv_unaligned;
+static int g_madv_unaligned_lines;
+unsigned long app_madv_unaligned(void) { return g_madv_unaligned; }
+
 int app_madvise(uint64_t addr, uint64_t len, int advice) {
     struct app *a_ = cur();
     if (!a_ || !len) return -1;
@@ -6032,14 +6038,31 @@ int app_madvise(uint64_t addr, uint64_t len, int advice) {
      * error -- if something IS passing unaligned addresses here, the complaint
      * below names it instead of it costing a page of somebody's data. */
     if (addr & (uint64_t)(PAGE_SIZE - 1)) {
-        static int told;
-        if (!told) {
-            told = 1;
-            kprintf("[madvise] REFUSING an unaligned MADV_DONTNEED at %lx len %lu: madvise(2) "
-                    "requires a page-aligned address and returns EINVAL. Rounding down would "
-                    "discard the page holding the bytes BEFORE it, which the caller never "
-                    "asked to drop -- a success that destroys live data.\n",
-                    (unsigned long)addr, (unsigned long)len);
+        /* COUNT these, and NAME THE CALLER on every line (M2195).
+         *
+         * The first version of this complaint was a global one-shot `static
+         * int told`. The first caller to reach it was tools/lx/lxmadv -- the
+         * probe written to prove the refusal works, which passes an unaligned
+         * address on purpose. The probe fired the one-shot and MUTED the
+         * instrument for the whole rest of the boot, so the reading said
+         * "something passed an unaligned address" when the question asked was
+         * "does FIREFOX pass one". It answered the adjacent question, which is
+         * the recurring defect of this entire campaign, and a global one-shot
+         * guarantees it on any path a test exercises deliberately.
+         *
+         * So: a count that cannot saturate, and a pid and title on each line
+         * so a probe's call can never be mistaken for the program under test.
+         * The line budget bounds the log, not the measurement. */
+        g_madv_unaligned++;
+        if (g_madv_unaligned_lines < 8) {
+            g_madv_unaligned_lines++;
+            kprintf("[madvise] REFUSING unaligned MADV_DONTNEED #%lu at %lx len %lu "
+                    "from pid %d '%s': madvise(2) requires a page-aligned address and "
+                    "returns EINVAL. Rounding down would discard the page holding the "
+                    "bytes BEFORE it, which the caller never asked to drop -- a success "
+                    "that destroys live data.\n",
+                    (unsigned long)g_madv_unaligned, (unsigned long)addr,
+                    (unsigned long)len, a_->pid, a_->title ? a_->title : "?");
         }
         return -1;
     }

@@ -463,9 +463,21 @@ LXWAIT: reaped 40/40 children
         echo "  FAIL: dup3 is wrong:"; grep -a "LXBOX" "$SLOG3" | grep -a FAIL | head -4; f3=1
     fi
     if grep -aq "LXMADV: OK" "$SLOG3"; then
-        echo "  ok: MADV_DONTNEED zeroes a COW-shared range and leaves the forked child's copy intact (M2106, 13 checks)"
+        echo "  ok: MADV_DONTNEED zeroes a COW-shared range, leaves the forked child's copy intact, and an UNALIGNED one is refused without destroying the bytes before it (M2106/M2194, 16 checks)"
     else
-        echo "  FAIL: MADV_DONTNEED is not honouring its zero-fill contract:"; grep -a "LXMADV" "$SLOG3" | grep -a FAIL | head -6; f3=1
+        echo "  FAIL: MADV_DONTNEED is not honouring its contract:"; grep -a "LXMADV" "$SLOG3" | grep -a FAIL | head -6; f3=1
+    fi
+    # M2195 -- THE KERNEL'S COMPLAINT WAS A GLOBAL ONE-SHOT, AND THIS PROBE
+    # SPENT IT. lxmadv makes two unaligned MADV_DONTNEED calls on purpose, so
+    # the kernel must produce two lines. With a `static int told` it produces
+    # one, and every later process in the boot -- Firefox included -- makes
+    # that call invisibly. This gate is the difference between an instrument
+    # that answers "does Firefox do this" and one that answers "did anything".
+    MADVN=$(grep -ac "\[madvise\] REFUSING unaligned" "$SLOG3" || true)
+    if [ "${MADVN:-0}" -ge 2 ]; then
+        echo "  ok: the kernel complains about EVERY unaligned MADV_DONTNEED, not just the first ($MADVN lines for 2 calls) (M2195)"
+    else
+        echo "  FAIL: only $MADVN complaint(s) for 2 unaligned calls -- the instrument is a one-shot and mutes itself:"; grep -a "\[madvise\]" "$SLOG3" | head -3; f3=1
     fi
     # M2088 -- getsockopt ANSWERED A CONFIDENT ZERO TO EVERY OPTION EVER ASKED.
     # It wrote a 4-byte zero into the caller's buffer and returned success

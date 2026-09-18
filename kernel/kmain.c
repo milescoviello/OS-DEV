@@ -1900,6 +1900,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * child processes were never the reason. */
                     app_set_next_env("MOZ_FORCE_DISABLE_E10S=1");
                     app_set_next_env("MOZ_DISABLE_CONTENT_SANDBOX=1");
+                    /* Snapshot the unaligned-madvise count HERE so the
+                     * heartbeat can report Firefox's OWN calls as a delta
+                     * (M2195). The probe battery above deliberately makes one,
+                     * so the absolute count can never answer "does Firefox do
+                     * this" -- it starts at 1 in a healthy boot. A difference
+                     * of two samples can. */
+                    unsigned long madv0 = app_madv_unaligned();
                     kprintf("[ff] spawning FIREFOX against our compositor "
                             "(content in the PARENT process: MOZ_FORCE_DISABLE_E10S)...\n");
                     int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
@@ -2206,8 +2213,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                              * other one every time. */
                             int bp2 = app_biggest_pid();
                             kprintf("[ff] t=%ds launcher pid %d state=%d, browser pid %d, "
-                                    "%u Wayland client(s), syscalls +%lu\n",
-                                    (t + 1) * 15, fpid, st, bp2, wl_clients_connected(), now - prev);
+                                    "%u Wayland client(s), syscalls +%lu, %lu unaligned madvise\n",
+                                    (t + 1) * 15, fpid, st, bp2, wl_clients_connected(), now - prev,
+                                    app_madv_unaligned() - madv0);
                             prev = now;
                             {   int cpid = 0, csig = lx_fatal_signal(&cpid);
                                 if (csig) { kprintf("[ff] *** pid %d CRASHED with signal %d ***\n",

@@ -115,8 +115,6 @@ int main(void) {
     CK(all_bytes_are(a + ps, len - ps, 0), "...and the pages past it are still zero");
 
     munmap(a, len);
-    if (!fails) printf("LXMADV: OK\n");
-    else        printf("LXMADV: %d failure(s)\n", fails);
     /* AN UNALIGNED MADV_DONTNEED MUST NOT DESTROY THE PAGE BEFORE IT (M2194).
      *
      * `app_madvise` rounded the start address DOWN to a page boundary. On real
@@ -142,6 +140,16 @@ int main(void) {
              * would take the whole second page with it. */
             int urc = madvise(r + pg + 64, (size_t)pg, MADV_DONTNEED);
             CK(urc != 0, "an unaligned MADV_DONTNEED is refused (Linux returns EINVAL)");
+            /* A SECOND unaligned call, at a different offset, so the KERNEL's
+             * complaint can be checked for being a one-shot (M2195). The first
+             * version of that complaint was `static int told` -- global, and
+             * spent by this very probe, which then muted the instrument for
+             * every later process in the boot. The run that was supposed to
+             * answer "does Firefox pass an unaligned address" answered "did
+             * anything", and the only thing it had measured was the test.
+             * run-linuxabi-tests.sh requires TWO of those lines. */
+            int urc2 = madvise(r + pg + 128, (size_t)pg, MADV_DONTNEED);
+            CK(urc2 != 0, "a SECOND unaligned MADV_DONTNEED is refused too");
             int lost = 0;
             for (long i = 0; i < 64; i++) if ((unsigned char)r[pg + i] != 0xA5) lost++;
             CK(lost == 0, "the bytes BEFORE an unaligned MADV_DONTNEED survive it");
@@ -152,6 +160,15 @@ int main(void) {
         }
     }
 
+    /* THE SUMMARY MUST COME AFTER THE LAST CHECK (M2195).
+     *
+     * It used to print above the M2194 block, and run-linuxabi-tests.sh gates
+     * on "LXMADV: OK" -- so both of M2194's assertions could FAIL with the
+     * line still reading OK and the suite still going green. The revert proof
+     * for M2194 was read off the log by eye; the gate never covered it. A
+     * check the gate cannot see is not a test. */
+    if (!fails) printf("LXMADV: OK\n");
+    else        printf("LXMADV: %d failure(s)\n", fails);
     printf("LXMADV: done\n");
     return fails ? 1 : 0;
 }
