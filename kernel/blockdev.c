@@ -221,6 +221,24 @@ static void reg(const char *name, int (*read)(void *, uint64_t, uint32_t, void *
     g_ndev++;
 }
 
+/* THE TABLE AS IT STANDS, WITHOUT RE-PROBING ANYTHING (M2231).
+ *
+ * M2229 stopped blockdev_init() zeroing g_ndev, which removed the window in
+ * which every concurrent read failed. It did NOT stop /proc/partitions calling
+ * it -- so every read of that file still re-probes ATA, AHCI, NVMe, virtio-blk
+ * and USB storage, touching five drivers' hardware while other cores are using
+ * them. The superblock failures went to zero and the inode-table rejections
+ * came back at 72-111 per boot with one run reaching 1467524 rejected block
+ * pointers, which is M2174's cascade: one bad group-descriptor read makes
+ * every inode in that group come back as data.
+ *
+ * A LISTING IS A READ. It has no business probing anything. This returns what
+ * is already registered, and probes only if nothing ever has been. */
+int blockdev_ready(void) {
+    if (g_ndev > 0) return g_ndev;
+    return blockdev_init();
+}
+
 int blockdev_init(void) {
     /* NO TEARDOWN. See reg() above: zeroing g_ndev here is what made every
      * concurrent read on another core fail while /proc/partitions was being
@@ -792,7 +810,11 @@ static void blockdev_mount_scan(void) {
      * M2144 made this scan incrementally, keyed on the block-device INDEX, so
      * that a device registering after the first mount lookup would still be
      * picked up. That assumed device indices are stable across calls, and they
-     * are not: a later blockdev_init() re-registers, and ata0 came back at a
+     * are not -- historically a later blockdev_init() re-registered and ata0 came
+     * back at a different index, which M2229 fixed by making registration
+     * additive; the note stays because the ORIGINAL reasoning for copying was
+     * sound and the copy is still the right shape. Historically: ata0 came
+     * back at a
      * different index. The result was the boot volume mounted TWICE under two
      * names --
      *
@@ -832,7 +854,7 @@ static void blockdev_mount_scan(void) {
             return;                           /* budget spent: behave as before */
         }
     }
-    blockdev_init();                          /* make sure devices are registered */
+    blockdev_ready();                         /* make sure devices are registered (M2231: without re-probing if they already are) */
     g_mount_scanned_upto = 1;
     for (int i = 0; i < g_ndev && g_nmount < 8; i++) {
         uint64_t starts[17];
@@ -1172,7 +1194,7 @@ int blockdev_losetup(uint8_t *data, uint64_t len) {
 /* --- the headless browsing demo -------------------------------------------- */
 
 void blockdev_enumerate(void) {
-    int ndev = blockdev_init();
+    int ndev = blockdev_ready();       /* a listing does not re-probe (M2231) */
     kprintf("[ ok ] block devices: %d present (browsable across all storage drivers).\n",
             ndev);
 
@@ -1257,7 +1279,9 @@ static int sdec(char *b, int p, int max, uint64_t v) {
 
 int blockdev_format(char *out, int max) {
     if (!out || max < 2) return 0;
-    int ndev = blockdev_init();
+    /* /proc/partitions lands here. It must not re-probe five storage drivers
+     * while other cores are reading from them (M2231). */
+    int ndev = blockdev_ready();
     int p = 0;
     p = sapp(out, p, max, "block devices: ");
     p = sdec(out, p, max, (uint64_t)ndev);
