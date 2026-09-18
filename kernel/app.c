@@ -3685,6 +3685,7 @@ static void relro_watch_report(uint64_t addr) {
  * Bounded reporting, and it does NOT fail the call: by the time this runs the
  * mapping exists and refusing would strand it. The point is to say so. */
 unsigned long g_mmap_postfail;
+unsigned long g_mmap_postraced;   /* short because another thread carved: correct, not a bug (M2198) */
 void app_mmap_postcheck(uint64_t base, uint64_t len, int prot, const char *how) {
     struct app *a = cur();
     if (!a || !base || !len) return;
@@ -3705,16 +3706,40 @@ void app_mmap_postcheck(uint64_t base, uint64_t len, int prot, const char *how) 
     }
     vma_unlock(a, fl);
     if (!bad) return;
+    /* IS THE SHORTFALL UNMAPPED, OR SOMEBODY ELSE'S? (M2198)
+     *
+     * This check runs after the syscall has released the VMA lock, so on eight
+     * cores another thread can legitimately MAP_FIXED over part of the range
+     * between the mapping being made and this looking at it -- and a carve is
+     * CORRECT behaviour, not a violation. Reporting that as "mmap lied" would
+     * be an instrument inventing a bug, which is the thing this session has
+     * spent its whole length learning not to do.
+     *
+     * So say which it is: if the bytes past the short VMA are covered by a
+     * DIFFERENT VMA, someone carved and the mapping was fine when it was made.
+     * If they are covered by nothing, the mapping really was short and the
+     * caller has an address it cannot use. */
+    int raced = 0;
+    if (bad == 2) {
+        uint64_t hole = vs + vl;
+        uint64_t f2 = vma_lock(a);
+        for (int i = 0; i < a->nvma; i++) {
+            if (!a->vma[i].len) continue;
+            if (hole >= a->vma[i].start && hole < a->vma[i].start + a->vma[i].len) { raced = 1; break; }
+        }
+        vma_unlock(a, f2);
+    }
+    if (raced) { g_mmap_postraced++; return; }   /* a legitimate carve by another thread */
     g_mmap_postfail++;
     if (g_mmap_postfail <= 8)
         kprintf("[mmap] ** POSTCONDITION FAILED (%s): returned %lx for len %lx prot %d, but %s "
-                "(vma %lx+%lx prot %d). The caller's first write to this address will fault "
-                "somewhere unrelated. **\n",
+                "(vma %lx+%lx prot %d), and the bytes past it belong to NO mapping. The caller's "
+                "first write past %lx will fault. **\n",
                 how, (unsigned long)base, (unsigned long)len, want,
                 bad == 1 ? "NO VMA covers it" :
                 bad == 2 ? "the VMA is SHORTER than the request" :
                            "the VMA's protection is not the one requested",
-                (unsigned long)vs, (unsigned long)vl, vp);
+                (unsigned long)vs, (unsigned long)vl, vp, (unsigned long)(vs + vl));
 }
 
 /* Called by the Linux mmap translation right after a file mapping lands. */
