@@ -1628,6 +1628,28 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * handler, remote-command path or process-assignment step
                      * in between. The document was opened on some runs and not
                      * others with the command line alone. */
+                    /* VERIFY THE STATIC INPUTS FIRST (M2175).
+                     *
+                     * The 1-in-4 blank page has the parent alive, compositing
+                     * normally, and the document fetched byte-for-byte as in a
+                     * passing run -- so the decision that goes wrong is made
+                     * from data, and until now nothing checked the two pieces
+                     * of data it is made from. `ffpage.html` and the staged
+                     * prefs are the whole static input to that navigation, and
+                     * the concurrent session's finding makes it concrete: a
+                     * single unchecked inode-table pointer produced NINE
+                     * MILLION garbage block pointers in one run, so a small
+                     * file coming back wrong is not a hypothetical.
+                     *
+                     * `[html] read -> 1068` only ever said the LENGTH matched.
+                     * This checks the BYTES, against a hash computed on the
+                     * host, for every file in the manifest at or under 64 KiB
+                     * -- milliseconds, so it runs on every boot rather than
+                     * being an opt-in nobody remembers to pass. */
+                    {   static const char *av_small[] = { "--small", "65536" };
+                        int src = app_run_linux_sync("/disk2/lxmapcmp", av_small, 2, 60000);
+                        kprintf("[ff] static-input check -> %d (0 = ffpage.html and the prefs "
+                                "are byte-identical to the host's copies)\n", src); }
                     static const char *av_fw[] = { "--no-remote", "--new-instance",
                                                    "file:///ffpage.html" };
                     static const char *av_fd[] = { "--no-remote", "--new-instance",

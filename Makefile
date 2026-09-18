@@ -650,7 +650,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@# comparison cannot see a sector that was WRONG WHEN INSTALLED, because both
 	@# of its sides read through the block cache. So bake in a length and a hash
 	@# per library, computed HERE, by the same binary, over the host's own copies.
-	@if [ -x $(LXROOT)/lxmapcmp ]; then 	    $(LXROOT)/lxmapcmp --gen /usr/lib64/firefox/libxul.so /usr/lib64/libgtk-3.so.0 	        /usr/lib64/libc.so.6 > $(LXROOT)/lxmapcmp.manifest 2>/dev/null || true; 	    echo "  STAGE   lxmapcmp.manifest ($$(wc -l < $(LXROOT)/lxmapcmp.manifest) host-computed hashes)"; fi
+	@if [ -x $(LXROOT)/lxmapcmp ]; then 	    $(LXROOT)/lxmapcmp --gen /usr/lib64/firefox/libxul.so /usr/lib64/libgtk-3.so.0 	        /usr/lib64/libc.so.6 /ffpage.html=$(LXROOT)/ffpage.html $(FIREFOX_DIR)/browser/defaults/preferences/osdev-prefs.js=tools/lx/osdev-firefox-prefs.js > $(LXROOT)/lxmapcmp.manifest 2>/dev/null || true; 	    echo "  STAGE   lxmapcmp.manifest ($$(wc -l < $(LXROOT)/lxmapcmp.manifest) host-computed hashes)"; fi
 	@touch $@
 
 

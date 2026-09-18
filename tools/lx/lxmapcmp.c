@@ -71,28 +71,45 @@ static unsigned long long file_hash(const unsigned char *p, size_t n) {
 }
 
 /* `--gen`: print `<len> <hash> <path>` for each file, for the image build to
- * bake in. Runs on the HOST, over the host's copies. */
-static int gen_one(const char *path) {
+ * bake in. Runs on the HOST, over the host's copies.
+ *
+ * Accepts `GUESTPATH=HOSTFILE`, because the file the guest reads is not always
+ * at the path the host keeps it: ffpage.html is `tools/lx/ffpage.html` here and
+ * `/ffpage.html` there, and the prefs are staged into firefox's own directory
+ * under a different name. Hashing the host's copy and recording the GUEST's
+ * path is the whole point -- the number has to come from outside the guest. */
+static int gen_one(const char *spec) {
+    char guest[768]; const char *path = spec;
+    const char *eq = strchr(spec, '=');
+    if (eq) {
+        size_t n = (size_t)(eq - spec);
+        if (n >= sizeof guest) return 1;
+        memcpy(guest, spec, n); guest[n] = 0;
+        path = eq + 1;
+    } else {
+        snprintf(guest, sizeof guest, "%s", spec);
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 1;
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 1; }
     unsigned char *m = mmap(0, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (m == MAP_FAILED) { close(fd); return 1; }
-    printf("%lld %llu %s\n", (long long)st.st_size, file_hash(m, (size_t)st.st_size), path);
+    printf("%lld %llu %s\n", (long long)st.st_size, file_hash(m, (size_t)st.st_size), guest);
     munmap(m, (size_t)st.st_size); close(fd);
     return 0;
 }
 
 /* Verify a mapping against the manifest the host wrote. Returns 0 = matched,
  * 1 = mismatch, 2 = not testable. */
-static int verify_manifest(const char *mpath) {
+static int verify_manifest_upto(const char *mpath, long long maxlen) {
     FILE *f = fopen(mpath, "r");
     if (!f) { printf("LXMAPCMP: SKIP manifest (%s absent -- rebuild the image)\n", mpath); return 2; }
     char line[1024]; int bad = 0, n = 0;
     while (fgets(line, sizeof line, f)) {
         long long want_len = 0; unsigned long long want_hash = 0; char path[768];
         if (sscanf(line, "%lld %llu %767s", &want_len, &want_hash, path) != 3) continue;
+        if (maxlen > 0 && want_len > maxlen) continue;   /* --small: skip the big ones */
         int fd = open(path, O_RDONLY);
         if (fd < 0) { printf("LXMAPCMP: manifest: %s is ABSENT in the guest\n", path); bad++; continue; }
         struct stat st;
@@ -167,6 +184,22 @@ static int compare_one(const char *path, int backwards) {
 }
 
 int main(int argc, char **argv) {
+    /* `--small N`: verify ONLY the manifest entries at or under N bytes, and
+     * skip the byte-for-byte passes entirely. Cheap enough to run immediately
+     * before Firefox on every boot, which is the point: `ffpage.html` and the
+     * staged prefs are the two static inputs a navigation decision is made
+     * from, and neither was covered by anything. If a garbage inode read makes
+     * one of them come back wrong, Gecko decides from bad data with every layer
+     * downstream healthy -- which is exactly the "alive, compositing, document
+     * fetched, never displayed" signature. */
+    if (argc > 2 && !strcmp(argv[1], "--small")) {
+        long long maxlen = atoll(argv[2]);
+        int r = verify_manifest_upto("/lxmapcmp.manifest", maxlen > 0 ? maxlen : 65536);
+        if (r == 1) { printf("LXMAPCMP: A STATIC INPUT IS WRONG\n"); return 1; }
+        if (r == 2) { printf("LXMAPCMP: SKIP (no manifest)\n"); return 0; }
+        printf("LXMAPCMP: the static inputs match the host's hashes\n");
+        return 0;
+    }
     if (argc > 2 && !strcmp(argv[1], "--gen")) {
         int bad = 0;
         for (int i = 2; i < argc; i++) bad += gen_one(argv[i]);
@@ -195,7 +228,7 @@ int main(int argc, char **argv) {
     /* THE ORACLE FROM OUTSIDE (see the header). Run last, so a mapping-versus-
      * read difference is reported separately from a bytes-are-simply-wrong
      * one -- they point at different subsystems. */
-    { int r = verify_manifest("/lxmapcmp.manifest"); if (r == 1) fails++; else if (r == 0) tested++; }
+    { int r = verify_manifest_upto("/lxmapcmp.manifest", 0); if (r == 1) fails++; else if (r == 0) tested++; }
     if (!tested && !fails) { printf("LXMAPCMP: SKIP (nothing was testable)\n"); return 0; }
     printf(fails ? "LXMAPCMP: %d COMPARISON(S) FAILED\n" : "LXMAPCMP: ALL PASSED (%d comparisons)\n",
            fails ? fails : tested);
