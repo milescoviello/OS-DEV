@@ -73,14 +73,14 @@ static uint32_t       g_ncap   = BCACHE_STATIC_N;
 static uint32_t       g_nbucket = BCACHE_STATIC_N;   /* power of two */
 static uint32_t       g_hand;
 static uint64_t       g_hits, g_miss, g_evict, g_promote;
-static unsigned long  g_chain_broken;   /* corrupted-chain walks refused (M2176) */
+static unsigned long  g_chain_broken;   /* corrupted-chain walks refused (M2179) */
 
 static volatile int g_lock;
 /* BCACHE_HOST_TEST: `cli` is privileged, so the host test would take a SIGSEGV
  * on the first lock. Same accommodation kheap.c already makes for the same
  * reason -- the atomic exchange is kept, so what the test exercises is still
  * the real bookkeeping, just without the interrupt masking that a
- * single-threaded userspace process has no use for. (M2176) */
+ * single-threaded userspace process has no use for. (M2179) */
 static inline uint64_t bc_lock(void) {
     uint64_t f = 0;
 #ifndef BCACHE_HOST_TEST
@@ -120,7 +120,7 @@ static void bc_link(uint32_t idx) {
     g_meta[idx].next = g_bucket[b];
     g_bucket[b] = idx + 1;
 }
-/* A CORRUPTED CHAIN MUST NOT HANG THE KERNEL (M2176).
+/* A CORRUPTED CHAIN MUST NOT HANG THE KERNEL (M2179).
  *
  * This walked the chain with no bound. A chain can only ever be as long as the
  * pool, so a walk that exceeds that has found a cycle -- and the walk runs
@@ -277,7 +277,7 @@ void bcache_flush(void) {
     bc_unlock(f);
 }
 
-/* HOW MANY WALKS FOUND A CORRUPT CHAIN (M2176). Exposed because the bound in
+/* HOW MANY WALKS FOUND A CORRUPT CHAIN (M2179). Exposed because the bound in
  * bc_find turns a corrupt chain into a MISS -- which is a legal answer, and so
  * invisible to a test whose invariant is "a hit must be correct". Hardening
  * that hides the bug it guards against is the same defect as no hardening;

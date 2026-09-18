@@ -1,5 +1,5 @@
 #!/bin/sh
-# A cache that answers with the WRONG BLOCK is worse than no cache (M2176).
+# A cache that answers with the WRONG BLOCK is worse than no cache (M2179).
 #
 # Host test: tests/bcache/bcache_test.c #includes kernel/bcache.c and stubs the
 # few kernel symbols it touches. No QEMU, no disk, a couple of seconds.

@@ -49,7 +49,7 @@ void bcache_flush(void);
 int  bcache_stats(char *out, int max);
 /* Walks that found a corrupt bucket chain and answered MISS rather than spin.
  * Zero on a healthy cache; non-zero means the table's own links are wrong.
- * (M2176) */
+ * (M2179) */
 unsigned long bcache_chain_breaks(void);
 /* Numeric hit/miss counters (for self-tests). */
 void bcache_counts(uint64_t *hits, uint64_t *miss);

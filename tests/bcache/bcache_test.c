@@ -1,5 +1,5 @@
 /* bcache_test.c -- A CACHE THAT ANSWERS WITH THE WRONG BLOCK IS WORSE THAN NO
- * CACHE. Host test for kernel/bcache.c (M2176).
+ * CACHE. Host test for kernel/bcache.c (M2179).
  *
  * WHY. The in-guest self-test (`bcache_selftest`) measures the HIT RATE, which
  * is the usable size and says nothing about correctness. Nothing anywhere
