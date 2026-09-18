@@ -59,8 +59,16 @@
 > seeing another's relocations" family, and confirm the M2155-M2158 storage chain
 > is genuinely fixed, since that comparison would have been overwhelmingly
 > likely to fail before it.
-> **(M2160-M2165) THE STORAGE AND MEMORY BUGS ARE CLOSED. 8-CORE FIREFOX IS
-> STILL 1-IN-4, AND WHAT IS LEFT IS NOT A PROTECTION BUG.**
+> **(M2160-M2165) THE STORAGE AND MEMORY BUGS ARE CLOSED. WHAT IS LEFT IS NOT A
+> PROTECTION BUG.**
+>
+> *Corrected by the block above and by M2172: the heading here originally said
+> "8-CORE FIREFOX IS STILL 1-IN-4", which framed the failure as a property of
+> eight cores. It is not -- one core misses the page at the same rate, six of
+> eight runs, so it is core-count-independent. The ~24-second time-to-page this
+> block's predecessors quote was never measured properly either: the sampler
+> fired every fifteen seconds. Left in place rather than rewritten, because a
+> block that quietly loses the claim it got wrong teaches nothing.*
 >
 > Where this actually stands, measured rather than asserted. One core, current
 > build: the page renders, `VERDICT: the PAGE is on screen -- 87% of the content
