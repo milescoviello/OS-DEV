@@ -869,6 +869,19 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: a grown memfd unshared itself from its own mapping:"; grep -a "LXMEMFD" "$SLOG3" | grep -a -iE "disagree|grow" | head -4; f3=1
     fi
+    # ...AND THAT A MAPPING MADE AT AN OFFSET KNOWS WHICH BYTES IT COVERS
+    # (M2205). mmap's `offset` was honoured when the pages were mapped and then
+    # discarded, and /proc/self/maps printed a hardcoded 00000000 for every
+    # mapping in the process -- so three separate defects of the same shape
+    # (the remap in memfd_grow, the sharing audit, the wl_surface.commit check,
+    # all comparing two different offsets) were invisible from userspace. These
+    # are the assertions that would have caught all three.
+    if grep -aq "LXMEMFD-OK: after a grow, a mapping made at an offset still covers the same bytes" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: /proc/self/maps reports the mapping's real object offset" "$SLOG3"; then
+        echo "  ok: a memfd mapping made at an offset survives a grow, and maps reports the offset (M2205)"
+    else
+        echo "  FAIL: memfd mapping offsets:"; grep -a "LXMEMFD" "$SLOG3" | grep -aiE "offset|grow" | head -5; f3=1
+    fi
     if grep -aq "LXMEMFD-RESULT: 0 failure" "$SLOG3"; then
         echo "  ok: the memfd ownership test reported no failures"
     else

@@ -126,6 +126,77 @@ int main(void) {
     } else ok(0, "a second memfd for the grow-while-mapped case");
     if (g >= 0) close(g);
 
+    /* (4) A MAPPING MADE AT AN OFFSET KNOWS WHICH BYTES IT COVERS (M2205).
+     *
+     * mmap's `offset` argument was accepted and honoured when the pages were
+     * mapped, and then discarded -- `vma[].foff` was never set for a memfd
+     * mapping -- so nothing afterwards could say which part of the object a
+     * mapping was of. /proc/self/maps printed a hardcoded 00000000 for every
+     * mapping in the process, which is why that was invisible: a field that
+     * cannot disagree with the kernel proves nothing about it.
+     *
+     * Three separate defects lived behind it, all of the same shape (comparing
+     * two different offsets): the remap in memfd_grow, the sharing audit, and
+     * the wl_surface.commit check. This is the assertion that would have caught
+     * all three from outside the kernel. */
+    {   int o = (int)syscall(SYS_memfd_create, "offset-mapping", 0);
+        if (o >= 0 && ftruncate(o, (off_t)SZ * 4) == 0) {
+            const unsigned long OFF = 4096 * 3;
+            unsigned char *mo = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, o, (off_t)OFF);
+            if (mo != MAP_FAILED) {
+                /* The mapping covers [OFF, OFF+SZ) of the object. Write a byte
+                 * through it and require the DESCRIPTOR to see it at OFF --
+                 * this is the part a wrong foff corrupts once the object moves. */
+                mo[0] = 0x5E;
+                unsigned char at_off = 0, at_zero = 0xFF;
+                if (pread(o, &at_off, 1, (off_t)OFF) != 1) at_off = 0;
+                if (pread(o, &at_zero, 1, 0) != 1) at_zero = 0xFF;
+                ok(at_off == 0x5E, "a write through a mapping made at offset 12288 lands at 12288 in the file");
+                ok(at_zero == 0, "...and NOT at offset 0");
+
+                /* Now grow it enough to force the buffer to move, with that
+                 * offset mapping live, and require the mapping to still be the
+                 * same bytes. Pre-M2205 the remap re-pointed it at the wrong
+                 * part of the new buffer. */
+                if (ftruncate(o, (off_t)SZ * 64) == 0) {
+                    mo[0] = 0x6F;
+                    unsigned char after = 0;
+                    if (pread(o, &after, 1, (off_t)OFF) != 1) after = 0;
+                    if (after != 0x6F)
+                        printf("LXMEMFD: after growing the object the offset mapping points "
+                               "somewhere else: wrote 6f at object offset %lu, the file says "
+                               "%02x there\n", OFF, after);
+                    ok(after == 0x6F,
+                       "after a grow, a mapping made at an offset still covers the same bytes");
+                }
+
+                /* And /proc/self/maps has to SAY which bytes, or none of the
+                 * above is checkable without kernel access. */
+                {   FILE *f = fopen("/proc/self/maps", "r");
+                    char line[512]; int found = 0;
+                    if (f) {
+                        while (fgets(line, sizeof line, f)) {
+                            unsigned long lo = 0, hi = 0, off2 = 0;
+                            char perms[8];
+                            if (sscanf(line, "%lx-%lx %7s %lx", &lo, &hi, perms, &off2) != 4) continue;
+                            if (lo != (unsigned long)mo) continue;
+                            found = 1;
+                            if (off2 != OFF)
+                                printf("LXMEMFD: /proc/self/maps says this mapping starts at "
+                                       "object offset %lu; it was mmap'd at %lu\n", off2, OFF);
+                            ok(off2 == OFF, "/proc/self/maps reports the mapping's real object offset");
+                            break;
+                        }
+                        fclose(f);
+                    }
+                    if (!found) ok(0, "the offset mapping appears in /proc/self/maps");
+                }
+                munmap(mo, SZ);
+            } else ok(0, "mmap of a memfd at a non-zero offset");
+            close(o);
+        } else ok(0, "a memfd for the offset-mapping case");
+    }
+
     munmap(churn, CHURN);
     munmap(q, SZ);
     return done();

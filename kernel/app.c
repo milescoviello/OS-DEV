@@ -1031,8 +1031,18 @@ static int maps_hexraw(char *b, int p, int max, uint64_t v) {   /* no 0x prefix:
     while (n > 0 && p < max - 1) b[p++] = t[--n];
     return p;
 }
+/* THE OFFSET FIELD SAID 00000000 FOR EVERYTHING (M2205).
+ *
+ * Linux's third field is "which byte of the backing object this mapping starts
+ * at", and this printed a literal zero -- so a mapping made at an offset was
+ * reported as covering the start of the file, for every file-backed mapping in
+ * the process and every memfd. `foff` has always existed for file mappings;
+ * M2203 gave memfd mappings one too, and M2205 fixed the three trim/split
+ * sites that were not sliding it. A field that is hardcoded cannot disagree
+ * with the kernel, which is exactly why none of those bugs were visible from
+ * userspace. Printing it makes them testable from a probe. */
 static int maps_line(char *b, int p, int max, uint64_t start, uint64_t end,
-                     int prot, const char *path) {
+                     int prot, uint64_t foff, const char *path) {
     p = maps_hexraw(b, p, max, start);
     p = maps_str(b, p, max, "-");
     p = maps_hexraw(b, p, max, end);
@@ -1044,7 +1054,14 @@ static int maps_line(char *b, int p, int max, uint64_t start, uint64_t end,
     perms[3] = 'p';                     /* everything here is MAP_PRIVATE */
     perms[4] = 0;
     p = maps_str(b, p, max, perms);
-    p = maps_str(b, p, max, " 00000000 00:00 0 ");
+    p = maps_str(b, p, max, " ");
+    /* Linux pads this to 8 hex digits; a reader that parses with %lx does not
+     * care, and one that column-slices would break on either form. */
+    {   char t[17]; int n = 0; uint64_t v = foff;
+        while (n < 16) { t[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; }
+        int lead = 16; while (lead > 8 && t[lead - 1] == '0') lead--;
+        while (lead > 0 && p < max - 1) b[p++] = t[--lead]; }
+    p = maps_str(b, p, max, " 00:00 0 ");
     if (path && path[0]) { p = maps_str(b, p, max, "                 "); p = maps_str(b, p, max, path); }
     p = maps_str(b, p, max, "\n");
     return p;
@@ -1057,7 +1074,7 @@ int app_format_maps(app_t *a, char *b, int max) {
     uint64_t stk_hi = USTACK_BASE + (uint64_t)USTACK_PAGES * PAGE_SIZE;
     if (a->heap_end > UHEAP_BASE)       /* the program break heap */
         p = maps_line(b, p, max, UHEAP_BASE, a->heap_end,
-                      VMA_PROT_READ | VMA_PROT_WRITE, "[heap]");
+                      VMA_PROT_READ | VMA_PROT_WRITE, 0, "[heap]");
     for (int i = 0; i < a->nvma; i++) {
         /* The lazily-faulted part of the stack is a VMA too; it is reported as
          * part of the single [stack] range below, not twice. */
@@ -1069,11 +1086,12 @@ int app_format_maps(app_t *a, char *b, int max) {
          * and killed the process. (M1987) */
         int prot = a->vma[i].prot;
         p = maps_line(b, p, max, a->vma[i].start, a->vma[i].start + a->vma[i].len,
-                      prot, a->vma[i].huge ? "[mmap-huge]" : vma_path((struct app *)a, i));
+                      prot, a->vma[i].foff,
+                      a->vma[i].huge ? "[mmap-huge]" : vma_path((struct app *)a, i));
     }
     /* ONE contiguous stack entry covering everything a program may use, so the
      * line containing __libc_stack_end exists and is findable. */
-    p = maps_line(b, p, max, stk_lo, stk_hi, VMA_PROT_READ | VMA_PROT_WRITE, "[stack]");
+    p = maps_line(b, p, max, stk_lo, stk_hi, VMA_PROT_READ | VMA_PROT_WRITE, 0, "[stack]");
     if (p < max) b[p] = 0;
     return p;
 }
