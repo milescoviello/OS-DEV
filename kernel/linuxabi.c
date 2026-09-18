@@ -1378,10 +1378,17 @@ unsigned long g_poll_naps, g_poll_nap_ms, g_poll_yields;
  * correctness bug rather than a latency win. */
 #define LX_NAPPERS 64
 volatile unsigned char g_lx_pollnap[LX_NAPPERS];
+/* HOW MANY THREADS ARE IN A POLL NAP RIGHT NOW (M2208). epoll_note_peer_ready
+ * walks 32 x 1024 fd slots to find someone to wake, on every AF_UNIX send and
+ * every pty write, and when nobody is napping every one of those iterations is
+ * wasted. One counter turns the common case into a load and a branch. */
+volatile int g_lx_nappers;
 void lx_poll_nap_sleep(int ms) {
     int slot = (int)(task_current_id() & (LX_NAPPERS - 1));
     g_lx_pollnap[slot] = 1;
+    __atomic_add_fetch(&g_lx_nappers, 1, __ATOMIC_RELAXED);
     task_sleep_ms((uint64_t)ms);
+    __atomic_sub_fetch(&g_lx_nappers, 1, __ATOMIC_RELAXED);
     g_lx_pollnap[slot] = 0;
 }
 

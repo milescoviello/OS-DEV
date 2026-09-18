@@ -11157,6 +11157,17 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
          * counter staying non-zero across two posts must not swallow the
          * second one. */
         epoll_note_post(a, fd);
+        /* ...AND WAKE THE THREAD THAT IS WAITING FOR IT (M2208).
+         *
+         * Re-arming the edge is no use to a thread that will not look again for
+         * another 1-5 ms. An eventfd is a thread pool's post-work primitive and
+         * a GLib main context's wakeup, so this is a CROSS-THREAD HANDOFF
+         * inside one process and it was paying a timer tick every time. The
+         * blocking readers above are woken precisely; the ones parked in
+         * poll()/epoll_wait() -- which is what an event loop actually does --
+         * were not woken at all. Same process, so this is exact rather than a
+         * scan: an eventfd is not shared across processes here. */
+        app_wake_pollers(a);
         return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 16) {  /* accepted AF_INET connection (M2020) */
@@ -11189,7 +11200,15 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         return w;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: master write feeds the ldisc, slave write -> master output (M1274) */
-        return pty_write(a->fd[fd].obj, buf, len);
+        long ptw = pty_write(a->fd[fd].obj, buf, len);
+        /* WAKE THE OTHER END'S POLLERS (M2208). A pty's two ends are ids
+         * `id` and `id|1`; a master write makes the SLAVE readable and a slave
+         * write makes the MASTER readable, and whoever is watching that end is
+         * a terminal program or a terminal emulator sitting in poll. Third
+         * instance of the same omission, after AF_UNIX (M2138) and the pipe and
+         * eventfd above. */
+        if (ptw > 0) epoll_note_peer_ready(11, a->fd[fd].obj ^ 1);
+        return ptw;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 12) {  /* AF_UNIX endpoint: send (M1965) */
         if (a->fd[fd].obj < 0) return -1;
@@ -11221,6 +11240,27 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
      * a 4096-byte write into a ring with 100 bytes free must move those 100 and
      * say so, not block on the remainder. */
     long pw = pipe_write_ex(idx, buf, len, app_fd_nonblock(fd));
+    /* AND WAKE WHOEVER IS POLLING THE READ END (M2208).
+     *
+     * M2138 gave AF_UNIX this and stopped there, and the pipe is the OTHER
+     * half of every event loop in the system: GLib's main context, Firefox's
+     * MessagePump and libuv's async handle all wake a sleeping main thread by
+     * writing one byte into a pipe -- that is what the self-pipe trick IS. A
+     * reader parked in a poll nap slept out its full 1-5 ms anyway, so a
+     * cross-thread wakeup cost a timer tick instead of costing nothing. The
+     * budget for a Firefox first paint says the machine is 89% IDLE with 27958
+     * poll naps in it; this is where a large share of them are.
+     *
+     * Same object, both ends: a pipe's fd entries share the pipe index, so
+     * matching on it reaches the reader wherever it lives. */
+    /* THE CURRENT PROCESS, NOT A SCAN OF ALL OF THEM. The self-pipe's writer
+     * and reader are two threads of ONE process -- that is the whole idiom --
+     * and app_wake_pollers walks 192 thread slots where
+     * epoll_note_peer_ready walks 32 x 1024 fd slots. A pipe write is one of
+     * the most frequent calls in the system and making it 170x more expensive
+     * to save a millisecond is the M2162 mistake. A cross-process pipe reader
+     * is left to the nap backstop; it is a shell pipeline, not an event loop. */
+    if (pw > 0) app_wake_pollers(a);
     if (pw == PIPE_EAGAIN) return APP_FD_EAGAIN;
     if (pw == -1) app_request_signal(a, SIGPIPE);   /* no readers left (EPIPE) -> also SIGPIPE, like real POSIX (M1581) */
     return pw;
@@ -12376,6 +12416,14 @@ static void epoll_rearm_edge(struct app *a, int fd) {
  * `app_fd_ready` is still the gate, so scanning is safe: an fd that is not
  * actually ready for what its owner asked about is never re-armed. */
 static void epoll_note_peer_ready(int fdtype, int obj) {
+    /* NOTHING TO DO IF NOBODY IS ASLEEP IN A POLL (M2208). This walks 32 x
+     * 1024 fd slots and it is called on every AF_UNIX send and every pty
+     * write; the whole point of it is to wake a napper, so when there is no
+     * napper it is 32768 iterations of nothing. The counter is maintained by
+     * lx_poll_nap_sleep, which is the only thing that sets the flags this
+     * function's payload tests. */
+    {   extern volatile int g_lx_nappers;
+        if (g_lx_nappers <= 0) return; }
     if (obj < 0) return;
     for (int k = 0; k < MAX_APPS; k++) {
         struct app *pa = &apps[k];
