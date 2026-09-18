@@ -39,6 +39,7 @@
 #include <setjmp.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <errno.h>
 
 #define LEN (64 * 1024)
 
@@ -111,6 +112,50 @@ int main(void) {
                "returned %u. This is the shape JavaScriptCore reserves its structure heap "
                "with, so that StructureID 0 is an invalid id.\n", g_sink);
         fails++;
+    }
+
+    /* AN UNALIGNED mprotect MUST BE REFUSED, NOT ROUNDED DOWN (M2197).
+     *
+     * `app_mprotect_nl` rounded `addr` down to a page boundary, so an
+     * unaligned request changed the protection of the page holding the bytes
+     * BEFORE it -- and returned 0. mprotect(2) requires a page-aligned
+     * address and returns EINVAL; it does not round.
+     *
+     * Three assertions, and the SECOND is the one that matters. The return
+     * value is cheap; the question is whether the neighbouring page is still
+     * usable, because a kernel that returns EINVAL and revokes access anyway
+     * would pass the first check. With the rounding restored, the write below
+     * lands on a page that has just been made PROT_NONE and takes SIGSEGV --
+     * a fault in code that never asked for anything to change, which is what
+     * this bug looks like from the outside. */
+    {
+        long pg = 4096;
+        unsigned char *r = mmap(0, pg * 3, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (r == MAP_FAILED) {
+            printf("LXNONE: SKIP unaligned-mprotect (mmap failed)\n");
+        } else {
+            memset(r, 0x3c, (size_t)(pg * 3));
+            errno = 0;
+            int urc = mprotect(r + pg + 64, (size_t)pg, PROT_NONE);
+            if (urc == 0) {
+                printf("LXNONE: FAIL an unaligned mprotect(PROT_NONE) SUCCEEDED -- the "
+                       "start was rounded DOWN, so the page before the address lost its "
+                       "access rights and the caller was told the call worked\n");
+                fails++;
+            }
+            if (urc != 0 && errno != EINVAL) {
+                printf("LXNONE: FAIL an unaligned mprotect returned errno %d, not EINVAL\n", errno);
+                fails++;
+            }
+            /* The page the rounding would have taken: still writable? */
+            if (faults_on_write(r + pg)) {
+                printf("LXNONE: FAIL the page BEFORE an unaligned mprotect lost its write "
+                       "access -- the refusal did not protect the neighbour\n");
+                fails++;
+            }
+            munmap(r, (size_t)(pg * 3));
+        }
     }
 
     munmap(p, LEN); munmap(q, LEN);

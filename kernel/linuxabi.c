@@ -525,6 +525,34 @@ static const char *lx_fd_prefix_rewrite(const char *p, char *out, int max) {
     return out;
 }
 
+/* ONE REPORTER FOR ALL THREE TRUNCATION POINTS (M2197).
+ *
+ * M2062 added a complaint about truncated paths to lx_xlate's ABSOLUTE branch
+ * and only there. Its RELATIVE branch and lx_xlate_at's dirfd join both
+ * truncate with no diagnostic at all -- so the instrument could report
+ * nothing while two of the three paths silently named a different file, which
+ * is the same shape as the one-shot in M2195: an instrument whose silence
+ * means "I was not watching" and reads as "nothing happened".
+ *
+ * M2062's `static int told` also kept the count private to the function, so
+ * "how often does this happen" had no answer anywhere. This one counts
+ * without saturating, names the calling process, and prints BOTH the path
+ * asked for and the path produced, because the damage is that those two are
+ * different files. */
+static unsigned long g_path_trunc;
+unsigned long lx_path_truncations(void) { return g_path_trunc; }
+static void lx_path_truncated(const char *want, const char *got, int max) {
+    g_path_trunc++;
+    if (g_path_trunc > 8) return;
+    int n = 0; while (want && want[n]) n++;
+    app_t *a = app_current();
+    kprintf("[linuxabi] path TRUNCATED #%lu by pid %d: %d chars asked for, %d is the limit "
+            "(+%d for the mount prefix) -- this NAMES A DIFFERENT FILE.\n"
+            "           wanted \"%s\"\n           opened \"%s\"\n",
+            g_path_trunc, a ? app_pid_of(a) : -1, n, max - 1, LX_ROOT_LEN,
+            want ? want : "(null)", got ? got : "(null)");
+}
+
 static const char *lx_xlate(const char *p, char *out, int max) {
     if (!p) return p;
     int n = 0;
@@ -577,14 +605,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
          * chain against a 16 KB kernel stack -- so it is its own milestone.
          * Until then, say so: a wrong answer that announces itself can be
          * found, and this one could not. */
-        if (p[pi]) {
-            int want = 0; while (p[want]) want++;
-            static int told;
-            if (++told <= 4)
-                kprintf("[linuxabi] path TRUNCATED: %d chars requested, %d is the limit "
-                        "(+%d for the mount prefix) -- this names a DIFFERENT file: \"%s\"\n",
-                        want, max - 1, LX_ROOT_LEN, out);
-        }
+        if (p[pi]) lx_path_truncated(p, out, max);
         /* A TRAILING SLASH IS NOT A CHARACTER THE PATH WALKER FORGIVES, and
          * "/" is the path a program is most likely to hand us: the root itself
          * became "/disk2/", which resolved to nothing. Claude Code checks its
@@ -611,10 +632,11 @@ static const char *lx_xlate(const char *p, char *out, int max) {
     while (p[0] == '.' && p[1] == '/') p += 2;
     const char *cwd = app_cwd_str(app_current());
     if (!cwd || !cwd[0]) cwd = LX_ROOT;
-    for (int i = 0; cwd[i] && n < max - 1; i++) out[n++] = cwd[i];
+    int ci; for (ci = 0; cwd[ci] && n < max - 1; ci++) out[n++] = cwd[ci];
     if (n && out[n - 1] != '/' && n < max - 1) out[n++] = '/';
-    for (int i = 0; p[i] && n < max - 1; i++) out[n++] = p[i];
+    int ri; for (ri = 0; p[ri] && n < max - 1; ri++) out[n++] = p[ri];
     out[n] = 0;
+    if (cwd[ci] || p[ri]) lx_path_truncated(p, out, max);   /* M2197: this branch had no diagnostic */
     while (n > 1 && out[n - 1] == '/') out[--n] = 0;      /* same rule for a relative path */
     return out;
 }
@@ -687,12 +709,14 @@ static const char *lx_xlate_at(long dirfd, const char *up, char *out, int max) {
     if (!base) return lx_xlate(up, out, max);      /* not a path-bearing fd: old behaviour */
     int p = 0;
     while (base[p] && p < max - 2) { out[p] = base[p]; p++; }
+    int btrunc = base[p] ? 1 : 0;             /* the DIRECTORY did not fit (M2197) */
     if (p && out[p - 1] != '/') out[p++] = '/';
     /* skip a leading "./" so "./x" does not become "dir/./x" */
     const char *u = up;
     while (u[0] == '.' && u[1] == '/') u += 2;
-    for (int k = 0; u[k] && p < max - 1; k++) out[p++] = u[k];
+    int k; for (k = 0; u[k] && p < max - 1; k++) out[p++] = u[k];
     out[p] = 0;
+    if (btrunc || u[k]) lx_path_truncated(up, out, max);    /* M2197: this join had no diagnostic */
     return out;
 }
 

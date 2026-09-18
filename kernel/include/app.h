@@ -35,6 +35,7 @@ int         app_open_console_alias(void);                              /* a new 
 app_t      *app_out_to_of(app_t *a);                                   /* the window this app's output goes to, or NULL (M2004) */
 int         app_pid_of(app_t *a);                                      /* an app handle's pid (M2004) */
 unsigned long app_madv_unaligned(void);                                 /* unaligned MADV_DONTNEED calls refused -- a COUNT, not a flag (M2195) */
+unsigned long app_mprot_unaligned(void);                                /* unaligned mprotect calls refused (M2197) */
 void        app_arm_next_spawn(app_t *dest, int ppid);                 /* the next Linux spawn: output -> dest's window, parent = ppid (M2004) */
 int         app_console_size(int *cols, int *rows);                    /* the grid this process's output lands on; 0 = no terminal (M2004) */
 app_t      *app_out_to(void);                                          /* the current app's stdout target, or NULL (M1988) */

@@ -6095,11 +6095,33 @@ static int app_madvise_nl(uint64_t addr, uint64_t len, int advice) {
  *
  * The lock must be dropped before the IPI: a core spinning for it with
  * interrupts off can never acknowledge, which is the deadlock M1993 fixed. */
-/* Unaligned MADV_DONTNEED calls refused (M2194) and complaint lines spent
- * (M2195). Separate, because the log budget must never cap the count. */
+/* UNALIGNED ADDRESSES REFUSED, PER SYSCALL (M2194/M2195/M2197).
+ *
+ * Counts are per call site and the log budget is shared, because the budget
+ * must bound the LOG and never the measurement -- M2195 exists because a
+ * global one-shot let a test probe mute the instrument for a whole boot.
+ *
+ * One printer rather than a copy per site: this file already refuses unaligned
+ * addresses correctly in app_munmap_nl and app_mincore_nl, and the two that
+ * diverged did so because each was written on its own. A shared helper makes
+ * the convention visible at every new call site that needs it. */
 static unsigned long g_madv_unaligned;
-static int g_madv_unaligned_lines;
-unsigned long app_madv_unaligned(void) { return g_madv_unaligned; }
+static unsigned long g_mprot_unaligned;
+static int g_unaligned_lines;
+unsigned long app_madv_unaligned(void)  { return g_madv_unaligned; }
+unsigned long app_mprot_unaligned(void) { return g_mprot_unaligned; }
+
+static void unaligned_refused(const char *tag, const char *op, unsigned long n,
+                              uint64_t addr, uint64_t len, const char *harm) {
+    if (g_unaligned_lines >= 8) return;
+    g_unaligned_lines++;
+    struct app *a = cur();
+    kprintf("[%s] REFUSING unaligned %s #%lu at %lx len %lu from pid %d '%s': "
+            "%s(2) requires a page-aligned address and returns EINVAL -- it does "
+            "not round. %s\n",
+            tag, op, n, (unsigned long)addr, (unsigned long)len,
+            a ? a->pid : -1, (a && a->title) ? a->title : "?", tag, harm);
+}
 
 int app_madvise(uint64_t addr, uint64_t len, int advice) {
     struct app *a_ = cur();
@@ -6153,16 +6175,10 @@ int app_madvise(uint64_t addr, uint64_t len, int advice) {
          * so a probe's call can never be mistaken for the program under test.
          * The line budget bounds the log, not the measurement. */
         g_madv_unaligned++;
-        if (g_madv_unaligned_lines < 8) {
-            g_madv_unaligned_lines++;
-            kprintf("[madvise] REFUSING unaligned MADV_DONTNEED #%lu at %lx len %lu "
-                    "from pid %d '%s': madvise(2) requires a page-aligned address and "
-                    "returns EINVAL. Rounding down would discard the page holding the "
-                    "bytes BEFORE it, which the caller never asked to drop -- a success "
-                    "that destroys live data.\n",
-                    (unsigned long)g_madv_unaligned, (unsigned long)addr,
-                    (unsigned long)len, a_->pid, a_->title ? a_->title : "?");
-        }
+        unaligned_refused("madvise", "MADV_DONTNEED", g_madv_unaligned, addr, len,
+                          "Rounding down would discard the page holding the bytes "
+                          "BEFORE it, which the caller never asked to drop -- a "
+                          "success that destroys live data.");
         return -1;
     }
     uint64_t start = addr;
@@ -6421,7 +6437,36 @@ int app_munlockall(void) {
  * write-then-execute JIT pages. The range must be the app's own user pages. */
 static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
     if (len == 0) return -1;
-    uint64_t a0 = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    /* AN UNALIGNED START MUST BE REFUSED, NOT ROUNDED DOWN (M2197).
+     *
+     * The same defect as M2194's madvise, in the syscall that can do the most
+     * damage with it. This rounded `addr` down to a page boundary, so
+     *
+     *     mprotect(p + 64, 4096, PROT_NONE)
+     *
+     * made TWO pages inaccessible: the one holding the caller's live bytes
+     * before p+64, and the one after the requested end. It then returned 0.
+     * On Linux that call is EINVAL and nothing changes.
+     *
+     * Every protection is affected, not just PROT_NONE -- rounding down makes
+     * the PRECEDING page read-only just as silently, and the next write to it
+     * faults in code that never asked for anything to change. The resulting
+     * fault is a write to an address that IS inside a VMA whose recorded prot
+     * is not what its owner requested, which is indistinguishable from a wild
+     * pointer and is exactly the shape being chased in Firefox's crashes.
+     *
+     * This file already gets it right twice -- app_munmap_nl and
+     * app_mincore_nl both refuse an unaligned address. mprotect and madvise
+     * diverged from a convention already established around them. */
+    if (addr & (uint64_t)(PAGE_SIZE - 1)) {
+        g_mprot_unaligned++;
+        unaligned_refused("mprotect", "mprotect", g_mprot_unaligned, addr, len,
+                          "Rounding down would change the protection of the page "
+                          "holding the bytes BEFORE it -- a success that revokes "
+                          "access to memory the caller never named.");
+        return -1;
+    }
+    uint64_t a0 = addr;
     uint64_t end = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (end <= a0) return -1;
     struct app *a = cur();                                     /* deny if the range hits a sealed region (M1130) */

@@ -485,6 +485,18 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: MADV_DONTNEED is not honouring its contract:"; grep -a "LXMADV" "$SLOG3" | grep -a FAIL | head -6; f3=1
     fi
+    # M2197 -- lxnone HAD NO GATE AT ALL. It has run in the probe battery since
+    # M2179 and its four PROT_NONE assertions were never checked by make check:
+    # the probe printed FAIL lines into a log nothing grepped. That is worse
+    # than the LXMADV hole above -- there, the gate existed and covered the
+    # wrong lines; here there was no gate. It now also carries the M2197
+    # unaligned-mprotect checks, and the one that matters asserts the page
+    # BEFORE the address is still writable.
+    if grep -aq "LXNONE: ALL PASSED" "$SLOG3"; then
+        echo "  ok: PROT_NONE faults on read and write, does not discard what it protects, and an UNALIGNED mprotect is refused without revoking the neighbouring page (M2179/M2197, 7 checks)"
+    else
+        echo "  FAIL: PROT_NONE or unaligned-mprotect handling is wrong:"; grep -a "LXNONE: FAIL" "$SLOG3" | head -5; f3=1
+    fi
     # M2195 -- THE KERNEL'S COMPLAINT WAS A GLOBAL ONE-SHOT, AND THIS PROBE
     # SPENT IT. lxmadv makes two unaligned MADV_DONTNEED calls on purpose, so
     # the kernel must produce two lines. With a `static int told` it produces

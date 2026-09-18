@@ -41,6 +41,7 @@ void lx_trace_dump(const char *why);
 void lx_watch_fd(int fd);   /* follow the reads on a document's descriptor: a successful open is not a successful load (M2107) */
 void lx_fatal_record(int pid, int sig);
 int  lx_fatal_signal(int *pid);
+unsigned long lx_path_truncations(void);   /* paths silently shortened into a DIFFERENT file -- all three join points (M2197) */
 void lx_trace_dump_last(const char *why, unsigned long want);  /* ...or just the last `want` (M1985) */
 void lx_trace_dump_fault(void);   /* the ring at a ring-3 fault: deep under lxsystrace, modest otherwise (M2003) */
 void lx_trace_dump_addr(const char *why, unsigned long addr);   /* every mmap/munmap/mprotect that covered ONE address (M2088) */
