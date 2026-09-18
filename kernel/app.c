@@ -8030,7 +8030,17 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * Firefox and costing it a few milliseconds. If this one
                      * succeeds, the cache was holding another sector's bytes,
                      * and the counter says so. */
-                    if (got < 0 && ext2_distrust_events() != dt0 && fp && fp[0]) {
+                    /* CAPPED, because the drop is not free (M2223). Throwing
+                     * away a 128 MiB write-through cache costs a re-read of
+                     * the whole live working set, and a boot that distrusts
+                     * itself eighty-eight times would pay that eighty-eight
+                     * times -- turning a correctness fix into a boot that
+                     * never finishes. Sixteen is enough to rescue the common
+                     * case and to prove the mechanism; past that the attempts
+                     * are still counted, so the cap is visible rather than
+                     * silent. */
+                    if (got < 0 && ext2_distrust_events() != dt0 && fp && fp[0] &&
+                        g_fill_cachedrop < 16) {
                         g_fill_cachedrop++;
                         vfs_drop_caches_for(fp);
                         unsigned long dt1 = ext2_distrust_events();
