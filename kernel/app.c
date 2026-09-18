@@ -7893,9 +7893,7 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * distrust itself during this attempt" test below covers
                      * the read as well as the stat. (M2213) */
                     extern unsigned long ext2_distrust_events(void);
-                    extern unsigned long ext2_hole_events(void);
                     unsigned long dt0 = ext2_distrust_events();
-                    unsigned long hole0 = ext2_hole_events();
                     long got = vfs_pread(fp, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
                     /* A NEGATIVE RETURN IS AN ERROR, NOT A SHORT FILE (M2155).
                      * Retry it before believing it: the failure this was built
@@ -7984,36 +7982,31 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * mapping a zero page over it is the corruption M2155 was
                      * about. Transport-independent, so it holds for tmpfs and
                      * /proc as well as ext2. */
-                    /* A HOLE IN EXECUTABLE TEXT IS NOT A HOLE (M2221).
+                    /* THE HOLE CHECK IS REVERTED (M2224), and the reason is
+                     * worth more than the check was.
                      *
-                     * A zero block pointer is a sparse hole and zeros are the
-                     * right answer for one -- and it is also exactly what a
-                     * corrupted inode produces, with no error anywhere. A page
-                     * of libstdc++'s TEXT came back that way and the process
-                     * jumped into it; the fault report even said "code check:
-                     * memory ... file ... IDENTICAL", because the verification
-                     * read came back from the same hole.
+                     * M2221 refused an EXECUTABLE page whenever the global
+                     * hole counter moved across the read. That is only sound
+                     * if nothing ELSE can move it -- and on eight cores
+                     * another thread reading a genuinely sparse file moves it
+                     * constantly. The check therefore refused perfectly good
+                     * text pages, and Firefox stopped reaching a window at all:
+                     * three boots, `largest window 64x32`, no crash, no page.
                      *
-                     * ext2 cannot tell the two apart. The caller can: no
-                     * linker produces a sparse hole in the middle of a PROT_EXEC
-                     * segment. Refuse, and say so, rather than mapping zeros
-                     * over code -- the same rule as M2218, reached from the
-                     * success path instead of the failure path. */
-                    if (got > 0 && (v.prot & VMA_PROT_EXEC) &&
-                        ext2_hole_events() != hole0) {
-                        g_fill_exec_hole++;
-                        static int htold;
-                        if (htold++ < 4)
-                            kprintf("[fault] %lx from %s+%lx: the filesystem served this "
-                                    "EXECUTABLE page from a sparse HOLE (%lu hole block(s) during "
-                                    "the read). No linker leaves a hole in text -- this is a "
-                                    "corrupted block pointer reading as zero. Refusing rather "
-                                    "than mapping zeros over code. (M2221)\n",
-                                    page, fp, (unsigned long)fileoff,
-                                    ext2_hole_events() - hole0);
-                        pmm_free_frame(frame);
-                        return 0;
-                    }
+                     * A GLOBAL COUNTER SAMPLED AS A DELTA IS ONLY VALID IF THE
+                     * CALLER IS THE ONLY WRITER. M2213's distrust sampling gets
+                     * away with it because it is consulted only on a read that
+                     * FAILED, which is rare; this one was consulted on every
+                     * successful fill, which is thousands of times a boot, so
+                     * a spurious hit was not a risk but a certainty.
+                     *
+                     * The defect M2221 found is real -- a corrupted inode whose
+                     * block pointer reads as zero returns a page of zeros and
+                     * calls it a sparse hole, with no error anywhere. Catching
+                     * it needs a PER-CALL hole count, not a global one, which
+                     * means an out-parameter through ext2_pread and vfs_pread.
+                     * The counter and its report stay; the refusal comes back
+                     * when it can tell whose hole it was. */
                     /* ONE MORE ATTEMPT, WITH THE CACHE DROPPED (M2223).
                      *
                      * The two retries above re-read through the SAME cache, so
