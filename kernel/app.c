@@ -3321,6 +3321,7 @@ uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
 uint64_t g_flt_major, g_flt_minor, g_flt_cow, g_flt_other;
 unsigned long g_flt_cow_shared;   /* COW faults on a MAP_SHARED page, answered by restoring write access instead of copying (M2209) */
 unsigned long g_fill_distrust;     /* fills refused because the filesystem distrusted itself, not because the file was unlinked (M2213) */
+unsigned long g_fill_exec_refused; /* fills refused because the mapping is EXECUTABLE: zeros there are never right (M2218) */
 void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other) {
     extern unsigned long g_spurious_faults;
     if (maj)   *maj   = g_flt_major;
@@ -8003,6 +8004,41 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                                         "(M2213)\n",
                                         page, fp, (unsigned long)fileoff,
                                         ext2_distrust_events() - dt0);
+                        }
+                        /* AND NEVER FOR AN EXECUTABLE MAPPING (M2218).
+                         *
+                         * M2160's exception exists for SQLite's `-shm` file,
+                         * which is unlinked while mapped and whose correct
+                         * contents really are zeros -- a WRITABLE DATA
+                         * mapping. A PROT_EXEC mapping whose file has
+                         * "disappeared" is never legitimately zeros: filling it
+                         * guarantees the process executes them, which is what
+                         * this boot did --
+                         *
+                         *   [fault] 11768c000 from libxul.so+9452000: the FILE
+                         *           IS GONE ... Filling with zeros
+                         *   [fault] Page Fault at rip=0x11768c190 (CR2=0x0)
+                         *
+                         * rip is INSIDE the page that was just zero-filled, and
+                         * CR2=0 because zeros decode to instructions that
+                         * dereference null. M2213's distrust guard did not stop
+                         * it: nothing distrusted the volume, the path lookup
+                         * simply answered "absent" for a file that is plainly
+                         * there (a negative path-cache hit is the leading
+                         * suspect, and the A/B for it is running).
+                         *
+                         * Whatever the cause of the bad answer, zero-filling
+                         * EXECUTABLE memory can never be the right response to
+                         * it. Refuse, and say which mapping. */
+                        if (gone && (v.prot & VMA_PROT_EXEC)) {
+                            gone = 0;
+                            g_fill_exec_refused++;
+                            static int xtold;
+                            if (xtold++ < 4)
+                                kprintf("[fault] %lx from %s+%lx: the path lookup says this file "
+                                        "is GONE, but the mapping is EXECUTABLE -- zero-filling it "
+                                        "would make the process execute zeros. Refusing. (M2218)\n",
+                                        page, fp, (unsigned long)fileoff);
                         }
                         if (gone) {
                             static unsigned long gone_told;

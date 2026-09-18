@@ -37,11 +37,15 @@ echo "==> pinned to $PIN, $N boot(s) per arm, $CORES core(s), CAP=$CAP"
 
 row() {   # $1 = tag, $2 = log
     L=$2
-    printf '%-18s page=%-3s samples=%-3s crash=%s refused=%s badblk=%-8s itable=%-5s groups=%-4s page_ms=%-7s kstack=%s\n' \
+    # `crash` is a LINE COUNT and the watcher re-reports a crash every 15s, so
+    # read it as "did it crash", not "how many". `samples` counts the probe's
+    # own per-sample header, which the watcher prints (M2214 moved it there and
+    # the old `[page] --- sample` marker went with the blocking loop).
+    printf '%-18s page=%-3s samples=%-3s crashed=%s refused=%s badblk=%-8s itable=%-5s groups=%-4s page_ms=%-7s kstack=%s\n' \
       "$1" \
       "$(grep -ac 'VERDICT: the PAGE is on screen' "$L")" \
-      "$(grep -ac '\[page\] --- sample' "$L")" \
-      "$(grep -ac 'CRASHED with signal' "$L")" \
+      "$(grep -ac '^\[page\] client ' "$L")" \
+      "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \
       "$(grep -ac 'DEVICE failure, not an' "$L")" \
       "$(grep -ao 'bad block pointers rejected [0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
       "$(grep -ao 'inode tables rejected [0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
