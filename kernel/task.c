@@ -466,8 +466,19 @@ static void idle_loop(void) {
          * that is why eight were slower than one. */
         int me = smp_current_cpu() & 15;
         smp_core_idle[me] = 1;
+        /* `sti; hlt` is one unit as far as this matters: sti enables interrupts
+         * only after the NEXT instruction retires, so an IPI that arrives in
+         * the window cannot be missed -- it is taken out of the halt rather
+         * than before it. */
         __asm__ volatile("sti; hlt");
         smp_core_idle[me] = 0;
+        /* AND CLEAR THE IN-FLIGHT FLAG ON THE WAY OUT. The 0x43 handler clears
+         * it, but a reschedule IPI can also be overtaken by this core waking
+         * for its own timer -- and a flag left set means this core is never
+         * poked again, which is a permanent latency regression from a fix for
+         * latency. Clearing it here makes the flag self-healing: the worst a
+         * lost IPI costs is one tick. */
+        smp_resched_ack(me);
         g_idle_cycles += idle_tsc() - t0;
     }
 }
