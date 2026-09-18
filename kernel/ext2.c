@@ -68,12 +68,27 @@ static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level);   /* M2176; defin
  * off the end of the filesystem means the descriptor block we read was not a
  * descriptor block, and every inode in that group would come back as data. */
 unsigned long g_e2_bad_itable, g_e2_bad_groups;
+/* EVERY REASON THIS VOLUME COULD NOT BE BELIEVED, IN ONE COUNTER (M2213).
+ *
+ * A caller that has just had -1 out of a read needs to know whether the answer
+ * was "that path does not exist" or "the device/metadata failed", and the
+ * DIFFERENCE decides whether zero-filling a page is correct or is corruption
+ * (see app.c's unlinked-mapping case, M2160). `g_e2_pread_why` almost says it,
+ * but it is a per-call code that goes stale the moment the mapping is on tmpfs
+ * or /proc instead -- and a stale 4 there would refuse a legitimate
+ * zero-fill, which is the regression M2160 exists to undo.
+ *
+ * A monotonic EVENT COUNT cannot go stale: sample it before the read and after,
+ * and a value that moved means something in this transport distrusted itself
+ * during THIS read, whatever transport it was. */
+unsigned long g_e2_distrust;
+unsigned long ext2_distrust_events(void) { return g_e2_distrust; }
 unsigned int  g_e2_bad_itable_val;
 
 static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     int r = v->read(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
-    if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
+    if (r < 0) { v->ioerr = 1; g_e2_distrust++; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
     return r;
 }
 /* ONE SECTOR OF A BLOCK, for the two reads that need 32 and 256 bytes (M2212).
@@ -104,7 +119,7 @@ static int rdsec(ext2_t *v, uint32_t blk, uint32_t secoff, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     if (secoff >= spb) return -1;
     int r = v->read(v->ctx, v->start + (uint64_t)blk * spb + secoff, 1, buf);
-    if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
+    if (r < 0) { v->ioerr = 1; g_e2_distrust++; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
     return r;
 }
 /* `n` PHYSICALLY CONSECUTIVE blocks in one request (M2101).
@@ -123,7 +138,7 @@ static int rdsec(ext2_t *v, uint32_t blk, uint32_t secoff, uint8_t *buf) {
 static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     int r = v->read(v->ctx, v->start + (uint64_t)blk * spb, n * spb, buf);
-    if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }
+    if (r < 0) { v->ioerr = 1; g_e2_distrust++; g_e2_vstart = v->start; }
     return r;
 }
 /* How many blocks a single request may cover: the block device's own transfer
@@ -182,7 +197,7 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
      * stack, on a path that reaches it at 90% full with interrupts enabled. */
     uint8_t sec[SECSZ];
     uint32_t gd_per_block = v->block_size / 32;
-    if (v->groups && group >= v->groups) { v->ioerr = 1; g_e2_bad_groups++; return -1; }
+    if (v->groups && group >= v->groups) { v->ioerr = 1; g_e2_bad_groups++; g_e2_distrust++; return -1; }
     /* The descriptor block itself is a produced block number too (M2176). */
     uint32_t gdblk = v->gdt_block + group / gd_per_block;
     if (!e2_ptr_ok(v, gdblk, 5)) { v->ioerr = 1; return -1; }
@@ -297,7 +312,7 @@ static uint32_t e2_ptr_ok(ext2_t *v, uint32_t blk, int level) {
     if (!blk) return 0;                                    /* a real hole */
     g_e2_blocks_count = v->blocks_count;
     if (v->blocks_count && blk >= v->blocks_count) {
-        g_e2_bad_ptrs++;
+        g_e2_bad_ptrs++; g_e2_distrust++;
         g_e2_bad_ptr_val = blk;
         g_e2_bad_ptr_level = level;
         v->ioerr = 1;                                      /* corruption, NOT a hole */

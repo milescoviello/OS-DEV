@@ -3320,6 +3320,7 @@ uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
  * asks. */
 uint64_t g_flt_major, g_flt_minor, g_flt_cow, g_flt_other;
 unsigned long g_flt_cow_shared;   /* COW faults on a MAP_SHARED page, answered by restoring write access instead of copying (M2209) */
+unsigned long g_fill_distrust;     /* fills refused because the filesystem distrusted itself, not because the file was unlinked (M2213) */
 void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other) {
     extern unsigned long g_spurious_faults;
     if (maj)   *maj   = g_flt_major;
@@ -7872,6 +7873,11 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                     /* The interned path index came out with the copy, so the
                      * lookup does not have to re-find the VMA. */
                     const char *fp = (v.fidx >= 0 && v.fidx < g_vma_npath) ? g_vma_paths[v.fidx] : "";
+                    /* Sampled BEFORE the read, so the "did the filesystem
+                     * distrust itself during this attempt" test below covers
+                     * the read as well as the stat. (M2213) */
+                    extern unsigned long ext2_distrust_events(void);
+                    unsigned long dt0 = ext2_distrust_events();
                     long got = vfs_pread(fp, z, want, fileoff);   /* bytes past EOF stay zero; MAP_PRIVATE: writable copy */
                     /* A NEGATIVE RETURN IS AN ERROR, NOT A SHORT FILE (M2155).
                      * Retry it before believing it: the failure this was built
@@ -7962,7 +7968,43 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                      * /proc as well as ext2. */
                     if (got < 0) {
                         struct statx probe;
-                        if (vfs_stat(fp, &probe) != 0) {
+                        /* AND ONLY IF NOTHING DISTRUSTED THE VOLUME (M2213).
+                         *
+                         * `vfs_stat` failing is not the same as "the path is
+                         * gone": the stat does its own path walk, so a device
+                         * error or corrupt metadata fails BOTH the read and the
+                         * stat -- and this then concluded "unlinked" and mapped
+                         * a ZERO PAGE over a page of libxul's text. That is the
+                         * observed 8-core death, in my own M2160 code:
+                         *
+                         *   [fault] 11181d000 from libxul.so+2b3a000: the FILE
+                         *           IS GONE ... Filling with zeros
+                         *   [fault] bytes at rip: 00 00 00 00 00 00 00 00
+                         *
+                         * libxul.so is not unlinked. The ext2 layer had already
+                         * rejected 69 inode tables and 610984 block pointers in
+                         * that boot; the read failed because the filesystem
+                         * distrusted itself, and M2155's refusal was the right
+                         * answer for exactly that case.
+                         *
+                         * A monotonic event count cannot go stale the way a
+                         * per-call reason code does when the mapping is on
+                         * tmpfs or /proc, so sample it across the attempt. */
+                        int gone = (vfs_stat(fp, &probe) != 0);
+                        if (gone && ext2_distrust_events() != dt0) {
+                            gone = 0;                     /* the device failed, not the path */
+                            g_fill_distrust++;
+                            static int dtold;
+                            if (dtold++ < 4)
+                                kprintf("[fault] %lx from %s+%lx: the read AND the stat both "
+                                        "failed, but the filesystem distrusted itself %lu time(s) "
+                                        "during them -- so this is a DEVICE failure, not an "
+                                        "unlinked file. Refusing rather than zero-filling code. "
+                                        "(M2213)\n",
+                                        page, fp, (unsigned long)fileoff,
+                                        ext2_distrust_events() - dt0);
+                        }
+                        if (gone) {
                             static unsigned long gone_told;
                             g_fill_unlinked++;
                             if (gone_told < 4) {
