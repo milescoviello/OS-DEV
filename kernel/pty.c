@@ -236,6 +236,13 @@ int pty_ctl(int id, int cmd, int arg) {
         return 0;
     }
     if (cmd == 3) return (int)(((unsigned)p->ws_rows << 16) | p->ws_cols);           /* TIOCGWINSZ: rows<<16 | cols */
+    /* GET the line-discipline mode, for tcgetattr (M2211). Setting it has been
+     * possible since M1185 and reading it back was never wired, so a program
+     * doing the standard tcgetattr / modify / tcsetattr dance -- which is how
+     * every terminal program turns off echo -- had to invent the current
+     * state. The three bits are ISIG/ICANON/ECHO and they have the same
+     * numeric values as Linux's c_lflag, so this needs no mapping. */
+    if (cmd == 4) return (int)p->lflag;
     return -1;
 }
 

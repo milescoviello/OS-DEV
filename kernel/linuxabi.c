@@ -48,6 +48,7 @@
 #include "kheap.h"  /* execve copies argv/envp into heap buffers, not onto the kernel stack (M1962) */
 #include "syscall.h"   /* AT_PAGESZ/AT_ENTRY/AT_UID/... -- the auxv types we share with /proc/<pid>/auxv */
 #include <stdint.h>
+#include "pty.h"       /* a pty is a terminal: its ioctls answer from the pty (M2211) */
 
 /* ---- MSRs ---------------------------------------------------------------- */
 #define MSR_EFER            0xC0000080u
@@ -3613,6 +3614,90 @@ static void lx_dispatch_body(struct registers *r) {
          * then asks the DUP whether it is a tty. Type 14 is the console alias,
          * so any copy of it answers yes, exactly as a dup of a tty does on
          * Linux. */
+        /* A PTY IS A TERMINAL, AND THIS GATE SAID IT WAS NOT (M2211).
+         *
+         * Everything below answers for the CONSOLE, and a pty fd failed
+         * `is_console` -- so every terminal ioctl on a pty returned ENOTTY,
+         * including the TIOCGPTN and TIOCSPTLCK that M2206 added further down
+         * to make openpty() work. They were unreachable for the one descriptor
+         * type they exist for. (openpty() failed one step earlier anyway, on
+         * grantpt's S_ISCHR check -- fixed in fstat above -- so the two
+         * defects hid each other.)
+         *
+         * A pty has its own window size, its own line discipline and its own
+         * foreground pgid; kernel/pty.c has held all three since M1185/M1279.
+         * So answer from the PTY rather than from the console, which is what
+         * makes a terminal program running on one behave. */
+        {   int pty_id = (app_fd_type((int)a1) == 11) ? app_fd_obj((int)a1) : -1;
+            if (pty_id >= 0) {
+                if (req == 0x5413 /*TIOCGWINSZ*/) {
+                    if (!vmm_user_ok(r->rdx, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+                    int ws = pty_ctl(pty_id, 3, 0);
+                    uint16_t *w = (uint16_t *)r->rdx;
+                    uint16_t pr = (uint16_t)((ws >> 16) & 0xFFFF), pc = (uint16_t)(ws & 0xFFFF);
+                    if (!pr || !pc) { pr = 24; pc = 80; }   /* never sized: the classic default */
+                    w[0] = pr; w[1] = pc; w[2] = (uint16_t)(pc * 8); w[3] = (uint16_t)(pr * 16);
+                    r->rax = 0; break;
+                }
+                if (req == 0x5414 /*TIOCSWINSZ*/) {
+                    if (!vmm_user_ok(r->rdx, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+                    const uint16_t *w = (const uint16_t *)r->rdx;
+                    pty_ctl(pty_id, 2, (int)(((unsigned)w[0] << 16) | w[1]));   /* also SIGWINCHes the fg group */
+                    r->rax = 0; break;
+                }
+                if (req == 0x5401 /*TCGETS*/ || req == 0x802c542a /*TCGETS2*/) {
+                    if (!vmm_user_ok(r->rdx, 44)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+                    uint8_t *t = (uint8_t *)r->rdx;
+                    for (int i = 0; i < 44; i++) t[i] = 0;
+                    int lf = pty_ctl(pty_id, 4, 0);
+                    if (lf < 0) lf = ISIG | ICANON | ECHO;
+                    *(uint32_t *)(t + 0)  = 0x0500u;          /* c_iflag: ICRNL|IXON, the usual cooked pair */
+                    *(uint32_t *)(t + 4)  = 0x0005u;          /* c_oflag: OPOST|ONLCR */
+                    *(uint32_t *)(t + 8)  = 0x00000cbfu;      /* c_cflag: B38400 CS8 CREAD */
+                    /* ISIG/ICANON/ECHO have the same numeric values here as in
+                     * Linux's c_lflag, so the three bits transfer directly; the
+                     * rest of a real c_lflag (ECHOE, ECHOK, IEXTEN) describes
+                     * editing behaviour this line discipline does not vary. */
+                    *(uint32_t *)(t + 12) = (uint32_t)lf | 0x00008010u;   /* + ECHOE|IEXTEN */
+                    t[17 + 0] = 3;    /* VINTR  ^C */
+                    t[17 + 1] = 28;   /* VQUIT  ^\ */
+                    t[17 + 2] = 127;  /* VERASE DEL */
+                    t[17 + 3] = 21;   /* VKILL  ^U */
+                    t[17 + 4] = 4;    /* VEOF   ^D */
+                    r->rax = 0; break;
+                }
+                if (req == 0x5402 || req == 0x5403 || req == 0x5404 ||          /* TCSETS/W/F */
+                    req == 0x402c542b || req == 0x402c542c || req == 0x402c542d) {  /* TCSETS2/W2/F2 */
+                    if (!vmm_user_ok(r->rdx, 36)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+                    const uint8_t *t = (const uint8_t *)r->rdx;
+                    unsigned lf = *(const uint32_t *)(t + 12);
+                    pty_ctl(pty_id, 0, (int)(lf & (unsigned)(ISIG | ICANON | ECHO)));
+                    r->rax = 0; break;
+                }
+                if (req == 0x540F /*TIOCGPGRP*/) {
+                    if (r->rdx && vmm_user_ok(r->rdx, 4)) *(int32_t *)r->rdx = app_current_pid();
+                    r->rax = 0; break;
+                }
+                if (req == 0x5410 /*TIOCSPGRP*/) {
+                    if (r->rdx && vmm_user_ok(r->rdx, 4)) pty_ctl(pty_id, 1, (int)*(const int32_t *)r->rdx);
+                    r->rax = 0; break;
+                }
+                if (req == 0x80045430 /*TIOCGPTN*/) {
+                    if (!vmm_user_ok(r->rdx, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+                    long n = app_pts_number((int)a1);
+                    if (n < 0) { r->rax = (uint64_t)-(long)LX_ENOTTY; break; }
+                    *(uint32_t *)r->rdx = (uint32_t)n;
+                    { static int told; if (!told) { told = 1;
+                        kprintf("[tty] TIOCGPTN: fd %d is the master of /dev/pts/%ld -- openpty() "
+                                "can complete now (M2206/M2211)\n", (int)a1, n); } }
+                    r->rax = 0; break;
+                }
+                /* TIOCSPTLCK: the slave starts unlocked here, so accept it.
+                 * Refusing makes unlockpt() fail and openpty() give up. */
+                if (req == 0x40045431 /*TIOCSPTLCK*/) { r->rax = 0; break; }
+                r->rax = (uint64_t)-(long)LX_ENOTTY; break;
+            }
+        }
         int is_console = (app_fd_type((int)a1) == 14 ||
                           ((a1 >= 0 && a1 <= 2) && !app_fd_is_open((int)a1)))
                          && app_console_size(&cols, &rows);
@@ -3676,32 +3761,10 @@ static void lx_dispatch_body(struct registers *r) {
             r->rax = 0; break;
         }
         if (req == 0x5410 /*TIOCSPGRP*/) { r->rax = 0; break; }
-        /* THE TWO IOCTLS THAT MAKE A PTY REACHABLE FROM A LINUX BINARY (M2206).
-         *
-         * /dev/ptmx and /dev/pts/<n> have been openable since M1274, and the
-         * pty itself is complete -- line discipline, canonical editing,
-         * INTR->signal, window size. But glibc's openpty() asks the master for
-         * its slave NUMBER (TIOCGPTN) and unlocks it (TIOCSPTLCK) before it
-         * will hand anything back, and both answered ENOTTY -- so no Linux
-         * program could get a pty at all, and there was no way to know from
-         * outside that the reason was two missing ioctl numbers rather than a
-         * missing pty.
-         *
-         * app_pts_number already computes the index for a ptmx master fd. */
-        if (req == 0x80045430 /*TIOCGPTN*/) {
-            if (!vmm_user_ok(r->rdx, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-            int n = (int)app_pts_number((int)a1);
-            if (n < 0) { r->rax = (uint64_t)-(long)LX_ENOTTY; break; }
-            *(uint32_t *)r->rdx = (uint32_t)n;
-            { static int told; if (!told) { told = 1;
-                kprintf("[tty] TIOCGPTN: fd %d is the master of /dev/pts/%d -- openpty() can "
-                        "complete now (M2206)\n", (int)a1, n); } }
-            r->rax = 0; break;
-        }
-        /* TIOCSPTLCK: the slave starts unlocked here -- there is no lock to
-         * clear -- so accept it. Refusing makes unlockpt() fail and openpty()
-         * gives up without saying why. */
-        if (req == 0x40045431 /*TIOCSPTLCK*/) { r->rax = 0; break; }
+        /* (M2206's TIOCGPTN/TIOCSPTLCK cases used to live HERE, after the
+         * is_console gate -- which a pty fd never passes, so they could not be
+         * reached for the only descriptor type they exist for. They are in the
+         * pty block above now. M2211.) */
         r->rax = (uint64_t)-(long)LX_ENOTTY;
         break;
     }
@@ -4155,6 +4218,39 @@ static void lx_dispatch_body(struct registers *r) {
                     *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
                     r->rax = 0;
                     break;
+                }
+                /* AND A PTY IS A CHARACTER DEVICE, which is not a detail:
+                 * glibc's grantpt() does
+                 *
+                 *     if (__fstat64 (fd, &st) < 0) return -1;
+                 *     if (! S_ISCHR (st.st_mode)) { __set_errno (EINVAL); ... }
+                 *
+                 * so a pty master reported as a FIFO makes openpty() fail with
+                 * EINVAL before it has even asked for the slave number -- which
+                 * is exactly what happened after M2206 added TIOCGPTN and
+                 * TIOCSPTLCK: `LXPTY: openpty failed: Invalid argument`. Two
+                 * missing ioctls were not the whole reason a Linux binary could
+                 * not get a pty; this was the third. ptsname_r checks the same
+                 * thing. (M2211)
+                 *
+                 * rdev carries the real /dev/pts index in the minor, because
+                 * ttyname() and a few TUI programs read it to find their own
+                 * terminal: major 5 minor 2 is /dev/ptmx, major 136 is a pts
+                 * slave, which is what Linux reports. */
+                {   long ptsn = app_pts_number((int)a1);
+                    int is_pty = app_fd_type((int)a1) == 11;
+                    if (is_pty) {
+                        *(uint32_t *)(st + LXST_O_MODE)  = LX_S_IFCHR | 0620u;
+                        *(uint64_t *)(st + LXST_O_NLINK) = 1;
+                        *(uint64_t *)(st + LXST_O_RDEV)  = (ptsn >= 0)
+                                                           ? ((5ull << 8) | 2ull)      /* the master: /dev/ptmx */
+                                                           : ((136ull << 8) | 0ull);   /* a slave: /dev/pts/N */
+                        *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
+                        *(uint64_t *)(st + LXST_O_INO)   = 0x3000ull + (uint64_t)a1;
+                        *(uint64_t *)(st + LXST_O_DEV)   = LX_FAKE_DEV;
+                        r->rax = 0;
+                        break;
+                    }
                 }
                 *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
                 *(uint64_t *)(st + LXST_O_NLINK)   = 1;
