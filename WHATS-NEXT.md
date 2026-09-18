@@ -1,5 +1,70 @@
 # What's next
 
+> **(M2227-M2230) THE 8-CORE FIREFOX CRASH WAS READING `/proc/partitions`.**
+>
+> ```
+> /proc/partitions -> gen_partitions -> blockdev_format -> blockdev_init
+> blockdev_init:  g_ndev = 0;  bcache_flush();  ...re-probe every driver...
+> ```
+>
+> `blockdev_read` opens with
+> `if (i < 0 || i >= g_ndev || !buf || count == 0) return -1;`
+> so **every disk read running on another core fails for the whole duration of
+> an ATA/AHCI/NVMe/USB probe**. Firefox's GIO volume monitor reads
+> /proc/partitions. On ONE core nothing else is mid-read while the probe runs,
+> which is the entire reason this looked like an SMP memory bug for two days.
+>
+> Measured, same workload, three boots each:
+>
+> | | before | after |
+> |---|---|---|
+> | superblock read failures | 6 / 48 / 6 | **0 / 0 / 0** |
+> | inode tables rejected | 173 | **0** |
+> | distrust events | 197 | **2 / 0 / 0** |
+> | **crashed** | **2 of 3** | **0 of 3** |
+>
+> **Four theories died because the corruption was never in the filesystem.**
+> ext2 was told "there is no such device" and faithfully reported it; every
+> downstream symptom -- 173 rejected inode tables, a page of libxul read as
+> zeros, "the FILE IS GONE" for a file plainly present -- is that one answer
+> propagating. Killed by measurement, in order: the ext2 path cache
+> (`nopathcache`: unchanged), a kernel stack overflow in `read_inode`
+> (8240 -> 560 bytes: unchanged), a device error (`ata: 0 retr 0 FAIL`), and
+> the block cache (`cache-drop retries 4, 0 RECOVERED`).
+>
+> **The instrument that cracked it was a counter per failure REASON.**
+> `blockdev_fail_why()` remembered only the LAST refusal, and the last one was
+> always a downstream garbage LBA from the cascade. Counting all seven reasons
+> separately showed **all seven at zero** while reads were demonstrably
+> failing -- which pointed at the one `return -1` in the entire path that
+> recorded nothing. *When a failure has no recorded reason, the unrecorded path
+> IS the answer.*
+>
+> **And "idempotent" in a comment is not idempotent.** `blockdev_init` calls
+> `ata_identify_all()` with the comment *"idempotent; ensure probed"*. It zeroed
+> `present`, `sectors` and `lba48` on the live table and re-issued IDENTIFY --
+> **with no `ata_lock`**, so it can interleave with an in-flight transfer on
+> another core. That is a mechanism for wrong bytes that the driver would never
+> record as an error, reachable from the same single read of /proc/partitions
+> (M2230).
+>
+> **The fix shape: never tear down live global state to rebuild it.**
+> Registration is additive and an index NEVER MOVES. That also closes a latent
+> bug the old code *documented instead of fixing*: `g_mount[].dev` stores an
+> INDEX, so re-registering in a different order silently repoints a mounted
+> filesystem at another disk -- the mount scan's own comment notes "ata0 came
+> back at a different index" as a known effect.
+>
+> **What it cost on the way, all real and all fixed:** M2217, two 96 KiB
+> `r[APP_MAXVMA]` locals of mine on a 16 KiB kernel stack, double-faulting
+> every run of one A/B; M2221 reverted in M2224 after it refused good text
+> pages on a GLOBAL hole counter (**a global counter sampled as a delta is only
+> valid if the caller is the only writer** -- and a healthy boot shows 81 sparse
+> holes, so holes are ordinary here); and M2225, where the `[fs]` health line
+> lived inside `wl_page_probe` and so printed nothing on exactly the boots that
+> needed it. A health line gated behind the success whose absence it explains
+> is not an instrument.
+
 > **(M2212-M2219) EIGHT CORES IS NOW THE FAST PATH — 29.5 s TO THE PAGE — AND
 > STILL CRASHES 2 IN 3, ON AN ext2 CORRUPTION THAT HAS OUTLIVED FOUR THEORIES.**
 >
