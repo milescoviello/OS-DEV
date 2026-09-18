@@ -1,5 +1,78 @@
 # What's next
 
+> **(M2197-M2198) THE SAME DEFECT IN mprotect, AND A COMPOSITOR STACK 93% FULL
+> ON A CHAIN A CLIENT DISCONNECT TAKES.**
+>
+> M2194 found `madvise` rounding an unaligned address DOWN and destroying the
+> page before it. `mprotect` did the same thing, and it is the worse place for
+> it:
+>
+> ```c
+> uint64_t a0 = addr & ~(uint64_t)(PAGE_SIZE - 1);   /* before M2197 */
+> ```
+>
+> So `mprotect(p + 64, 4096, PROT_NONE)` made **two** pages inaccessible --
+> the one holding the caller's live bytes before `p+64`, and the one past the
+> requested end -- and returned 0. On Linux that call is `EINVAL`. Every
+> protection is affected, not only `PROT_NONE`: rounding down makes the
+> *preceding* page read-only just as silently, and the next write to it faults
+> in code that never asked for anything to change. The resulting state is a
+> write to an address that **is** inside a VMA whose recorded protection is not
+> what its owner requested -- which is the crash the concurrent session has
+> been chasing, and their provenance table correctly reported "no mprotect
+> covers this mapping" because the owner never made a call.
+>
+> This file already refuses unaligned addresses correctly in `app_munmap_nl`
+> and `app_mincore_nl`. `mprotect` and `madvise` each diverged from a
+> convention already established around them, so the complaint is now one
+> shared helper instead of a copy per site.
+>
+> **The reference implementation is free, and it is now a rule.** `lxnone` is
+> a `-static-pie` Linux binary, so the host kernel runs it: all 7 assertions
+> pass on Linux. The expectations encode real `mprotect(2)` semantics rather
+> than a reading of them. Any probe that builds static-pie gets a
+> definitionally-correct oracle before it ever boots.
+>
+> **Then a measurement run for one reason answered another.** Sizing the
+> `VFS_PATH_MAX` repair meant compiling every kernel translation unit with
+> `-fstack-usage`, and one task entry point was not fine:
+>
+>     wl_server_task   15344 of 16384 bytes (93%)
+>
+>     wl_server_task -> wl_compositor_poll -> wl_client_release -> unix_close
+>     -> app_scm_drop_conn (9536) -> net_tcp_sock_close -> tcp_close (1712)
+>     -> tcp_send_seg (1696) -> nic_send -> bpf_run -> bpf_jit_compile (832)
+>
+> That is a Wayland client disconnecting -- what happens every time a Firefox
+> content process exits -- on the compositor's stack, with one guard page below
+> it and an adjacent task's stack below that. `app_scm_drop_conn` copied a
+> whole `struct fdent` per doomed descriptor, and fdent carries a 256-byte
+> path: 9,472 bytes of stack to read 6 bytes of each entry. Now 256, and the
+> compositor gets 256 KiB like every app task.
+>
+> **What I got wrong on the way, because it is the whole lesson of the tool.**
+> `app_core_dump`'s frame measures 65,920 bytes, and my first reading compared
+> that against `STACK_SIZE` (16,384) and called it a four-times overflow
+> silently corrupting another task's stack on the crash path. It is not. App
+> tasks are created with a **256 KiB** stack, so it fits, and the `[core] wrote
+> /tmp/core` lines in every captured log were telling the truth. A per-function
+> byte limit means nothing without the stack the function runs on, and this
+> kernel uses six different sizes -- a flat threshold flagged 58 functions,
+> nearly all fine, which is a gate nobody would keep.
+>
+> So `make stackusagetest` walks chains per entry point, roots the interrupt
+> depth at every function passed to `irq_install_handler` (rather than cutting
+> edges by hand until the number looks reasonable), adds that depth to every
+> task because an interrupt lands on top of whatever was running, and **fails
+> at 75% rather than 100%** -- because failing only on `need > size` would have
+> passed the very bug it was written for, and every number is a lower bound
+> while the VFS and block layer dispatch through function pointers.
+>
+> **Still not the blank page, and said plainly.** Firefox renders 1 in 5 and
+> nothing here has moved that. What these two milestones did is remove two ways
+> for the kernel to corrupt a process that did nothing wrong, and add a gate
+> that would have caught the second one.
+
 > **(M2193-M2195) A SYSCALL THAT RETURNED SUCCESS AND DESTROYED THE CALLER'S
 > DATA -- AND AN INSTRUMENT THAT MEASURED MY OWN TEST.**
 >
