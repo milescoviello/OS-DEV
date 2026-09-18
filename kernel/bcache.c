@@ -73,16 +73,29 @@ static uint32_t       g_ncap   = BCACHE_STATIC_N;
 static uint32_t       g_nbucket = BCACHE_STATIC_N;   /* power of two */
 static uint32_t       g_hand;
 static uint64_t       g_hits, g_miss, g_evict, g_promote;
+static unsigned long  g_chain_broken;   /* corrupted-chain walks refused (M2176) */
 
 static volatile int g_lock;
+/* BCACHE_HOST_TEST: `cli` is privileged, so the host test would take a SIGSEGV
+ * on the first lock. Same accommodation kheap.c already makes for the same
+ * reason -- the atomic exchange is kept, so what the test exercises is still
+ * the real bookkeeping, just without the interrupt masking that a
+ * single-threaded userspace process has no use for. (M2176) */
 static inline uint64_t bc_lock(void) {
-    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    uint64_t f = 0;
+#ifndef BCACHE_HOST_TEST
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+#endif
     while (__atomic_exchange_n(&g_lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
     return f;
 }
 static inline void bc_unlock(uint64_t f) {
     __atomic_store_n(&g_lock, 0, __ATOMIC_RELEASE);
+#ifndef BCACHE_HOST_TEST
     __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+#else
+    (void)f;
+#endif
 }
 
 static inline uint32_t bc_hash(uint32_t owner, uint64_t lba) {
@@ -107,8 +120,27 @@ static void bc_link(uint32_t idx) {
     g_meta[idx].next = g_bucket[b];
     g_bucket[b] = idx + 1;
 }
+/* A CORRUPTED CHAIN MUST NOT HANG THE KERNEL (M2176).
+ *
+ * This walked the chain with no bound. A chain can only ever be as long as the
+ * pool, so a walk that exceeds that has found a cycle -- and the walk runs
+ * inside cli plus a spinlock, so the machine stops with no diagnostic and no
+ * way back. Not hypothetical: mutating `bcache_install` to skip unlinking an
+ * evicted victim -- exactly the kind of thing a later refactor gets wrong --
+ * HUNG the new host test instead of failing it, which is how this was found.
+ *
+ * Bounded, it degrades to a miss, which is always a legal answer for a cache,
+ * and says so once. A wrong answer would be worse, and a hang worse still. */
 static int bc_find(uint32_t owner, uint64_t lba) {
+    uint32_t steps = 0;
     for (uint32_t e = g_bucket[bc_hash(owner, lba)]; e; e = g_meta[e - 1].next) {
+        if (e > g_ncap || ++steps > g_ncap) {       /* a cycle, or an index off the end */
+            if (!g_chain_broken++)
+                kprintf("[bcache] CHAIN CORRUPT in the bucket for owner %u lba %lu after %u "
+                        "step(s) -- answering MISS. This bucket is degraded, not wrong.\n",
+                        owner, (unsigned long)lba, steps);
+            return -1;
+        }
         struct bcmeta *m = &g_meta[e - 1];
         if (m->valid && m->owner == owner && m->lba == lba) return (int)(e - 1);
     }
@@ -244,6 +276,13 @@ void bcache_flush(void) {
     for (uint32_t k = 0; k < g_nbucket; k++) g_bucket[k] = 0;
     bc_unlock(f);
 }
+
+/* HOW MANY WALKS FOUND A CORRUPT CHAIN (M2176). Exposed because the bound in
+ * bc_find turns a corrupt chain into a MISS -- which is a legal answer, and so
+ * invisible to a test whose invariant is "a hit must be correct". Hardening
+ * that hides the bug it guards against is the same defect as no hardening;
+ * this is what makes it observable. Must be zero. */
+unsigned long bcache_chain_breaks(void) { return g_chain_broken; }
 
 void bcache_counts(uint64_t *hits, uint64_t *miss) {
     uint64_t f = bc_lock();
