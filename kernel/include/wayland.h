@@ -62,6 +62,7 @@ void wl_window_extent(uint32_t *w, uint32_t *h);     /* the bounding box of all 
  * window meant the 64x32 test client kept the only slot while Firefox painted
  * full-size frames with nowhere to go. */
 int  wl_client_used(int ci);
+int  wl_client_window_ready(int ci);   /* 1 = it has a toplevel (or no shell at all) -- M2200 */
 int  wl_client_count(void);
 int  wl_client_layers(int ci, struct wl_layer *out, int max);
 void wl_client_extent(int ci, uint32_t *w, uint32_t *h);
@@ -70,7 +71,7 @@ void wl_largest_window(uint32_t *w, uint32_t *h);
 /* Sample the CONTENT area of the biggest window and report what colour
  * dominates it. "Painted" has meant a >=640x480 extent, which chrome around an
  * empty page satisfies just as well as a page. (M2106) */
-void wl_page_probe(uint32_t want_rgb);
+int wl_page_probe(uint32_t want_rgb);   /* 1 = the page is on screen (M2200) */
 /* The composited window as a small PPM in hex, so it can be LOOKED at rather
  * than inferred from a colour histogram. (M2110) */
 void wl_page_dump(void);   /* has ANY client painted a real window? (M2089) */

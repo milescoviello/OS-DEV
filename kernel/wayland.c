@@ -84,6 +84,9 @@
 #define WL_SURFACE_DAMAGE        2
 #define WL_SURFACE_FRAME         3
 #define WL_SURFACE_COMMIT        6
+unsigned long g_wl_shm_mismatch, g_wl_shm_ok;   /* M2200: does the compositor read what the client wrote? */
+extern uint64_t vmm_translate(uint64_t virt);
+extern int app_memfd_mapper_at(int mfd, unsigned long off, uint64_t *out_va, uint64_t *out_phys);
 /* wl_buffer requests/events */
 #define WL_BUFFER_DESTROY        0
 #define WL_BUFFER_EV_RELEASE     0
@@ -254,6 +257,7 @@ struct wl_object {
      *   state that used to live in four file-scope globals. (M2058) */
     uint8_t *base; unsigned long size;
     uint32_t off, width, height, stride, format;
+    int      shmchk;               /* M2200: the compositor-vs-client frame check ran once */
     /* wl_shm_pool: how many bytes the BACKING OBJECT actually owns, which is
      * the ceiling a resize may not pass. The client's claimed size and the
      * memfd's real capacity are different numbers and only one of them is
@@ -559,6 +563,36 @@ void wl_client_extent(int ci, uint32_t *w, uint32_t *h) {
     }
     if (w) *w = maxx > 0 ? (uint32_t)maxx : 0;
     if (h) *h = maxy > 0 ? (uint32_t)maxy : 0;
+}
+
+/* IS THIS CLIENT A WINDOW, OR JUST A CONNECTION? (M2200)
+ *
+ * The window manager opened a desktop window for every client with a non-zero
+ * extent, and that is not the same question. A Wayland surface with NO ROLE is
+ * not displayable -- the protocol says so -- and Firefox's child processes each
+ * connect, bind xdg_wm_base, create surfaces and commit to them without ever
+ * asking for a toplevel. wl_client_root's roleless-but-mapped fallback then
+ * scored those 2, they got an extent, and the desktop opened a black window per
+ * content process ON TOP of the browser it had just opened. The screenshot of
+ * the first ffshow run shows exactly that: a real rendered page with an empty
+ * black window covering a third of it.
+ *
+ * The fallback itself has to stay: our own raw test client (tools/lx/lxwl)
+ * never binds a shell at all, and it is the thing the compositor was first
+ * proven against. So the test is "a toplevel, OR no shell to ask one from" --
+ * which admits the raw client and excludes a client that HAS a shell and has
+ * not made a window with it. */
+int wl_client_window_ready(int ci) {
+    if (!wl_client_used(ci)) return 0;
+    struct wl_client *c = &g_cl[ci];
+    int has_shell = 0;
+    for (int j = 0; j < c->nobj; j++) {
+        struct wl_object *o = &c->obj[j];
+        if (!o->id) continue;
+        if (o->kind == WLK_XDG_WM_BASE) has_shell = 1;
+        if (o->kind == WLK_SURFACE && o->role == WLR_TOPLEVEL) return 1;
+    }
+    return !has_shell;
 }
 
 const char *wl_client_title_of(int ci) {
@@ -1763,6 +1797,70 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                             if (pct >= 50) g_wl_page_commits++;
                             g_wl_commits_seen++;
                         }
+                        /* IS THE COMPOSITOR READING THE MEMORY THE CLIENT WROTE? (M2200)
+                         *
+                         * The compositor reads a committed buffer through the
+                         * memfd's KERNEL-HEAP pointer; the client writes through
+                         * its OWN mapping of that memfd. Nothing has ever
+                         * verified that those two resolve to the same physical
+                         * pages -- and if they do not, the compositor blits
+                         * memory the client never wrote, which presents as a
+                         * frame of the client's blank canvas with every other
+                         * layer healthy -- which is the SHAPE of the 1-core
+                         * failure: document fetched, parsed, ACTIVE in the
+                         * window, 181 commits at the right size, content area
+                         * showing something else.
+                         *
+                         * IT IS NOT THAT FAILURE, AND THIS CHECK IS WHAT SAYS
+                         * SO. Measured across four boots it fires on runs that
+                         * render the page perfectly (page=39 of 39 samples,
+                         * mismatch=1) as often as on blank ones, and the pool
+                         * it fires on was 8 MiB from creation and never grew.
+                         * So the mismatch is real, rare, and NOT the blank
+                         * page; keeping the check is how the next theory gets
+                         * tested instead of believed.
+                         *
+                         * Compare the frames. The compositor's side is
+                         * `vmm_translate` of its heap pointer; the client's side
+                         * is the same offset inside whichever of its VMAs is
+                         * backed by this memfd, translated in ITS address space.
+                         * A mismatch is the answer; a match eliminates the last
+                         * mechanism that leaves no other trace.
+                         *
+                         * Once per buffer, bounded: this runs on every commit. */
+                        if (b->mfd >= 0 && !b->shmchk) {
+                            b->shmchk = 1;
+                            /* COMPARE THE SAME OFFSET (M2200).
+                             *
+                             * The first cut compared `o->base` -- which already
+                             * includes the buffer's offset within the pool --
+                             * against the client's VMA START, i.e. offset 0 of
+                             * its mapping. Two different offsets of one object
+                             * are two different pages, so it reported a
+                             * "mismatch" for buffers that were shared perfectly.
+                             * It fired once in a run that RENDERED, which is the
+                             * tell. Take the object's base from the memfd and
+                             * compare at a single offset on both sides. */
+                            void *mb = 0;
+                            unsigned long moff = 0;
+                            if (app_memfd_obj_info(b->mfd, &mb, 0, 0) == 0 && mb &&
+                                (uint8_t *)o->base >= (uint8_t *)mb)
+                                moff = (unsigned long)((uint8_t *)o->base - (uint8_t *)mb);
+                            uint64_t kp = vmm_translate((uint64_t)o->base);
+                            uint64_t up = 0, uva = 0;
+                            int upid = app_memfd_mapper_at(b->mfd, moff, &uva, &up);
+                            if (kp && up && kp != up) {
+                                g_wl_shm_mismatch++;
+                                kprintf("[wl] ** THE COMPOSITOR IS NOT READING THE CLIENT'S "
+                                        "MEMORY: memfd %d, compositor heap %lx -> phys %lx, "
+                                        "client pid %d va %lx -> phys %lx. Every pixel blitted "
+                                        "from this buffer is memory the client never wrote. **\n",
+                                        b->mfd, (unsigned long)o->base, (unsigned long)kp,
+                                        upid, (unsigned long)uva, (unsigned long)up);
+                            } else if (kp && up) {
+                                g_wl_shm_ok++;
+                            }
+                        }
                         uint32_t mid = 0;
                         if (need2 <= o->size && b->height && b->width)
                             mid = rd32(o->base + (unsigned long)(b->height / 2) * b->stride + (unsigned long)(b->width / 2) * 4);
@@ -2114,18 +2212,26 @@ void wl_page_dump(void) {
 }
 
 #define WL_PROBE_GRID 32
-void wl_page_probe(uint32_t want) {
+/* RETURNS 1 WHEN THE PAGE IS ACTUALLY ON SCREEN (M2200), 0 otherwise.
+ *
+ * It was void, and the caller therefore had no way to know what it had just
+ * printed -- so the ffwl run sampled a fixed forty times at fifteen seconds
+ * whatever the answer was, and the window manager was not allowed to run for
+ * ten minutes after the page had already rendered. The demo is a human looking
+ * at the screen; a probe that has proved the thing and then blocks the screen
+ * for another nine minutes is measuring instead of delivering. */
+int wl_page_probe(uint32_t want) {
     int best = -1; uint64_t barea = 0;
     for (int ci = 0; ci < WL_MAXCLIENT; ci++) {
         if (!g_cl[ci].used) continue;
         uint32_t w = 0, h = 0; wl_client_extent(ci, &w, &h);
         if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = ci; }
     }
-    if (best < 0 || barea == 0) { kprintf("[page] no client has a window to sample\n"); return; }
+    if (best < 0 || barea == 0) { kprintf("[page] no client has a window to sample\n"); return 0; }
     uint32_t ww = 0, wh = 0; wl_client_extent(best, &ww, &wh);
     struct wl_layer L[WL_MAXOBJ > 32 ? 32 : WL_MAXOBJ];
     int nl = wl_client_layers(best, L, (int)(sizeof L / sizeof L[0]));
-    if (nl <= 0) { kprintf("[page] client %d has a %ux%u extent but no layers\n", best, ww, wh); return; }
+    if (nl <= 0) { kprintf("[page] client %d has a %ux%u extent but no layers\n", best, ww, wh); return 0; }
 
     /* The chrome is at the top. Sample below it, and never outside the window. */
     uint32_t y0 = wh > 200 ? 92 : 0;
@@ -2218,6 +2324,15 @@ void wl_page_probe(uint32_t want) {
                 sampled ? tally[i].n * 100 / sampled : 0,
                 (tally[i].c & 0x00ffffffu) == (want & 0x00ffffffu) ? "   <-- the page background" : "");
     if (uncovered) kprintf("[page]   %d sample(s) were not covered by any layer at all\n", uncovered);
+    /* AND WHETHER THE PIXELS CAME FROM THE CLIENT AT ALL (M2200). Both of
+     * these counters existed and neither was ever printed, so the question
+     * "is the compositor reading the client's own memory" could only be
+     * answered by a log line that fires when the answer is no -- and a
+     * counter with no report cannot say that the answer was YES. */
+    {   extern unsigned long g_memfd_remapped;
+        kprintf("[page]   shm: %lu commit(s) blitted the client's OWN frame, %lu did not; "
+                "%lu page(s) re-pointed after a mapped memfd grew\n",
+                g_wl_shm_ok, g_wl_shm_mismatch, g_memfd_remapped); }
     /* State the verdict, and state it against a threshold, so a page that
      * painted a thin strip of itself cannot read as a page that loaded. */
     int pct = sampled ? hit * 100 / sampled : 0;
@@ -2263,6 +2378,7 @@ void wl_page_probe(uint32_t want) {
                                       : "so the page was NEVER presented in any frame");
         kprintf("[page] VERDICT: only the CHROME -- %d%% of the content area is the page's %06x, "
                 "so the content area is showing something else\n", pct, want & 0x00ffffffu);
+    return pct >= 50;
 }
 
 /* VSYNC IS A PERIODIC SIGNAL, NOT A REPLY TO A COMMIT (M2110).

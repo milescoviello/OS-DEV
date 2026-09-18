@@ -3742,6 +3742,37 @@ void app_mmap_postcheck(uint64_t base, uint64_t len, int prot, const char *how) 
                 (unsigned long)vs, (unsigned long)vl, vp, (unsigned long)(vs + vl));
 }
 
+/* WHO ELSE HAS THIS MEMFD MAPPED, AND AT WHICH PHYSICAL PAGE? (M2200)
+ *
+ * The compositor reads a committed wl_shm buffer through the memfd's
+ * kernel-heap pointer while the client writes through its own mapping of the
+ * same memfd. Nothing has ever checked that those resolve to the same physical
+ * memory -- and if they do not, the compositor blits pixels the client never
+ * wrote, which looks like a frame of the client's blank canvas with every other
+ * layer healthy.
+ *
+ * Returns the pid of a process (other than the caller) that has `mfd` mapped,
+ * with the user VA at `off` into that mapping and the physical frame behind it
+ * in THAT address space. -1 if nobody else has it. */
+int app_memfd_mapper_at(int mfd, unsigned long off, uint64_t *out_va, uint64_t *out_phys) {
+    struct app *me = cur();
+    for (int p = 0; p < MAX_APPS; p++) {
+        struct app *a = &apps[p];
+        if (a == me || !a->used || !a->cr3) continue;
+        uint64_t fl = vma_lock(a);
+        uint64_t va = 0;
+        for (int i = 0; i < a->nvma; i++)
+            if (a->vma[i].len && a->vma[i].mfd == mfd) { va = a->vma[i].start; break; }
+        vma_unlock(a, fl);
+        if (!va) continue;
+        /* The same offset on both sides, or the comparison is meaningless. */
+        if (out_va) *out_va = va + off;
+        if (out_phys) *out_phys = vmm_translate_in(a->cr3, va + off);
+        return a->pid;
+    }
+    return -1;
+}
+
 /* Called by the Linux mmap translation right after a file mapping lands. */
 void app_protnote_mmap(uint64_t start, uint64_t len, int prot) {
     protnote(start, len, (unsigned char)(prot & 0x7), 1, start, len);
@@ -9850,6 +9881,8 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
  * kmalloc a new buffer and copy, leaving every existing mapping pointing at
  * freed memory. wl_shm sizes a pool once and then maps it, so refusing is
  * both correct and sufficient. */
+unsigned long g_memfd_remapped;   /* pages re-pointed after a mapped memfd grew (M2200) */
+
 /* RETIRED BUFFERS: how a MAPPED memfd is allowed to grow at all (M2082).
  *
  * Growing means kmalloc'ing a bigger buffer and copying, and the old buffer's
@@ -10064,7 +10097,75 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
         if (m->mapped) m->retired[m->nretired++] = m->raw;   /* still aliased into a process */
         else           kfree(m->raw);
     }
+    char *oldbuf = m->buf;
     m->raw = nr; m->buf = nb; m->cap = nc;
+    /* RE-POINT EVERY LIVE MAPPING AT THE NEW BUFFER (M2200).
+     *
+     * Retiring the old buffer stops a use-after-free and SILENTLY BREAKS THE
+     * SHARING, which is a different kind of wrong. A memfd exists so that two
+     * processes see ONE piece of memory; after a grow the object's bytes live at
+     * `nb` while every existing mmap still aliases the retired pages, so each
+     * side has a private copy and neither is told. The comment above -- "the
+     * live mapping keeps pointing at memory that is still ours" -- is true, and
+     * is exactly the defect: safe, and wrong.
+     *
+     * The contents were copied above, so a re-pointed mapping sees its own
+     * data; what changes is that both sides are looking at one buffer again.
+     *
+     * HONEST SCOPE. This was found while hunting the 1-core blank page, and it
+     * is NOT proven to be that: the commit-time check added alongside it
+     * (kernel/wayland.c) fired on a boot that rendered the page perfectly as
+     * well as on a blank one, and the pool it fired on was 8 MiB from creation
+     * and never grew at all -- so THIS path was not even on that boot's
+     * critical path. What is proven is the defect itself, from the code: a
+     * mapped memfd that grows leaves its mappings on memory the object no
+     * longer uses.
+     *
+     * THE FRAMES MUST BE REFCOUNTED, exactly as app_mmap_memfd_nl's ownership
+     * note says: munmap and teardown call pmm_free_frame on every present user
+     * page, so a mapping that is re-pointed has to take a reference on the new
+     * frame and give up the one it held on the old. Getting that wrong is
+     * M1985 again -- a live kernel-heap page handed back to the PMM.
+     *
+     * The VMA ranges are collected under the lock and mapped after it is
+     * released: vmm_map_to allocates page tables, and holding a VMA spinlock
+     * across an allocation is the shape that hung the machine in M1988. */
+    if (m->mapped && oldbuf) {
+        int idx = (int)(m - memfds);          /* the index vma.mfd holds */
+        unsigned long fixed = 0, unshareable = 0;
+        for (int pi = 0; pi < MAX_APPS; pi++) {
+            struct app *a = &apps[pi];
+            if (!a->used || !a->cr3) continue;
+            struct { uint64_t start, len; } r[APP_MAXVMA];
+            int nr2 = 0;
+            uint64_t fl = vma_lock(a);
+            for (int i = 0; i < a->nvma && nr2 < APP_MAXVMA; i++)
+                if (a->vma[i].len && a->vma[i].mfd == idx) {
+                    r[nr2].start = a->vma[i].start; r[nr2].len = a->vma[i].len; nr2++;
+                }
+            vma_unlock(a, fl);
+            if (!nr2) continue;
+            for (int i = 0; i < nr2; i++)
+                for (uint64_t off = 0; off < r[i].len; off += PAGE_SIZE) {
+                    if (off >= nc) break;                  /* past the new buffer */
+                    uint64_t ph = vmm_translate((uint64_t)(nb + off));
+                    if (!ph || !pmm_refcountable(ph)) { unshareable++; continue; }
+                    uint64_t oldph = vmm_translate_in(a->cr3, r[i].start + off);
+                    if (oldph == ph) continue;             /* already the new frame */
+                    pmm_addref(ph);                        /* THIS mapping's reference */
+                    vmm_map_to(a->cr3, r[i].start + off, ph,
+                               PTE_USER | PTE_WRITABLE | PTE_NX);
+                    if (oldph) pmm_free_frame(oldph);      /* give up the retired one */
+                    fixed++;
+                }
+            app_tlb_sync(a);   /* another core may still cache the old frame */
+        }
+        g_memfd_remapped += fixed;
+        if (unshareable)
+            kprintf("[memfd] %lu page(s) of the grown buffer are not refcountable, so the "
+                    "mappings still alias the RETIRED pages there and the object is unshared "
+                    "across them\n", unshareable);
+    }
     return 0;
 }
 
