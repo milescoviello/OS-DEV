@@ -324,12 +324,46 @@ static void ffshow_watch_task(void) {
         {   int cpid = 0, csig = lx_fatal_signal(&cpid);
             if (csig) kprintf("[ffshow] *** pid %d CRASHED with signal %d -- what is on the "
                               "screen from here is the corpse ***\n", cpid, csig); }
-        if (pw >= 640 && ph >= 480 && !seen && wl_page_probe(0x101820)) {
-            seen = 1;
-            kprintf("[time] PAGE ON SCREEN (ffshow) at %lu ms since boot -- it is on the "
-                    "display right now; go and look at it\n", (unsigned long)timer_ms());
+        /* THE FULL PAGE PROBE, EVERY SAMPLE, NOT ONCE (M2214).
+         *
+         * The watcher used to run wl_page_probe only until the first success,
+         * because `ffwl` -- which held the framebuffer for its own diagnostics
+         * -- was where the real series lived. Booting to the desktop is now the
+         * rule rather than a mode (the user's: "we should almost always be
+         * booting to desktop as there's no reason not to"), so the series has to
+         * live HERE, on serial, where it costs the screen nothing.
+         *
+         * console_gfx_release means every line below goes to COM1 only once the
+         * window manager owns the display, so this is the same measurement the
+         * blocking loop produced and the same log a suite greps -- with the
+         * machine showing the desktop the whole time. */
+        if (pw >= 640 && ph >= 480) {
+            {   extern void lx_syscall_top(int);
+                extern void lx_syscall_time_top(int);
+                lx_syscall_top(6);
+                lx_syscall_time_top(6); }
+            {   static uint64_t pc, psx, ph2;
+                uint64_t c = 0, se = 0, h = 0, cx = 0, chh = 0;
+                ata_io_stats(&c, &se, &h, &cx, &chh);
+                kprintf("[diskrate] +%lu command(s), +%lu sector(s), +%lu cache hit(s) "
+                        "since the last sample\n",
+                        (unsigned long)(c > pc ? c - pc : 0),
+                        (unsigned long)(se > psx ? se - psx : 0),
+                        (unsigned long)(h > ph2 ? h - ph2 : 0));
+                pc = c; psx = se; ph2 = h; }
+            int onscreen = wl_page_probe(0x101820);
+            if (onscreen && !seen) {
+                seen = 1;
+                kprintf("[time] PAGE ON SCREEN at %lu ms since boot -- it is on the "
+                        "display right now; go and look at it\n", (unsigned long)timer_ms());
+            }
+            if (!onscreen) {
+                int bp = app_biggest_pid();
+                app_wait_summary(bp > 0 ? bp : 0);
+            }
         }
     }
+    kprintf("[ffshow] the watcher has finished its window; the desktop keeps running\n");
 }
 
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
@@ -807,10 +841,28 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
-        if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
-        if (cmdline_has(cl, "ffnet"))      { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffnet = 1; }   /* Firefox against a REAL URL (M2210) */
-        if (cmdline_has(cl, "ffshow"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
-                                             g_ffshow = 1; g_noprobes = 1; }              /* ...and hand the screen over AT ONCE (M2200) */
+        /* BOOTING TO THE DESKTOP IS THE RULE, NOT A MODE (M2214).
+         *
+         * The user's, and it is a hard one: "we should almost always be booting
+         * to desktop as there's no reason not to." There genuinely is no reason:
+         * console output is serial-only once the window manager owns the screen
+         * (console_gfx_release), so a boot that hands over loses nothing from
+         * the log and gains a machine somebody can look at. `ffwl` held the
+         * framebuffer for ninety one-second heartbeats and then up to forty
+         * fifteen-second page samples -- ten minutes of scrolling text on a boot
+         * that had already rendered the page, which is exactly what the user was
+         * staring at when they asked where Firefox was.
+         *
+         * So `ffwl`, `ffnet` and `ffshow` are one thing now, and the diagnostics
+         * run on a watcher thread (ffshow_watch_task) printing the same series
+         * to COM1. `ffhold` is the escape hatch for the rare boot that dies
+         * before the desktop starts and therefore needs the log ON SCREEN. */
+        if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") || cmdline_has(cl, "ffnet")) {
+            g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
+        }
+        if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
+        if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
+                                             g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
         if (cmdline_has(cl, "ffmozlog"))   g_ffmozlog = 1;                /* + Firefox's OWN widget/Wayland logging, to stderr (M2010) */
         if (cmdline_has(cl, "ffshot"))     { g_lxabi_test = 1; g_ffshot = 1; }   /* Firefox HEADLESS, rendering a page to a PNG (M2003) */

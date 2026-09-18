@@ -24,6 +24,12 @@ set -e
 PVE_HOST=${PVE_HOST:-192.168.1.5}
 VMID=${VMID:-122}
 PVE_DIR=${PVE_DIR:-/root/osdev}
+# BOOT TO THE DESKTOP. A hard rule (the user's): "we should almost always be
+# booting to desktop as there's no reason not to." Since M2214 `ffwl` hands the
+# framebuffer to the window manager as soon as Firefox is spawned and runs its
+# diagnostics on a watcher thread -- console output is serial-only once the WM
+# owns the screen, so the log this harness captures is unchanged. `ffhold` is
+# the escape hatch for a boot that dies before the desktop starts.
 APPEND=${APPEND:-"ffwl nonetdemo"}
 CAP=${CAP:-180}
 MEM=${MEM:-8192}
