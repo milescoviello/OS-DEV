@@ -6125,7 +6125,38 @@ static int app_mprotect_nl(uint64_t addr, uint64_t len, int prot) {
     struct app *a = cur();                                     /* deny if the range hits a sealed region (M1130) */
     if (a) for (int i = 0; i < a->nvma; i++)
         if (a->vma[i].sealed && a0 < a->vma[i].start + a->vma[i].len && a->vma[i].start < end) return -1;
-    uint64_t flags = PTE_USER;
+    /* PROT_NONE MUST MAKE THE PAGE INACCESSIBLE, NOT MERELY UNWRITABLE (M2179).
+     *
+     * This built `PTE_USER` unconditionally and then chose only WRITABLE and
+     * NX -- so mprotect(PROT_NONE) produced a page that is present, user-
+     * readable and non-writable. A read of it succeeds and returns the data.
+     *
+     * M2165 fixed the VMA side (a requested PROT_NONE was being RECORDED as
+     * read-only), which the fault handler needs for pages that are not
+     * resident yet. It did nothing for pages that ARE resident, because those
+     * never fault again -- the PTE already permits the read. Two halves of one
+     * mechanism, and fixing the half that is easy to see leaves the guarantee
+     * broken. `tools/lx/lxnone.c` caught it on the first boot it ran:
+     *
+     *   LXNONE: FAIL a READ of a PROT_NONE page did not fault -- it
+     *           returned 193
+     *
+     * 193 is the byte the probe had written at that offset, so the mapping was
+     * not merely readable, it was intact.
+     *
+     * Clearing PTE_USER rather than PTE_PRESENT is the right lever: the page
+     * stays present for the kernel (so msync, fork and the fault handler can
+     * still reach it through the VMA), while any ring-3 access faults and is
+     * refused against the VMA's recorded prot of 0 -- which is what M2060 built
+     * that path for.
+     *
+     * The case this exists for: glibc mprotects the gaps between a shared
+     * object's segments PROT_NONE so a stray pointer into the padding traps
+     * instead of reading a neighbouring segment, and JavaScriptCore reserves
+     * its 4 GiB structure heap PROT_NONE so that StructureID 0 is an invalid
+     * id. A PROT_NONE region that answers with data makes id 0 resolve to a
+     * zeroed Structure. */
+    uint64_t flags = (prot & 0x7) ? PTE_USER : 0;
     if (prot & 0x2) flags |= PTE_WRITABLE;       /* PROT_WRITE  */
     if (!(prot & 0x4)) flags |= PTE_NX;          /* not PROT_EXEC -> no-execute */
 
@@ -7675,7 +7706,50 @@ int app_signal_deliver(struct registers *r, int signo) {
      * split is not a simplification, it is what Linux does: sigaction is
      * shared by every thread, the mask, the alternate stack and the
      * interrupted context are not. */
-    if (!a->sig_handler[signo] || a->sig_handler[signo] == APP_SIG_IGN || !a->sig_restorer || th->sig_in) return 0;
+    /* A HANDLER THAT LONGJMPS OUT NEVER REACHES sigreturn (M2180).
+     *
+     * `sig_in` is set here and cleared ONLY by app_sigreturn. `siglongjmp` out
+     * of a handler -- which is the standard way to recover from a fault, used
+     * by sandboxes, JITs probing memory, guard-page handlers and every
+     * "try this access and catch the SIGSEGV" idiom -- does not call sigreturn:
+     * it restores the saved context directly. So `sig_in` stayed 1 for the rest
+     * of the process's life and every later signal was refused delivery, which
+     * means the process was KILLED by a signal it had a perfectly good handler
+     * for. **A SIGSEGV handler could catch exactly one fault.**
+     *
+     * Found by tools/lx/lxnone.c, which faults on purpose four times and died
+     * on the second with exit 139 after the first was correctly delivered.
+     *
+     * Detect the abandoned frame from the stack pointer, and be careful WHICH
+     * one: the first cut of this recorded the INTERRUPTED rsp, and a siglongjmp
+     * returns to very nearly that same value -- the setjmp and the faulting
+     * access are usually in the same frame -- so the comparison could not tell
+     * the two apart and the fix did nothing. The discriminator is the rsp the
+     * HANDLER was given, which is strictly below the interrupted one (or on a
+     * different stack entirely under SA_ONSTACK). Code genuinely running inside
+     * the handler has rsp at or below that; a longjmp back to any outer frame
+     * has rsp above it.
+     *
+     * The 8 MiB window is the largest plausible growth within one handler; past
+     * it, a different stack. Conservative in the safe direction: a wrong "still
+     * in the handler" answer costs a killed process, a wrong "escaped" answer
+     * costs a nested handler, which is what SA_NODEFER asks for anyway. */
+    if (th->sig_in) {
+        uint64_t ersp = th->sig_entry_rsp, crsp = r->rsp;
+        int escaped = !ersp || crsp > ersp || crsp + (8ull << 20) < ersp;
+        if (!escaped) return 0;
+        static int told;
+        if (told < 4) {
+            told++;
+            kprintf("[signal] the handler for a previous signal never returned through "
+                    "sigreturn (rsp %lx now, %lx at entry) -- it longjmp'd out. Delivering "
+                    "signal %d rather than killing a process that has a handler for it.\n",
+                    (unsigned long)crsp, (unsigned long)ersp, signo);
+        }
+        th->sig_in = 0;
+        th->sig_saved = 0;
+    }
+    if (!a->sig_handler[signo] || a->sig_handler[signo] == APP_SIG_IGN || !a->sig_restorer) return 0;
     struct registers *saveto = sig_frame_of(th);
     if (!saveto) return 0;                   /* cannot save the context -> do not enter the handler */
 
@@ -7711,6 +7785,7 @@ int app_signal_deliver(struct registers *r, int signo) {
         th->sig_uctx = mctx_addr;
         th->sig_in = 1;
         r->rsp = ret;
+        th->sig_entry_rsp = ret;       /* the HANDLER's rsp, not the interrupted one (M2180) */
         r->rip = a->sig_handler[signo];
         r->rdi = (uint64_t)signo;                         /* h(signo, */
         r->rsi = si_addr;                                 /*   siginfo*, */
@@ -7723,8 +7798,10 @@ int app_signal_deliver(struct registers *r, int signo) {
     *saveto = *r;                                    /* save the interrupted context */
     th->sig_uctx = 0;
     th->sig_in = 1;
+
     *(volatile uint64_t *)nrsp = a->sig_restorer;    /* handler's return address -> trampoline */
     r->rsp = nrsp;
+    th->sig_entry_rsp = nrsp;                        /* the HANDLER's rsp (M2180) */
     r->rip = a->sig_handler[signo];
     r->rdi = (uint64_t)signo;                        /* handler(int signo) */
     return 1;

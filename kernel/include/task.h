@@ -121,6 +121,12 @@ typedef struct task {
     uint64_t      sig_q_value;      /* si_value for the signal being delivered */
     int           sig_q_code;       /* si_code  for the signal being delivered */
     int           sig_in;           /* 1 while this thread runs a handler */
+    uint64_t      sig_entry_rsp;    /* user rsp when that handler was entered. A handler
+                                     * that longjmps out never reaches sigreturn, so
+                                     * sig_in would stay 1 for ever and every later
+                                     * signal be refused -- killing a process that has a
+                                     * handler. This is how the abandoned frame is
+                                     * detected. See app_signal_deliver. (M2180) */
     int           pin_core;    /* CPU AFFINITY (M1531): -1 = may run on any core; >=0 = the ONE core
                                  * (APIC id & 15) allowed to run this task. Used for each core's own
                                  * floor/idle task (must never migrate) AND for task 0 (the kernel's own
