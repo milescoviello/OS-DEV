@@ -370,6 +370,24 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: signal dispositions are not honoured:"; grep -a "LXSIG" "$SLOG3" | grep -a FAIL | head -4; f3=1
     fi
+    # M2196 -- PROT_NONE MUST FAULT, AND A HANDLER MUST SURVIVE A LONGJMP.
+    # Both of these probes ran in the battery from M2175/M2178 and NOTHING
+    # GATED THEM: a regression in either would have left the suite green, which
+    # is the one failure mode that makes a green tree actively misleading. The
+    # probes found two real bugs on their first two boots (a PROT_NONE page that
+    # was still fully readable, and sig_in never being cleared after a
+    # siglongjmp so a SIGSEGV handler could catch exactly one fault), so they
+    # are worth asserting rather than merely running.
+    if grep -aq "LXNONE: ALL PASSED" "$SLOG3"; then
+        echo "  ok: PROT_NONE faults on read and on write, protects rather than discards, and faults when mmap'd that way from the start"
+    else
+        echo "  FAIL: PROT_NONE is not enforced:"; grep -a "LXNONE" "$SLOG3" | grep -a FAIL | head -4; f3=1
+    fi
+    if grep -aq "LXCOWPROT: ALL PASSED" "$SLOG3"; then
+        echo "  ok: an mprotect over a forked page keeps it copy-on-write, and keeps the dirty bit msync needs"
+    else
+        echo "  FAIL: mprotect breaks copy-on-write or loses a dirty page:"; grep -a "LXCOWPROT" "$SLOG3" | grep -a FAIL | head -4; f3=1
+    fi
     # M2083 -- TLS IS PER-THREAD, AND SO IS A WAIT.
     # Firefox died reading the stack canary at %fs:0x28, which means a thread
     # with NO TLS. Two defects behind it, each of which this probe fails on

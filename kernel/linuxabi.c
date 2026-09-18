@@ -3731,6 +3731,8 @@ static void lx_dispatch_body(struct registers *r) {
              * libxul's .data.rel.ro. (M2165) */
             { extern void app_protnote_mmap(uint64_t start, uint64_t len, int prot);
               app_protnote_mmap(fbase, (uint64_t)len, (int)prot); }
+        { extern void app_mmap_postcheck(uint64_t b, uint64_t l, int p, const char *how);
+          app_mmap_postcheck(fbase, (uint64_t)len, (int)prot, "file"); }
             r->rax = fbase;
             break;
         }
@@ -3792,6 +3794,8 @@ static void lx_dispatch_body(struct registers *r) {
          * "granted access and it did not take" (M2188). */
         { extern void app_protnote_mmap(uint64_t start, uint64_t len, int prot);
           app_protnote_mmap(base, (uint64_t)len, (int)prot); }
+        { extern void app_mmap_postcheck(uint64_t b, uint64_t l, int p, const char *how);
+          app_mmap_postcheck(base, (uint64_t)len, (int)prot, "anon"); }
         r->rax = base;
         break;
     }

@@ -3343,6 +3343,34 @@ void app_describe_fault_addr(uint64_t cr2) {
          * different VMA. Print it where the refusing mapping is identified. */
         protnote_report(a->vma[i].start);
         relro_watch_report(cr2);
+        /* IS IT INSIDE EXACTLY ONE MAPPING? (M2196)
+         *
+         * This loop reported the FIRST VMA containing the address and stopped.
+         * So for every fault all day it has been answering "here is a mapping
+         * that covers it" when the question worth asking is "how many do".
+         * M2190 established that mmap could hand back a range that was already
+         * mapped, and `vma_audit` only ever compared VMA against VMA on demand
+         * -- so two VMAs over one address is exactly the state that would
+         * produce the remaining crash (a pointer into one allocation is a
+         * pointer into the other) and exactly the state this report was unable
+         * to show. Count them all. */
+        {   int cover = 0, first = -1, second = -1;
+            for (int j = 0; j < a->nvma; j++) {
+                if (!a->vma[j].len) continue;
+                if (cr2 < a->vma[j].start || cr2 >= a->vma[j].start + a->vma[j].len) continue;
+                cover++;
+                if (first < 0) first = j; else if (second < 0) second = j;
+            }
+            if (cover != 1)
+                kprintf("[fault]   ** %d VMAs COVER THIS ADDRESS (vma[%d] %lx+%lx and vma[%d] "
+                        "%lx+%lx). Two allocations share it, so a pointer into one is a pointer "
+                        "into the other. **\n",
+                        cover, first,
+                        first >= 0 ? (unsigned long)a->vma[first].start : 0,
+                        first >= 0 ? (unsigned long)a->vma[first].len : 0, second,
+                        second >= 0 ? (unsigned long)a->vma[second].start : 0,
+                        second >= 0 ? (unsigned long)a->vma[second].len : 0);
+        }
         /* THE QUESTION THAT DECIDES THIS (M2166). A read-only file mapping the
          * program is WRITING to: has anything modified it since it was mapped?
          * If it still matches the file, ld.so's relocations into it were lost,
@@ -3617,6 +3645,59 @@ static void relro_watch_report(uint64_t addr) {
         kprintf("[fault]   ** THIS PAGE HAS CHANGED since the range was made READ-ONLY by tid %d "
                 "(hash %x, now %x). Nothing in the program can have written it. The kernel lost "
                 "or replaced the page. **\n", g_rw.tid, g_rw.h[i], now);
+}
+
+/* DOES mmap's OWN POSTCONDITION HOLD? (M2196)
+ *
+ * The one syscall that returns a POINTER is the one place a plausible wrong
+ * value does the most damage, and this project's signature defect is exactly
+ * that: a mechanism answering with a believable wrong answer instead of
+ * failing. Everything else about the remaining crash has been eliminated --
+ * the library bytes, the RELRO pages, the relocations, private mappings, the
+ * static inputs, storage errors, the FS base, VMA overlap -- and what is left
+ * is a write to an address that IS inside a VMA and yet is not the mapping the
+ * program asked for: `prot=0 'anon'` when the caller wanted read-write.
+ *
+ * So check the contract at the point of return, where it is cheap and where
+ * the caller's request is still in hand: the address handed back must be
+ * covered by a VMA, that VMA must extend over the whole requested length, and
+ * its recorded protection must be the one asked for. A violation means mmap
+ * returned an address it did not map as requested, and the program's first
+ * write to it will fault somewhere unrelated -- which is the symptom.
+ *
+ * Bounded reporting, and it does NOT fail the call: by the time this runs the
+ * mapping exists and refusing would strand it. The point is to say so. */
+unsigned long g_mmap_postfail;
+void app_mmap_postcheck(uint64_t base, uint64_t len, int prot, const char *how) {
+    struct app *a = cur();
+    if (!a || !base || !len) return;
+    uint8_t want = (uint8_t)(prot & 0x7);
+    uint64_t fl = vma_lock(a);
+    int found = -1;
+    for (int i = 0; i < a->nvma; i++) {
+        if (!a->vma[i].len) continue;
+        if (base < a->vma[i].start || base >= a->vma[i].start + a->vma[i].len) continue;
+        found = i; break;
+    }
+    int bad = 0; uint64_t vs = 0, vl = 0; uint8_t vp = 0;
+    if (found < 0) bad = 1;
+    else {
+        vs = a->vma[found].start; vl = a->vma[found].len; vp = a->vma[found].prot;
+        if (base + len > vs + vl) bad = 2;        /* the mapping is shorter than asked */
+        else if (vp != want)      bad = 3;        /* not the protection asked for */
+    }
+    vma_unlock(a, fl);
+    if (!bad) return;
+    g_mmap_postfail++;
+    if (g_mmap_postfail <= 8)
+        kprintf("[mmap] ** POSTCONDITION FAILED (%s): returned %lx for len %lx prot %d, but %s "
+                "(vma %lx+%lx prot %d). The caller's first write to this address will fault "
+                "somewhere unrelated. **\n",
+                how, (unsigned long)base, (unsigned long)len, want,
+                bad == 1 ? "NO VMA covers it" :
+                bad == 2 ? "the VMA is SHORTER than the request" :
+                           "the VMA's protection is not the one requested",
+                (unsigned long)vs, (unsigned long)vl, vp);
 }
 
 /* Called by the Linux mmap translation right after a file mapping lands. */
@@ -4801,6 +4882,7 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
  * because handing back an address that is already in use is the wrong answer
  * however cheap it was to produce. */
 static unsigned long g_gap_collisions;
+static unsigned long g_gap_fails;
 /* WHERE THE ORPHAN SITS (M2191). The check fired -- a present, writable, user
  * page with no VMA over it -- and "no VMA" alone does not say where it came
  * from. A page immediately past the end of a VMA is a boundary leak (a
@@ -4895,6 +4977,23 @@ static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align) {
             }
         }
     }
+    /* A FAILED SEARCH MUST NOT BE SILENT (M2196).
+     *
+     * Returning 0 here makes mmap return -ENOMEM, and a caller that does not
+     * check gets NULL and stores through a field of it -- which is exactly the
+     * crash another session just caught on ONE core: a user write to
+     * `CR2=0x467`, a struct field off a null pointer, with 1448 VMAs against a
+     * 4096 cap so the table was not full. Whatever returned that NULL did so
+     * silently. If it was this function, the log will now say so.
+     *
+     * Reported with the operands, because "out of address space" with 1448
+     * mappings in a 32 TiB window would itself be the bug. */
+    g_gap_fails++;
+    if (g_gap_fails <= 8)
+        kprintf("[vma] ** NO GAP for len %lx align %lx: the address space search failed with %d "
+                "VMAs mapped. mmap will return ENOMEM, and a caller that does not check gets "
+                "NULL. **\n",
+                (unsigned long)len, (unsigned long)align, a->nvma);
     return 0;
 }
 
