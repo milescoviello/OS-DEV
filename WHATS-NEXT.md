@@ -1,7 +1,22 @@
 # What's next
 
-> **(M2204-M2209) SIX REAL DEFECTS, ONE OF THEM THE SHAPE OF THE BLANK PAGE: A
-> fork() COPY-ON-WROTE MAP_SHARED PAGES.**
+> **(M2204-M2211) THE BLANK PAGE IS FIXED, AND IT WAS A fork() THAT
+> COPY-ON-WROTE MAP_SHARED PAGES.**
+>
+> **Measured, one core, four boots with the fix: 4 of 4 render**, 40 of 40 probe
+> samples each, no crashes, page on screen at 35.8-36.8 s -- tightly clustered
+> where before it was 2/4, 1/2 and 1/4 across builds. And the fix's own counter
+> says why it looked like a race:
+>
+>     [share] 59 mapping(s) of mapped memfds, 449 sampled page(s) agree,
+>             0 do NOT; 2420 COW fault(s) on a shared page were answered
+>             WITHOUT copying
+>
+> **2420 per boot, the same number in all four runs.** It was never a rare
+> race: privatising those pages was a deterministic part of Firefox's startup,
+> and the only probabilistic part was *which* of the 2420 mattered. The audit's
+> mismatch count went 33 (with the instrument's own offset bug in it) to 17
+> (offset fixed) to **0**.
 >
 > `vmm_fork_cow` write-protects **every** page of the parent, because it walks
 > the page tables and the page tables do not record which mappings are shared.
