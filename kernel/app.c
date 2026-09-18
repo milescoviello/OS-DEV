@@ -11148,6 +11148,26 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
         return (n == NET_SOCK_EAGAIN) ? APP_FD_EAGAIN : n;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 11) {  /* pty endpoint: read through the line discipline (M1274) */
+        /* O_NONBLOCK, WHICH THIS BRANCH IGNORED ENTIRELY (M2215).
+         *
+         * pty_read BLOCKS on an empty ring -- it parks the caller in
+         * p->in_waiter and waits for the peer. So a non-blocking read of an
+         * empty pty hung the caller, which is M2009's pipe bug one fd type
+         * over: an event loop drains a descriptor until EAGAIN, and the read
+         * that is SUPPOSED to find it empty is the one that never returns.
+         *
+         * It could not be hit until M2211, because until then no Linux binary
+         * could get a pty at all -- and the first probe that could
+         * (tools/lx/lxpty.c) hung in exactly that drain loop and was killed by
+         * its 60-second deadline: `LXPTY exit -> -2`, after four assertions
+         * had already passed.
+         *
+         * pty_ready is the same predicate the poll ladder uses, and it counts a
+         * pending EOF and a closed peer as ready -- so a non-blocking read at
+         * EOF still returns 0 rather than EAGAIN, which is what a caller
+         * looking for the end of the stream needs. Same shape as the AF_UNIX
+         * branch immediately below. */
+        if (app_fd_nonblock(fd) && !pty_ready(a->fd[fd].obj)) return APP_FD_EAGAIN;
         return pty_read(a->fd[fd].obj, buf, max);
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 12) {  /* AF_UNIX endpoint: recv (M1965) */
