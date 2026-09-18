@@ -1,5 +1,62 @@
 # What's next
 
+> **(M2190-M2191) mmap WAS HANDING OUT RANGES THAT WERE ALREADY MAPPED. AND THE
+> PAGE NEVER FAILS WITHOUT A CRASH -- 8 BOOTS, NO EXCEPTIONS.**
+>
+> **The correlation that replaces every rate in this document.** Counting the
+> page-probe SAMPLES as well as the verdicts, across eight 8-core boots:
+>
+>     page > 0  =>  crash = 0     (every one)
+>     page = 0  =>  samples = 1, crash = 2     (every one)
+>
+> So a blank page is never a blank page here: it is a dead process, caught by a
+> probe that ran once and found nothing alive. That is worth more than any
+> pass-rate, because it means **fixing the crash fixes the rate** and there is
+> no separate rendering bug to find. Latest measurement, 8 cores at CAP=620:
+> 2 of 4 fully clean (`page=10 crash=0`, `page=5 crash=0`), 2 of 4 the parent
+> dies of SIGSEGV.
+>
+> **mmap could return an address that was already in use.** `vma_find_gap`
+> proves a candidate range overlaps no VMA. Nothing proved it overlaps no
+> MAPPING -- and elf_load, the initial stack, memfd and shm mappings all leave
+> PTEs with no table entry to collide with. `vma_audit` has only ever compared
+> VMA against VMA, which is why it reported zero overlaps all day while this
+> went unchecked. It fires:
+>
+>     [vma] ** the gap chosen at 11c002000+9c000 is NOT EMPTY: 11c002000 is
+>     already mapped (pte 800000000a6e2007) with no VMA covering it. Two
+>     allocations would have shared pages. Refusing this range. **
+>
+> `pte ...007` is present, writable, user. Two logical allocations sharing
+> physical memory is exactly "a pointer into one is a pointer into the other",
+> which is the shape of every remaining crash: a write to an address computed
+> from registers, landing where it should not. Sampled rather than walked (a
+> 2 GiB reservation is half a million pages and this runs on every mmap), and it
+> REFUSES the range rather than returning a live address.
+>
+> Not yet proven as the crash's cause -- one collision in one boot, and the
+> crash also happens in boots where it does not fire. What is established is
+> that an invariant which must never break, broke.
+>
+> **What is ELIMINATED for the remaining crash, all by measurement:** the
+> library bytes (host-computed hashes), the RELRO pages (unchanged between
+> protect and fault), the relocations (identical zero-word counts in passing and
+> failing boots), private mappings across processes, the static inputs, storage
+> errors (neither necessary nor sufficient -- one boot failed with none, another
+> rendered with two), and the FS base (checked for INEQUALITY on every fault,
+> not just for zero on a canary read; never fires). The cause is a wrong pointer
+> value in the guest whose origin is still unidentified.
+>
+> **Two instruments that manufactured their own results, recorded because this
+> is the recurring cost.** A `page=0` count meant "no verdict" and was read as
+> "the page was blank", when for a truncated capture it means "the probe never
+> ran" -- distinguishable only by counting samples, which nothing did. And an
+> always-on `MOZ_LOG` spec with `sync` cost **26 seconds** of boot (36.6s to
+> 64.7s), justified at the time by measuring the LINE COUNT and calling that
+> the cost; those 26 seconds pushed the slow tail past the capture window and
+> manufactured the very failures being counted. Four layers of artifact on one
+> number.
+
 > **(M2186-M2187) WHAT IS NOW RULED OUT, WHICH IS WORTH MORE THAN THE FIXES: THE
 > FIREFOX FAILURE IS NOT THE LIBRARY, NOT THE PAGES, AND NOT THE RELOCATIONS.**
 >
