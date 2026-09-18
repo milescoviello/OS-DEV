@@ -10263,17 +10263,46 @@ void app_memfd_selftest(void) {
  * object and neither copies a pixel. The frames come from the memfd's own
  * page-aligned buffer, so both mappings resolve to the same physical memory
  * and a write through one is immediately visible through the other. */
+/* SAY WHY A MEMFD MAPPING FAILED (M2203).
+ *
+ * Seven `return 0`s, and the Linux layer turned all of them into one ENOMEM
+ * that it only printed under `-append lxsystrace`. mmap'ing a memfd is how
+ * Firefox's content process hands a rendered display list to the parent -- the
+ * `org.mozilla.ipc.<pid>.<n>` objects -- and a frame dropped because that
+ * mapping failed looks, from outside, exactly like a frame that was never
+ * rendered. Silent failure in the one path whose failure mode is the symptom
+ * being chased.
+ *
+ * Capped, because a program that hits it once tends to hit it repeatedly, and
+ * the first few carry all the information. */
+static unsigned long g_memfd_mmap_fail;
+static uint64_t memfd_mmap_no(const char *why, int fd, uint64_t len, uint64_t off) {
+    g_memfd_mmap_fail++;
+    if (g_memfd_mmap_fail <= 8)
+        kprintf("[memfd] mmap(fd %d, len %lx, off %lx) REFUSED: %s -- the caller gets ENOMEM and "
+                "whatever it was going to share through this object does not get shared\n",
+                fd, (unsigned long)len, (unsigned long)off, why);
+    return 0;
+}
+unsigned long app_memfd_mmap_failures(void) { return g_memfd_mmap_fail; }
+
 static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     struct app *a = cur(); if (!a || !len) return 0;
-    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3) return 0;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3)
+        return memfd_mmap_no("that descriptor is not a memfd", fd, len, off);
     struct memfd *m = &memfds[a->fd[fd].obj];
-    if (!m->used || !m->buf) return 0;
+    if (!m->used || !m->buf)
+        return memfd_mmap_no("the object has no buffer", fd, len, off);
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    if (off & (PAGE_SIZE - 1)) return 0;                  /* must start on a page */
-    if (off + len > m->cap) return 0;                     /* beyond the object */
+    if (off & (PAGE_SIZE - 1))
+        return memfd_mmap_no("the offset is not page-aligned", fd, len, off);
+    if (off + len > m->cap)
+        return memfd_mmap_no("the range runs past the object's capacity", fd, len, off);
     uint64_t base = vma_find_gap(a, len, 0);
-    if (!base) return 0;
-    if (vma_full(a)) return 0;   /* no slot to record it: see the ownership note below */
+    if (!base)
+        return memfd_mmap_no("no free address range of that size", fd, len, off);
+    if (vma_full(a))
+        return memfd_mmap_no("the VMA table is full", fd, len, off);   /* see the ownership note below */
     /* OWNERSHIP (M1985). These frames belong to the KERNEL HEAP -- they are the
      * memfd's kmalloc'd buffer, aliased into the process, not pages this
      * process allocated. Two things follow, and neither was true before:
@@ -10305,7 +10334,8 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
             uint64_t up = vmm_translate(base + u);
             if (up) { vmm_unmap(base + u); pmm_free_frame(up); }
         }
-        return 0;
+        return memfd_mmap_no("a page of the object is unbacked or not refcountable, so the "
+                             "mapping would have had a hole in it", fd, len, off);
     }
     m->mapped = 1;
     memfd_ref(a->fd[fd].obj);            /* the MAPPING keeps the object alive, not the fd */
