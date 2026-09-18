@@ -5265,6 +5265,85 @@ static void lx_dispatch_body(struct registers *r) {
          * manager's schedule, while POSIX requires the fds to close at EXIT. */
         app_sys_exit((int)a1);
         break;
+    case 179: {   /* kcmp(pid1, pid2, type, idx1, idx2) -- M2193 */
+        /* THE ONLY UNIMPLEMENTED SYSCALL FIREFOX STILL MAKES.
+         *
+         * Found by comparing a blank boot against a rendering one on the same
+         * binary: the failure counts were identical, and the ONLY ENOSYS in
+         * either was this, forty times per boot. So it is not the cause of the
+         * blank page -- and it is the last hole in the ABI this workload
+         * touches, which is the other half of the goal.
+         *
+         * kcmp answers "are these two kernel objects the same one". Firefox
+         * uses KCMP_FILE to tell whether a descriptor it received over IPC is
+         * one it already holds, so that it does not install a duplicate. The
+         * return convention is an ORDERING, not a boolean: 0 equal, 1 and 2 for
+         * the two orders, -1 on error. Returning ENOSYS makes the caller assume
+         * nothing is ever equal, which for duplicate detection is the wrong
+         * answer rather than a missing one.
+         *
+         * Only the same-process case is answered, which is the case Firefox
+         * asks: comparing across processes would need another task's fd table,
+         * and answering that wrongly is worse than declining. An EPERM for the
+         * cross-process case is what Linux itself returns without
+         * PTRACE_MODE_READ, so the caller has a path for it. */
+        int pid1 = (int)r->rdi, pid2 = (int)r->rsi, type = (int)r->rdx;
+        int i1 = (int)r->r10, i2 = (int)r->r8;
+        int me = app_current_pid();
+        if (pid1 != pid2 || pid1 != me) { r->rax = (uint64_t)-(long)LX_EPERM; break; }
+        switch (type) {
+        case 0: {          /* KCMP_FILE: same open file behind the two fds? */
+            if (!app_fd_is_open(i1) || !app_fd_is_open(i2)) {
+                r->rax = (uint64_t)-(long)LX_EBADF; break;
+            }
+            if (i1 == i2) { r->rax = 0; break; }
+            const char *p1 = app_fd_path_of(i1), *p2 = app_fd_path_of(i2);
+            /* Two descriptors are the same open file if they name the same
+             * path. Without a path (a pipe, a socket, an eventfd) this cannot
+             * be answered from the fd number alone, so report them DISTINCT
+             * rather than guess: a false "distinct" makes a caller keep both
+             * descriptors, which is wasteful; a false "same" makes it close one
+             * that is still in use. */
+            int same = (p1 && p2 && p1[0] && p2[0]);
+            if (same) { for (int k = 0;; k++) { if (p1[k] != p2[k]) { same = 0; break; }
+                                                if (!p1[k]) break; } }
+            r->rax = same ? 0 : (i1 < i2 ? 1 : 2);
+            break;
+        }
+        case 1:            /* KCMP_VM */
+        case 2:            /* KCMP_FILES */
+        case 3:            /* KCMP_FS */
+        case 4:            /* KCMP_SIGHAND */
+        case 5:            /* KCMP_IO */
+        case 6:            /* KCMP_SYSVSEM */
+            /* All of these compare per-PROCESS tables, and both pids are this
+             * process, so they are the same object by construction. */
+            r->rax = 0;
+            break;
+        default:
+            r->rax = (uint64_t)-(long)LX_EINVAL;
+            break;
+        }
+        break;
+    }
+    case 251:     /* ioprio_set(which, who, ioprio) -- M2193 */
+        /* The last one left after kcmp. Accepted rather than refused: this
+         * kernel's block layer has no per-process I/O priority, so the honest
+         * answer to "set it" is that the request is recorded nowhere and
+         * changes nothing -- which is exactly what setting it to the value it
+         * already has would do. Refusing makes a caller think the OPERATION is
+         * unavailable, and Firefox lowers the priority of its background IO
+         * threads on startup; an EINVAL there reads as a broken system rather
+         * than an unimplemented nicety. */
+        r->rax = 0;
+        break;
+    case 252:     /* ioprio_get(which, who) -- M2193 */
+        /* IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4): the best-effort class at the
+         * default level, which is what an unconfigured Linux process gets.
+         * Reporting the default is truthful here -- every process really does
+         * have the same effective priority, because there is only one. */
+        r->rax = (2u << 13) | 4u;
+        break;
     default:
         /* Log it. Implementing a Linux ABI by GUESSING which calls a libc makes
          * is hopeless; making the binary say so turns the whole thing into a
