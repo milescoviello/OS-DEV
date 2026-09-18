@@ -329,6 +329,27 @@ static int raw_write(int i, uint64_t lba, uint32_t count, const void *buf) {
  * double-cache coherence gap the bcache.h note wrongly claimed was already gone). */
 static int is_ata_backed(int i) { return g_dev[i].read == ata_bd_read; }
 
+/* DROP A RANGE FROM WHICHEVER CACHE HOLDS IT (M2220).
+ *
+ * ext2.c is #included and compiled on the host by tests/ext2/ext2_test.c and
+ * deliberately calls nothing outside itself, so it cannot reach bcache. It
+ * needs to: `ext2_open` reads the superblock on EVERY pread, and on eight
+ * cores that read comes back with the wrong MAGIC often enough to kill
+ * Firefox two boots in three -- the fault handler's own diagnosis being
+ * "the ext2 SUPERBLOCK could not be read". Whether the wrong bytes are in the
+ * cache or came off the wire is the question, and dropping the range and
+ * re-reading answers it in one step while also being the repair.
+ *
+ * Which owner key applies depends on the transport, which is exactly the
+ * knowledge blockdev has and ext2 does not: an ATA-backed device is cached by
+ * the driver under BCACHE_OWNER_ATA and every other one under
+ * BCACHE_OWNER_BLK (M1885 -- one coherent copy per sector, never both). */
+void blockdev_drop_cache(int i, uint64_t lba, uint32_t count) {
+    if (i < 0 || i >= g_ndev || !count) return;
+    if (is_ata_backed(i)) bcache_inval_range(BCACHE_OWNER_ATA((int)(intptr_t)g_dev[i].ctx), lba, count);
+    else                  bcache_inval_range(BCACHE_OWNER_BLK(i), lba, count);
+}
+
 /* The largest run handed to the ATA driver in one call. It must match the
  * driver's DMA transfer ceiling exactly: a call bigger than that falls back to
  * PIO for the WHOLE request, which is slower than splitting it. M2091 set this

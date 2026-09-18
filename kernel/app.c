@@ -3565,6 +3565,9 @@ static int fault_file_compare(const char *path, uint64_t fo, uint64_t addr, cons
         extern unsigned int  g_e2_bad_itable_val;
         extern unsigned long g_e2_itable_reread, g_e2_itable_differed, g_e2_itable_secondgood;
         extern unsigned int  g_e2_bad_itable_2nd;
+        extern unsigned long g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield;
+        extern unsigned long g_e2_sb_retried, g_e2_sb_retry_ok;
+        extern unsigned int  g_e2_sb_sawmagic;
         int bdev = -1; uint64_t bdlba = 0, bdcap = 0; uint32_t bdcnt = 0;
         blockdev_fail_operands(&bdev, &bdlba, &bdcnt, &bdcap);
         kprintf("[fault] %s check at %lx: THE READ FAILED -- %s at offset %lx returned %ld.\n"
@@ -3584,7 +3587,9 @@ static int fault_file_compare(const char *path, uint64_t fo, uint64_t addr, cons
                 (unsigned long)g_e2_blocks_count, g_e2_vstart, g_ata_drained_sectors,
                 g_e2_bad_itable, (unsigned long)g_e2_bad_itable_val, g_e2_bad_groups,
                 g_e2_itable_reread, g_e2_itable_differed, g_e2_itable_secondgood,
-                (unsigned long)g_e2_bad_itable_2nd);
+                (unsigned long)g_e2_bad_itable_2nd,
+                g_e2_sb_readfail, g_e2_sb_badmagic, (unsigned)g_e2_sb_sawmagic, g_e2_sb_badfield,
+                g_e2_sb_retried, g_e2_sb_retry_ok);
         return 0;
     }
     const unsigned char *mem = (const unsigned char *)addr;

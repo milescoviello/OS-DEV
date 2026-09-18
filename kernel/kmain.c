@@ -284,6 +284,12 @@ static volatile int g_ffwl;                   /* -append ffwl: run Firefox again
  * actual window. */
 static volatile int g_ffshow;
 static volatile int g_ffdata;                 /* -append ffdata: render a data: URL instead of the staged file, so the filesystem is not part of the question (M2107) */
+/* ext2 -> blockdev cache drop (M2220). The ctx ext2 carries for a mounted
+ * volume is the blockdev index, cast through a pointer the same way
+ * bd_blk_read reads it back. */
+static void ext2_cache_drop_hook(void *ctx, uint64_t lba, uint32_t n) {
+    blockdev_drop_cache((int)(intptr_t)ctx, lba, n);
+}
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
  * still gets printed -- just to COM1, from a thread, while the framebuffer
@@ -3236,6 +3242,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     usb_storage_selftest();
 
     ext2_set_clock(rtc_unix);      /* real inode timestamps on ext2 writes (M1175) */
+    /* AND THE CACHE-DROP HOOK (M2220), so ext2_open can drop the two
+     * superblock sectors and read them again when the magic comes back wrong.
+     * ext2.c is host-compiled and cannot reach bcache; blockdev knows which
+     * owner key this transport uses. The ctx it gets is the one it passed
+     * down, which for a mounted volume is the blockdev index. */
+    ext2_set_cache_drop(ext2_cache_drop_hook);
 
     /* Bring up a USB HID boot keyboard, sharing the one UHCI controller with the
      * tablet + mass-storage above (skipping the tablet's port, using the shared

@@ -62,6 +62,7 @@ blockdev_t *blockdev_get(int i);
  * Returns 0 on success, -1 on a bad index / unregistered device / driver error /
  * (where the capacity is known) an out-of-range request. */
 int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf);
+void blockdev_drop_cache(int i, uint64_t lba, uint32_t count);   /* drop a range from whichever cache holds it (M2220) */
 
 /* Write `count` 512-byte sectors at absolute LBA `lba` to device `i` from `buf`.
  * Returns 0 on success, -1 on a bad index / read-only (no write fn) device /

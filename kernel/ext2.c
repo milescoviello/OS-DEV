@@ -153,26 +153,69 @@ static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
 #define EXT2_MAX_RUN 16u
 
 /* parse + validate the superblock; 0 on a supported ext2, -1 otherwise */
+/* DROP A RANGE FROM THE BLOCK CACHE, if the kernel wired one (M2220).
+ *
+ * Same shape as ext2_set_clock: a function pointer, so ext2.c stays
+ * self-contained and host-#include-linkable. The kernel points it at
+ * blockdev_drop_cache, which knows which owner key this transport uses; a host
+ * test sets nothing and the retry below simply re-reads. */
+static void (*ext2_dropc)(void *ctx, uint64_t lba, uint32_t n);
+void ext2_set_cache_drop(void (*fn)(void *, uint64_t, uint32_t)) { ext2_dropc = fn; }
+
+/* WHY THE SUPERBLOCK WAS NOT BELIEVED (M2220). Every one of these used to be a
+ * bare `return -1` with no ioerr and no counter, so the fault handler's
+ * distrust guard (M2213) could not see them and zero-filled a page of libxul
+ * instead -- which is how "the ext2 SUPERBLOCK could not be read" ends up
+ * presenting as a SIGSEGV at a rip full of zeros. */
+unsigned long g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield;
+unsigned long g_e2_sb_retried, g_e2_sb_retry_ok;
+unsigned int  g_e2_sb_sawmagic;
+
 static int ext2_open(blk_read_fn read, void *ctx, uint64_t start, ext2_t *v) {
     uint8_t sb[1024];
     v->ioerr = 0;
-    if (read(ctx, start + 2, 2, sb) < 0) { v->ioerr = 1; return -1; }   /* superblock: byte 1024 = LBA+2, 1024 bytes */
-    if (e_rd16(sb + 56) != EXT2_MAGIC) return -1;
+    if (read(ctx, start + 2, 2, sb) < 0) {                 /* superblock: byte 1024 = LBA+2 */
+        v->ioerr = 1; g_e2_sb_readfail++; g_e2_distrust++; return -1;
+    }
+    if (e_rd16(sb + 56) != EXT2_MAGIC) {
+        /* THE BYTES ARE NOT THIS SECTOR'S. Drop the two sectors from whatever
+         * cache holds them and read once more: if the second read is good, the
+         * cache was serving another sector's bytes and this both proves it and
+         * repairs it. If it is still wrong, the bytes came off the wire that
+         * way. Either answer is worth far more than the silent `return -1`
+         * this replaced -- and on eight cores this fires often enough to kill
+         * Firefox two boots in three. */
+        g_e2_sb_badmagic++;
+        g_e2_sb_sawmagic = e_rd16(sb + 56);
+        if (ext2_dropc) {
+            ext2_dropc(ctx, start + 2, 2);
+            g_e2_sb_retried++;
+            if (read(ctx, start + 2, 2, sb) >= 0 && e_rd16(sb + 56) == EXT2_MAGIC) {
+                g_e2_sb_retry_ok++;                        /* the CACHE was wrong, and is now right */
+                goto magic_ok;
+            }
+        }
+        v->ioerr = 1; g_e2_distrust++;
+        return -1;
+    }
+  magic_ok:;
     uint32_t logbs = e_rd32(sb + 24);
-    if (logbs > 2) return -1;                              /* only 1024/2048/4096 */
+    if (logbs > 2) { v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }   /* only 1024/2048/4096 */
     v->read = read; v->write = 0; v->ctx = ctx; v->start = start;
     v->block_size = 1024u << logbs;
     v->inodes_per_group = e_rd32(sb + 40);
     uint32_t rev = e_rd32(sb + 76);
     v->inode_size = (rev >= 1) ? e_rd16(sb + 88) : 128;
-    if (!v->inodes_per_group || v->inode_size < 128 || v->inode_size > 256) return -1;
+    if (!v->inodes_per_group || v->inode_size < 128 || v->inode_size > 256) {
+        v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }
     v->gdt_block = (v->block_size == 1024) ? 2 : 1;        /* GDT follows the superblock's block */
     v->blocks_per_group = e_rd32(sb + 32);
     v->first_data_block = e_rd32(sb + 20);
     v->blocks_count     = e_rd32(sb + 4);
     v->first_ino        = (rev >= 1) ? e_rd32(sb + 84) : 11;
     v->feat_incompat    = (rev >= 1) ? e_rd32(sb + 96) : 0;   /* `extent`=0x40, for extent writes (M1189) */
-    if (!v->blocks_per_group || v->blocks_count <= v->first_data_block) return -1;
+    if (!v->blocks_per_group || v->blocks_count <= v->first_data_block) {
+        v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }
     v->groups = (v->blocks_count - v->first_data_block + v->blocks_per_group - 1) / v->blocks_per_group;
     return 0;
 }
