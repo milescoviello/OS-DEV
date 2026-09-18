@@ -6011,7 +6011,39 @@ int app_madvise(uint64_t addr, uint64_t len, int advice) {
         vma_unlock(a_, f_);
         return r_;
     }
-    uint64_t start = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    /* AN UNALIGNED START MUST BE REFUSED, NOT ROUNDED DOWN (M2194).
+     *
+     * This rounded the start DOWN to a page boundary. madvise(2) requires
+     * `addr` to be page-aligned and returns EINVAL when it is not -- it does
+     * not round -- and for MADV_DONTNEED, which is the destructive advice and
+     * the only one that reaches here, rounding down DISCARDS THE PAGE
+     * CONTAINING THE BYTES BEFORE `addr`. Those bytes belong to the caller and
+     * it never asked for them to be dropped; on the next read they are zero.
+     *
+     * That is this project's signature defect in its most damaging form: the
+     * call succeeds, the return value is the one the caller expects, and live
+     * data is gone. It is also exactly the shape being hunted in Firefox's
+     * blank content area -- a painted buffer that reads back empty, with no
+     * failed syscall anywhere in the trace, because nothing failed.
+     *
+     * Refusing matches Linux, so no caller can be relying on the rounding: on
+     * a real kernel an unaligned madvise returns EINVAL and the caller must
+     * already handle it. And it turns a silent overreach into a diagnosable
+     * error -- if something IS passing unaligned addresses here, the complaint
+     * below names it instead of it costing a page of somebody's data. */
+    if (addr & (uint64_t)(PAGE_SIZE - 1)) {
+        static int told;
+        if (!told) {
+            told = 1;
+            kprintf("[madvise] REFUSING an unaligned MADV_DONTNEED at %lx len %lu: madvise(2) "
+                    "requires a page-aligned address and returns EINVAL. Rounding down would "
+                    "discard the page holding the bytes BEFORE it, which the caller never "
+                    "asked to drop -- a success that destroys live data.\n",
+                    (unsigned long)addr, (unsigned long)len);
+        }
+        return -1;
+    }
+    uint64_t start = addr;
     uint64_t end   = (addr + len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (end < start) return -1;
     /* MADV_DONTNEED ON A COW PAGE DID NOTHING AND SAID IT WORKED (M2106).

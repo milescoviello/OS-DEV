@@ -117,6 +117,41 @@ int main(void) {
     munmap(a, len);
     if (!fails) printf("LXMADV: OK\n");
     else        printf("LXMADV: %d failure(s)\n", fails);
+    /* AN UNALIGNED MADV_DONTNEED MUST NOT DESTROY THE PAGE BEFORE IT (M2194).
+     *
+     * `app_madvise` rounded the start address DOWN to a page boundary. On real
+     * Linux an unaligned `addr` is EINVAL -- madvise does not round -- so
+     * rounding down discarded the page holding the bytes BEFORE `addr`, which
+     * the caller never asked to drop. The call returned 0 and live data was
+     * gone: a success that destroys memory, which is the worst shape a bug can
+     * take here and leaves no failed syscall in any trace.
+     *
+     * Two assertions, and the second is the one that matters. The return value
+     * is the cheap check; the DATA is the expensive one, because a kernel that
+     * returns EINVAL and discards anyway would pass the first.
+     */
+    {
+        long pg = 4096;
+        char *r = mmap(0, pg * 3, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (r == MAP_FAILED) {
+            printf("LXMADV: SKIP unaligned-DONTNEED (mmap failed)\n");
+        } else {
+            memset(r, 0xA5, (size_t)(pg * 3));
+            /* Unaligned start, one byte into the SECOND page. Rounding down
+             * would take the whole second page with it. */
+            int urc = madvise(r + pg + 64, (size_t)pg, MADV_DONTNEED);
+            CK(urc != 0, "an unaligned MADV_DONTNEED is refused (Linux returns EINVAL)");
+            int lost = 0;
+            for (long i = 0; i < 64; i++) if ((unsigned char)r[pg + i] != 0xA5) lost++;
+            CK(lost == 0, "the bytes BEFORE an unaligned MADV_DONTNEED survive it");
+            if (lost)
+                printf("LXMADV:   %d of the 64 bytes before the address were zeroed -- the "
+                       "start was rounded DOWN and took live data with it\n", lost);
+            munmap(r, (size_t)(pg * 3));
+        }
+    }
+
     printf("LXMADV: done\n");
     return fails ? 1 : 0;
 }
