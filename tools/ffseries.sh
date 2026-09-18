@@ -19,7 +19,7 @@ while [ $i -le $N ]; do
         echo "the runs after would be different kernels, which is not a series."
         exit 1
     fi
-    NOBUILD=1 APPEND="ffwl lxout noprobes nonetdemo" CORES=$CORES CAP=$CAP tools/pve-run.sh >/dev/null 2>&1
+    WAIT=full NOBUILD=1 APPEND="ffwl lxout nonetdemo" CORES=$CORES CAP=$CAP tools/pve-run.sh >/dev/null 2>&1
     scp -q root@192.168.1.5:/root/osdev/boot.log $S/$TAG-c$CORES-r$i.log
     L=$S/$TAG-c$CORES-r$i.log
     printf '%s c%s run %s: page=%s samples=%s crash=%s spin=%s paint_ms=%s page_ms=%s unshared=%s sharedcow=%s napms=%s\n' \

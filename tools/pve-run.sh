@@ -134,13 +134,38 @@ $SSH "qm stop $VMID >/dev/null 2>&1; sleep 1; rm -f $PVE_DIR/boot.log; \
         OPEN:$PVE_DIR/boot.log,creat,trunc >/dev/null 2>&1 < /dev/null & \
       sleep 1; echo started" >/dev/null
 
+# EQUAL WINDOWS, OR IT IS NOT A SERIES (WAIT=full, M2214).
+#
+# Breaking on the first marker gives a run that SUCCEEDS a shorter observation
+# window than one that fails -- a rendering boot stops ~20s after the page and a
+# blank one runs the whole CAP -- so every other per-run count in a series is
+# then compared across unequal windows. That cost me a correlation once already
+# (M2203). Measurement wants WAIT=full; a human watching wants the marker.
+if [ "${WAIT:-marker}" = full ]; then
+    echo "==> waiting out the FULL ${CAP}s window (WAIT=full: equal windows across runs)"
+    sleep "$CAP"
+    i=$CAP
+else
 echo "==> waiting for a marker (not for a duration)..."
 i=0
 while [ $i -lt "$CAP" ]; do
-    if $SSH "grep -aqE 'it has PAINTED|OSDEV-BASH-OK|lxask] exit|FFSHOT-PNGEND|FFSHOT: no PNG|no Wayland client left|the process is GONE|KERNEL PANIC|desktop is taking over' $PVE_DIR/boot.log 2>/dev/null"; then break; fi
+    # 'desktop is taking over' IS NO LONGER A COMPLETION MARKER (M2214).
+    #
+    # It used to be the last line of a boot, so waiting for it meant "the run is
+    # over". Booting to the desktop is the rule now, so it prints in the first
+    # second -- and leaving it in this list would have ended every capture
+    # twenty-five seconds into a run whose subject paints at thirty-six. That is
+    # the trap M1911 wrote down: a completion detector must key on a marker
+    # printed on every exit path AND on no other.
+    #
+    # What ends a Firefox run: the page appeared, the process died, or the
+    # watcher ran out of window. A blank boot matches none of them and waits out
+    # the full CAP, which is exactly what a measurement of a blank boot needs.
+    if $SSH "grep -aqE 'PAGE ON SCREEN|OSDEV-BASH-OK|lxask] exit|FFSHOT-PNGEND|FFSHOT: no PNG|no Wayland client left|the process is GONE|CRASHED with signal|KERNEL PANIC|the watcher has finished its window' $PVE_DIR/boot.log 2>/dev/null"; then break; fi
     sleep 2; i=$((i+2))
 done
-echo "==> marker after ~${i}s"
+fi
+echo "==> waited ~${i}s"
 # Keep capturing past the marker: the boot budget prints at the DESKTOP
 # handover, which is after the paint, and killing the capture at the paint
 # threw away every number the run was made to produce. (M2103)
