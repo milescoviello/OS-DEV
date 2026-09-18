@@ -284,6 +284,7 @@ static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claud
  * what it said. */
 static volatile int g_lxask;
 static volatile int g_lxbash;      /* -append lxbash: ask Claude Code to RUN A COMMAND, which is the Bash-tool demo (M2118) */
+static volatile int g_ffnavlog;    /* -append ffnavlog: DocumentChannel logging -- costs ~26s of time-to-page (M2189) */
 static volatile int g_lxedit;      /* -append lxedit: ask Claude Code to EDIT A FILE in OS-DEV's own tree (M2170) */
 static volatile int g_termtest;               /* -append termtest: the VT/ANSI terminal self-test (M2057) */
 /* -append lxhist: every 15 s, print the top syscall numbers each live Linux
@@ -739,6 +740,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnogc"))   g_lx_env_cmdline[1] = "BUN_JSC_useConcurrentGC=0";
         if (cmdline_has(cl, "lxnogen"))  g_lx_env_cmdline[2] = "BUN_JSC_useGenerationalGC=0";   /* what each Linux process is actually doing (M2066) */
         if (cmdline_has(cl, "lxbash")) { g_lxabi_test = 1; g_lxask = 1; g_lxbash = 1; }   /* the Bash-tool demo (M2118) */
+        if (cmdline_has(cl, "ffnavlog")) g_ffnavlog = 1;              /* navigation logging, at ~26s of time-to-page (M2189) */
         if (cmdline_has(cl, "lxedit")) { g_lxabi_test = 1; g_lxask = 1; g_lxedit = 1; }   /* the file-EDIT demo (M2170) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1; }
@@ -1765,7 +1767,36 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }
-                    /* NAVIGATION LOGGING IS NOT OPT-IN ANY MORE (M2185).
+                    /* AND IT IS OPT-IN AGAIN, BECAUSE IT COST 26 SECONDS (M2189).
+                     *
+                     * Measured, which is what I failed to do when turning it
+                     * on. Time from boot to the page on screen, same 1-core
+                     * configuration:
+                     *
+                     *     without this log   36650 / 39280 ms
+                     *     with it            64660 / 65670 / 64960 / 80850 ms
+                     *
+                     * I justified enabling it with "the cost is measured: 209
+                     * lines, nothing against what this boot already emits". I
+                     * measured the LINE COUNT and called it the cost. The cost
+                     * is `sync`, which makes each line block until the serial
+                     * console drains -- 208 lines, twenty-six seconds, on a
+                     * goal whose first word is "fast".
+                     *
+                     * It is worse than a slow boot. Those 26 seconds pushed the
+                     * slow tail of runs past the capture window, and the
+                     * "1-in-4 blank page" I was hunting turned out to be boots
+                     * with ZERO and ONE page-probe samples against a passing
+                     * boot's seventeen -- they never reached first paint before
+                     * the capture closed. The instrument manufactured the
+                     * failures it was measuring, which is this campaign's
+                     * signature defect and I reproduced it exactly.
+                     *
+                     * Kept behind `-append ffnavlog` so a deliberate hunt can
+                     * still have it. The evidence it was turned on to get has
+                     * been got (M2188: the navigation COMPLETES in a failing
+                     * boot), so paying for it on every boot buys nothing. */
+                    /* NAVIGATION LOGGING, ONCE UNCONDITIONAL (M2185).
                      *
                      * The remaining Firefox defect is a blank page in roughly
                      * one run in four: the parent alive, compositing normally,
@@ -1822,7 +1853,30 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * Level 3, not 5: PresShell logs paints, and a spec chatty
                      * enough to change the boot's timing would perturb the very
                      * intermittency being chased. */
-                    app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,DocLoader:3,PresShell:3");
+                    /* AND `DocLoader` AND `PresShell` ARE SILENT TOO (M2189).
+                     *
+                     * Zero lines across four boots at level 3, after
+                     * `nsDocShell:5` produced one line in a whole boot. All
+                     * three are exact standalone strings in libxul, so M2114's
+                     * void-the-whole-spec rule is satisfied and DocumentChannel
+                     * logs normally beside them -- they simply do not emit
+                     * here. Three guesses, three silences.
+                     *
+                     * Dead modules in an always-on spec are cost with no
+                     * benefit, and worse, they look like evidence: "PresShell
+                     * logged nothing" reads as "the document got no
+                     * presentation" when it means "this module does not talk".
+                     * So they are removed rather than left in hopefully.
+                     *
+                     * The presentation question is answerable WITHOUT Gecko's
+                     * cooperation: a rendered page commits a 1280x960
+                     * wl_surface whose pixels are the page's own background,
+                     * and `wl_page_probe` already samples exactly that. Asking
+                     * our own compositor what it was handed is cheaper and more
+                     * direct than asking Firefox to narrate. (The concurrent
+                     * session made this point and it is the right one.) */
+                    if (g_ffnavlog)
+                        app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per
