@@ -6893,6 +6893,7 @@ int app_fault_handle(uint64_t cr2, uint64_t err) {
 
 /* How many faults the FS_BASE repair below has had to make (M2099). */
 uint64_t g_fsbase_repairs;
+uint64_t g_fsbase_wrong;      /* live MSR != the thread's saved base, on any fault (M2189) */
 
 static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
     struct app *a = cur();
@@ -6924,6 +6925,49 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
      * it happened rather than how often it was survived. What it buys is a
      * browser that does not die of it, which is the difference between
      * "sometimes works" and "consistent". */
+    /* A WRONG FS BASE IS NOT ONLY A ZERO ONE (M2189).
+     *
+     * The repair below fires for exactly one shape: a read of `%fs:0x28` -- the
+     * stack canary -- with a LIVE BASE OF ZERO. Two conditions, and both of
+     * them narrow it past the case that matters.
+     *
+     * %fs is how every thread reaches its thread-local storage, so a thread
+     * running with ANOTHER THREAD'S base does not fault on 0x28: it reads that
+     * other thread's variables, gets plausible values, and returns a pointer
+     * belonging to a different thread's arena. The fault then happens later,
+     * somewhere else, as a write to an address computed from registers -- which
+     * is precisely the shape every remaining Firefox failure has:
+     *
+     *   err=0x6 CR2=0x1be000000 [tid 130 'BgIOThr~Pool #1']
+     *     inside vma[1447] 1be000000-1be035000 prot=0 'anon'
+     *   (the store is `vmovdqu %xmm0,0x10(%rdi,%rdx,1)` -- target from registers)
+     *
+     * And it is per-CORE state, which is why it would show up under eight cores
+     * and not one. So check the invariant on EVERY ring-3 fault, not just on a
+     * canary read, and for INEQUALITY rather than for zero. A mismatch between
+     * the thread's saved base and the live MSR is never legitimate:
+     * task_set_fs_base is documented as the single authority for both.
+     *
+     * Reported loudly because if this fires it is the cause and not a
+     * symptom. */
+    {
+        uint64_t live = 0, cached = 0; int core = -1;
+        task_fs_base_live(&live, &cached, &core);
+        uint64_t saved = task_fs_base();
+        if (saved && live != saved) {
+            g_fsbase_wrong++;
+            if (g_fsbase_wrong <= 8) {
+                kprintf("[fault] ** FS_BASE IS WRONG, not merely zero: tid %d has saved base %p "
+                        "and the live MSR says %p (core %d last loaded %p). Every TLS access this "
+                        "thread makes reads ANOTHER thread's variables, so the pointers it "
+                        "computes belong to someone else. CR2 %lx err %lx. **\n",
+                        task_current_id(), (void *)saved, (void *)live, core, (void *)cached,
+                        (unsigned long)cr2, (unsigned long)err);
+            }
+            task_set_fs_base(saved);           /* re-assert, and re-sync the per-core shadow */
+            return 1;                          /* retry: the access may have been through %fs */
+        }
+    }
     if (cr2 == 0x28 && !(err & 2)) {
         uint64_t live = 0, cached = 0; int core = -1;
         task_fs_base_live(&live, &cached, &core);
