@@ -1168,6 +1168,25 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * where Bash goes through fork, execve and a pipe. Nothing exercised
          * the write path against the real source tree, so when the login comes
          * back the only untested thing left should be Claude Code itself. */
+        /* DID ld.so COMPUTE THE RELOCATIONS CORRECTLY? (M2186)
+         *
+         * The last standing hypothesis for Firefox's remaining fault, and the
+         * only one not yet ruled out by measurement. An indirect call through a
+         * GOT slot holding a non-canonical pointer, plus a write into libxul's
+         * RELRO -- with the library's bytes proven to be the FILE's bytes
+         * (M2173, hashed on the host), private mappings proven private across
+         * processes (M2167), the RELRO page proven UNCHANGED since it was made
+         * read-only (M2177, so the kernel did not lose it), and the protections
+         * proven correct (GNU_RELRO covers exactly that LOAD). What is left is
+         * the relocation itself.
+         *
+         * 4096 R_X86_64_RELATIVE pointers in `.data.rel.ro` -- thousands
+         * because the symptom is ONE wrong pointer among many -- each compared
+         * against the address taken at runtime by different arithmetic, and
+         * then CALLED, with the target counting its own invocations. */
+        kprintf("[lxabi] launching the ld.so relocation probe...\n");
+        {   int rrc = app_run_linux_sync("/disk2/lxrelo", 0, 0, 120000);
+            kprintf("[lxabi] LXRELO exit -> %d\n", rrc); }
         kprintf("[lxabi] launching the edit-tool write-path probe...\n");
         /* `/src`, NOT `/disk2/src`. A Linux program's paths are relative to
          * LX_ROOT and the kernel prepends `/disk2` itself, so handing it the

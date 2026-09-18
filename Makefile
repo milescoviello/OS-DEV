@@ -330,6 +330,16 @@ $(LXROOT)/lxnread: tools/lx/lxnread.c
 	$(CC) -static-pie -O2 -o $@ $<
 	@echo "  HOSTCC  $@ (FIONREAD was answered 'that descriptor is not a terminal')"
 
+$(LXROOT)/lxrelolib.so: tools/lx/lxrelolib.c
+	@mkdir -p $(LXROOT)
+	$(CC) -shared -fPIC -O2 -o $@ $<
+	@echo "  HOSTCC  $@ (4096 R_X86_64_RELATIVE pointers in .data.rel.ro, for ld.so to relocate)"
+
+$(LXROOT)/lxrelo: tools/lx/lxrelo.c $(LXROOT)/lxrelolib.so
+	@mkdir -p $(LXROOT)
+	$(CC) -O2 -o $@ $< -L$(LXROOT) -l:lxrelolib.so -Wl,-rpath,/
+	@echo "  HOSTCC  $@ (DYNAMIC on purpose: this tests ld.so's relocation arithmetic)"
+
 $(LXROOT)/lxwrite: tools/lx/lxwrite.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -456,7 +466,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
