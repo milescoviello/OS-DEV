@@ -284,6 +284,7 @@ static volatile int g_ffwl;                   /* -append ffwl: run Firefox again
  * actual window. */
 static volatile int g_ffshow;
 static volatile int g_ffdata;                 /* -append ffdata: render a data: URL instead of the staged file, so the filesystem is not part of the question (M2107) */
+static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
  * still gets printed -- just to COM1, from a thread, while the framebuffer
  * belongs to the window manager. It stops reporting once it has seen the page,
@@ -792,6 +793,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         if (cmdline_has(cl, "ffwl"))       { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; }   /* Firefox ON the compositor, then the desktop (M1985) */
+        if (cmdline_has(cl, "ffnet"))      { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffnet = 1; }   /* Firefox against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffshow"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 1; g_noprobes = 1; }              /* ...and hand the screen over AT ONCE (M2200) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
@@ -1838,7 +1840,33 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     static const char *av_fd[] = { "--no-remote", "--new-instance",
                                                    "data:text/html,<body%20style%3D%22background%3A%23101820%22>"
                                                    "<h1%20style%3D%22color%3A%234fd1c5%22>OS-DEV</h1>" };
-                    const char **av_use = g_ffdata ? av_fd : av_fw;
+                    /* -append ffnet: A PAGE OFF THE ACTUAL INTERNET (M2210).
+                     *
+                     * Everything measured so far is `file:///ffpage.html`,
+                     * which exercises layout, style, the compositor and our
+                     * own filesystem and says nothing about the half of a
+                     * browser that is a network client. Firefox does NOT use
+                     * the kernel's TLS or resolver -- it brings its own NSS and
+                     * its own necko -- so "Claude Code reaches the internet"
+                     * (M1967) does not transfer: what it needs from us is
+                     * sockets, poll, getaddrinfo and a clock, on its own
+                     * code paths.
+                     *
+                     * http, not https, deliberately: a failure at the TCP
+                     * layer and a failure inside NSS are different bugs, and
+                     * starting with the one that has fewer moving parts is how
+                     * the first reading means something. example.com is the
+                     * page whose bytes are stable and whose owner expects to
+                     * be fetched by test clients.
+                     *
+                     * The page probe's colour key does not apply to a page
+                     * this kernel did not write, so the verdict for this mode
+                     * is the SCREENSHOT plus whether the content area stops
+                     * being the browser's background -- which is what the
+                     * probe's "varied / UNIFORM" line already reports. */
+                    static const char *av_fn[] = { "--no-remote", "--new-instance",
+                                                   "http://example.com/" };
+                    const char **av_use = g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw);
                     /* When Firefox parks, the syscall trace shows a futex
                      * address and nothing else -- it cannot name the Gecko
                      * code that is waiting. Firefox can: MOZ_LOG prints the
