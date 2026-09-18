@@ -170,10 +170,47 @@ static inline void blk_lock_take(int i) {
 }
 static inline void blk_lock_give(int i) { __atomic_store_n(&blk_lock[i], 0, __ATOMIC_RELEASE); }
 
+unsigned long g_bd_reg_skipped;      /* re-registrations that kept the existing index (M2229) */
+unsigned long g_bd_init_calls;       /* how often anything asked for a (re)probe (M2229) */
+/* REGISTRATION IS ADDITIVE, AND AN INDEX NEVER MOVES (M2229).
+ *
+ * It used to be "zero g_ndev and register everything again", which is two
+ * separate disasters.
+ *
+ * THE FIRST, MEASURED: `/proc/partitions` -> gen_partitions ->
+ * blockdev_format -> blockdev_init, so ANY program reading that file sets
+ * g_ndev to 0 for the duration of a full device probe. Every blockdev_read
+ * running on another core during that window fails at the entry guard --
+ * silently, because that guard was the one return -1 in the whole path with no
+ * reason recorded. The failing 8-core boots show exactly that: 6 to 48
+ * SUPERBLOCK read failures at LBA 2, `ata: 0 retr 0 FAIL`, and every one of
+ * the seven refusal reasons at zero. Firefox's GIO volume monitor reads
+ * /proc/partitions. On ONE core nothing else is mid-read while the probe runs,
+ * which is why this was 8-core-only.
+ *
+ * THE SECOND, latent: `g_mount[].dev` stores an INDEX. Re-registering in a
+ * different order silently repoints a mounted filesystem at another disk. The
+ * comment at the mount scan already notes indices "came back at a different
+ * index" as a known effect, which is a bug being described rather than fixed.
+ *
+ * So: never zero the table, and skip a device that is already registered under
+ * the same name. A later probe (a USB disk that appeared after boot -- which
+ * is why kmain calls this a second time) still adds what is new, and every
+ * index that already existed keeps meaning what it meant. */
 static void reg(const char *name, int (*read)(void *, uint64_t, uint32_t, void *),
                 int (*write)(void *, uint64_t, uint32_t, const void *),
                 uint64_t sectors, void *ctx) {
     if (g_ndev >= BLOCKDEV_MAX) return;
+    for (int k = 0; k < g_ndev; k++) {
+        const char *a = g_dev[k].name, *b = name;
+        if (!a || !b) continue;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a == *b) {                       /* same name: already registered */
+            g_dev[k].sectors = sectors;       /* size can legitimately be re-reported */
+            g_bd_reg_skipped++;
+            return;
+        }
+    }
     g_dev[g_ndev].name    = name;
     g_dev[g_ndev].read    = read;
     g_dev[g_ndev].write   = write;
@@ -185,8 +222,12 @@ static void reg(const char *name, int (*read)(void *, uint64_t, uint32_t, void *
 }
 
 int blockdev_init(void) {
-    g_ndev = 0;
-    bcache_flush();                  /* device indices may change -> drop stale cached blocks */
+    /* NO TEARDOWN. See reg() above: zeroing g_ndev here is what made every
+     * concurrent read on another core fail while /proc/partitions was being
+     * formatted. The probe below is additive and idempotent now, so calling
+     * this repeatedly is harmless -- and bcache_flush() is gone with it,
+     * because there are no stale indices to drop when indices never move. */
+    g_bd_init_calls++;
 
     /* ATA drives 0..3 — those that answered IDENTIFY. Static names so the
      * registered pointer stays valid for the lifetime of the kernel. */
@@ -284,13 +325,14 @@ void blockdev_fail_operands(int *dev, uint64_t *lba, uint32_t *count, uint64_t *
  * Counted per reason, and the capacity the device CLAIMED at the moment of a
  * reason-4 refusal is kept with them: a capacity of zero on a device that has
  * sectors is a different bug from an LBA that is genuinely too large. */
-unsigned long g_bd_fail_n[8];
+unsigned long g_bd_fail_n[9];
+int g_bd_badidx = -99, g_bd_badndev = -99;   /* the index and the table size at the last reason-8 refusal (M2228) */
 uint64_t      g_bd_fail_cap4;     /* d->sectors as seen by the last reason-4 refusal */
 uint64_t      g_bd_fail_lba4;
 static void bd_fail(int reason, int i, uint64_t lba, uint32_t count, uint64_t cap) {
     g_bd_fail_reason = reason; g_bd_fail_dev = i;
     g_bd_fail_lba = lba; g_bd_fail_count = count; g_bd_fail_cap = cap;
-    if (reason >= 0 && reason < 8) g_bd_fail_n[reason]++;
+    if (reason >= 0 && reason < 9) g_bd_fail_n[reason]++;
     if (reason == 4) { g_bd_fail_cap4 = cap; g_bd_fail_lba4 = lba; }
 }
 const char *blockdev_fail_why(void) {
@@ -302,6 +344,7 @@ const char *blockdev_fail_why(void) {
     case 5: return "lba + count overflowed 64 bits";
     case 6: return "the request runs past the device's reported capacity";
     case 7: return "the DRIVER returned an error";
+    case 8: return "the DEVICE INDEX was out of range at blockdev_read's own entry guard (M2228)";
     default: return "no recorded reason";
     }
 }
@@ -398,7 +441,32 @@ static int bread(int i, uint64_t lba, uint8_t *dst) {
 #define BLOCKDEV_INSTALL_MAX 256u
 
 int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
-    if (i < 0 || i >= g_ndev || !buf || count == 0) return -1;
+    /* THE ONLY RETURN -1 IN THE WHOLE PATH THAT RECORDED NOTHING (M2228).
+     *
+     * Measured: a failing 8-core boot reports 6 to 48 SUPERBLOCK read failures
+     * -- `ext2_open`'s `read(ctx, start + 2, 2, sb) < 0` -- with
+     *
+     *     ata: 0 retr 0 FAIL 0 dma-short
+     *     blockdev refusals by reason: idx 0 nohook 0 zerocount 0 LBA>=cap 0
+     *                                  ovf 0 past-cap 0 driver 0
+     *
+     * The disk never errored and `raw_read` never refused, so the -1 came from
+     * HERE, the one guard with no bd_fail behind it. The superblock read has a
+     * non-null buffer and a count of 2, which leaves exactly one possibility:
+     * `i < 0 || i >= g_ndev`. The device index that reaches this function is
+     * wrong, or g_ndev is.
+     *
+     * Reason 8 records it with the offending index AND the g_ndev it was
+     * compared against, because "the index is 3 and g_ndev is 4" and "the
+     * index is 3 and g_ndev is 0" are different bugs -- the second means the
+     * device table itself was transiently empty, which would refuse every read
+     * on the machine at once and is exactly the burst this failure looks like
+     * from outside. */
+    if (i < 0 || i >= g_ndev || !buf || count == 0) {
+        bd_fail(8, i, lba, count, (uint64_t)g_ndev);
+        g_bd_badidx = i; g_bd_badndev = g_ndev;
+        return -1;
+    }
     uint8_t *out = (uint8_t *)buf;
     /* STOP SHREDDING (M2091).
      *
