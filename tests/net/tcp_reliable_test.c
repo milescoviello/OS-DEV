@@ -29,10 +29,18 @@ static void tn_push(const uint8_t *f, int len) {
     int nx = (tn_tail + 1) % 1024; if (nx == tn_head) return;   /* full: drop (shouldn't happen) */
     memcpy(tn_buf[tn_tail], f, len); tn_len[tn_tail] = len; tn_tail = nx;
 }
+/* See net_test.c's note: this suite has not LINKED since M2126, because net.c's
+ * miss report calls `nic_rx_total()` from nic.c, which this harness does not
+ * stub. Counted rather than constant -- the report subtracts two samples, so a
+ * stub that never moves reports "the NIC delivered nothing". (M2184) */
+static uint64_t g_stub_rx_total;
+uint64_t nic_rx_total(void) { return g_stub_rx_total; }
+
 int nic_receive(void *out, uint16_t max) {
     if (tn_head == tn_tail) return 0;
     int len = tn_len[tn_head]; if (len > (int)max) len = max;
     memcpy(out, tn_buf[tn_head], len); tn_head = (tn_head + 1) % 1024;
+    g_stub_rx_total++;                                /* keep nic_rx_total() honest */
     return len;
 }
 

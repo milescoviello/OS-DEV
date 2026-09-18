@@ -17,9 +17,27 @@
 /* net.c reaches the NIC through the nic.c dispatcher (nic_send/receive/mac),
  * so the harness stubs that seam rather than a concrete card driver. */
 static const uint8_t *g_pkt; static int g_pktlen, g_consumed;
+/* THIS SUITE HAS NOT LINKED SINCE M2126 (M2184).
+ *
+ * M2126 added a miss report to net.c that calls `nic_rx_total()` -- which lives
+ * in nic.c, not in the seam this harness stubs -- so both `nettest` and
+ * `tcpreliabletest` have failed at the LINK step ever since, with
+ * `undefined reference to nic_rx_total`. Both are listed in `check-all`, so the
+ * suite reported nothing at all for that whole stretch and nobody looked:
+ * nothing looks less like a failure than a test that was never run.
+ *
+ * COUNTED, not a constant. net.c's report subtracts two samples of this, and a
+ * stub answering the same number every time makes that difference zero -- which
+ * reads as "the NIC delivered nothing" and is precisely the confidently-wrong
+ * answer that report was added to stop giving. A stub is a model of the thing,
+ * and a model that cannot move cannot be right. */
+static uint64_t g_stub_rx_total;
+uint64_t nic_rx_total(void) { return g_stub_rx_total; }
+
 int nic_receive(void *out, uint16_t max) {            /* feed one fuzz frame, then "none" */
     if (g_consumed) return 0;
     g_consumed = 1;
+    g_stub_rx_total++;                                /* keep nic_rx_total() honest */
     int n = g_pktlen; if (n > max) n = max;
     for (int i = 0; i < n; i++) ((uint8_t *)out)[i] = g_pkt[i];
     return n;
