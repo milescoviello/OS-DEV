@@ -1001,6 +1001,24 @@ static int lx_watched(int fd) {
     for (int i = 0; i < g_watch_n; i++) if (g_watch_fd[i] == fd) return 1;
     return 0;
 }
+/* AND STOP WATCHING IT WHEN IT CLOSES (M2202).
+ *
+ * The watch is keyed on the fd NUMBER and nothing removed it, so once the
+ * document's descriptor was closed and the number handed to the next open --
+ * a library, a socket, anything -- every read on it was still counted as the
+ * document's bytes. ffpage.html is 1068 bytes and the probe reported
+ *
+ *   the document was OPENED 3 time(s) and 54 read(s) delivered 142574 byte(s)
+ *
+ * which I read, twice, as proof that the page had been fetched. It had been --
+ * the two 1068-byte reads are in the log -- but that total is not evidence of
+ * it, and a number that is 67x too big is a number that can support any
+ * conclusion. The raw `[html] read(fd N) -> 1068` lines are the fact; this
+ * makes the counter agree with them. */
+static void lx_unwatch(int fd) {
+    for (int i = 0; i < g_watch_n; i++)
+        if (g_watch_fd[i] == fd) { g_watch_fd[i] = g_watch_fd[--g_watch_n]; return; }
+}
 /* COUNT IT, DO NOT ONLY PRINT IT (M2174).
  *
  * `[html] read(fd N) -> 1068` is the right fact and it is in the wrong place:
@@ -4358,7 +4376,7 @@ static void lx_dispatch_body(struct registers *r) {
             int cl_rc;
             if (cl_sock) { __asm__ volatile("sti"); cl_rc = app_fd_close((int)a1); __asm__ volatile("cli"); }
             else cl_rc = app_fd_close((int)a1);
-            if (cl_rc == 0) { r->rax = 0; break; }
+            if (cl_rc == 0) { lx_unwatch((int)a1); r->rax = 0; break; }
         }
         /* fd 0/1/2 are the console when they are not fd-table entries -- they
          * ARE open, so closing them succeeds; there is simply nothing to free.

@@ -45,7 +45,20 @@ static inline void usock_irq_restore(uint64_t fl) {
  * sender back through poll for each 4 KiB. */
 #define U_LISTEN  32              /* concurrent listeners */
 #define U_CONN    128             /* concurrent connections (each = 2 endpoints) */
-#define U_RING    16384           /* bytes buffered per direction */
+/* 64 KiB, not 16 (M2202). Linux's default AF_UNIX send buffer is ~208 KiB and
+ * ours was 16, which is not a tuning difference when the program on top is
+ * Firefox: its IPC channel filled the ring to 16383 of 16383 bytes in every
+ * boot this tree has produced, and the sender then spun on EAGAIN because poll
+ * had told it the socket was writable (fixed alongside this -- see
+ * unix_writable). A full ring is legitimate backpressure; a ring that fills on
+ * an ordinary burst turns every message into a round trip through the peer's
+ * scheduler. 128 connections x 2 directions x 64 KiB = 16 MiB of BSS, against
+ * the 4 MiB it was.
+ *
+ * Still static, and still a fixed per-connection cost -- Linux allocates per
+ * socket and autotunes. If this ever needs to be 208 KiB the rings have to come
+ * off the BSS and out of kmalloc first. */
+#define U_RING    65536           /* bytes buffered per direction */
 #define U_PATH    128             /* Linux sun_path is 108 (M1965) */
 
 struct uring { unsigned char buf[U_RING]; int head, tail; };   /* empty when head==tail */
@@ -450,6 +463,38 @@ int unix_readable(int ep) {
     int r = ep_readable(ep);
     usock_irq_restore(fl);
     return r;
+}
+/* WOULD A SEND BLOCK? (M2202)
+ *
+ * The other half of the pair, and it was missing -- app_fd_ready answered
+ * POLLOUT unconditionally for every AF_UNIX endpoint, with the comment "the
+ * ring drains quickly; a blocked send is brief". That is an assumption standing
+ * where a measurement belongs, and the measurement disagrees: EVERY Firefox
+ * boot in this tree logs
+ *
+ *   SPINNING: pid 165 tid 87 has had EAGAIN from sendmsg(fd 58) 1000 times in a
+ *   row -- ... TX_queued=16383 tx_room=0 peer_reader_waiting=0 nonblock=1
+ *
+ * which is a thread that poll TOLD it could write, writing, being refused, and
+ * going straight back to poll. A thousand times in a row, on a uniprocessor,
+ * against a ring only the peer can drain -- so the spinner is starving the one
+ * thread that could make it progress.
+ *
+ * "Would not block" is the whole meaning of POLLOUT, and a dead peer satisfies
+ * it: the send fails at once with EPIPE, which is not blocking. So room, or no
+ * connection at all, or a peer that has gone away. */
+int unix_writable(int ep) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    int w;
+    if (!c) w = 1;                    /* no connection: the send errors, it does not block */
+    else {
+        struct uring *tx = s ? &c->b2a : &c->a2b;
+        int peer_closed = (s ? c->a_closed : c->b_closed) || (s ? c->b_wr_closed : c->a_wr_closed);
+        w = rfree(tx) > 0 || peer_closed;
+    }
+    usock_irq_restore(fl);
+    return w;
 }
 /* THE PID ON THE OTHER END, for SO_PEERCRED (M2088). 0 when nothing has
  * accepted yet -- a pending connection has no server. */

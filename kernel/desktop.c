@@ -1792,6 +1792,42 @@ static unsigned desktop_key_to_evdev(int ch) {
 }
 
 static int wl_window_open;
+/* A PROCESS THAT DRAWS ITS OWN WINDOW DOES NOT NEED A TERMINAL ON TOP OF IT
+ * (M2202).
+ *
+ * make_app_window gives every spawned Linux process a terminal window for its
+ * stdout, which is exactly right for `claude` and exactly wrong for Firefox:
+ * it spawns copies of itself, each one gets a black terminal, and the newest
+ * opens ABOVE the browser window the same program is painting into. The first
+ * ffshow screenshot is a fully rendered page with a black rectangle over a
+ * third of it, titled /disk2/usr/lib64/firefo.
+ *
+ * The question that separates the two cases is already answerable: has this
+ * process opened a Wayland connection? If it has, its display is the window it
+ * draws in. Minimize the terminal rather than destroying it -- the taskbar
+ * entry stays, the output is still there, and one click brings it back -- and
+ * do it ONCE per pid, so a person who restores it keeps it. */
+static int wlpid_seen[16], nwlpid_seen;
+static void wl_hide_console_for_clients(void) {
+    for (int ci = 0; ci < wl_client_count(); ci++) {
+        if (!wl_client_used(ci)) continue;
+        int pid = wl_client_pid(ci);
+        if (pid <= 0) continue;
+        int known = 0;
+        for (int i = 0; i < nwlpid_seen; i++) if (wlpid_seen[i] == pid) { known = 1; break; }
+        if (known) continue;
+        if (nwlpid_seen < (int)(sizeof wlpid_seen / sizeof wlpid_seen[0]))
+            wlpid_seen[nwlpid_seen++] = pid;
+        for (int i = 0; i < win_count; i++) {
+            if (windows[i].kind != KIND_APP || !windows[i].app) continue;
+            if (app_pid_of((app_t *)windows[i].app) != pid) continue;
+            if (windows[i].minimized) continue;
+            windows[i].minimized = 1;
+            kprintf("[desktop] pid %d is a Wayland client, so its terminal window is "
+                    "minimized -- it draws its own\n", pid);
+        }
+    }
+}
 static void wl_window_poll(void) {
     /* ONE WINDOW PER CLIENT (M2089). This used to open exactly one, ever,
      * latched by wl_window_open -- so the first client to commit anything took
@@ -1826,6 +1862,15 @@ static void wl_window_poll(void) {
          * button is. Clamp to the framebuffer; the blit already clips. */
         if (ww > fb_width() - 8)  ww = fb_width() - 8;
         if (wh > fb_height() - 8) wh = fb_height() - 8;
+        /* AND IT HAS TO FIT ON THE SCREEN AT THAT POSITION (M2202). The size
+         * was clamped and the position was not, so a browser window as wide as
+         * the framebuffer opened at x=150 and lost 150 pixels of the page off
+         * the right edge -- visible in the first ffshow screenshot as a page
+         * cut off mid-sentence. Cascade only as far as there is room. */
+        if (x + ww > fb_width() - 4)  x = fb_width() - 4 - ww;
+        if (y + wh > fb_height() - TASKBAR_H - 4) y = fb_height() - TASKBAR_H - 4 - wh;
+        if (x < 2) x = 2;
+        if (y < 2) y = 2;
         /* The title comes from xdg_toplevel.set_title, which is how a Wayland
          * client names its own window -- the same call Firefox uses to put a
          * page title in the titlebar. */
@@ -2125,6 +2170,7 @@ void desktop_run(void) {
         app_t *na;
         while (win_count < MAX_WINDOWS && (na = app_take_pending())) { make_app_window(na); dirty = 1; }
         { int before = win_count; wl_window_poll(); if (win_count != before) dirty = 1; }
+        { int nb = nwlpid_seen; wl_hide_console_for_clients(); if (nwlpid_seen != nb) dirty = 1; }
 
         /* open browser windows requested by the shell (`browse <url>`) */
         char burl[160];

@@ -772,6 +772,21 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: socketpair flags:"; grep -a "LXNB: socketpair" "$SLOG3" | head -4; f3=1
     fi
+    # ...AND WHETHER POLL TELLS THE TRUTH ABOUT WRITING (M2202). app_fd_ready
+    # answered POLLOUT unconditionally for AF_UNIX, on the stated assumption
+    # that "the ring drains quickly; a blocked send is brief". Every Firefox
+    # boot in this tree disproves it: a thread poll had just told it could
+    # write, spinning on EAGAIN a thousand times in a row against a ring at
+    # 16383 of 16383 bytes -- and on one core that spinner starves the peer
+    # whose read is the only thing that can drain it. Four of the probe's six
+    # assertions fail if the unconditional answer comes back; the empty-socket
+    # and drained-socket ones fail if the fix overshoots into always-false,
+    # which would break every event loop in the system.
+    if grep -aq "LXPOLLOUT: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: poll's POLLOUT on an AF_UNIX socket matches what a write actually does (M2202)"
+    else
+        echo "  FAIL: POLLOUT honesty:"; grep -a "LXPOLLOUT" "$SLOG3" | head -8; f3=1
+    fi
     # ABSOLUTE DEADLINES (M2010). FUTEX_WAIT_BITSET's timeout is a timestamp,
     # not a duration -- that is the entire difference between it and
     # FUTEX_WAIT -- and reading it as a duration made every glibc
@@ -842,6 +857,17 @@ LXWAIT: reaped 40/40 children
         echo "  ok: ...and a mapping outlives the last close() of the memfd, which is how every toolkit uses one"
     else
         echo "  FAIL: closing a mapped memfd freed its buffer:"; grep -a "LXMEMFD" "$SLOG3" | head -3; f3=1
+    fi
+    # ...AND THAT GROWING ONE DOES NOT SPLIT IT IN TWO (M2200). M2082 let a
+    # MAPPED memfd grow by RETIRING the buffer it had to move off, which keeps
+    # the live mapping valid and silently stops it being the same object as the
+    # file. One process proves it: write through the mapping, read the same
+    # offset through the descriptor. Reverting the remap in memfd_grow fails
+    # this and nothing else in the suite.
+    if grep -aq "LXMEMFD-OK: after growing a MAPPED memfd, the mapping and the file are still ONE object" "$SLOG3"; then
+        echo "  ok: growing a mapped memfd keeps the mapping and the file one object (M2200)"
+    else
+        echo "  FAIL: a grown memfd unshared itself from its own mapping:"; grep -a "LXMEMFD" "$SLOG3" | grep -a -iE "disagree|grow" | head -4; f3=1
     fi
     if grep -aq "LXMEMFD-RESULT: 0 failure" "$SLOG3"; then
         echo "  ok: the memfd ownership test reported no failures"

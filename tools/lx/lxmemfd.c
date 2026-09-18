@@ -83,6 +83,49 @@ int main(void) {
     if (bad2) printf("LXMEMFD: %d of %d bytes changed after close() with the mapping live\n", bad2, SZ);
     ok(bad2 == 0, "the mapping OUTLIVED the last close() of the memfd");
 
+    /* (3) A MAPPED memfd THAT GROWS MUST STILL BE ONE OBJECT (M2200).
+     *
+     * This kernel serves a memfd out of a kmalloc'd buffer, so growing one can
+     * mean moving it -- and a buffer that some process has mapped cannot simply
+     * be freed. M2082's answer was to RETIRE the old buffer and keep it alive,
+     * which stops a use-after-free and silently unshares the object: from then
+     * on the file's bytes are in the new buffer and the live mapping is looking
+     * at the old one. Safe, and wrong -- and invisible, because both sides keep
+     * working and merely stop agreeing.
+     *
+     * One process is enough to prove it. Write through the MAPPING and read the
+     * same offset through the DESCRIPTOR: on Linux a file and its MAP_SHARED
+     * mapping are the same bytes by definition, and if a grow has unshared them
+     * here, these two reads disagree.
+     *
+     * The grow must be big enough to force a move. MEMFD headroom means a
+     * resize usually fits in the capacity already allocated, so ask for
+     * something far past it. */
+    int g = (int)syscall(SYS_memfd_create, "grown-while-mapped", 0);
+    if (g >= 0 && ftruncate(g, SZ) == 0) {
+        unsigned char *m1 = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_SHARED, g, 0);
+        if (m1 != MAP_FAILED) {
+            memset(m1, 0x11, SZ);
+            /* Grow it by 64x while that mapping is live. */
+            int grew = ftruncate(g, (off_t)SZ * 64);
+            ok(grew == 0, "a memfd can be grown 64x while a mapping of it is live");
+            /* Now write a distinct byte through the mapping... */
+            m1[0] = 0x77; m1[SZ - 1] = 0x77;
+            /* ...and read the same offsets through the descriptor. */
+            unsigned char v0 = 0, vn = 0;
+            ssize_t r0 = pread(g, &v0, 1, 0);
+            ssize_t rn = pread(g, &vn, 1, SZ - 1);
+            if (r0 == 1 && rn == 1 && (v0 != 0x77 || vn != 0x77))
+                printf("LXMEMFD: after the grow the mapping and the descriptor DISAGREE: "
+                       "wrote 77 through the mapping, the file says %02x at 0 and %02x at %d "
+                       "-- the object was silently unshared\n", v0, vn, SZ - 1);
+            ok(r0 == 1 && rn == 1 && v0 == 0x77 && vn == 0x77,
+               "after growing a MAPPED memfd, the mapping and the file are still ONE object");
+            munmap(m1, (size_t)SZ);
+        } else ok(0, "mmap of the memfd that is about to grow");
+    } else ok(0, "a second memfd for the grow-while-mapped case");
+    if (g >= 0) close(g);
+
     munmap(churn, CHURN);
     munmap(q, SZ);
     return done();

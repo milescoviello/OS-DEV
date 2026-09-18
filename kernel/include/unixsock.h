@@ -24,6 +24,7 @@ int  unix_wait_any(const int *eps, int n);                     /* poll/epoll: in
 int  unix_socketpair(int *a, int *b);                          /* socketpair(2): a pre-connected endpoint pair, no path; 0/-1 (M1254) */
 int  unix_ep_conn(int ep);                                     /* connection index behind an endpoint (SCM_RIGHTS key); -1 invalid (M1265) */
 int  unix_readable(int ep);      /* non-blocking: is there data (or a closed peer)? for poll/epoll (M1965) */
+int  unix_writable(int ep);      /* non-blocking: would a send block? for poll/epoll POLLOUT (M2202) */
 long unix_nread(int ep);         /* FIONREAD: bytes queued on this endpoint's RX ring; -1 bad ep (M2086) */
 long unix_txqueued(int ep);      /* bytes waiting in the ring WE WRITE INTO (the peer's RX); -1 bad ep (M2131) */
 int  unix_txroom(int ep);        /* free bytes in that same ring: 0 means a send will EAGAIN */

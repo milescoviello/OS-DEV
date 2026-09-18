@@ -63,6 +63,7 @@ void wl_window_extent(uint32_t *w, uint32_t *h);     /* the bounding box of all 
  * full-size frames with nowhere to go. */
 int  wl_client_used(int ci);
 int  wl_client_window_ready(int ci);   /* 1 = it has a toplevel (or no shell at all) -- M2200 */
+int  wl_client_pid(int ci);            /* the pid on the other end of that connection (M2202) */
 int  wl_client_count(void);
 int  wl_client_layers(int ci, struct wl_layer *out, int max);
 void wl_client_extent(int ci, uint32_t *w, uint32_t *h);

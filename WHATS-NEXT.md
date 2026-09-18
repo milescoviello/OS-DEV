@@ -1,5 +1,99 @@
 # What's next
 
+> **(M2200-M2202) FIREFOX IS ON THE SCREEN, AND THE WINDOW MANAGER WAS NOT
+> ALLOWED TO DRAW IT FOR TEN MINUTES.**
+>
+> The page renders. In an OS-DEV desktop window, inside our own window manager,
+> with our taskbar along the bottom: **page on screen 29.2 seconds after
+> boot**, tab titled `OS-DEV`, `file:///ffpage.html` in the URL bar, the teal
+> heading and the three CSS boxes with border radius laid out and painted.
+> Screendumped off the node and looked at, which is the only test that counts
+> for this.
+>
+> It had been rendering for a while. Nobody could see it, because `ffwl` -- the
+> harness -- spawns Firefox and then keeps the framebuffer for its own
+> diagnostics: ninety one-second heartbeats, then **forty fifteen-second page
+> samples, unconditionally**. A boot that rendered the page in the first sample
+> still held the screen for another nine and a half minutes. `wl_page_probe`
+> was `void`, so the caller had no way to know what it had just printed.
+>
+> - It returns its verdict now, and the loop stops on the first "the PAGE is on
+>   screen" and hands the framebuffer over.
+> - **`-append ffshow`** is the same run *for looking at*: Firefox spawned
+>   exactly as `ffwl` spawns it, the desktop taking the screen at once, and the
+>   diagnostics still flowing to COM1 from a watcher thread, where they are not
+>   in the way (console output is serial-only once the window manager owns the
+>   screen).
+>
+> **Then the screenshot found two more, which is the whole argument for looking
+> at the thing.** A fully rendered page with a black rectangle covering a third
+> of it, and the page cut off mid-sentence at the right edge:
+>
+> - `wl_window_poll` opened a desktop window for every client with a non-zero
+>   extent, which is not the same question as "did the client ask for a
+>   window". A Wayland surface with **no role is not displayable** -- the
+>   protocol says so -- and Firefox's content processes each connect, bind
+>   `xdg_wm_base`, and commit to a roleless surface without ever asking for a
+>   toplevel. The test is now "has a toplevel, **or** has no shell to ask one
+>   from", which still admits `tools/lx/lxwl` (the raw client the compositor
+>   was first proven against, which binds no shell at all).
+> - `make_app_window` gives every spawned Linux process a terminal window for
+>   its stdout -- right for `claude`, wrong for Firefox, which spawns copies of
+>   itself and whose newest terminal opens **above** the browser window the
+>   same program is painting into. A process with a Wayland connection draws
+>   its own window; its terminal is now minimized once, so the taskbar entry
+>   and the output stay and one click brings it back.
+> - The window's *size* was clamped to the framebuffer and its *position* was
+>   not, so a 1280-wide browser opened at x=150 and lost 150 pixels off the
+>   right edge.
+>
+> **poll told a thread it could write, then the write refused. A thousand times
+> in a row.** `app_fd_ready` answered `POLLOUT` unconditionally for every
+> AF_UNIX endpoint, with the assumption written in the comment: *"the ring
+> drains quickly; a blocked send is brief"*. Every Firefox boot in this tree
+> disproves it --
+>
+>     SPINNING: pid 165 tid 87 has had EAGAIN from sendmsg(fd 58) 1000 times in
+>     a row -- ... TX_queued=16383 tx_room=0 peer_reader_waiting=0 nonblock=1
+>
+> -- and on one core that spinner is starving the peer whose read is the only
+> thing that can drain the ring it is waiting on. So the lie is not merely
+> wasteful: it removes the mechanism that would have made it untrue.
+> `unix_writable` is the missing half of a pair whose other half has been
+> exported since M1965. The ring went from 16 KiB to 64 KiB in the same pass --
+> Linux's default is ~208 KiB, and 16 was not a tuning difference for a program
+> whose IPC filled it in every boot.
+>
+> **And a memfd that grew stopped being one object.** M2082 let a *mapped*
+> memfd grow, which here means kmalloc a bigger buffer, copy, and keep the old
+> one alive because a live mmap still aliases it. That stops a use-after-free
+> and **silently unshares the file from its own mapping**: from then on the
+> bytes are in the new buffer and the mapping is looking at the old one. Safe,
+> and wrong, and invisible -- both sides keep working and merely stop agreeing.
+> `memfd_grow` re-points the live mappings now, with the refcounting
+> `app_mmap_memfd_nl`'s own ownership note demands, and the VMA ranges are
+> collected under the lock and mapped after it is released (holding a VMA
+> spinlock across a page-table allocation is the shape that hung the machine in
+> M1988).
+>
+> **Honest scope, and it is the reason the check exists.** That was found while
+> hunting the 1-core blank page and it is **not** that bug: the commit-time
+> check added alongside it fires on boots that render the page perfectly as
+> well as on blank ones, and the pool it fired on was 8 MiB from creation and
+> never grew at all. Three theories died this way in one session -- the memfd
+> mismatch, the `/proc/<pid>/smaps` read failure, and the spinning `sendmsg`
+> all separate a blank boot from a rendering one until the fourth log arrives
+> and they don't. Each is a real defect, proven from the code and fixed; none
+> of them is the blank page.
+>
+> Two probes, both `-static-pie`, so the host kernel is the oracle:
+> `tools/lx/lxpollout.c` (6 assertions -- including that an *empty* socket
+> still polls writable, which is the failure this fix could plausibly
+> introduce, and that a full socket whose peer is **closed** does poll writable
+> because the send errors rather than blocking) and a sixth case in
+> `tools/lx/lxmemfd.c` that writes through a grown mapping and reads the same
+> offset through the descriptor.
+
 > **(M2197-M2198) THE SAME DEFECT IN mprotect, AND A COMPOSITOR STACK 93% FULL
 > ON A CHAIN A CLIENT DISCONNECT TAKES.**
 >

@@ -302,6 +302,23 @@ static void ffshow_watch_task(void) {
         kprintf("[ffshow] t=%ds: largest window %ux%u, %u Wayland client(s), "
                 "+%lu syscalls, +%lu faults\n", (k + 1) * 15, pw, ph,
                 wl_clients_connected(), ns - ps, (unsigned long)(pf1 - pf0));
+        /* ZERO SYSCALLS IS NOT "QUIET", IT IS STOPPED (M2202). The first
+         * ffshow run to fail did it like this: 58 calls in the first fifteen
+         * seconds and then not one more, no crash, no fault, for five minutes
+         * -- and the watcher printed fifteen identical lines saying so without
+         * once asking WHAT everything was blocked on. Ask, twice, and then
+         * stop: the dumps are long and the answer does not change. */
+        if (ns == ps) {
+            static int dumped;
+            if (dumped++ < 2) {
+                int bp = app_biggest_pid();
+                kprintf("[ffshow] ZERO syscalls in that interval -- every Linux thread is "
+                        "blocked. Who is waiting for what:\n");
+                app_wait_summary(bp > 0 ? bp : 0);
+                app_futex_dump();
+                lx_trace_dump_last("the last calls before everything stopped", 24);
+            }
+        }
         ps = ns; pf0 = pf1;
         {   int cpid = 0, csig = lx_fatal_signal(&cpid);
             if (csig) kprintf("[ffshow] *** pid %d CRASHED with signal %d -- what is on the "
@@ -1511,6 +1528,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the non-blocking-pipe probe...\n");
         int nbrc = app_run_linux_sync("/disk2/lxnbpipe", 0, 0, 60000);
         kprintf("[lxabi] LXNB exit -> %d\n", nbrc);
+        /* ...AND WHETHER POLL TELLS THE TRUTH ABOUT WRITING (M2202). The same
+         * shape one layer over: the pipe ignored O_NONBLOCK, and the AF_UNIX
+         * socket honoured it and then had poll promise the write it was about
+         * to refuse. The pipe's version cost one wedged thread; this one costs
+         * a core spinning, in every Firefox boot this tree has produced. */
+        kprintf("[lxabi] launching the POLLOUT-honesty probe...\n");
+        int porc = app_run_linux_sync("/disk2/lxpollout", 0, 0, 60000);
+        kprintf("[lxabi] LXPOLLOUT exit -> %d\n", porc);
         /* ...and ABSOLUTE deadlines. FUTEX_WAIT_BITSET and
          * clock_nanosleep(TIMER_ABSTIME) both take a timestamp, and reading
          * one as a duration is a fifty-six-year wait while substituting a

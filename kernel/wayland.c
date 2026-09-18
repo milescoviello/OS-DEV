@@ -582,6 +582,15 @@ void wl_client_extent(int ci, uint32_t *w, uint32_t *h) {
  * proven against. So the test is "a toplevel, OR no shell to ask one from" --
  * which admits the raw client and excludes a client that HAS a shell and has
  * not made a window with it. */
+/* THE PID ON THE OTHER END OF A CLIENT CONNECTION (M2202). The window manager
+ * needs it to answer one question: has this process asked the compositor for a
+ * display? If it has, the terminal window the desktop opened for its stdout is
+ * covering the window it actually draws in. */
+int wl_client_pid(int ci) {
+    if (!wl_client_used(ci)) return -1;
+    return unix_peer_pid(g_cl[ci].ep);
+}
+
 int wl_client_window_ready(int ci) {
     if (!wl_client_used(ci)) return 0;
     struct wl_client *c = &g_cl[ci];
@@ -2333,6 +2342,13 @@ int wl_page_probe(uint32_t want) {
         kprintf("[page]   shm: %lu commit(s) blitted the client's OWN frame, %lu did not; "
                 "%lu page(s) re-pointed after a mapped memfd grew\n",
                 g_wl_shm_ok, g_wl_shm_mismatch, g_memfd_remapped); }
+    /* AND THE SAME QUESTION ABOUT EVERY OTHER SHARED MAPPING (M2203). The
+     * commit check above covers the wl_shm pool the compositor is blitting; the
+     * content process ships its rendering to the parent through memfds of its
+     * own, and a window with working chrome and a background-coloured content
+     * area is what a broken one of THOSE looks like. */
+    {   extern unsigned long app_memfd_share_audit(int verbose);
+        app_memfd_share_audit(1); }
     /* State the verdict, and state it against a threshold, so a page that
      * painted a thin strip of itself cannot read as a page that loaded. */
     int pct = sampled ? hit * 100 / sampled : 0;

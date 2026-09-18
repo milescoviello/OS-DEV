@@ -10418,6 +10418,82 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
  *
  * `cap` is the useful bound: whole pages the object already owns and has
  * zeroed, which a resize can claim without anything moving. */
+/* IS EVERY SHARED MAPPING IN THE SYSTEM ACTUALLY SHARED? (M2203)
+ *
+ * The commit-time check in kernel/wayland.c asks this about one buffer at the
+ * moment it is blitted, which is the right question in the wrong scope: the
+ * wl_shm pool is not the only memory two of these processes share. Firefox's
+ * content process renders into memfds it passes to the parent over IPC, and the
+ * parent composites from them -- so a memfd whose mappings stop agreeing
+ * presents as a window with working chrome and a content area painted in the
+ * browser's background colour, which is the 1-core failure exactly.
+ *
+ * A memfd mapping is EAGER (app_mmap_memfd_nl maps every page up front), so the
+ * invariant is total and checkable: for every VMA that names a memfd, the
+ * physical frame behind each page must be the frame behind the same offset of
+ * the object's buffer. Anything that breaks it -- a grow that retires the
+ * buffer (M2200), a fork that copies a shared page, a fault handler that
+ * demand-zeroes over one, a stale VMA -- shows up here, and none of them have
+ * an instrument of their own.
+ *
+ * SAMPLED, NOT WALKED. An 8 MiB pool is 2048 pages and there are several
+ * mappings of it; checking every page of every one on every probe would cost
+ * more than the thing being measured. Sharing breaks wholesale (a mapping
+ * points at one buffer or the other), so 16 evenly-spaced pages per mapping
+ * find it, and the stride is reported so the sampling cannot be mistaken for
+ * proof of the pages between.
+ *
+ * Returns the number of mismatched samples; 0 is the healthy answer. */
+unsigned long g_memfd_share_bad, g_memfd_share_ok;
+unsigned long app_memfd_share_audit(int verbose) {
+    unsigned long bad = 0, okc = 0, maps = 0;
+    for (int mi = 0; mi < NMEMFD; mi++) {
+        struct memfd *m = &memfds[mi];
+        if (!m->used || !m->buf || !m->mapped) continue;
+        for (int pi = 0; pi < MAX_APPS; pi++) {
+            struct app *a = &apps[pi];
+            if (!a->used || !a->cr3) continue;
+            struct { uint64_t start, len; } r[APP_MAXVMA];
+            int nr = 0;
+            uint64_t fl = vma_lock(a);
+            for (int i = 0; i < a->nvma && nr < APP_MAXVMA; i++)
+                if (a->vma[i].len && a->vma[i].mfd == mi) {
+                    r[nr].start = a->vma[i].start; r[nr].len = a->vma[i].len; nr++;
+                }
+            vma_unlock(a, fl);
+            for (int i = 0; i < nr; i++) {
+                maps++;
+                uint64_t npg = r[i].len / PAGE_SIZE;
+                if (!npg) continue;
+                uint64_t stride = npg > 16 ? npg / 16 : 1;
+                for (uint64_t pg = 0; pg < npg; pg += stride) {
+                    uint64_t off = pg * PAGE_SIZE;
+                    if (off >= m->cap) break;
+                    uint64_t want = vmm_translate((uint64_t)(uintptr_t)(m->buf + off));
+                    uint64_t got  = vmm_translate_in(a->cr3, r[i].start + off);
+                    if (!want) continue;                  /* the object's own page is unbacked: not a sharing fault */
+                    if (got == want) { okc++; continue; }
+                    bad++;
+                    if (bad <= 4)
+                        kprintf("[share] ** memfd %d ('%s') is NOT SHARED with pid %d: object offset "
+                                "%lu is phys %lx, but the process's mapping at %lx resolves to %lx. "
+                                "Whatever that process writes there, nobody else sees. **\n",
+                                mi, m->name[0] ? m->name : "?", a->pid, (unsigned long)off,
+                                (unsigned long)want, (unsigned long)(r[i].start + off),
+                                (unsigned long)got);
+                }
+            }
+        }
+    }
+    g_memfd_share_bad += bad;
+    g_memfd_share_ok  += okc;
+    if (verbose)
+        kprintf("[share] %lu mapping(s) of mapped memfds, %lu sampled page(s) agree, %lu do NOT "
+                "(sampled 16 per mapping, so the pages between are not proven)\n",
+                maps, okc, bad);
+    return bad;
+}
+
 int app_memfd_obj_info(int idx, void **base, unsigned long *size, unsigned long *cap) {
     if (idx < 0 || idx >= NMEMFD) return -1;
     uint64_t f = memfd_lock_take();
@@ -12275,7 +12351,15 @@ int app_fd_ready(app_t *ap, int fd, int events) {
          * impossible. unix_readable is the same predicate unix_wait_any uses,
          * exported so it can be asked without blocking. */
         if ((events & POLLIN) && a->fd[fd].obj >= 0 && unix_readable(a->fd[fd].obj)) re |= POLLIN;
-        if (events & POLLOUT) re |= POLLOUT;               /* the ring drains quickly; a blocked send is brief */
+        /* AND THE SAME QUESTION FOR WRITING (M2202). This answered POLLOUT
+         * unconditionally, on the stated assumption that "the ring drains
+         * quickly; a blocked send is brief". Every Firefox boot in this tree
+         * disproves it: a thread poll had just told it could write, spinning on
+         * EAGAIN a thousand times in a row against a ring at 16383 of 16383
+         * bytes -- and on one core that spinner starves the peer whose read is
+         * the only thing that can drain it. unix_writable was the missing half
+         * of a pair whose other half has been exported since M1965. */
+        if ((events & POLLOUT) && a->fd[fd].obj >= 0 && unix_writable(a->fd[fd].obj)) re |= POLLOUT;
     } else if (a->fd[fd].type == 13) {                     /* AF_UNIX listener (M1965) */
         /* POLLIN on a listening socket means "accept() would not block", which
          * is exactly what a server's event loop waits for. */
