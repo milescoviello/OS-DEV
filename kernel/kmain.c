@@ -1156,6 +1156,22 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * process loads a library at its own ASLR base. lxcow covers ANONYMOUS
          * memory after fork and lxfmap covers a non-zero offset; neither asks
          * this. */
+        /* THE KERNEL HALF OF THE EDIT TOOL (M2180). Phase 7's demo is Claude
+         * Code editing a file in OS-DEV's own tree, and it cannot run at all
+         * right now: the staged OAuth access token expired and the CLI declines
+         * to refresh it, so every run stops before a tool call. Renewing the
+         * login needs a human.
+         *
+         * The API is half of that demo. The other half is a kernel path, and a
+         * DIFFERENT one from the Bash tool M2130 proved -- Write and Edit go
+         * through openat(O_CREAT|O_TRUNC)/write/fsync/rename against ext2,
+         * where Bash goes through fork, execve and a pipe. Nothing exercised
+         * the write path against the real source tree, so when the login comes
+         * back the only untested thing left should be Claude Code itself. */
+        kprintf("[lxabi] launching the edit-tool write-path probe...\n");
+        {   static const char *av_w[] = { "/disk2/src" };
+            int wrc = app_run_linux_sync("/disk2/lxwrite", av_w, 1, 120000);
+            kprintf("[lxabi] LXWRITE exit -> %d\n", wrc); }
         kprintf("[lxabi] launching the private-file-mapping probe...\n");
         {   int pvrc = app_run_linux_sync("/disk2/lxpriv", 0, 0, 180000);
             kprintf("[lxabi] LXPRIV exit -> %d\n", pvrc); }
