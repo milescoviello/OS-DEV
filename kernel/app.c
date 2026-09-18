@@ -1404,7 +1404,21 @@ int app_scm_recv(int ep) {
  * slot that can never be reused. Called from unix_forget_conn. */
 void app_scm_drop_conn(int ci) {
     if (ci < 0 || ci >= SCM_SLOTS) return;
-    struct fdent doomed[32]; int n = 0;
+    /* COPY THE THREE FIELDS THIS NEEDS, NOT THE WHOLE DESCRIPTOR (M2198).
+     *
+     * `struct fdent doomed[32]` was 9,472 bytes of stack -- 58% of the 16 KiB
+     * default kernel stack in one frame -- because fdent carries a 256-byte
+     * path. The teardown below reads exactly three fields from each entry and
+     * never looks at the path.
+     *
+     * It matters because of who calls this. wl_client_release -> unix_close ->
+     * here, so a Wayland client disconnecting runs it on the COMPOSITOR's
+     * 16 KiB stack, and tools/check-stack-usage.py measured that task's
+     * deepest chain at 15,344 of 16,384 bytes with this frame in it -- 93%,
+     * and a lower bound, since calls through function pointers are invisible
+     * to that analysis. Firefox's content process exiting is exactly the
+     * event that takes this path. 9,472 bytes becomes 256. */
+    struct { int obj; uint8_t type, write_end; } doomed[32]; int n = 0;
     uint64_t f = scm_lock_take();
     scm_pool_init();
     for (int side = 0; side < 2; side++) {
@@ -1412,7 +1426,10 @@ void app_scm_drop_conn(int ci) {
         while (q->head >= 0 && n < 32) {
             short e = q->head;
             q->head = g_scmpool[e].next;
-            doomed[n++] = g_scmpool[e].fe;
+            doomed[n].obj        = g_scmpool[e].fe.obj;
+            doomed[n].type       = g_scmpool[e].fe.type;
+            doomed[n].write_end  = g_scmpool[e].fe.write_end;
+            n++;
             g_scmpool[e].next = g_scmfree; g_scmfree = e;
         }
         if (q->head < 0) q->tail = -1;
@@ -9102,12 +9119,39 @@ void app_core_dump(struct registers *r) {
     struct app *a = t ? (struct app *)t->proc : 0;
     if (!a || !r) return;
 
-    struct { uint64_t va, len; } reg[2 + APP_MAXVMA]; int nreg = 0;
+    /* A QUARTER OF THE KERNEL STACK IN ONE ARRAY, AND IT SCALES WITH A
+     * CONSTANT THE STACK DOES NOT (M2198).
+     *
+     * `reg[2 + APP_MAXVMA]` at 16 bytes an entry is 65,568 bytes, and
+     * -fstack-usage measures this function's frame at 65,920. App tasks get a
+     * 256 KiB kernel stack (app.c's task_create_stack call), so this FITS and
+     * always has -- captured logs contain "[core] wrote /tmp/core (4628
+     * bytes) for pid 103" and those dumps were not corrupting anything. It is
+     * not an overflow and this comment is not going to claim it was.
+     *
+     * What is wrong with it is the coupling. APP_MAXVMA was 16 when this was
+     * written and is 4096 now (M1962 raised it for Firefox); the array grew
+     * 256-fold by inheritance, on the stack, with nothing connecting the
+     * constant to the stack it is allocated on. At 16384 VMAs -- one more
+     * raise of the same kind -- the frame is the entire stack. A crash
+     * handler is the worst possible place to find that out, because the
+     * failure would land in another task's stack rather than in a fault:
+     * kstack_alloc bump-allocates stacks adjacently behind a single guard
+     * page.
+     *
+     * A core dump is a rare, slow, already-allocating path (it kzalloc's the
+     * whole dump below), so the heap costs nothing here and the frame stops
+     * tracking a constant it has no relationship to. */
+    const int REGMAX = 2 + APP_MAXVMA;
+    struct cd_reg { uint64_t va, len; };
+    struct cd_reg *reg = (struct cd_reg *)kmalloc((uint64_t)REGMAX * sizeof *reg);
+    if (!reg) return;
+    int nreg = 0;
     uint64_t sp = r->rsp & ~(uint64_t)(PAGE_SIZE - 1);          /* active stack: from the faulting RSP up to the top */
     uint64_t stop = USTACK_BASE + (uint64_t)USTACK_PAGES * PAGE_SIZE;
     if (sp >= USTACK_BASE && sp < stop) { reg[nreg].va = sp; reg[nreg].len = stop - sp; nreg++; }
     if (a->heap_end > UHEAP_BASE) { reg[nreg].va = UHEAP_BASE; reg[nreg].len = a->heap_end - UHEAP_BASE; nreg++; }
-    for (int i = 0; i < a->nvma && nreg < (int)(sizeof reg / sizeof reg[0]); i++) {
+    for (int i = 0; i < a->nvma && nreg < REGMAX; i++) {
         reg[nreg].va = a->vma[i].start; reg[nreg].len = a->vma[i].len; nreg++;
     }
 
@@ -9127,10 +9171,10 @@ void app_core_dump(struct registers *r) {
         nreg = (nreg >= 1) ? 1 : 0; phnum = 1 + nreg;
         off_note = 64 + (uint64_t)phnum * 56; off_data = off_note + NOTESZ;
         total = off_data + (nreg ? reg[0].len : 0);
-        if (total > core_cap) return;
+        if (total > core_cap) { kfree(reg); return; }
     }
     uint8_t *buf = kzalloc(total);     /* zeroed: demand-paged holes stay zero in the core */
-    if (!buf) return;
+    if (!buf) { kfree(reg); return; }
 
     /* ELF64 header (ET_CORE, x86-64) */
     buf[0] = 0x7F; buf[1] = 'E'; buf[2] = 'L'; buf[3] = 'F';
@@ -9180,6 +9224,7 @@ void app_core_dump(struct registers *r) {
 
     tmpfs_write("core", buf, total);                           /* -> /tmp/core */
     kfree(buf);
+    kfree(reg);
     kprintf("[core] wrote /tmp/core (%lu bytes) for pid %d at rip=%p\n",
             (unsigned long)total, a->pid, (void *)r->rip);
 }

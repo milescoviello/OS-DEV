@@ -1627,7 +1627,25 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                  * simply stopped answering, which looks exactly like a client
                  * that has hung. A display server has to keep serving whatever
                  * its clients are doing. */
-                task_create(wl_server_task, 0, 0);
+                /* 256 KiB, NOT THE 16 KiB DEFAULT (M2198).
+                 *
+                 * tools/check-stack-usage.py measured this task's deepest
+                 * chain at 15,344 of 16,384 bytes -- 93%, and that is a LOWER
+                 * bound, because calls through function pointers are
+                 * invisible to it. The chain is not exotic either:
+                 *
+                 *   wl_server_task -> wl_compositor_poll -> wl_client_release
+                 *   -> unix_close -> app_scm_drop_conn -> net_tcp_sock_close
+                 *   -> tcp_close -> tcp_send_seg -> nic_send -> bpf_run
+                 *   -> bpf_jit_compile
+                 *
+                 * i.e. a Wayland client disconnecting, which is what happens
+                 * every time a Firefox content process exits. M2198 also cut
+                 * app_scm_drop_conn's frame from 9,472 bytes to 256, but a
+                 * compositor is not the place to run close to the edge of a
+                 * stack whose overflow lands past one guard page in another
+                 * task's stack -- and every app task already gets 256 KiB. */
+                task_create_stack(wl_server_task, 0, 0, 256 * 1024);
                 /* The raw client first: it proves whether the BYTES arrive
                  * intact, independently of libwayland's opinion of them. */
                 if (g_wlraw) {
