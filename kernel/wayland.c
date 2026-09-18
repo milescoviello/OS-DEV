@@ -2247,6 +2247,8 @@ void wl_fs_health_line(void) {
         extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
         extern unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;
         extern unsigned long g_memfd_remapped, g_memfd_unretired;
+        extern unsigned long g_bd_fail_n[8];
+        extern uint64_t g_bd_fail_cap4, g_bd_fail_lba4;
         /* Declared here rather than in ata.h, the same way app.c's fault
          * report reaches them: they are diagnostics, not driver API. */
         extern void ata_error_counts(uint64_t *retries, uint64_t *failures);
@@ -2255,7 +2257,9 @@ void wl_fs_health_line(void) {
         kprintf("[fs] superblock: %lu readfail %lu BADMAGIC %lu badfield, %lu retried %lu "
                 "RETRY-OK | %lu itable %lu badptr %lu hole(s) | distrust %lu | refused: "
                 "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED | "
-                "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired\n",
+                "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired | "
+                "blockdev refusals by reason: idx %lu nohook %lu zerocount %lu LBA>=cap %lu "
+                "ovf %lu past-cap %lu driver %lu (last cap-refusal: lba %lu vs cap %lu)\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
@@ -2263,7 +2267,10 @@ void wl_fs_health_line(void) {
                 g_fill_cachedrop, g_fill_cachedrop_ok,
                 (unsigned long)atretr, (unsigned long)atfail,
                 (unsigned long)ata_dma_short_count(),
-                g_memfd_remapped, g_memfd_unretired); }
+                g_memfd_remapped, g_memfd_unretired,
+                g_bd_fail_n[1], g_bd_fail_n[2], g_bd_fail_n[3], g_bd_fail_n[4],
+                g_bd_fail_n[5], g_bd_fail_n[6], g_bd_fail_n[7],
+                (unsigned long)g_bd_fail_lba4, (unsigned long)g_bd_fail_cap4); }
 }
 
 int wl_page_probe(uint32_t want) {

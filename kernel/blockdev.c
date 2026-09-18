@@ -271,9 +271,27 @@ void blockdev_fail_operands(int *dev, uint64_t *lba, uint32_t *count, uint64_t *
     if (count) *count = g_bd_fail_count;
     if (cap)   *cap   = g_bd_fail_cap;
 }
+/* ONE COUNTER PER REASON (M2227).
+ *
+ * `blockdev_fail_why` remembers only the LAST refusal, so a boot that refuses
+ * a superblock read six times and a garbage LBA a hundred times reports
+ * whichever happened last -- and the one that matters is the one that did not.
+ * The measured case: `6 readfail 0 BADMAGIC` on the superblock (LBA 2, which
+ * cannot be past any capacity) while the last recorded refusal said exactly
+ * that. Two different failures wearing one number, which is the shape this
+ * whole hunt keeps turning up.
+ *
+ * Counted per reason, and the capacity the device CLAIMED at the moment of a
+ * reason-4 refusal is kept with them: a capacity of zero on a device that has
+ * sectors is a different bug from an LBA that is genuinely too large. */
+unsigned long g_bd_fail_n[8];
+uint64_t      g_bd_fail_cap4;     /* d->sectors as seen by the last reason-4 refusal */
+uint64_t      g_bd_fail_lba4;
 static void bd_fail(int reason, int i, uint64_t lba, uint32_t count, uint64_t cap) {
     g_bd_fail_reason = reason; g_bd_fail_dev = i;
     g_bd_fail_lba = lba; g_bd_fail_count = count; g_bd_fail_cap = cap;
+    if (reason >= 0 && reason < 8) g_bd_fail_n[reason]++;
+    if (reason == 4) { g_bd_fail_cap4 = cap; g_bd_fail_lba4 = lba; }
 }
 const char *blockdev_fail_why(void) {
     switch (g_bd_fail_reason) {
