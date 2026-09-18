@@ -1551,6 +1551,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the pty probe...\n");
         int ptrc = app_run_linux_sync("/disk2/lxpty", 0, 0, 60000);
         kprintf("[lxabi] LXPTY exit -> %d\n", ptrc);
+        /* ...AND WHETHER A fork() QUIETLY UNSHARES A MAP_SHARED MAPPING
+         * (M2209). vmm_fork_cow write-protects every page of the parent
+         * because the page tables do not record which mappings are shared, and
+         * nothing undid it for the shared ones -- so the first write to a
+         * shared page got a private copy and the mapping stopped being the
+         * object. Firefox forks per content process and every IPC buffer it
+         * held across a fork was one write away from that. */
+        kprintf("[lxabi] launching the shared-mapping-across-fork probe...\n");
+        int shrc = app_run_linux_sync("/disk2/lxshcow", 0, 0, 60000);
+        kprintf("[lxabi] LXSHCOW exit -> %d\n", shrc);
         /* ...and ABSOLUTE deadlines. FUTEX_WAIT_BITSET and
          * clock_nanosleep(TIMER_ABSTIME) both take a timestamp, and reading
          * one as a duration is a fifty-six-year wait while substituting a

@@ -3319,6 +3319,7 @@ uint64_t g_pf_count, g_pf_cycles, g_pf_repaired;
  * children are most of the population and they are gone by the time anything
  * asks. */
 uint64_t g_flt_major, g_flt_minor, g_flt_cow, g_flt_other;
+unsigned long g_flt_cow_shared;   /* COW faults on a MAP_SHARED page, answered by restoring write access instead of copying (M2209) */
 void app_fault_kinds(uint64_t *maj, uint64_t *min, uint64_t *cow, uint64_t *spur, uint64_t *other) {
     extern unsigned long g_spurious_faults;
     if (maj)   *maj   = g_flt_major;
@@ -7409,6 +7410,56 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
          * A split that does not add up is not a split. */
         g_flt_cow++;
         uint64_t old = pte & PTE_ADDR_MASK;
+        /* A MAP_SHARED PAGE IS NEVER COPIED (M2209).
+         *
+         * vmm_fork_cow write-protects EVERY page of the parent, because it
+         * walks the page tables and the page tables do not record which
+         * mappings are shared. Nothing afterwards undid that for the shared
+         * ones -- so the first write to a MAP_SHARED memfd page, by the parent
+         * or the child, landed here and was given a PRIVATE COPY. From that
+         * moment the mapping is not the object any more: both sides keep
+         * working and quietly stop agreeing, which is the whole failure mode
+         * this milestone's audit exists to catch.
+         *
+         * MEASURED. The audit reported, in a boot that rendered the page:
+         *
+         *   ** memfd 44 ('org.mozilla.ipc.166.45') is NOT SHARED with pid 166:
+         *   object offset 0 is phys 2be76000, but the process's mapping at
+         *   1bed00000 resolves to 27030000 **
+         *
+         * pid 166 is the Firefox parent and that is its own mapping of its own
+         * IPC buffer. Firefox forks per content process, so every shared buffer
+         * it holds across a fork was one write away from being unshared.
+         *
+         * Linux never copy-on-writes a shared mapping; the page IS the object,
+         * and the only correct answer is to restore write access to the frame
+         * that is already there. Looked up in the VMA table rather than from
+         * the PTE, because sharedness is a property of the MAPPING -- the same
+         * reason madvise(MADV_DONTNEED) consults it (M2000). */
+        {   struct app *ca = cur();
+            int shared_here = 0;
+            if (ca) {
+                uint64_t vfl = vma_lock(ca);
+                for (int i = 0; i < ca->nvma; i++)
+                    if (ca->vma[i].len && fpage >= ca->vma[i].start &&
+                        fpage < ca->vma[i].start + ca->vma[i].len) {
+                        shared_here = ca->vma[i].shared; break;
+                    }
+                vma_unlock(ca, vfl);
+            }
+            if (shared_here) {
+                uint64_t keep = (pte & ~(uint64_t)PTE_COW) | PTE_WRITABLE | PTE_PRESENT;
+                vmm_set_raw(fpage, keep);
+                g_flt_cow_shared++;
+                static int told;
+                if (told++ < 4)
+                    kprintf("[fault] COW on a MAP_SHARED page at %lx -- restoring write access to "
+                            "frame %lx instead of copying it, or this mapping would stop being "
+                            "the object it maps (M2209)\n",
+                            (unsigned long)fpage, (unsigned long)old);
+                return 1;
+            }
+        }
         /* ALWAYS COPY (M2044, and re-affirmed in M2050).
          *
          * The "refcount is 0, so I am the sole owner, so just make it writable
@@ -10540,6 +10591,7 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
  *
  * Returns the number of mismatched samples; 0 is the healthy answer. */
 unsigned long g_memfd_share_bad, g_memfd_share_ok;
+extern unsigned long g_flt_cow_shared;
 unsigned long app_memfd_share_audit(int verbose) {
     unsigned long bad = 0, okc = 0, maps = 0;
     for (int mi = 0; mi < NMEMFD; mi++) {
@@ -10587,8 +10639,9 @@ unsigned long app_memfd_share_audit(int verbose) {
     g_memfd_share_ok  += okc;
     if (verbose)
         kprintf("[share] %lu mapping(s) of mapped memfds, %lu sampled page(s) agree, %lu do NOT "
-                "(sampled 16 per mapping, so the pages between are not proven)\n",
-                maps, okc, bad);
+                "(sampled 16 per mapping, so the pages between are not proven); %lu COW fault(s) "
+                "on a shared page were answered WITHOUT copying (M2209)\n",
+                maps, okc, bad, g_flt_cow_shared);
     /* WHO MAPS THE CONTENT PROCESS'S BUFFERS? (M2203)
      *
      * Firefox's IPC shared memory is a memfd named `org.mozilla.ipc.<pid>.<n>`

@@ -799,6 +799,20 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: pty from a Linux binary:"; grep -a "LXPTY" "$SLOG3" | head -8; f3=1
     fi
+    # ...AND THAT A fork() DOES NOT QUIETLY UNSHARE A MAP_SHARED MAPPING
+    # (M2209). vmm_fork_cow write-protects every page of the parent -- it walks
+    # the page tables, which do not record which mappings are shared -- and
+    # nothing undid that for the shared ones, so the first write to a MAP_SHARED
+    # page got a PRIVATE COPY and the mapping stopped being the object it maps.
+    # Found by a kernel-side audit on a boot that rendered the page: the Firefox
+    # parent's own mapping of its own IPC buffer resolved to a different
+    # physical frame than the buffer. Five assertions, both directions, and the
+    # file itself as the arbiter.
+    if grep -aq "LXSHCOW: 0 failure(s)" "$SLOG3"; then
+        echo "  ok: a MAP_SHARED mapping survives a fork on both sides (M2209)"
+    else
+        echo "  FAIL: fork unshares a MAP_SHARED mapping:"; grep -a "LXSHCOW" "$SLOG3" | head -8; f3=1
+    fi
     # ABSOLUTE DEADLINES (M2010). FUTEX_WAIT_BITSET's timeout is a timestamp,
     # not a duration -- that is the entire difference between it and
     # FUTEX_WAIT -- and reading it as a duration made every glibc
