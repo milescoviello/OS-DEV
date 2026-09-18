@@ -185,6 +185,8 @@ void    task_wake(task_t *t);              /* mark a blocked task runnable again
 static inline task_state_t task_state_of(task_t *t) { return t->state; }   /* never wake a DEAD task (M1990) */
 void    task_sleep_ms(uint64_t ms);        /* sleep the current task off-CPU until the timer wakes it */
 void    task_wake_sleepers(void);          /* timer IRQ: wake tasks whose sleep deadline passed */
+void     task_stack_watch(void);            /* timer IRQ: sample how deep the interrupted task's stack got (M2212) */
+uint64_t task_stack_low_water(const char **who, uint64_t *total);   /* the fewest bytes ever left, and whose (M2212) */
 void    task_set_name(const char *n);      /* record prctl(PR_SET_NAME) for the current thread (M2014) */
 const char *task_name_of(task_t *t);       /* ...and read it back; "" if the thread never named itself */
 uint64_t task_fs_base_live_value(void);                                  /* the CPU's real FS base, read straight from the MSR (M2013) */

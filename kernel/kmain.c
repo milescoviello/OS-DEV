@@ -653,6 +653,21 @@ void kmain_budget(const char *when) {
         if (cow > maj + min)
             kprintf("[budget]     COPY-ON-WRITE DOMINATES: the cost is fork, not the disk and not demand-zero\n");
     }
+    /* AND THE CLOSEST ANY KERNEL STACK CAME TO ITS BOTTOM (M2212). The canary
+     * is a tripwire that fires after the damage and only if the overrun reached
+     * the very bottom; this is the margin, sampled from the timer tick across
+     * the whole boot. The ext2 read path was at 90% of 16 KiB with interrupts
+     * enabled across it, which is how a 4 KiB buffer in read_inode turned into
+     * 204 rejected inode tables and a crash. */
+    {   const char *who = "?"; uint64_t tot = 0;
+        uint64_t freeb = task_stack_low_water(&who, &tot);
+        if (freeb && tot)
+            kprintf("[budget]   kstack   %lu byte(s) free at the deepest sample, of %lu "
+                    "(%lu%% used), in '%s'%s\n",
+                    (unsigned long)freeb, (unsigned long)tot,
+                    (unsigned long)((tot - freeb) * 100 / tot), who,
+                    freeb < tot / 8 ? "  <-- UNDER 12% LEFT: an interrupt at that depth "
+                                      "can write past the bottom" : ""); }
     {   extern unsigned long g_poll_naps, g_poll_nap_ms;
         /* WALL-CLOCK MILLISECONDS, not cycles, because a nap is time nobody
          * spent -- and that is exactly the quantity the 95%-idle reading is

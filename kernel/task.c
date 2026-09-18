@@ -35,6 +35,7 @@
  * task ring, GPF'ing in task_wake_sleepers with no hint of the real cause). */
 #define STACK_CANARY 0x9e3b8a7c5d6f1024ull
 
+
 /* --- multi-core scheduler state (M1531) ---------------------------------
  * Before this, `current`/`active_cr3` were single globals: only the BSP ever
  * ran the scheduler, every other core sat in kernel/smp.c's job-pool-only
@@ -52,6 +53,49 @@ static task_t   *cur[MAX_SCHED_CPUS];
 static uint64_t  active_cr3_arr[MAX_SCHED_CPUS];
 static inline int mycore(void) { return smp_current_cpu() & (MAX_SCHED_CPUS - 1); }
 #define current    (cur[mycore()])
+
+/* HOW CLOSE DID ANYTHING ACTUALLY GET? (M2212)
+ *
+ * The canary is a tripwire: it says a stack was overrun AFTER the damage, and
+ * only if the overrun reached the very bottom. It cannot say "the deepest path
+ * in this boot used 15.1 of 16 KiB", which is the number that decides whether
+ * a stack is big enough -- and -fstack-usage can only add up frames a human
+ * picked, which is how M2198 measured one task and missed the ext2 read path
+ * at 90%.
+ *
+ * Sampled from the TIMER INTERRUPT, because an interrupt runs on the stack of
+ * whatever it interrupted: at IRQ entry `rsp` is within a frame or two of that
+ * task's deepest live point. A hundred samples a second across a whole boot
+ * finds the real high-water mark of the real workload, with no list of
+ * functions to be wrong about.
+ *
+ * The name is copied, not pointed at: the task can be freed before the report
+ * is printed. */
+static volatile uint64_t g_stack_min_free = ~0ull;
+static char              g_stack_min_who[24];
+static volatile uint64_t g_stack_min_total;
+void task_stack_watch(void) {
+    task_t *t = current;
+    if (!t || !t->stack_base) return;
+    uint64_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    /* Only for the stack we are actually on: an interrupt taken in ring 3
+     * lands on kstack_top, and an IST fault lands somewhere else entirely. */
+    if (rsp <= t->stack_base || rsp > t->stack_base + STACK_SIZE) return;
+    uint64_t freeb = rsp - t->stack_base;
+    if (freeb >= g_stack_min_free) return;
+    g_stack_min_free = freeb;
+    g_stack_min_total = STACK_SIZE;
+    const char *n = t->name;
+    int i = 0;
+    for (; n && n[i] && i < (int)sizeof g_stack_min_who - 1; i++) g_stack_min_who[i] = n[i];
+    g_stack_min_who[i] = 0;
+}
+uint64_t task_stack_low_water(const char **who, uint64_t *total) {
+    if (who)   *who   = g_stack_min_who[0] ? g_stack_min_who : "?";
+    if (total) *total = g_stack_min_total ? g_stack_min_total : STACK_SIZE;
+    return g_stack_min_free == ~0ull ? 0 : g_stack_min_free;
+}
 #define active_cr3 (active_cr3_arr[mycore()])
 
 /* The cross-core ready-ring lock. Local interrupt disabling (irq_save/

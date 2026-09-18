@@ -71,6 +71,12 @@ static void timer_handler(struct registers *r) {
     prof_tick(r->rip, r->cs);  /* sampling profiler: record the interrupted kernel RIP (M1086) */
     task_cpu_tick(tick_ms, (r->cs & 3) == 3);  /* charge this tick to current's user/sys time (getrusage, M1150) */
     audio_pump();          /* keep the audio DMA fed (no-op unless streaming) */
+    /* HOW DEEP IS THE STACK WE ARE STANDING ON? (M2212) An interrupt runs on
+     * the stack of whatever it interrupted, so rsp here is within a frame or
+     * two of that task's deepest live point -- which makes the timer tick a
+     * free, workload-accurate sampler for the one number that decides whether
+     * STACK_SIZE is big enough. See task_stack_watch. */
+    task_stack_watch();
     task_wake_sleepers();  /* wake any timed-sleep task whose deadline has passed (M1079) */
     app_alarm_tick();      /* raise SIGALRM if the current app's periodic alarm is due (M1102) */
     app_timer_tick();      /* fire any due POSIX timer_create() timers, on every app (M1272) */

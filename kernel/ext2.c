@@ -76,6 +76,37 @@ static int rdblk(ext2_t *v, uint32_t blk, uint8_t *buf) {
     if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
     return r;
 }
+/* ONE SECTOR OF A BLOCK, for the two reads that need 32 and 256 bytes (M2212).
+ *
+ * THE BUG THIS EXISTS FOR. `read_inode` declared TWO 4096-byte buffers -- one
+ * for the group-descriptor block and one for the inode-table block -- and
+ * -fstack-usage puts the function at 8240 bytes. The kernel stack is 16384.
+ * The fault path to a file read is
+ *
+ *   app_fault_handle 64 + _inner 960 + vfs_pread 592 + ext2_pread 4528
+ *   + walk_d 416 + read_inode 8240  =  ~14800 of 16384  (90%)
+ *
+ * and M2163 deliberately enables interrupts across that read so the ATA
+ * deadline can expire -- so an interrupt arriving at the deepest point pushes
+ * its own frame and its handler's onto the same stack. What comes out is
+ * exactly the 8-core crash: 204 inode-table pointers rejected in one boot, a
+ * block pointer off the end of the filesystem, an LBA of 15088200464 against a
+ * 6553600-sector device -- garbage in a LOCAL buffer, which is what a stack
+ * that has been written past looks like from inside.
+ *
+ * Neither read needs a block. A group descriptor is 32 bytes and an inode is
+ * 128 or 256; both divide 512, so each lies wholly inside one sector. Reading
+ * the sector instead of the block takes read_inode from 8240 bytes of stack to
+ * about 700, and asks the disk for 512 bytes instead of 4096 while it is at it.
+ *
+ * `secoff` is the sector index WITHIN the block. */
+static int rdsec(ext2_t *v, uint32_t blk, uint32_t secoff, uint8_t *buf) {
+    uint32_t spb = v->block_size / SECSZ;
+    if (secoff >= spb) return -1;
+    int r = v->read(v->ctx, v->start + (uint64_t)blk * spb + secoff, 1, buf);
+    if (r < 0) { v->ioerr = 1; g_e2_vstart = v->start; }   /* see ext2_t.ioerr (M2155) */
+    return r;
+}
 /* `n` PHYSICALLY CONSECUTIVE blocks in one request (M2101).
  *
  * Measured under KVM, so this is about the kernel and not about emulation:
@@ -146,25 +177,36 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
     if (ino == 0) return -1;
     uint32_t group = (ino - 1) / v->inodes_per_group;
     uint32_t index = (ino - 1) % v->inodes_per_group;
-    uint8_t gd[4096];
+    /* ONE SECTOR EACH, NOT ONE BLOCK EACH (M2212) -- see rdsec. Two 4096-byte
+     * buffers here put this function at 8240 bytes of a 16384-byte kernel
+     * stack, on a path that reaches it at 90% full with interrupts enabled. */
+    uint8_t sec[SECSZ];
     uint32_t gd_per_block = v->block_size / 32;
     if (v->groups && group >= v->groups) { v->ioerr = 1; g_e2_bad_groups++; return -1; }
     /* The descriptor block itself is a produced block number too (M2176). */
-    if (!e2_ptr_ok(v, v->gdt_block + group / gd_per_block, 5)) { v->ioerr = 1; return -1; }
-    if (rdblk(v, v->gdt_block + group / gd_per_block, gd) < 0) return -1;
-    uint32_t inode_table = e_rd32(gd + (group % gd_per_block) * 32 + 8);
-    if (!inode_table || (v->blocks_count && inode_table >= v->blocks_count)) {
-        v->ioerr = 1;
-        g_e2_bad_itable++;
-        g_e2_bad_itable_val = inode_table;
-        return -1;
+    uint32_t gdblk = v->gdt_block + group / gd_per_block;
+    if (!e2_ptr_ok(v, gdblk, 5)) { v->ioerr = 1; return -1; }
+    {   uint32_t gdbyte = (group % gd_per_block) * 32;      /* byte offset in the block */
+        if (rdsec(v, gdblk, gdbyte / SECSZ, sec) < 0) return -1;
+        uint32_t inode_table = e_rd32(sec + (gdbyte % SECSZ) + 8);
+        if (!inode_table || (v->blocks_count && inode_table >= v->blocks_count)) {
+            v->ioerr = 1;
+            g_e2_bad_itable++;
+            g_e2_bad_itable_val = inode_table;
+            return -1;
+        }
+        uint64_t byte_off = (uint64_t)index * v->inode_size;
+        uint32_t off = (uint32_t)(byte_off % v->block_size);
+        if (off + v->inode_size > v->block_size) return -1;  /* straddles a block (non-standard) */
+        /* An inode is 128 or 256 bytes and both divide 512, so it cannot cross
+         * a sector boundary either -- but say so rather than assume it, because
+         * a filesystem with a 512-byte inode_size would silently read half. */
+        if ((off % SECSZ) + v->inode_size > SECSZ) return -1;
+        if (rdsec(v, inode_table + (uint32_t)(byte_off / v->block_size),
+                  off / SECSZ, sec) < 0) return -1;
+        uint32_t so = off % SECSZ;
+        for (uint32_t i = 0; i < v->inode_size; i++) out[i] = sec[so + i];
     }
-    uint64_t byte_off = (uint64_t)index * v->inode_size;
-    uint8_t b[4096];
-    if (rdblk(v, inode_table + (uint32_t)(byte_off / v->block_size), b) < 0) return -1;
-    uint32_t off = (uint32_t)(byte_off % v->block_size);
-    if (off + v->inode_size > v->block_size) return -1;    /* inode straddles a block (non-standard) */
-    for (uint32_t i = 0; i < v->inode_size; i++) out[i] = b[off + i];
     return 0;
 }
 
@@ -793,6 +835,13 @@ static int wrblk(ext2_t *v, uint32_t blk, const uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     return v->write(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
 }
+/* The write counterpart of rdsec (M2212): one sector of a block. */
+static int wrsec(ext2_t *v, uint32_t blk, uint32_t secoff, const uint8_t *buf) {
+    if (!v->write) return -1;
+    uint32_t spb = v->block_size / SECSZ;
+    if (secoff >= spb) return -1;
+    return v->write(v->ctx, v->start + (uint64_t)blk * spb + secoff, 1, buf);
+}
 static int rd_sb(ext2_t *v, uint8_t *sb) { return v->read(v->ctx, v->start + 2, 2, sb); }      /* the 1024-byte superblock */
 static int wr_sb(ext2_t *v, const uint8_t *sb) { return v->write ? v->write(v->ctx, v->start + 2, 2, sb) : -1; }
 
@@ -899,17 +948,33 @@ static uint32_t alloc_inode(ext2_t *v) {
 static int write_inode(ext2_t *v, uint32_t ino, const uint8_t *in) {
     if (ino == 0) return -1;
     uint32_t group = (ino - 1) / v->inodes_per_group, index = (ino - 1) % v->inodes_per_group;
-    uint8_t gd[4096], b[4096];
+    /* ONE SECTOR EACH, as in read_inode (M2212): 8240 bytes of stack for two
+     * reads that need 32 and 256 bytes, in a file whose deepest path already
+     * runs at 90% of a 16 KiB kernel stack. */
+    uint8_t sec[SECSZ];
     uint32_t gd_per_block = v->block_size / 32;
-    if (rdblk(v, v->gdt_block + group / gd_per_block, gd) < 0) return -1;
-    uint32_t itable = e_rd32(gd + (group % gd_per_block) * 32 + 8);
+    uint32_t gdblk = v->gdt_block + group / gd_per_block;
+    uint32_t gdbyte = (group % gd_per_block) * 32;
+    if (!e2_ptr_ok(v, gdblk, 5)) { v->ioerr = 1; return -1; }
+    if (rdsec(v, gdblk, gdbyte / SECSZ, sec) < 0) return -1;
+    uint32_t itable = e_rd32(sec + (gdbyte % SECSZ) + 8);
+    /* CHECK IT HERE TOO. read_inode has rejected an out-of-range inode table
+     * since M2174; this one took the same value on trust and would write an
+     * inode into whatever data block the arithmetic landed on -- the same
+     * defect, in the direction that destroys the filesystem instead of merely
+     * misreading it. */
+    if (!itable || (v->blocks_count && itable >= v->blocks_count)) {
+        v->ioerr = 1; g_e2_bad_itable++; g_e2_bad_itable_val = itable; return -1;
+    }
     uint64_t byte_off = (uint64_t)index * v->inode_size;
     uint32_t tblk = itable + (uint32_t)(byte_off / v->block_size);
     uint32_t off = (uint32_t)(byte_off % v->block_size);
     if (off + v->inode_size > v->block_size) return -1;
-    if (rdblk(v, tblk, b) < 0) return -1;
-    for (uint32_t i = 0; i < v->inode_size; i++) b[off + i] = in[i];
-    return wrblk(v, tblk, b);
+    if ((off % SECSZ) + v->inode_size > SECSZ) return -1;   /* would straddle a sector */
+    if (rdsec(v, tblk, off / SECSZ, sec) < 0) return -1;
+    {   uint32_t so = off % SECSZ;
+        for (uint32_t i = 0; i < v->inode_size; i++) sec[so + i] = in[i]; }
+    return wrsec(v, tblk, off / SECSZ, sec);
 }
 
 static int free_block(ext2_t *v, uint32_t blk);        /* defined below; bmap_alloc unwinds with it */
