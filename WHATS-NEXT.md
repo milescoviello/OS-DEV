@@ -1,5 +1,72 @@
 # What's next
 
+> **(M2160-M2165) THE STORAGE AND MEMORY BUGS ARE CLOSED. 8-CORE FIREFOX IS
+> STILL 1-IN-4, AND WHAT IS LEFT IS NOT A PROTECTION BUG.**
+>
+> Where this actually stands, measured rather than asserted. One core, current
+> build: the page renders, `VERDICT: the PAGE is on screen -- 87% of the content
+> area`, no crash, no panic. Eight cores, four runs at a 470-second window:
+>
+>     page on screen     1 of 4
+>     child process died 4 of 4
+>     kernel panics      0 of 4
+>     storage failures   0 of 4
+>
+> So the chain M2151-M2159 closed really is closed -- no zeroed executable
+> pages, no kernel panics, no fill failures in any run since -- and the
+> remaining 8-core defect is something else.
+>
+> **Four things were positively CLEARED, which is worth as much as a fix**
+> (this half was done in a second session working in parallel):
+>
+> - **The protections are right.** The provenance line said libxul's read-only
+>   data segment was made read-only by `mprotect` from the faulting thread
+>   itself, over exactly `116f93000+5d0000` -- and `readelf -lW` gives GNU_RELRO
+>   at 0x9d3dfa0 size 0x5ce9b0, byte-for-byte that LOAD. So it IS RELRO, prot=1
+>   is correct, ld.so applied it on time, and the **write** is the anomaly.
+> - **Private file mappings are private.** A probe that `execve`s an independent
+>   process (not `fork`, which may legitimately share copy-on-write and so
+>   cannot answer the question) and maps the same file must see the file's bytes;
+>   four assertions, passing on the host and in OS-DEV on eight cores.
+> - **The mapped bytes are the file's bytes.** A whole-library comparison,
+>   forwards and backwards, of the demand-fault path against the ordinary read
+>   path: libxul 171910680 bytes identical both ways, libgtk-3 and libc likewise
+>   -- ~362 MB clean. That also happens to be the strongest available
+>   confirmation that the abandoned-DMA chain is fixed, because 171 MB of
+>   demand-faulted pages is precisely the workload that used to pick up a stale
+>   sector.
+> - **The relocation INPUT is therefore sound**, so a wild pointer is in the
+>   resolver's output rather than in what it read.
+>
+> **The instrument that had to be fixed first, again.** The provenance table was
+> printed from `app_describe_addr`, which describes the mapping the RIP is in --
+> so on every one of these faults it reported on libxul's EXECUTABLE segment
+> while the access had been refused by a different VMA entirely. Two sessions
+> spent runs reading that line as though it described the refusing mapping.
+>
+> **Two regressions of my own, both measured:**
+>
+> - M2162 made `app_mprotect` run on every mmap. Necessary -- a `MAP_FIXED`
+>   mapping inherits the carved VMA's protection, so `PROT_READ|PROT_WRITE` is
+>   not a no-op there -- but its coverage check asked "is this page inside any
+>   VMA?" once **per page**, scanning the whole table each time. libxul's text
+>   segment is 29184 pages against a table reaching ~1900 entries: **55 million
+>   iterations for one mmap**, hundreds of times during startup. The page
+>   stopped appearing within 420 seconds at all, against ~24 seconds before.
+>   M2164 hops VMAs instead of pages.
+> - M2155's "refuse to publish a page whose read failed" is right for a device
+>   error and wrong for a mapping whose file was **unlinked while mapped** --
+>   which SQLite does to its `-shm` file, and which Linux allows because a
+>   mapping holds the inode. The silent-zero behaviour was accidentally correct
+>   there. M2160 asks whether the path still exists: gone, and zeros are the
+>   only available answer; still there, and the device refused.
+>
+> **Also closed:** an `mprotect(PROT_NONE)` was recorded as READ-ONLY, so a
+> reservation a program made precisely so that touching it would fail answered
+> every read with a demand-zeroed page. glibc mprotects the gaps between a
+> library's segments that way, and JavaScriptCore reserves its 4 GiB structure
+> heap that way on purpose so StructureID 0 is invalid.
+
 > **(M2156-M2159) AN ABANDONED DMA HANDED ITS SECTOR TO THE NEXT READ, AND A
 > GIGABYTE OF RAM WAS ALLOCATABLE BUT UNMAPPED.**
 >
