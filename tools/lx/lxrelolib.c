@@ -1,4 +1,4 @@
-/* lxrelolib.c -- a shared object whose whole content is RELOCATIONS (M2186).
+/* lxrelolib.c -- a shared object whose whole content is RELOCATIONS (M2187).
  *
  * See lxrelo.c for why. Every entry of `g_ptr` is initialised to the address of
  * a function in this same object, which the compiler emits as an
@@ -38,6 +38,11 @@ void (*const g_ptr[NPTR])(void) = {
 #define P1024 P256, P256, P256, P256
     P1024, P1024, P1024, P1024
 };
+
+/* The table's own address and extent, so the probe can mprotect the very pages
+ * ld.so relocated and then made read-only. (M2187) */
+void *lxrelo_table(void)             { return (void *)g_ptr; }
+unsigned long lxrelo_table_bytes(void) { return sizeof g_ptr; }
 
 int  lxrelo_n(void)                  { return NPTR; }
 void (*lxrelo_slot(int i))(void)     { return (i >= 0 && i < NPTR) ? g_ptr[i] : NULL; }

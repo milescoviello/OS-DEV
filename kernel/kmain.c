@@ -1168,7 +1168,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * where Bash goes through fork, execve and a pipe. Nothing exercised
          * the write path against the real source tree, so when the login comes
          * back the only untested thing left should be Claude Code itself. */
-        /* DID ld.so COMPUTE THE RELOCATIONS CORRECTLY? (M2186)
+        /* DID ld.so COMPUTE THE RELOCATIONS CORRECTLY? (M2187)
          *
          * The last standing hypothesis for Firefox's remaining fault, and the
          * only one not yet ruled out by measurement. An indirect call through a

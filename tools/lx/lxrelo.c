@@ -1,4 +1,4 @@
-/* lxrelo.c -- DID ld.so COMPUTE THE RELOCATIONS CORRECTLY? (M2186)
+/* lxrelo.c -- DID ld.so COMPUTE THE RELOCATIONS CORRECTLY? (M2187)
  *
  * WHY THIS EXISTS, and it is the last standing hypothesis rather than a guess.
  * Firefox's remaining fault is an indirect call through a GOT slot holding a
@@ -43,11 +43,16 @@
  * the function is the one case a comparison alone still misses.
  */
 #include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
 
 extern int lxrelo_n(void);
 extern void (*lxrelo_slot(int i))(void);
 extern void (*lxrelo_expect(void))(void);
 extern int lxrelo_calls(void);
+extern void *lxrelo_table(void);
+extern unsigned long lxrelo_table_bytes(void);
 
 int main(void) {
     int n = lxrelo_n();
@@ -84,6 +89,56 @@ int main(void) {
     }
     printf("LXRELO: and all %d are callable, and the target ran exactly %d time(s)\n",
            n, lxrelo_calls());
+    /* PART 2: A WRITE INTO A RELOCATED, THEN READ-ONLY, PAGE (M2187).
+     *
+     * This is the state RELRO leaves and the state the Firefox fault occurs
+     * in: ld.so relocated `.data.rel.ro`, then mprotected it read-only, and
+     * something then writes to it. Whether that write is legitimate or not,
+     * what the KERNEL must do is unambiguous -- grant write, keep the page's
+     * existing contents, and not substitute a fresh or a shared one.
+     *
+     * The dangerous failure is not the write failing. It is the write
+     * SUCCEEDING while the page is quietly replaced: a copy-on-write break
+     * that copies the wrong source, or a fresh zeroed frame, loses every
+     * relocation in the page and leaves exactly one wrong pointer among
+     * thousands -- which is the reported symptom. So the assertion is that the
+     * OTHER 4095 pointers survive a write to one page. */
+    {
+        unsigned long pagesz = 4096;
+        char *tbl = (char *)lxrelo_table();
+        unsigned long bytes = lxrelo_table_bytes();
+        char *page = (char *)((unsigned long)tbl & ~(pagesz - 1));
+
+        if (mprotect(page, pagesz, PROT_READ) != 0)
+            printf("LXRELO: SKIP part 2 (cannot make the table read-only: errno %d)\n", errno);
+        else if (mprotect(page, pagesz, PROT_READ | PROT_WRITE) != 0)
+            printf("LXRELO: *** granting WRITE back to a read-only relocated page FAILED: "
+                   "errno %d -- an mprotect that cannot re-grant access is the M2186 shape ***\n",
+                   errno), wrong++;
+        else {
+            /* Write a sentinel into the first slot, then require every OTHER
+             * slot in the table to be untouched. */
+            void (**slot0)(void) = (void (**)(void))page;
+            void (*saved)(void) = *slot0;
+            *slot0 = (void (*)(void))0x1234;
+            int lost = 0;
+            for (int i = 1; i < n; i++) if (lxrelo_slot(i) != want) lost++;
+            *slot0 = saved;
+            if (mprotect(page, pagesz, PROT_READ) != 0)
+                printf("LXRELO: (note: could not restore read-only, errno %d)\n", errno);
+            if (lost) {
+                printf("LXRELO: *** writing one slot of a relocated read-only page LOST %d of "
+                       "%d other pointers -- the page was replaced, not made writable ***\n",
+                       lost, n - 1);
+                wrong += lost;
+            } else {
+                printf("LXRELO: a write into a relocated read-only page kept the other %d "
+                       "pointers (%lu-byte table)\n", n - 1, bytes);
+            }
+        }
+    }
+
+    if (wrong) { printf("LXRELO: %d CHECK(S) FAILED\n", wrong); return 1; }
     printf("LXRELO: ALL PASSED\n");
     return 0;
 }
