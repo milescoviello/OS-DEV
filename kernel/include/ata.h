@@ -43,6 +43,7 @@ void ata_cache_selftest(void);   /* boot self-test: fill+hit+write-invalidate co
  * is detected via the status register, never hangs). Records which are present
  * and their sector counts. Returns the number of present drives. Idempotent. */
 int ata_identify_all(void);
+int  ata_reprobe(void);          /* FORCE a re-IDENTIFY: tears down the live table, no caller today (M2230) */
 
 /* Info for drive `drive` (runs ata_identify_all() lazily on first use). NULL for
  * an out-of-range index; check ->present for whether a disk is actually there. */

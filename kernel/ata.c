@@ -1426,7 +1426,32 @@ static int identify_drive(int drive, struct ata_drive_info *out) {
     return 1;
 }
 
-int ata_identify_all(void) {
+/* GENUINELY IDEMPOTENT, WHICH IT WAS ONLY CLAIMED TO BE (M2230).
+ *
+ * blockdev_init calls this with the comment "idempotent; ensure probed", and
+ * it was nothing of the kind: it zeroed `present`, `sectors` and `lba48` for
+ * every drive and re-issued IDENTIFY. Two hazards, both live on any core but
+ * the one running it, and both reachable from a single read of
+ * /proc/partitions (see M2229):
+ *
+ *   - `sectors = 0` on a live table. blockdev re-registers from these values,
+ *     so a device could be registered with a capacity of zero -- after which
+ *     `lba >= d->sectors` refuses every read of it.
+ *   - `identify_drive` drives the command block directly (REG_DRIVE,
+ *     REG_STATUS, IDENTIFY) with NO ata_lock, so it can interleave with an
+ *     in-flight transfer on another core. That is a mechanism for wrong bytes
+ *     that the driver would never record as an error, which is precisely the
+ *     shape of failure this hunt spent the day chasing.
+ *
+ * The probe is a boot-time question. Answer it once. `ata_reprobe()` stays for
+ * a caller that genuinely needs a rescan, and is called by nobody today --
+ * deliberately, so that adding a caller is a decision rather than an accident.
+ *
+ * NOT wrapped in ata_lock: identify_drive touches the command block itself and
+ * the lock is not recursive, so taking it here would need the probe split from
+ * its callers. Making the probe run exactly once removes the race without that
+ * surgery; the locking question is written down rather than guessed at. */
+int ata_reprobe(void) {
     int found = 0;
     for (int d = 0; d < ATA_MAX_DRIVES; d++) {
         g_drives[d].present = 0;
@@ -1439,6 +1464,14 @@ int ata_identify_all(void) {
     }
     g_probed = 1;
     return found;
+}
+int ata_identify_all(void) {
+    if (g_probed) {
+        int n = 0;
+        for (int d = 0; d < ATA_MAX_DRIVES; d++) if (g_drives[d].present) n++;
+        return n;
+    }
+    return ata_reprobe();
 }
 
 const struct ata_drive_info *ata_drive(int drive) {
