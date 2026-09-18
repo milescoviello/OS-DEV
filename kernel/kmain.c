@@ -1060,6 +1060,18 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the zero-fill/COW probe...\n");
         {   int zrc = app_run_linux_sync("/disk2/lxzero", 0, 0, 180000);
             kprintf("[lxabi] LXZERO exit -> %d\n", zrc); }
+        /* ...and whether PROT_NONE actually FAULTS (M2175). A reservation a
+         * program made precisely so that touching it would fail was answering
+         * reads with a demand-zeroed page, because mprotect recorded a
+         * requested PROT_NONE as READ-ONLY. glibc protects the gaps between a
+         * shared object's segments that way, and JavaScriptCore reserves its
+         * 4 GiB structure heap that way so that StructureID 0 is an invalid
+         * id -- if that reservation reads as zeroes, id 0 resolves to a zeroed
+         * Structure and it surfaces as a garbage JSValue somewhere unrelated.
+         * A counter could not have caught that; only taking the signal can. */
+        kprintf("[lxabi] launching the PROT_NONE probe...\n");
+        {   int nrc = app_run_linux_sync("/disk2/lxnone", 0, 0, 120000);
+            kprintf("[lxabi] LXNONE exit -> %d\n", nrc); }
         /* ...and whether a thread can find its own stack, for the same
          * reason: a conservative collector scans between the stack pointer
          * and the base it was told, so the bounds are a correctness input. */
