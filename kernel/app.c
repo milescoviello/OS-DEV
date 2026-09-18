@@ -3625,9 +3625,42 @@ void app_protnote_mmap(uint64_t start, uint64_t len, int prot) {
 }
 
 static void protnote_report(uint64_t start) {
+    /* SEARCH BY CONTAINMENT, NOT BY EXACT START (M2188).
+     *
+     * Keyed lookup on the VMA's start address answers the wrong question. The
+     * case that matters is a program that reserves a large range PROT_NONE and
+     * then mprotects a SUB-RANGE to read-write: the mprotect splits the VMA, so
+     * the piece that faults has a start address the mprotect never mentioned,
+     * and an exact-start lookup reports "no record of who set this mapping's
+     * protection" -- which reads as "nobody did", the strongest possible wrong
+     * answer here, when the truth may be "somebody did and it did not take".
+     *
+     * That is exactly the fault under investigation: a write into
+     * `vma[1447] 1be000000-1be035000 prot=0 'anon'`, a 212 KB piece whose size
+     * says it IS a split product, with the report claiming no provenance. So
+     * scan for any recorded call whose REQUESTED range contains the address,
+     * and say which. */
     struct protnote *p = &g_protn[(start >> 12) & (PROTN_SLOTS - 1)];
     if (!p->used || p->start != start) {
-        kprintf("[fault]   no record of who set this mapping's protection\n");
+        int found = -1;
+        for (int i = 0; i < PROTN_SLOTS; i++) {
+            struct protnote *q = &g_protn[i];
+            if (!q->used || !q->arg_len) continue;
+            if (start >= q->arg_addr && start < q->arg_addr + q->arg_len) { found = i; break; }
+        }
+        if (found < 0) {
+            kprintf("[fault]   no call recorded for this mapping, and none whose range "
+                    "CONTAINS it -- so its protection is the one it was created with\n");
+            return;
+        }
+        struct protnote *q = &g_protn[found];
+        static const char *const who[] = { "?", "mmap", "mprotect", "a VMA split" };
+        kprintf("[fault]   ** a %s by tid %d DID cover this address -- it asked for prot %d over "
+                "%lx+%lx, and the mapping that faulted (%lx) is inside that range but did NOT "
+                "get it. The call was recorded against %lx+%lx. **\n",
+                who[q->who < 4 ? q->who : 0], q->tid, q->prot,
+                (unsigned long)q->arg_addr, (unsigned long)q->arg_len, (unsigned long)start,
+                (unsigned long)q->start, (unsigned long)q->len);
         return;
     }
     static const char *const who[] = { "?", "mmap", "mprotect", "a VMA split" };

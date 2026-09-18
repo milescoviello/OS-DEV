@@ -3788,6 +3788,10 @@ static void lx_dispatch_body(struct registers *r) {
         /* Same reasoning as the file path above (M2162): an anonymous MAP_FIXED
          * over a carved region inherits that region's protection too. */
         app_mprotect(base, (uint64_t)len, (int)prot);
+        /* Record it, so a later fault can tell "created PROT_NONE" from
+         * "granted access and it did not take" (M2188). */
+        { extern void app_protnote_mmap(uint64_t start, uint64_t len, int prot);
+          app_protnote_mmap(base, (uint64_t)len, (int)prot); }
         r->rax = base;
         break;
     }
