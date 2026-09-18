@@ -1,5 +1,71 @@
 # What's next
 
+> **(M2212-M2219) EIGHT CORES IS NOW THE FAST PATH — 29.5 s TO THE PAGE — AND
+> STILL CRASHES 2 IN 3, ON AN ext2 CORRUPTION THAT HAS OUTLIVED FOUR THEORIES.**
+>
+> The good half first, because it is the half the goal names. With M2209 in,
+> **8 cores reaches the page in 29.5 s against one core's 36 s**. The earlier
+> reading that said eight cores took 156 s was taken before M2209 and does not
+> survive it.
+>
+> The bad half: on 8 cores, 2 boots in 3 die. The chain is now visible end to
+> end, and the last step of it was mine:
+>
+>     [fault] 11768c000 from libxul.so+9452000: the FILE IS GONE (unlinked
+>             while mapped ...). Filling with zeros
+>     [fault] Page Fault at rip=0x11768c190 (CR2=0x0)
+>
+> `rip` is INSIDE the page that was just zero-filled, and CR2 is 0 because zeros
+> decode to instructions that dereference null. M2160 let a fault zero-fill when
+> `vfs_stat` says the file is gone -- correct for SQLite's `-shm`, which is
+> unlinked while mapped and whose contents really are zeros -- but the stat does
+> its own path walk, so whatever makes the read fail makes the stat fail too.
+> **M2218: never zero-fill an EXECUTABLE mapping**, whatever the lookup claims.
+> Zeros there are never right, and the process executes them.
+>
+> **What is producing the bad answer is still open, and four theories are dead.**
+> The ext2 layer rejects 11-204 inode-table pointers per boot on EIGHT cores and
+> **zero on one**, in every crashing run and in none that survive. Ruled out by
+> measurement, not by argument:
+>
+> | theory | died on |
+> |---|---|
+> | the ext2 path cache | `-append nopathcache`, 2 boots: still `itable=88` and `itable=11`, still crashed |
+> | a kernel stack overflow in `read_inode` | 8240 bytes -> 560 (M2212); corruption unchanged |
+> | a device error the distrust guard would catch | `refused=0` -- and then M2219 found the guard was never wired to the site that fires |
+> | anything below ext2 | `ata_lock` covers the whole transfer including DMA; `bcache` copies in and out under its own lock |
+>
+> So M2219 stops theorising and runs an experiment: **when a rejected
+> inode-table pointer is re-read from the same sector, does the answer change?**
+> Different means the storage path handed back another sector's bytes; same
+> means the block number we computed was wrong. One extra sector read on the
+> failure path, and the fault report prints the verdict.
+>
+> **And the guard that should have caught all of this was watching the wrong
+> door.** M2213 added `g_e2_distrust` so the fault handler could tell "this path
+> does not exist" from "the filesystem does not believe itself" -- and fed every
+> rejection site except the inode-table one, because the edit landed on the
+> pre-M2212 text. Every crashing boot reported `refused=0` while rejecting
+> eighty-eight inode tables.
+>
+> **M2217, and it was mine too.** Both the memfd remap and the sharing audit
+> snapshotted VMA ranges into `r[APP_MAXVMA]` -- 4096 entries at 24 bytes, a
+> **96 KiB local** -- on a 16 KiB kernel stack in syscall context and on the
+> watcher's 64 KiB one once M2214 moved the page probe there. Every run of one
+> A/B double-faulted with `rbp-rsp = 0x10028`. The snapshot was never necessary:
+> since M1988 a VMA entry never moves, so an index is stable and the lock only
+> has to cover the read of one entry. `app.c`'s largest frame went from 96 KiB
+> to 4208 bytes.
+>
+> **A latent SMP bug found while reading, and deliberately NOT claimed as this
+> one:** `kernel/vfs.c` keeps the live cwd in three globals (`synth_cwd`,
+> `mount_sub[128]`, the fat32 cwd cluster) and swaps them per process at syscall
+> entry. On 8 cores two processes are in the VFS at once and can overwrite each
+> other's -- including `app_cwd_save` stashing the wrong directory into a process
+> permanently. It does **not** explain the Firefox failures: `mount_path`
+> consults none of it for an ABSOLUTE path, and every path a Linux process
+> hands the VFS is absolute. Real, filed, not the culprit.
+
 > **(M2204-M2211) THE BLANK PAGE IS FIXED, AND IT WAS A fork() THAT
 > COPY-ON-WROTE MAP_SHARED PAGES.**
 >
