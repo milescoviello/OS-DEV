@@ -187,6 +187,14 @@ struct app {
  * check vma_full() beforehand rather than `nvma >= APP_MAXVMA`, because a full
  * high-water mark with tombstones in it still has room. */
 #define vma_full(a) (vma_pick_slot(a) < 0)
+/* A VMA WHOSE foff MEANS SOMETHING (M2205). Every place that trims or splits a
+ * mapping has to slide its offset into the backing object by the same amount,
+ * and all three of them tested `file_backed` -- which was complete until M2203
+ * gave memfd mappings a real foff. A memfd mapping is `shared` with `mfd >= 0`
+ * and is NOT file_backed, so a split or a head-trim left the new piece naming
+ * the wrong bytes of the object. mprotect splits (app_vma_split_at), and
+ * Firefox mprotects its shared buffers. */
+#define vma_has_offset(v) ((v).file_backed || (v).mfd >= 0)
 /* CLAIMING A SLOT IS THE ONE PART THAT MUST BE MUTUALLY EXCLUSIVE (M1988).
  *
  * Tombstoning fixed removal; allocation was still racing. Two threads calling
@@ -5475,8 +5483,8 @@ static int app_vma_split_at(struct app *a, uint64_t addr) {
         a->vma[ss] = a->vma[i];       /* a COPY on purpose: no VMA_NEW here */
         a->vma[ss].start = addr;
         a->vma[ss].len   = e0 - addr;
+        if (vma_has_offset(a->vma[ss])) a->vma[ss].foff += addr - s0;   /* memfd too (M2205) */
         if (a->vma[ss].file_backed) {
-            a->vma[ss].foff += addr - s0;
             /* fvalid is measured from the VMA start, so the tail's shrinks by
              * exactly what the head keeps -- and clamps at zero when the split
              * lands past the last file-backed byte. */
@@ -5773,8 +5781,9 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
             a->vma[i].len   = e0 - ce;
             vma_alloc_unlock(a, hfl);
             /* The file offset tracks the VMA's new start, or every later
-             * demand-fault in this region reads the wrong part of the file. */
-            if (a->vma[i].file_backed) a->vma[i].foff += ce - s0;
+             * demand-fault in this region reads the wrong part of the file.
+             * A memfd mapping has an offset too (M2205). */
+            if (vma_has_offset(a->vma[i])) a->vma[i].foff += ce - s0;
         } else if (ce == e0) {                      /* tail trimmed */
             uint64_t tfl2 = vma_alloc_lock(a);
             a->vma[i].len = cs - s0;
@@ -5787,7 +5796,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
             if (a->vma[i].mfd >= 0) memfd_ref(a->vma[i].mfd);   /* now TWO mappings hold it (M1985) */
             a->vma[ns].start = ce;
             a->vma[ns].len   = e0 - ce;
-            if (a->vma[ns].file_backed) a->vma[ns].foff += ce - s0;
+            if (vma_has_offset(a->vma[ns])) a->vma[ns].foff += ce - s0;   /* memfd too (M2205) */
             if (ns >= a->nvma) a->nvma = ns + 1;
             vma_alloc_unlock(a, cfl);
             a->vma[i].len = cs - s0;
@@ -10136,19 +10145,30 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
         for (int pi = 0; pi < MAX_APPS; pi++) {
             struct app *a = &apps[pi];
             if (!a->used || !a->cr3) continue;
-            struct { uint64_t start, len; } r[APP_MAXVMA];
+            struct { uint64_t start, len, foff; } r[APP_MAXVMA];
             int nr2 = 0;
             uint64_t fl = vma_lock(a);
             for (int i = 0; i < a->nvma && nr2 < APP_MAXVMA; i++)
                 if (a->vma[i].len && a->vma[i].mfd == idx) {
-                    r[nr2].start = a->vma[i].start; r[nr2].len = a->vma[i].len; nr2++;
+                    r[nr2].start = a->vma[i].start; r[nr2].len = a->vma[i].len;
+                    /* WHICH BYTES OF THE OBJECT THIS MAPPING COVERS (M2205).
+                     * The first cut of this loop used `off` as both the
+                     * mapping offset and the object offset, so a mapping made
+                     * at a non-zero offset was re-pointed at the WRONG part of
+                     * the new buffer -- a fix introducing the corruption it
+                     * was written to prevent. foff did not even exist for a
+                     * memfd mapping until M2203, which is how it went
+                     * unnoticed: there was nothing to be wrong. */
+                    r[nr2].foff = a->vma[i].foff;
+                    nr2++;
                 }
             vma_unlock(a, fl);
             if (!nr2) continue;
             for (int i = 0; i < nr2; i++)
                 for (uint64_t off = 0; off < r[i].len; off += PAGE_SIZE) {
-                    if (off >= nc) break;                  /* past the new buffer */
-                    uint64_t ph = vmm_translate((uint64_t)(nb + off));
+                    uint64_t ooff = r[i].foff + off;        /* the OBJECT offset */
+                    if (ooff >= nc) break;                 /* past the new buffer */
+                    uint64_t ph = vmm_translate((uint64_t)(nb + ooff));
                     if (!ph || !pmm_refcountable(ph)) { unshareable++; continue; }
                     uint64_t oldph = vmm_translate_in(a->cr3, r[i].start + off);
                     if (oldph == ph) continue;             /* already the new frame */
