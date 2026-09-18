@@ -252,7 +252,11 @@ void smp_tlb_shootdown_selftest(void) {
  * picks one core that has it set, and a second wake while the first IPI is
  * still unhandled is skipped.
  *
- * Vector 0x42, beside the job-pool wake (0x40) and the TLB shootdown (0x41).
+ * Vector 0x43. 0x42 is the PER-CORE LAPIC TIMER (M1532) and the first draft of
+ * this took it -- which would have shadowed the only preemption source and the
+ * only CPU accounting every AP has, from a change meant to make eight cores
+ * faster. Allocated: 0x40 job-pool wake, 0x41 TLB shootdown, 0x42 LAPIC timer,
+ * 0x43 reschedule, 0xFF spurious.
  * Its handler EOIs and calls sched_tick(), which is exactly what the timer
  * interrupt does -- so this runs in a context the scheduler is already entered
  * from, rather than a new one. */
@@ -270,7 +274,7 @@ void smp_send_resched_ipi(void) {
         if (i == me || !smp_core_idle[i]) continue;
         if (__atomic_exchange_n(&smp_resched_sent[i], 1, __ATOMIC_ACQ_REL)) continue;  /* one in flight already */
         lapic_wr(LAPIC_ICRHI, (uint32_t)i << 24);
-        lapic_wr(LAPIC_ICRLO, 0x42 | (1u << 14));            /* fixed, assert, that core */
+        lapic_wr(LAPIC_ICRLO, 0x43 | (1u << 14));            /* fixed, assert, that core */
         for (uint32_t g = 0; g < 1000000u && (lapic_rd(LAPIC_ICRLO) & ICR_PENDING); g++)
             __asm__ volatile("pause");
         return;                                              /* one idle core is enough for one task */

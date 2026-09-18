@@ -101,6 +101,15 @@ isr66:
     push 66
     jmp isr_common
 
+; 0x43 = the reschedule IPI (M2216): wake ONE parked core to pick up a task
+; task_wake just made runnable, instead of leaving it for that core's next
+; 100 Hz tick. Deliberately NOT 0x42, which is the per-core LAPIC timer.
+global isr67
+isr67:
+    push 0
+    push 67
+    jmp isr_common
+
 global isr255
 isr255:
     push 0

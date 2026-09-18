@@ -206,8 +206,17 @@ void isr_dispatch(struct registers *r) {
      * idle core waited up to ten milliseconds for a scheduler that already had
      * work for it. This is the interrupt that says "look again now". EOI, clear
      * the in-flight flag, then sched_tick(), which is exactly what the timer
-     * interrupt does with the same stack shape. */
-    if (r->int_no == 0x42) { lapic_eoi(); smp_resched_ack(smp_current_cpu()); sched_tick(); return; }
+     * interrupt does with the same stack shape.
+     *
+     * VECTOR 0x43, and the first draft of this used 0x42 -- which is the
+     * PER-CORE LAPIC TIMER (M1532), sitting fifteen lines below. That handler
+     * is the only preemption source on every AP and the only thing charging
+     * their CPU time, and a duplicate case above it would have shadowed it
+     * completely: no preemption and no accounting on seven of eight cores,
+     * from a change whose entire purpose was to make eight cores faster. The
+     * allocated vectors are 0x40 job-pool wake, 0x41 TLB shootdown, 0x42
+     * LAPIC timer, 0xFF spurious. */
+    if (r->int_no == 0x43) { lapic_eoi(); smp_resched_ack(smp_current_cpu()); sched_tick(); return; }
     /* This core's own local LAPIC timer (M1532): the real per-core preemption
      * source, armed by lapic_timer_start_this_cpu() on every AP (never the
      * BSP, which keeps its own working PIT-driven tick_handler). EOI FIRST,
