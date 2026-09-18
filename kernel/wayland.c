@@ -1089,6 +1089,13 @@ static void wl_toplevel_configure(struct wl_client *c, struct wl_object *o, uint
 }
 
 static void wl_kbd_enter(struct wl_client *c);   /* focus is granted on map, not on a keypress (M2113) */
+/* See the M2190 note in the commit path: the high-water mark of page-coloured
+ * pixels over EVERY commit, so a paint that happened between two 15-second
+ * samples is still reported. */
+static uint32_t g_wl_watch_colour;
+static unsigned g_wl_page_best, g_wl_page_commits, g_wl_commits_seen;
+void wl_page_watch(uint32_t argb) { g_wl_watch_colour = argb; }
+
 static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     uint32_t obj = rd32(m + 0);
     uint32_t sz_op = rd32(m + 4);
@@ -1716,14 +1723,45 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                     int loud = (nth++ % 64) == 0;
                     {
                         unsigned long need2 = (unsigned long)b->stride * b->height;
-                        unsigned nz = 0, seen = 0;
+                        /* WATCH EVERY COMMIT, NOT EVERY FIFTEENTH SECOND (M2190).
+                         *
+                         * `wl_page_probe` SAMPLES: it looks at whatever is on
+                         * screen when it happens to run, every 15 seconds. A
+                         * page that painted and was then replaced between two
+                         * samples is invisible to it, and "the content area is
+                         * not the page right now" is not the same claim as "the
+                         * page was never presented". Those need opposite
+                         * investigations, and the probe cannot tell them apart.
+                         *
+                         * Every committed buffer passes through here, so the
+                         * high-water mark of page-coloured pixels across ALL
+                         * commits answers the second question outright and
+                         * costs one comparison per already-sampled pixel. The
+                         * concurrent session's point: ask our own compositor
+                         * what it was handed rather than asking Gecko to
+                         * narrate -- and unlike a MOZ_LOG spec, this cannot be
+                         * silent, because the commits are ours. */
+                        unsigned nz = 0, seen = 0, pagepx = 0, pageseen = 0;
                         if (loud && need2 <= o->size) {
                             for (unsigned y = 0; y < b->height; y += 16)
                                 for (unsigned x = 0; x < b->width; x += 16) {
                                     uint32_t px = rd32(o->base + (unsigned long)y * b->stride + (unsigned long)x * 4);
                                     if (px & 0x00FFFFFFu) nz++;
                                     seen++;
+                                    /* The content area only: above the chrome's
+                                     * height the answer is always "chrome". */
+                                    if (g_wl_watch_colour && y >= 92) {
+                                        pageseen++;
+                                        if ((px & 0x00FFFFFFu) ==
+                                            (g_wl_watch_colour & 0x00FFFFFFu)) pagepx++;
+                                    }
                                 }
+                        }
+                        if (pageseen) {
+                            unsigned pct = pagepx * 100 / pageseen;
+                            if (pct > g_wl_page_best) g_wl_page_best = pct;
+                            if (pct >= 50) g_wl_page_commits++;
+                            g_wl_commits_seen++;
                         }
                         uint32_t mid = 0;
                         if (need2 <= o->size && b->height && b->width)
@@ -2214,6 +2252,15 @@ void wl_page_probe(uint32_t want) {
                     hb ? "so it was fetched and the content area is still blank: look at "
                          "navigation, not at paint"
                        : "so it was never fetched: look at the load, not at the renderer"); }
+        /* AND WHAT EVERY COMMIT EVER CARRIED (M2190). The sampled verdict is
+         * about this instant; this is about the whole run, so "not the page
+         * now" and "never the page" stop being the same sentence. */
+        if (g_wl_commits_seen)
+            kprintf("[page]   across ALL %u commit(s) the content area was at most %u%% the "
+                    "page's colour, and %u commit(s) were mostly it -- %s\n",
+                    g_wl_commits_seen, g_wl_page_best, g_wl_page_commits,
+                    g_wl_page_commits ? "so the page WAS presented and is not on screen now"
+                                      : "so the page was NEVER presented in any frame");
         kprintf("[page] VERDICT: only the CHROME -- %d%% of the content area is the page's %06x, "
                 "so the content area is showing something else\n", pct, want & 0x00ffffffu);
 }

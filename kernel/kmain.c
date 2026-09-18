@@ -1710,6 +1710,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * host, for every file in the manifest at or under 64 KiB
                      * -- milliseconds, so it runs on every boot rather than
                      * being an opt-in nobody remembers to pass. */
+                    /* Arm the commit-time page watcher BEFORE Firefox starts, so
+                     * the very first commit is counted (M2190). */
+                    { extern void wl_page_watch(uint32_t argb); wl_page_watch(0x101820); }
                     {   static const char *av_small[] = { "--small", "65536" };
                         int src = app_run_linux_sync("/disk2/lxmapcmp", av_small, 2, 60000);
                         kprintf("[ff] static-input check -> %d (0 = ffpage.html and the prefs "
