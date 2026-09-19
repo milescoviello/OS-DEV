@@ -7089,6 +7089,28 @@ void app_futex_dump(void) {
     }
 }
 
+/* Wake waiters on a PRIVATE futex by virtual address, with no requirement
+ * that the page still be mapped (M2257). A private futex's key is the address
+ * itself and its address space is the process, so a dying thread can still
+ * name it after unmapping the page it lives in. */
+unsigned long g_tidaddr_unmapped, g_tidaddr_rescued;
+static int app_futex_wake_private(uint64_t uaddr, int val) {
+    struct app *a = cur();
+    uint64_t f = irq_save();
+    int woke = 0;
+    for (int i = 0; i < FUTEX_NWAIT && woke < val; i++)
+        if (g_futex[i].used && g_futex[i].key == uaddr && g_futex[i].as == (void *)a) {
+            task_t *wt = (task_t *)g_futex[i].task;
+            g_futex[i].used = 0;
+            if (wt && task_state_of(wt) != TASK_DEAD) { task_wake(wt); woke++; }
+        }
+    irq_restore(f);
+    if (woke)
+        kprintf("[futex] thread exit: tid address %lx was UNMAPPED, woke %d joiner(s) anyway\n",
+                (unsigned long)uaddr, woke);
+    return woke;
+}
+
 long app_futex(uint64_t uaddr, int op, int val, long timeout_ms) {
     if (!vmm_user_ok(uaddr, 4)) return -1;
     if (!vmm_translate(uaddr & ~(uint64_t)(PAGE_SIZE - 1))) return -1;   /* must be mapped to be read */
@@ -14151,8 +14173,33 @@ void app_thread_exit(void) {
     /* CLONE_CHILD_CLEARTID (M1226): zero the registered tid address + wake any
      * futex waiter on it — the kernel side of a real blocking pthread_join. Done
      * here while the dying thread's CR3 is active (threads share the AS). */
+    /* AND WAKE THE JOINER EVEN IF THIS THREAD'S STACK IS ALREADY GONE (M2257).
+     *
+     * This used to be one condition: if the tid address was still mapped,
+     * zero it and wake; otherwise do NEITHER. But app_futex refuses an
+     * unmapped address at its first line, and musl unmaps a thread's own
+     * stack as it exits -- so a thread that got that far woke nobody, and
+     * whoever was in pthread_join on it slept for ever.
+     *
+     * Measured: 120-thread probe on eight cores, `133 WAKE, 128 of them woke
+     * NOBODY, 7 WAIT`, and ZERO wakes for 184400ce8 -- the one address a
+     * thread was still parked on. The boot hung there for four minutes with
+     * no faults, which is why `claude -p` never even started on 8 cores.
+     *
+     * The write needs a mapping. The WAKE does not: a private futex's key IS
+     * the virtual address plus the process, both of which a dying thread
+     * still knows. So do them separately, and always do the wake. */
     uint64_t ct = task_self()->clear_child_tid;
-    if (ct && vmm_user_ok(ct, 4)) { *(volatile int *)ct = 0; app_futex(ct, FUTEX_WAKE, 1, -1); }
+    if (ct) {
+        int mapped = vmm_user_ok(ct, 4) &&
+                     vmm_translate(ct & ~(uint64_t)(PAGE_SIZE - 1)) != 0;
+        if (mapped) { *(volatile int *)ct = 0; app_futex(ct, FUTEX_WAKE, 1, -1); }
+        else {
+            g_tidaddr_unmapped++;
+            if (app_futex_wake_private(ct, 1))
+                g_tidaddr_rescued++;      /* a join that would have hung forever */
+        }
+    }
     task_exit();
 }
 
