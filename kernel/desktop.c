@@ -1841,6 +1841,22 @@ static unsigned desktop_key_to_evdev_shift(int ch, int *need_shift) {
     if (c2 == 27)    return 1;                    /* Escape */
     if (c2 == '\b' || c2 == 127) return 14;       /* Backspace */
     if (c2 == '\t')  return 15;                   /* Tab */
+    /* ARROWS -- WHICH IS HOW YOU SCROLL A PAGE (M2244).
+     *
+     * The desktop's cooked codes for the four arrows are 0x11..0x14 (see the
+     * file manager and window-switcher handlers). They were not in this table,
+     * so a Wayland client got nothing for them and a browser could not be
+     * scrolled from the keyboard at all.
+     *
+     * The values are checked against OUR OWN keymap rather than assumed:
+     * kernel/include/xkbmap.h declares <UP> = 111, <DOWN> = 116, <LEFT> = 113,
+     * <RGHT> = 114, and an xkb keycode is the evdev code plus 8 -- so 103,
+     * 108, 105 and 106. A table that disagreed with the keymap we ship would
+     * translate to the wrong key and be very hard to see. */
+    if (c2 == 0x11) return 103;                   /* KEY_UP    (<UP>   = 111) */
+    if (c2 == 0x12) return 108;                   /* KEY_DOWN  (<DOWN> = 116) */
+    if (c2 == 0x13) return 105;                   /* KEY_LEFT  (<LEFT> = 113) */
+    if (c2 == 0x14) return 106;                   /* KEY_RIGHT (<RGHT> = 114) */
     return 0;
 }
 
@@ -1863,6 +1879,12 @@ static int wlpid_seen[16], nwlpid_seen;
 /* The topmost window the user can actually see -- the one that owns input.
  * -1 when every window is minimized (or there are none), which is the only
  * case where a keystroke legitimately has nowhere to go. (M2243) */
+/* DID THE KEY EVEN GET HERE? (M2244) Three counters that separate the three
+ * places a keystroke can die: never dequeued by the desktop, dequeued but the
+ * focused window is not a Wayland client, or forwarded and ignored by the
+ * client. Without these, all three look the same from a screenshot. */
+unsigned long g_dk_keys, g_dk_fwd;
+int g_dk_focus_kind = -2;
 static int focus_index(void) {
     for (int i = win_count - 1; i >= 0; i--)
         if (!windows[i].minimized) return i;
@@ -2561,7 +2583,9 @@ void desktop_run(void) {
              * and this used to answer "no visible focused window" and drop the
              * keystroke, with a perfectly good browser visible underneath it.
              * Focus belongs to the topmost window the user can actually SEE. */
+            g_dk_keys++;
             int fi = focus_index();
+            g_dk_focus_kind = (fi >= 0) ? (int)windows[fi].kind : -1;
             if (fi >= 0) {
                 window_t *top = &windows[fi];
                 if (top->kind == KIND_APP && top->app) { app_sel_clear((app_t *)top->app); app_key((app_t *)top->app, (char)k); dirty = 1; }
@@ -2574,6 +2598,7 @@ void desktop_run(void) {
                      * presses treats every key as held down forever. The value
                      * is an evdev keycode, which is what the protocol carries
                      * -- not the character. (M1983) */
+                    g_dk_fwd++;
                     int nsh = 0;
                     unsigned ev = desktop_key_to_evdev_shift(k, &nsh);
                     if (!ev) {

@@ -2293,6 +2293,10 @@ void wl_fs_health_line(void) {
         extern unsigned long g_e2_gd_pio_good, g_e2_gd_pio_same, g_e2_gd_pio_fail;
         extern unsigned long g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short;
         extern unsigned long g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts;
+        extern unsigned long g_dk_keys, g_dk_fwd; extern int g_dk_focus_kind;
+        unsigned wl_keys_sent(void);
+        int kbclients = 0;
+        for (int q = 0; q < WL_MAXCLIENT; q++) if (g_cl[q].used && g_cl[q].keyboard) kbclients++;
         extern int g_tab_lastx, g_tab_lasty, g_tab_lastbtn;
         extern uint64_t g_bd_fail_cap4, g_bd_fail_lba4;
         /* Declared here rather than in ata.h, the same way app.c's fault
@@ -2313,7 +2317,9 @@ void wl_fs_health_line(void) {
                 "gdt: %lu bad on read, %lu fixed by re-read, %lu REFUSED at write; "
                 "PIO says: %lu DISK-WAS-FINE (recovered), %lu disk really bad, %lu read failed | "
                 "tablet: %lu polls, %lu reports, %lu err, %lu short, last %d,%d btn %d | "
-                "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx\n",
+                "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx | "
+                "keys: %lu dequeued, %lu forwarded to wayland, focus kind %d, "
+                "%lu SENT on the wire to %d client(s) with a wl_keyboard\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
@@ -2335,7 +2341,9 @@ void wl_fs_health_line(void) {
                 g_e2_gd_pio_good, g_e2_gd_pio_same, g_e2_gd_pio_fail,
                 g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short,
                 g_tab_lastx, g_tab_lasty, g_tab_lastbtn,
-                g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts); }
+                g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts,
+                g_dk_keys, g_dk_fwd, g_dk_focus_kind,
+                (unsigned long)wl_keys_sent(), kbclients); }
 }
 
 int wl_page_probe(uint32_t want) {
