@@ -889,6 +889,15 @@ static void blockdev_mount_scan(void) {
             kprintf("[mount] %s = blockdev %d (%s) at LBA %lu, fstype %s\n",
                     m->name, i, g_dev[i].name, (unsigned long)starts[v],
                     fstype == FS_EXT2 ? "ext2" : (fstype == FS_ISO9660 ? "iso9660" : "fat"));
+            /* PROVE THE GROUP DESCRIPTORS ARE READABLE NOW, before any load
+             * (M2235). Every reading of this filesystem's corruption so far
+             * comes from a Firefox boot on eight cores, which cannot separate
+             * "it never read correctly" from "it stops reading correctly under
+             * concurrency" -- and those need opposite investigations. One read
+             * at mount time settles it, and a clean line on every boot is what
+             * will make the dirty one mean something. */
+            if (fstype == FS_EXT2)
+                ext2_gdt_selftest(bd_blk_read, (void *)(intptr_t)i, starts[v], kprintf);
             g_nmount++;
         }
     }

@@ -770,6 +770,44 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
     return ino;
 }
 
+/* IS THE GROUP DESCRIPTOR TABLE READABLE AT ALL, BEFORE ANY LOAD? (M2235)
+ *
+ * Every reading so far comes from a Firefox boot under concurrency, which
+ * cannot separate "this filesystem never read correctly" from "it stops
+ * reading correctly when eight cores hammer it". Those need opposite
+ * investigations and the difference is one read at mount time.
+ *
+ * Checks what the host says build/ext2.img contains -- descriptor 0's inode
+ * table is block 4, well inside 819200 -- so a failure here is unambiguous and
+ * a success makes every later failure a CONCURRENCY failure by elimination.
+ * Prints either way: a clean line every boot is what makes the dirty one
+ * mean something. */
+void ext2_gdt_selftest(blk_read_fn read, void *ctx, uint64_t start, void (*log)(const char *, ...)) {
+    ext2_t v;
+    if (ext2_open(read, ctx, start, &v) < 0) {
+        if (log) log("[ ?? ] ext2 GDT self-test: the superblock did not open at LBA %lu\n",
+                     (unsigned long)start);
+        return;
+    }
+    uint8_t sec[SECSZ];
+    uint32_t gdblk = v.gdt_block;
+    if (rdsec(&v, gdblk, 0, sec) < 0) {
+        if (log) log("[FAIL] ext2 GDT self-test: block %lu (LBA %lu) could not be read\n",
+                     (unsigned long)gdblk,
+                     (unsigned long)(v.start + (uint64_t)gdblk * (v.block_size / SECSZ)));
+        return;
+    }
+    uint32_t it0 = e_rd32(sec + 8), it1 = e_rd32(sec + 32 + 8);
+    int ok = it0 && it0 < v.blocks_count && it1 && it1 < v.blocks_count;
+    if (log)
+        log("[%s] ext2 GDT self-test: block %lu (LBA %lu) -> inode_table[0]=%lu [1]=%lu "
+            "of %lu blocks; first bytes %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            ok ? " ok " : "FAIL", (unsigned long)gdblk,
+            (unsigned long)(v.start + (uint64_t)gdblk * (v.block_size / SECSZ)),
+            (unsigned long)it0, (unsigned long)it1, (unsigned long)v.blocks_count,
+            sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7]);
+}
+
 int ext2_probe(blk_read_fn read, void *ctx, uint64_t start_lba) {
     /* A PROBE IS A QUESTION, NOT A FAILURE (M2222).
      *

@@ -13,6 +13,7 @@
 
 void ext2_set_clock(uint32_t (*fn)(void));   /* wire the inode-timestamp clock (kernel: rtc_unix) (M1175) */
 void ext2_set_cache_drop(void (*fn)(void *ctx, uint64_t lba, uint32_t n));   /* wire the block-cache drop, for the superblock retry (M2220) */
+void ext2_gdt_selftest(blk_read_fn read, void *ctx, uint64_t start, void (*log)(const char *, ...));   /* is the GDT readable before any load? (M2235) */
 int  ext2_probe(blk_read_fn read, void *ctx, uint64_t start_lba);   /* 0 if a valid ext2 volume, else -1 */
 int  ext2_list_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
                     fatvol_dirent *out, int max);                   /* list a dir; entries written, or -1 */
