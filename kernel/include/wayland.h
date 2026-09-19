@@ -88,6 +88,7 @@ void wl_selftest(void);
 void     wl_post_pointer_leave(void);
 void     wl_post_motion(int x, int y);
 void     wl_post_button(int x, int y, unsigned button, int pressed);
+void     wl_set_focus_client(int ci);   /* the WM names the focused client; input goes there (M2275) */
 void     wl_post_axis(int x, int y, int ticks_down);   /* wl_pointer.axis: vertical scroll (M2245) */
 void     wl_post_key(unsigned keycode, int pressed);
 unsigned wl_keys_sent(void);

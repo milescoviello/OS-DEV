@@ -2876,7 +2876,25 @@ static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *o
  * whose mapped toplevel is biggest -- the same rule wl_frame_tick already uses
  * to grant keyboard focus and the window manager uses to decide which window
  * is the real one -- and send to that one alone. */
+/* THE WINDOW MANAGER DECIDES FOCUS, NOT THE COMPOSITOR'S GUESS (M2275).
+ *
+ * desktop.c hit-tests the topmost VISIBLE window, computes the pointer
+ * position relative to THAT window, and calls wl_post_motion/button. The
+ * compositor then delivered those coordinates to whichever client had the
+ * biggest surface -- a completely independent rule. When the two disagree,
+ * coordinates measured against window A are handed to client B, and the
+ * client that the user is actually pointing at gets nothing.
+ *
+ * Two rules for one question is one rule too many. The window manager is the
+ * authority -- it owns stacking, visibility and hit-testing -- so it says
+ * which client it means, and the area heuristic survives only as the
+ * fallback for input that arrives before any window has been focused. */
+static int g_focus_ci = -1;
+void wl_set_focus_client(int ci) { g_focus_ci = ci; }
+
 static int wl_focus_client(void) {
+    if (g_focus_ci >= 0 && g_focus_ci < WL_MAXCLIENT && g_cl[g_focus_ci].used)
+        return g_focus_ci;
     int best = -1; uint64_t barea = 0;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         if (!g_cl[i].used) continue;

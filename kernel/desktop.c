@@ -2596,6 +2596,8 @@ void desktop_run(void) {
             g_dk_keys++;
             int fi = focus_index();
             g_dk_focus_kind = (fi >= 0) ? (int)windows[fi].kind : -1;
+            if (fi >= 0 && windows[fi].kind == KIND_WAYLAND)
+                wl_set_focus_client((int)(long)windows[fi].app - 1);
             if (fi >= 0) {
                 window_t *top = &windows[fi];
                 if (top->kind == KIND_APP && top->app) { app_sel_clear((app_t *)top->app); app_key((app_t *)top->app, (char)k); dirty = 1; }
@@ -2676,6 +2678,10 @@ void desktop_run(void) {
              * CHANGES: a Wayland client redraws on motion, and re-sending the
              * same position every frame would keep it busy forever. (M1983) */
             if (!fw->minimized && fw->kind == KIND_WAYLAND) {
+                /* Name the client this window belongs to, so the compositor
+                 * delivers to it rather than to whichever surface happens to
+                 * be largest (M2275). */
+                wl_set_focus_client((int)(long)fw->app - 1);
                 int sw3 = fw->w - 14, sh3 = fw->h - TITLEBAR_H - 14;
                 int rx = mx - (fw->x + 6), ry = my - (fw->y + TITLEBAR_H + 6);
                 /* HIT-TEST against the surface, not just the window: pointer
