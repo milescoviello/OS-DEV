@@ -13,3 +13,6 @@ __pycache__/
 
 # Playwright MCP scratch logs (created by research subagents' web fetching)
 .playwright-mcp/
+# the Firefox test URL: a real site to point the browser at, deliberately
+# NOT part of the repository (M2241)
+/ffurl.txt

@@ -290,6 +290,13 @@ static volatile int g_ffdata;                 /* -append ffdata: render a data: 
 static void ext2_cache_drop_hook(void *ctx, uint64_t lba, uint32_t n) {
     blockdev_drop_cache((int)(intptr_t)ctx, lba, n);
 }
+/* The independent second opinion, same shim shape (M2240): ext2 holds the
+ * blockdev index as an opaque ctx, so the cast lives here rather than in a
+ * device-agnostic file. */
+static int ext2_raw_read_hook(void *ctx, uint64_t lba, uint32_t n, void *buf) {
+    return blockdev_read_raw((int)(intptr_t)ctx, lba, n, buf);
+}
+static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
  * still gets printed -- just to COM1, from a thread, while the framebuffer
@@ -875,6 +882,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * to COM1. `ffhold` is the escape hatch for the rare boot that dies
          * before the desktop starts and therefore needs the log ON SCREEN. */
         if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") || cmdline_has(cl, "ffnet")) {
+        if (cmdline_has(cl, "ffurl")) { g_ffurl = 1; }   /* URL from a file in the image, never from the source tree (M2241) */
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
@@ -1950,7 +1958,47 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * probe's "varied / UNIFORM" line already reports. */
                     static const char *av_fn[] = { "--no-remote", "--new-instance",
                                                    "http://example.com/" };
-                    const char **av_use = g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw);
+                    /* A URL THAT IS NOT IN THE SOURCE TREE (M2241).
+                     *
+                     * Every page measured so far is `file:///ffpage.html` -- a
+                     * LOCAL FILE -- so "Firefox works" has never once meant a
+                     * real site, and the person asking for it had never seen
+                     * one. `ffnet` fixed that for example.com; this fixes it
+                     * for any site, without the address becoming part of the
+                     * repository.
+                     *
+                     * The URL lives in /disk2/ffurl.txt, staged from a
+                     * gitignored ffurl.txt at the top of the tree. Reading it
+                     * at spawn time keeps it out of the kernel image's
+                     * strings, out of every commit, and out of the build logs.
+                     * Trimmed at the first control character so a trailing
+                     * newline cannot become part of the address. */
+                    static char urlbuf[512];
+                    const char *av_uf[3];
+                    int have_url = 0;
+                    if (g_ffurl) {
+                        long un = vfs_pread("/disk2/ffurl.txt", urlbuf, sizeof urlbuf - 1, 0);
+                        if (un > 0) {
+                            urlbuf[un] = 0;
+                            for (long k = 0; k < un; k++)
+                                if ((unsigned char)urlbuf[k] < 0x20) { urlbuf[k] = 0; break; }
+                            if (urlbuf[0]) {
+                                av_uf[0] = "--no-remote"; av_uf[1] = "--new-instance";
+                                av_uf[2] = urlbuf;
+                                have_url = 1;
+                                /* Length and scheme only: enough to prove the
+                                 * file was read and parsed, without printing
+                                 * the address to a console someone may share. */
+                                kprintf("[ff] URL from /disk2/ffurl.txt: %d chars, scheme %.5s\n",
+                                        (int)__builtin_strlen(urlbuf), urlbuf);
+                            }
+                        }
+                        if (!have_url)
+                            kprintf("[ff] -append ffurl given but /disk2/ffurl.txt is missing or empty "
+                                    "-- put the address in ./ffurl.txt and rebuild build/ext2.img\n");
+                    }
+                    const char **av_use = have_url ? av_uf
+                                        : (g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw));
                     /* When Firefox parks, the syscall trace shows a futex
                      * address and nothing else -- it cannot name the Gecko
                      * code that is waiting. Firefox can: MOZ_LOG prints the
@@ -3259,7 +3307,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * owner key this transport uses. The ctx it gets is the one it passed
      * down, which for a mounted volume is the blockdev index. */
     ext2_set_cache_drop(ext2_cache_drop_hook);
-    ext2_set_raw_read(blockdev_read_raw);   /* an independent, cache-and-DMA-free second opinion (M2240) */
+    ext2_set_raw_read(ext2_raw_read_hook);   /* an independent, cache-and-DMA-free second opinion (M2240) */
 
     /* Bring up a USB HID boot keyboard, sharing the one UHCI controller with the
      * tablet + mass-storage above (skipping the tablet's port, using the shared

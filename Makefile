@@ -192,6 +192,20 @@ LXROOT  := $(BUILD)/lxroot
 # host credential rebuilds the image, and nothing else has to remember.
 # Local only -- build/ is gitignored and the file never leaves this machine.
 # CLAUDE_CREDS= to opt out.
+# THE FIREFOX TEST URL, STAGED BUT NEVER COMMITTED (M2241).
+# ./ffurl.txt is gitignored. If it exists it is staged to /disk2/ffurl.txt and
+# `-append ffurl` points Firefox at it, so a real site can be tested without
+# its address entering the repository, the kernel image's strings or a log.
+FFURL_SRC := $(wildcard ffurl.txt)
+ifneq ($(FFURL_SRC),)
+FFURL_DST := $(LXROOT)/ffurl.txt
+$(FFURL_DST): $(FFURL_SRC)
+	@mkdir -p $(dir $@)
+	@cp -f $< $@
+	@echo "  FFURL   staged ./ffurl.txt -> /disk2/ffurl.txt ($$(wc -c < $<) bytes, not committed)"
+else
+FFURL_DST :=
+endif
 CLAUDE_CREDS_SRC := $(if $(CLAUDE_CREDS_OPTOUT),,$(wildcard $(HOME)/.claude/.credentials.json))
 ifneq ($(CLAUDE_CREDS_SRC),)
 EXT2_CREDS := $(LXROOT)/root/.claude/.credentials.json
@@ -738,7 +752,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(EXT2_CREDS) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/.src-staged
+$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \

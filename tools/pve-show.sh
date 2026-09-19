@@ -57,6 +57,16 @@ fi
 [ "$L" = "$R" ] || { echo "FATAL: the node does not have this build." >&2; exit 1; }
 
 echo "==> booting VM $VMID ($CORES core(s), ${MEM}M, -append \"$APPEND\") -- NOT stopping it"
+# A PS/2 MOUSE, NOT A USB TABLET (M2241).
+#
+# Proxmox gives every VM `usb-tablet` as its pointer and NO PS/2 mouse:
+#     usb-tablet,id=tablet,bus=uhci.0,port=1
+# kernel/desktop.c reads the i8042, so every click the user made went to a
+# device nothing in this OS consumes -- and because the desktop focuses a
+# window on click, that killed TYPING too. One cause, both symptoms, and it
+# looked like "the desktop is frozen".
+# `--tablet 0` makes Proxmox attach a PS/2 mouse instead.
+$SSH "qm set $VMID --tablet 0" >/dev/null 2>&1 || true
 $SSH "qm set $VMID --memory $MEM --cores $CORES --args \
   '-snapshot -kernel $PVE_DIR/kernel32.elf -append \"$APPEND\" \
    -drive file=$PVE_DIR/fat.img,format=raw,if=ide,index=0 \
