@@ -858,13 +858,19 @@ static void wl_flush(struct wl_client *c) {
     wl_out_give(fl);
 }
 static void wl_flush_locked(struct wl_client *c) {
+    int sent_any = 0;
     while (c->outlen > 0) {
         long n = unix_send(c->ep, c->out, (unsigned long)c->outlen);
         if (n <= 0) break;                       /* ring full, or the peer is gone */
+        sent_any = 1;
         if (n >= c->outlen) { c->outlen = 0; break; }
         for (int i = 0; i + (int)n < c->outlen; i++) c->out[i] = c->out[i + (int)n];
         c->outlen -= (int)n;
     }
+    /* ...and tell the client's epoll/poll that there is something to read
+     * (M2262). unix_send wakes a task blocked in unix_recv; a Linux client
+     * blocked in epoll_wait is a different sleeper entirely. */
+    if (sent_any) app_unix_peer_ready(c->ep ^ 1);
 }
 
 /* A Wayland string: u32 length INCLUDING the NUL, then the bytes, padded to 4. */

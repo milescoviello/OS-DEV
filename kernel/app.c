@@ -12773,6 +12773,22 @@ static void epoll_rearm_edge(struct app *a, int fd) {
  *
  * `app_fd_ready` is still the gate, so scanning is safe: an fd that is not
  * actually ready for what its owner asked about is never re-armed. */
+/* THE COMPOSITOR'S WRITES MUST WAKE A LINUX POLLER TOO (M2262).
+ *
+ * epoll_note_peer_ready is called from the Linux-ABI write paths, so one
+ * Linux process writing to another's AF_UNIX socket re-arms the reader's
+ * epoll edge. The compositor does not go through those paths: kernel/wayland.c
+ * writes with the kernel's own unix_send(), which wakes a task blocked in
+ * unix_recv and NOTHING ELSE. A client parked in epoll_wait/poll on its
+ * Wayland fd is therefore never woken by anything the compositor sends it.
+ *
+ * Measured: GDK inside Firefox allocates ZERO events for a click that our
+ * output queue shows fully flushed (q0), while the same GDK in zenity
+ * allocates GDK_ENTER_NOTIFY / GDK_MOTION_NOTIFY / GDK_BUTTON_PRESS for the
+ * same click. zenity's GLib loop has timers and re-polls on its own; a client
+ * that blocks with no timeout waits for a wake-up that never comes. */
+void app_unix_peer_ready(int obj) { epoll_note_peer_ready(12, obj); }
+
 static void epoll_note_peer_ready(int fdtype, int obj) {
     /* NOTHING TO DO IF NOBODY IS ASLEEP IN A POLL (M2208). This walks 32 x
      * 1024 fd slots and it is called on every AF_UNIX send and every pty

@@ -439,3 +439,4 @@ int      app_unveil(app_t *a, const char *path, uint32_t perms);  /* add a prefi
 uint32_t app_unveil_parse(const char *perms);   /* "rwc" -> UV_* bits */
 int      app_unveil_ok(app_t *a, const char *path, int need_write);  /* 1 if the path is reachable */
 int    app_sys_history(char *buf, int max);  /* the caller's command history */
+void app_unix_peer_ready(int obj);   /* re-arm a Linux poller on the PEER of an AF_UNIX endpoint (M2262) */
