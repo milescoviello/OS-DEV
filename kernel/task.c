@@ -74,18 +74,41 @@ static inline int mycore(void) { return smp_current_cpu() & (MAX_SCHED_CPUS - 1)
 static volatile uint64_t g_stack_min_free = ~0ull;
 static char              g_stack_min_who[24];
 static volatile uint64_t g_stack_min_total;
+unsigned long g_stack_samples;    /* samples taken ON the current task's kernel stack (M2238) */
+unsigned long g_stack_offstack;   /* ...and samples discarded because rsp was somewhere else */
 void task_stack_watch(void) {
     task_t *t = current;
     if (!t || !t->stack_base) return;
     uint64_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
-    /* Only for the stack we are actually on: an interrupt taken in ring 3
-     * lands on kstack_top, and an IST fault lands somewhere else entirely. */
-    if (rsp <= t->stack_base || rsp > t->stack_base + STACK_SIZE) return;
+    /* THE EXTENT IS PER-TASK, NOT A CONSTANT (M2238).
+     *
+     * This bounded the sample by the STACK_SIZE literal, and kernel stacks in
+     * this tree are not all STACK_SIZE: net_rx_service gets 64 KiB, the
+     * browser worker 256 KiB, several self-tests 16 KiB explicitly.
+     * `task_create_stack` takes the size as an argument and stores the real
+     * top in kstack_top -- so for every task with a bigger stack, rsp near
+     * the top of it is greater than stack_base + 16384 and the sample was
+     * DISCARDED. The deepest stacks in the system were the ones systematically
+     * excluded, and `g_stack_min_total` then reported 16384 for them anyway,
+     * so the percentage was wrong as well as the depth.
+     *
+     * What that produced: `kstack 15776 byte(s) free at the deepest sample,
+     * of 16384 (3% used), in '?'` -- 608 bytes, in a kernel where alloc_block
+     * alone puts 8 KiB in a single frame. A reading of 3% next to an 8 KiB
+     * frame is not a measurement, and M2217 already double-faulted on exactly
+     * this (two 96 KiB locals on a 16 KiB stack).
+     *
+     * Bound by the task's own top, and COUNT the samples that fall outside it
+     * -- an IST fault or a core between stacks is legitimate, but "we sampled
+     * nothing" must be visible rather than silent. */
+    uint64_t top = t->kstack_top ? t->kstack_top : t->stack_base + STACK_SIZE;
+    if (rsp <= t->stack_base || rsp > top) { g_stack_offstack++; return; }
+    g_stack_samples++;
     uint64_t freeb = rsp - t->stack_base;
     if (freeb >= g_stack_min_free) return;
     g_stack_min_free = freeb;
-    g_stack_min_total = STACK_SIZE;
+    g_stack_min_total = top - t->stack_base;
     const char *n = t->name;
     int i = 0;
     for (; n && n[i] && i < (int)sizeof g_stack_min_who - 1; i++) g_stack_min_who[i] = n[i];

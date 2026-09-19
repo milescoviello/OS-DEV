@@ -710,7 +710,15 @@ void kmain_budget(const char *when) {
                     (unsigned long)freeb, (unsigned long)tot,
                     (unsigned long)((tot - freeb) * 100 / tot), who,
                     freeb < tot / 8 ? "  <-- UNDER 12% LEFT: an interrupt at that depth "
-                                      "can write past the bottom" : ""); }
+                                      "can write past the bottom" : "");
+        /* HOW MANY SAMPLES THAT DEPTH IS DRAWN FROM (M2238). A low-water mark
+         * says nothing without the population behind it: the old bound threw
+         * away every sample from a task with a non-default stack, and the
+         * reading that produced looked like a healthy 3% rather than like an
+         * instrument that had measured almost nothing. */
+        {   extern unsigned long g_stack_samples, g_stack_offstack;
+            kprintf("[budget]   kstack   from %lu on-stack sample(s), %lu discarded off-stack\n",
+                    g_stack_samples, g_stack_offstack); } }
     {   extern unsigned long g_poll_naps, g_poll_nap_ms;
         /* WALL-CLOCK MILLISECONDS, not cycles, because a nap is time nobody
          * spent -- and that is exactly the quantity the 95%-idle reading is
