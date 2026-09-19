@@ -44,7 +44,7 @@ while [ "$i" -le "$N" ]; do
     scp -q root@"${PVE_HOST:-192.168.1.5}":/root/osdev/boot.log "$L"
     printf '%s r%s: exit=%-4s t=%-5s bashok=%s crashed=%s | %s\n' "$MODE" "$i" \
       "$(grep -ao 'claude -p -> -\?[0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
-      "$(awk '/claude -p ->/{print last; exit} /\[runsync\] t=/{match($0,/t=[0-9]+s/); last=substr($0,RSTART+2,RLENGTH-2)}' "$L")" \
+      "$(tr -d '\0' < "$L" | awk '/claude -p ->/{print (last==""?"<60s":last); exit} /runsync\] t=/{match($0,/t=[0-9]+s/); last=substr($0,RSTART+2,RLENGTH-2)}')" \
       "$(grep -aq 'OSDEV-BASH-OK' "$L" && echo YES || echo no)" \
       "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \
       "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //; s/\| refused.*//' \
