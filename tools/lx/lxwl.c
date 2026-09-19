@@ -184,7 +184,7 @@ static void *mt_reader(void *arg) {
     return 0;
 }
 
-static int n_loops;
+static int n_loops, n_disp;
 int main(int argc, char **argv) {
     int mtread = 0;
     for (int i = 1; i < argc; i++)
@@ -479,11 +479,19 @@ int main(int argc, char **argv) {
                  * could not make, because both of its arms hung for want of
                  * input rather than for want of a wake-up. */
                 int d;
-                if (mtread) { d = wl_display_dispatch_pending(dpy); n_loops++; usleep(20000); }
+                if (mtread) { d = wl_display_dispatch_pending(dpy); n_loops++;
+                              if (d > 0) n_disp += d;            /* events the MAIN thread got */
+                              usleep(20000); }
                 else          d = wl_display_dispatch(dpy);
                 if ((n_loops % 250) == 249) {
-                    printf("LXWL-MT: main thread still dispatching, %d loops, %d motion\n",
-                           n_loops, n_motion);
+                    /* n_disp is the number the whole question turns on: events
+                     * the MAIN thread actually dispatched while a reader
+                     * thread owned the fd. Zero here with a live reader means
+                     * events are being read and never distributed to this
+                     * thread's queue -- which needs no input to observe, and
+                     * so can be compared against a real compositor. */
+                    printf("LXWL-MT: main thread dispatching: %d loops, %d EVENTS, %d motion\n",
+                           n_loops, n_disp, n_motion);
                     fflush(stdout);
                 }
                 if (d < 0) {
