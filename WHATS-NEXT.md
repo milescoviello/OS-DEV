@@ -1,5 +1,82 @@
 # What's next
 
+> **(M2239-M2251) THE USER COULD NOT CLICK, SCROLL OR TYPE -- EIGHT BUGS, AND
+> A GTK APP'S BUTTON NOW WORKS.**
+>
+> The browser had been rendering pages for fifty milestones and nobody had
+> ever *used* it. Asked to, the answer was: *"i cant click or scroll or
+> anything / or type"*. None of the eight causes was in Firefox.
+>
+> | # | what was wrong | how it presented |
+> |---|---|---|
+> | 1 | **The window manager ran at 0.15 Hz** -- `tablet: 9 polls` in a whole run. The desktop loop polls input once per iteration and Firefox's dozens of nice-0 threads starved it. `task_set_nice(-20)` -> **8830 polls** | a desktop that ignores the mouse |
+> | 2 | A **black console window** for a Firefox child sat on top; `wl_hide_console_for_clients` only looked for the window the first time it saw a pid | clicks went into an empty surface |
+> | 3 | A **minimized** top window *swallowed* keys instead of passing them down | typing did nothing |
+> | 4 | The keyboard map had **letters and digits only** -- `.` `/` `:` returned keycode 0 | **you could not type a URL** |
+> | 5 | **`wl_pointer.axis` did not exist** | scrolling was never implemented |
+> | 6 | Pointer focus named the **toplevel**; GTK renders into subsurfaces | -- |
+> | 7 | **`wl_surface.enter` was never sent** -- no surface was on any output | -- |
+> | 8 | **`wl_region`/`set_input_region` was never implemented** | see below |
+>
+> **(8) is the one worth reading.** Firefox says
+> `surface 18 -> EMPTY region (takes no input)` for the subsurface it paints
+> every single frame into, and `surface 32 -> region WITH area [-10,-10
+> 1300x980]` for the toplevel. So (6)'s protocol-correct "deepest surface
+> wins" aimed focus at precisely the surface the client *refuses* input on.
+> Both rules are right: deepest-wins **is** the rule, and it is subject to the
+> input region we were discarding.
+>
+> **THE RESULT THAT ENDED THE GUESSING (M2250).** Every hypothesis since M2243
+> cost a three-minute Firefox boot. `zenity` is GTK -- the same GDK Wayland
+> backend Firefox drives -- in 131 KB. `-append lxgtk` runs it instead:
+>
+> ```
+> [wl] desktop window for client slot 1: 344x268 ('Information')
+> 87620 px changed
+> [app] pid 169: exit_group from thread 82      <- zenity ACTED on the click
+> ```
+>
+> **A real GTK application's button responds to a click in OS-DEV.** The
+> compositor's input path is correct; Firefox's non-response is Gecko-specific.
+> Build the small control BEFORE binary-searching a protocol one slow boot at
+> a time -- that should have been step one, not step eight.
+>
+> **Driving the pointer at all** took its own correction: `qm monitor`'s
+> `mouse_move` does **not** queue to a USB tablet (the TD sat at
+> `td.cs 0x18880000` = ACTIVE|NAK forever, and I wrongly called the tablet
+> broken). QMP `input-send-event` does, to the exact pixel -- sent
+> 20000,20000 of 32767, cursor landed at 780,585 of 1280x960. M2242 is the
+> matching correction: M2241 turned the USB tablet OFF, which is the ABSOLUTE
+> pointing device this OS already prefers, and produced *"the mouse isnt in
+> the same place its offset weird"* -- then I read the `PS/2 (relative
+> fallback)` line my own change had caused as evidence about the original.
+>
+> **M2239** is a different animal: `claude -p` failed 3/3 with
+> `OAuth session expired and could not be refreshed`, and the "live" credential
+> copy M2181 added lived inside a **stamp-file rule**, so it ran once and never
+> again while printing a reassuring message on every build where it did
+> nothing. The credential is a real prerequisite of ext2.img now, so make's own
+> timestamps enforce freshness. *A live refresh inside a cached rule is not a
+> live refresh.*
+>
+> **What is still not fixed:** Firefox ignores input. Excluded by measurement,
+> not argument: delivery (zenity and lxwl both act on it), output-queue
+> overflow, client identity, object-id collisions, the fixed-point encoding,
+> surface choice (**both** arms, `-append ffptroot`), input regions, the
+> xdg_surface configure/ack handshake, the keymap, modifiers, ACTIVATED,
+> output association, unmapped-surface enters, CPU starvation (4 cores behaves
+> as 1), and input broadcast to every client (M2251 -- a seat has ONE focused
+> client, and we were telling four they had focus). Firefox **does** act on
+> frame callbacks and configure, so it reads the socket; it sends **zero**
+> `wl_pointer.set_cursor`, which is the tell that Gecko never processes motion.
+>
+> **And three of my own instruments failed, all the same shape:** a scroll test
+> against a page with no scrollbar (a test that cannot fail), a `static` latch
+> that dumped the 64x32 test client instead of the browser, and a global
+> written by a loop over every client that reported a helper process's failure
+> as the browser's -- believed for two rounds. *An instrument with more than
+> one writer, or with no way to fail, is not a measurement.*
+
 > **(M2231-M2238) THE RESIDUAL ext2 CORRUPTION WAS A WRITE, NOT A READ --
 > ext2 READ-MODIFY-WRITES THE WHOLE GROUP DESCRIPTOR BLOCK 19723 TIMES A BOOT.**
 >
