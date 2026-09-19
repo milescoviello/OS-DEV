@@ -10042,8 +10042,25 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * built here and nothing else can reach it. */
         for (int k = 0; k < LX_ENV_CMDLINE && en < 44; k++)
             if (g_lx_env_cmdline[k]) envp0[en++] = g_lx_env_cmdline[k];
+        /* AND SAY WHAT ACTUALLY WENT IN (M2253).
+         *
+         * MOZ_LOG produced zero lines for a module that provably logs in this
+         * environment, which means either Gecko has nothing to say or the
+         * variable never arrived -- and those look identical from outside.
+         * envp0 is `static const char *envp0[48]`, en starts at 33, and this
+         * loop appends without a bound; with LX_PEND_ENV raised to 16 that
+         * can write past the end. Print the one-shot entries as they are
+         * placed, and refuse to overflow. */
         for (int k = 0; k < LX_PEND_ENV; k++)
-            if (g_pend_env_extra[k]) { envp0[en++] = g_pend_env_extra[k]; g_pend_env_extra[k] = 0; }
+            if (g_pend_env_extra[k]) {
+                if (en >= (int)(sizeof envp0 / sizeof envp0[0]) - 1) {
+                    kprintf("[lx] envp0 FULL at %d: dropping '%s'\n", en, g_pend_env_extra[k]);
+                    g_pend_env_extra[k] = 0;
+                    continue;
+                }
+                kprintf("[lx] env[%d] = %s\n", en, g_pend_env_extra[k]);
+                envp0[en++] = g_pend_env_extra[k]; g_pend_env_extra[k] = 0;
+            }
         envp0[en] = 0;
         /* Dynamically linked? Map the interpreter too and enter IT: a
          * dynamically-linked program cannot be started directly, ld.so has to

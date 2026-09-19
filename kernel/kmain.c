@@ -2182,7 +2182,26 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * as actually producing output in this environment --
                          * an unrecognised name voids the whole spec, so this
                          * is not the place to guess. */
-                        app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,nsWindow:5");
+                        /* VERIFY THE INSTRUMENT BEFORE TRUSTING ITS SILENCE
+                         * (M2253). Widget:5,nsWindow:5 produced ZERO lines,
+                         * and "Gecko has nothing to say about input" and
+                         * "MOZ_LOG is not reaching Firefox" look identical
+                         * from outside. DocumentChannel is the module M2132
+                         * confirmed DOES log in this environment, so asking
+                         * for it alongside tests the mechanism and the
+                         * question in one boot. */
+                        app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,Widget:5,nsWindow:5");
+                        /* GDK'S OWN EVENT TRACE (M2253).
+                         *
+                         * Widget:5 turned out to log only window lifecycle --
+                         * Create, Configure, Resize, occlusion -- and not one
+                         * input event, so it cannot answer the only question
+                         * left: does GDK RECEIVE the pointer events the
+                         * compositor demonstrably puts on the wire? GDK_DEBUG
+                         * prints every event it dispatches, which splits
+                         * "never arrived" from "arrived and was discarded
+                         * above GDK" -- and those need opposite fixes. */
+                        app_set_next_env("GDK_DEBUG=events,input");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per
