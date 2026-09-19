@@ -903,6 +903,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl")) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
+        /* -append ffalone: Firefox as the ONLY Wayland client (M2287).
+         *
+         * Every Firefox boot also starts lxwl, so the compositor always has
+         * at least two clients and the focus machinery always has a choice to
+         * make. M2275 and M2281 made that choice the window manager's rather
+         * than a size heuristic, which should make it moot -- but "should"
+         * is what the last ten hours have been made of. One flag removes the
+         * variable instead of arguing that it does not matter. */
+        if (cmdline_has(cl, "ffalone")) g_wltest = 0;
         if (cmdline_has(cl, "ffurl")) g_ffurl = 1;
         if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */
         if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;

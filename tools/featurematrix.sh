@@ -32,6 +32,19 @@ cd "$(dirname "$0")/.."
 
 CORES=${CORES:-8}
 CAP=${CAP:-900}
+# PER-ROW BUDGETS, BECAUSE THE ROWS ARE NOT THE SAME SIZE (M2288).
+# claude-edit asks Claude to READ and MODIFY a file in OS-DEV's own tree --
+# several tool calls and several network round trips -- where claude-ask is
+# one question and one answer. At a shared 300 s cap the edit row reported
+# `fail` while its heartbeats showed majflt climbing 26639 -> 27231 and a DNS
+# connect at t=296s: it was working, not stuck. A budget that is too small
+# for a row does not measure that row, it measures the budget.
+row_cap() {
+    case $1 in
+        claude-edit) echo $((CAP < 700 ? 700 : CAP)) ;;
+        *)           echo "$CAP" ;;
+    esac
+}
 ROWS=${ROWS:-"gtk-input ff-local ff-net claude-ask claude-bash claude-edit"}
 OUT=build/featurematrix.txt
 LOGS=build/ablogs
@@ -80,7 +93,8 @@ for r in $ROWS; do
     NOW=$(md5sum build/kernel32.elf | cut -d' ' -f1)
     [ "$NOW" = "$PIN" ] || { echo "ABORT: kernel changed" | tee -a "$OUT"; exit 1; }
     A=$(row_append "$r"); M=$(row_marker "$r")
-    WAIT=full NOBUILD=1 APPEND="$A" CORES=$CORES CAP=$CAP tools/pve-run.sh >/dev/null 2>&1
+    RC=$(row_cap "$r")
+    WAIT=full NOBUILD=1 APPEND="$A" CORES=$CORES CAP=$RC tools/pve-run.sh >/dev/null 2>&1
     L=$LOGS/feat-$r-c$CORES.log
     scp -q root@"${PVE_HOST:-192.168.1.5}":/root/osdev/boot.log "$L"
     if grep -aqE "$M" "$L"; then V=PASS; else V=fail; fi
