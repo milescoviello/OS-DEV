@@ -596,6 +596,16 @@ $(LXROOT)/ffpage.html: tools/lx/ffpage.html
 	@cp $< $@
 	@echo "  STAGE   $@ (a real HTML page for Firefox to lay out)"
 
+# AND ONE WHOSE JOB IS TO MAKE INPUT VISIBLE (M2296). Pure CSS :hover/:active/
+# :focus over a 6000px body, so a pointer move, a button press, keyboard focus
+# and a scroll each change a large, known region of the screen. See the
+# comment at the top of the file for why the previous input tests could not
+# fail honestly.
+$(LXROOT)/ffinput.html: tools/lx/ffinput.html
+	@mkdir -p $(LXROOT)
+	@cp $< $@
+	@echo "  STAGE   $@ (the CSS-only input probe page)"
+
 $(LXROOT)/big.s: kernel/app.c
 	@mkdir -p $(LXROOT)
 	@$(CC) $(filter-out -MMD -MP -g,$(CFLAGS)) -S $< -o $@ 2>/dev/null || true
@@ -752,7 +762,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/.src-staged
+$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \

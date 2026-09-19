@@ -121,6 +121,7 @@ const char *app_cwd_str(app_t *a);     /* the cwd path string of any app, for /p
 const char *app_exe_str(app_t *a);     /* the spawn/exec path of any app, for /proc/<pid>/exe (M1250) */
 int    app_pipe2(int *out, int flags); /* pipe() + atomic O_CLOEXEC (M1239) */
 int    app_unix_send_fd(int sockfd, int fd);  /* SCM_RIGHTS keyed on the SOCKET fd (M1977) */
+int    app_unix_txroom(int sockfd);          /* free bytes in the peer's ring, by socket fd (M2296) */
 int    app_unix_recv_fd(int sockfd);          /* SCM_RIGHTS receive keyed on the socket fd; new fd/-1 (M1977) */
 int    app_scm_send(int ep, int fd);   /* SCM_RIGHTS: queue fd to pass over an AF_UNIX endpoint; 0/-1 (M1265) */
 int    app_scm_recv(int ep);           /* SCM_RIGHTS: install a passed fd from the peer; new fd/-1 (M1265) */

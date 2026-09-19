@@ -2809,6 +2809,54 @@ static void lx_dispatch_body(struct registers *r) {
                     }
                     for (int q = 0; q < nfd; q++) pend_fds[q] = fds[q];
                     pend_nfd = nfd;
+                    /* RESERVE THE BYTES FIRST, THEN THE DESCRIPTORS CAN GO
+                     * FIRST SAFELY (M2296).
+                     *
+                     * M2295 moved the fd queueing to AFTER the write, to stop
+                     * a retried EAGAIN queueing them twice. That fixed a
+                     * duplication I had reasoned my way to and never actually
+                     * observed, and it created a loss I then observed on the
+                     * first run -- Firefox says it plainly:
+                     *
+                     *   [Child 172, IPC I/O Child] WARNING: Message needs
+                     *   unreceived descriptors ... num_handles:1 num_fds:0
+                     *   Exiting due to channel error.
+                     *
+                     * The bytes and the descriptors live in two queues with
+                     * no ordering between them, so whichever goes second can
+                     * be missed: fds-first can duplicate on a retry, and
+                     * bytes-first lets the reader wake on the bytes and call
+                     * recvmsg before the fds are in. Choosing an order cannot
+                     * fix that; the message has to be all-or-nothing.
+                     *
+                     * It can be, because the only reason the write fails here
+                     * is a full ring. Ask first. If the whole payload will not
+                     * fit, return EAGAIN having queued nothing and written
+                     * nothing -- correct backpressure, which every caller of
+                     * a non-blocking socket already handles. If it will fit,
+                     * queue the descriptors and then write, and the reader
+                     * cannot see one without the other. */
+                    {   int room = app_unix_txroom((int)a1);
+                        if (room >= 0 && (unsigned long)room < tot) {
+                            g_scm_held_back++;
+                            kfree(gbuf);
+                            err = -(long)LX_EAGAIN;
+                            break;
+                        }
+                    }
+                    {   int passed = 0;
+                        for (int q = 0; q < pend_nfd; q++) {
+                            if (app_unix_send_fd((int)a1, pend_fds[q]) != 0) {
+                                kprintf("[sock] SCM_RIGHTS: could not pass fd %d (%d of %d done)\n",
+                                        pend_fds[q], passed, pend_nfd);
+                                break;
+                            }
+                            passed++;
+                            if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: passed fd %d\n", pend_fds[q]);
+                        }
+                        if (passed != pend_nfd) { kfree(gbuf); err = -(long)LX_EBADF; break; }
+                        pend_nfd = 0;          /* done here; the block after the write is now a no-op */
+                    }
                 }
             }
             long sn;
@@ -2824,38 +2872,10 @@ static void lx_dispatch_body(struct registers *r) {
             }
             /* ...and only now, with at least one byte accepted, do the
              * descriptors go (M2295). */
-            if (pend_nfd > 0) {
-                if (!err && sn > 0) {
-                    int passed = 0;
-                    for (int q = 0; q < pend_nfd; q++) {
-                        if (app_unix_send_fd((int)a1, pend_fds[q]) != 0) {
-                            kprintf("[sock] SCM_RIGHTS: could not pass fd %d (%d of %d done)\n",
-                                    pend_fds[q], passed, pend_nfd);
-                            break;
-                        }
-                        passed++;
-                        if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: passed fd %d\n", pend_fds[q]);
-                    }
-                    if (passed != pend_nfd) {
-                        /* Capacity said yes and a send still failed -- a bad fd
-                         * in the caller's array, which is EBADF and not
-                         * something to paper over with a byte count. */
-                        kfree(gbuf);
-                        err = -(long)LX_EBADF;
-                        break;
-                    }
-                } else {
-                    /* Nothing went -- EAGAIN on a full ring, or an error. The
-                     * caller will retry the whole message, cmsg and all, so
-                     * queueing here is what would duplicate them. Counted,
-                     * because this is the exact window the bug lived in and a
-                     * run should be able to say how often it opened. (The
-                     * first cut of this guard read `!err &&` on the OUTER
-                     * test, which skipped the count for EAGAIN -- the one
-                     * case it exists to measure.) */
-                    g_scm_held_back++;
-                }
-            }
+            /* pend_nfd is always 0 by here -- the descriptors went above, with
+             * the ring space already reserved. Kept as an assertion rather
+             * than deleted: if it ever fires, the reservation was bypassed. */
+            if (pend_nfd > 0) kprintf("[sock] BUG: %d descriptor(s) still pending after the write\n", pend_nfd);
             kfree(gbuf);
             if (err) break;
             /* A ONE-SHOT LINE WHEN THE CLAMP ACTUALLY FIRES, so "we silently

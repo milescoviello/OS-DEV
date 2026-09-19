@@ -303,6 +303,7 @@ static volatile int g_ffe10s;                 /* -append ffe10s: do NOT force E1
 static volatile int g_lxgtk3;                 /* -append lxgtk3: a GTK3 client, the toolkit Firefox uses (M2272) */
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
+static volatile int g_ffin;                   /* -append ffin: file:///ffinput.html, the page that makes input visible (M2296) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
  * still gets printed -- just to COM1, from a thread, while the framebuffer
@@ -900,7 +901,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * booted to a desktop with no browser in it at all -- the flag that
          * spawns Firefox is this one, and a URL with no spawn is not a mode. */
         if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") ||
-            cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl")) {
+            cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl") ||
+            cmdline_has(cl, "ffin")) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
         /* -append ffalone: Firefox as the ONLY Wayland client (M2287).
@@ -920,6 +922,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxgtk3")) g_lxgtk3 = 1;   /* the GTK3 control -- the toolkit Firefox actually uses (M2272) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
+        if (cmdline_has(cl, "ffin"))       g_ffin = 1;                    /* the CSS-only input probe page (M2296) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
@@ -2009,6 +2012,18 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                 "are byte-identical to the host's copies)\n", src); }
                     static const char *av_fw[] = { "--no-remote", "--new-instance",
                                                    "file:///ffpage.html" };
+                    /* -append ffin: THE PAGE THAT MAKES INPUT VISIBLE (M2296).
+                     *
+                     * Every input measurement before this one aimed a click
+                     * at a fixed screen coordinate on a page that had nothing
+                     * there, and scrolled a document shorter than the window.
+                     * Both correctly produced no change on screen, and both
+                     * were read as Firefox ignoring input. This page is pure
+                     * CSS -- :hover, :active, :focus over a 6000px body -- so
+                     * a pointer move with no click at all repaints a 1280x300
+                     * band, and a scroll repaints nearly everything. */
+                    static const char *av_fi[] = { "--no-remote", "--new-instance",
+                                                   "file:///ffinput.html" };
                     static const char *av_fd[] = { "--no-remote", "--new-instance",
                                                    "data:text/html,<body%20style%3D%22background%3A%23101820%22>"
                                                    "<h1%20style%3D%22color%3A%234fd1c5%22>OS-DEV</h1>" };
@@ -2088,7 +2103,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                     "-- put the address in ./ffurl.txt and rebuild build/ext2.img\n");
                     }
                     const char **av_use = have_url ? av_uf
-                                        : (g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw));
+                                        : (g_ffin ? av_fi
+                                        : (g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw)));
                     /* When Firefox parks, the syscall trace shows a futex
                      * address and nothing else -- it cannot name the Gecko
                      * code that is waiting. Firefox can: MOZ_LOG prints the

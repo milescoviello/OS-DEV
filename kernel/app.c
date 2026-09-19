@@ -12280,6 +12280,17 @@ int app_unix_send_fd(int sockfd, int fd) {
     if (a->fd[sockfd].obj < 0) return -1;
     return app_scm_send(a->fd[sockfd].obj, fd);
 }
+/* Room in the peer's ring, by SOCKET fd rather than endpoint (M2296).
+ *
+ * sendmsg needs this to make a descriptor-carrying message all-or-nothing:
+ * see the ordering note in kernel/linuxabi.c. Returns -1 if the fd is not an
+ * AF_UNIX socket. */
+int app_unix_txroom(int sockfd) {
+    struct app *a = cur(); if (!a) return -1;
+    if (sockfd < 0 || sockfd >= APP_NFD || !a->fd[sockfd].used || a->fd[sockfd].type != 12) return -1;
+    if (a->fd[sockfd].obj < 0) return -1;
+    return unix_txroom(a->fd[sockfd].obj);
+}
 int app_unix_recv_fd(int sockfd) {
     struct app *a = cur(); if (!a) return -1;
     if (sockfd < 0 || sockfd >= APP_NFD || !a->fd[sockfd].used || a->fd[sockfd].type != 12) return -1;

@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OSDEV-INPUT-PROBE</title>
+<!--
+  A page whose whole job is to make input VISIBLE, because the input tests
+  before it could not fail honestly.
+
+  The pointer arm clicked at a fixed screen coordinate that landed on blank
+  page, and the scroll arm ran on example.com, which is shorter than the
+  window and therefore has nothing to scroll. Both produced "no change on
+  screen", which is the CORRECT behaviour for a client receiving a click on
+  nothing, and it was read as Firefox ignoring input.
+
+  So: no JavaScript, nothing that can be disabled, only CSS that the renderer
+  must honour.
+
+    - HOVER    a 300px band at a known place turns bright green under the
+               pointer. Tests wl_pointer.motion with no click at all.
+    - ACTIVE   the same band turns magenta while a button is held. Tests
+               wl_pointer.button.
+    - FOCUS    a text box draws a thick yellow ring when it has keyboard
+               focus, and shows what was typed. Tests wl_keyboard.
+    - SCROLL   the body is 6000px tall with full-width colour bands every
+               400px, so ANY scroll changes most of the screen.
+
+  Coordinates are fixed and written on the page so the harness can aim at
+  them: the hover band is at y=300..600 of the DOCUMENT, full width.
+-->
+<style>
+  html,body { margin:0; padding:0; font:16px monospace; background:#101820; color:#e6f1ff; }
+  #hit {
+    position:absolute; top:300px; left:0; width:100%; height:300px;
+    background:#334; display:flex; align-items:center; justify-content:center;
+    font-size:40px; border:8px solid #667;
+  }
+  #hit:hover  { background:#00ff66; color:#000; }
+  #hit:active { background:#ff00cc; color:#fff; }
+  #typed { position:absolute; top:640px; left:40px; width:600px; height:60px;
+           font-size:28px; background:#001; color:#0f0; border:6px solid #445; }
+  #typed:focus { border-color:#ffdd00; outline:none; }
+  .band { height:400px; }
+</style>
+<h1 style="margin:20px">OSDEV INPUT PROBE</h1>
+<p style="margin:0 20px">hover band at document y=300..600 &middot; text box at y=640 &middot; body is 6000px tall</p>
+<div id="hit">HOVER ME</div>
+<input id="typed" placeholder="type here">
+<div style="position:absolute;top:760px;left:0;width:100%">
+  <div class="band" style="background:#7a1f1f">1</div>
+  <div class="band" style="background:#1f7a3a">2</div>
+  <div class="band" style="background:#1f3a7a">3</div>
+  <div class="band" style="background:#7a6a1f">4</div>
+  <div class="band" style="background:#5a1f7a">5</div>
+  <div class="band" style="background:#1f7a7a">6</div>
+  <div class="band" style="background:#7a3a1f">7</div>
+  <div class="band" style="background:#3a7a1f">8</div>
+  <div class="band" style="background:#7a1f5a">9</div>
+  <div class="band" style="background:#2a2a2a">10</div>
+  <div class="band" style="background:#9a9a9a">11</div>
+  <div class="band" style="background:#e0e0e0;color:#000">12 -- BOTTOM</div>
+</div>
