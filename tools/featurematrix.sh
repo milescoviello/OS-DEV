@@ -61,9 +61,15 @@ row_marker() {
         # The GTK row is proved by the client getting a window AND by the
         # compositor forwarding a real button to it -- a window alone says
         # nothing about input.
-        gtk-input)   echo "desktop window for client slot 1: 344x268" ;;
+        gtk-input)   echo "desktop window for client slot 1: .*Information" ;;
         ff-local)    echo "VERDICT: the PAGE is on screen" ;;
-        ff-net)      echo "desktop window for client slot 1: 1280x960" ;;
+        # NOT a hardcoded size (M2260). The first cut asserted
+        # "slot 1: 1280x960" and the row failed while the browser was plainly
+        # up -- the window came back 1230x939, because the desktop clamps it
+        # to the framebuffer minus its own chrome. A marker that encodes a
+        # number the system is free to change is a false failure waiting to
+        # happen, and this one arrived on its first run.
+        ff-net)      echo "desktop window for client slot 1: .*Mozilla Firefox" ;;
         claude-ask)  echo "claude -p -> 0" ;;
         claude-bash) echo "OSDEV-BASH-OK" ;;
         claude-edit) echo "claude -p -> 0" ;;
@@ -77,7 +83,7 @@ for r in $ROWS; do
     WAIT=full NOBUILD=1 APPEND="$A" CORES=$CORES CAP=$CAP tools/pve-run.sh >/dev/null 2>&1
     L=$LOGS/feat-$r-c$CORES.log
     scp -q root@"${PVE_HOST:-192.168.1.5}":/root/osdev/boot.log "$L"
-    if grep -aq "$M" "$L"; then V=PASS; else V=fail; fi
+    if grep -aqE "$M" "$L"; then V=PASS; else V=fail; fi
     printf '%-12s %-5s  crashed=%-3s  marker: %s\n' "$r" "$V" \
         "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" "$M" | tee -a "$OUT"
 done
