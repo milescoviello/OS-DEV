@@ -141,6 +141,7 @@ static int ksnprint_u(char *out, unsigned v) {
     for (int i = 0; i < n; i++) out[i] = t[n - 1 - i];
     return n;
 }
+unsigned long g_inpreg_calls, g_inpreg_obj;   /* set_input_region: total, and how many named a region OBJECT (M2249) */
 #define WL_SURFACE_EV_ENTER      0   /* wl_surface.enter(output) -- M2247 */
 #define WL_POINTER_EV_AXIS       4
 #define WL_POINTER_EV_FRAME      5
@@ -273,6 +274,12 @@ struct wl_object {
      * safe to read through. (M2058) */
     unsigned long cap;
     int      mfd;                  /* wl_shm_pool: the memfd object behind it, -1 = none */
+    /* wl_region: the bounding box of everything add()ed to it, and whether
+     * anything was. wl_surface: the input region last set on it. (M2249) */
+    int      rgn_any;              /* wl_region: at least one add() */
+    int      rgn_x, rgn_y, rgn_w, rgn_h;
+    int      in_rgn_set;           /* wl_surface: set_input_region named a region OBJECT */
+    int      in_any, in_x, in_y, in_w, in_h;
     uint32_t attached;             /* wl_surface: the wl_buffer id last attached (PENDING, applied on commit) */
     int      attach_set;           /* wl_surface: an attach arrived since the last commit. Distinguishes
                                     * "attached nothing" (keep showing the current frame) from
@@ -1720,11 +1727,66 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
      * explicitly so the log stops reporting them as gaps the client is waiting
      * on -- they are not. We do not clip to regions or scale buffers yet, which
      * is a missing FEATURE rather than a missing answer. */
+    if (o->kind == WLK_SURFACE && opcode == 5 /* set_input_region */) {
+        /* SWALLOWED SINCE THE COMPOSITOR WAS WRITTEN, AND IT IS IN THE INPUT
+         * PATH (M2249). A NULL region means "the whole surface takes input",
+         * which is the default and harmless. A REGION OBJECT can be empty,
+         * and an empty input region means this surface takes NO pointer
+         * events -- they belong to its parent. If GTK does that to the
+         * subsurface it renders into, then "deliver to the deepest surface"
+         * is wrong, and if it does it to the TOPLEVEL then delivering there
+         * is wrong too. Either way it decides where a click goes, so stop
+         * throwing it away silently and say what is actually being asked. */
+        uint32_t rid = (alen >= 4) ? rd32(args) : 0;
+        g_inpreg_calls++;
+        if (rid) g_inpreg_obj++;
+        o->in_rgn_set = rid ? 1 : 0;
+        o->in_any = 0;
+        if (rid) {
+            for (int j = 0; j < c->nobj; j++)
+                if (c->obj[j].id == rid && c->obj[j].kind == WLK_REGION) {
+                    o->in_any = c->obj[j].rgn_any;
+                    o->in_x = c->obj[j].rgn_x; o->in_y = c->obj[j].rgn_y;
+                    o->in_w = c->obj[j].rgn_w; o->in_h = c->obj[j].rgn_h;
+                    break;
+                }
+        }
+        static int shown;
+        if (shown < 12) { shown++;
+            kprintf("[wl] set_input_region on surface %u -> %s\n", o->id,
+                    !rid ? "NULL (whole surface)"
+                         : (o->in_any ? "a region WITH area" : "an EMPTY region -- takes no input")); }
+        return;
+    }
     if (o->kind == WLK_SURFACE && (opcode == WL_SURFACE_DAMAGE || opcode == 4 /* set_opaque_region */ ||
-                                   opcode == 5 /* set_input_region */ || opcode == 7 /* set_buffer_transform */ ||
+                                   opcode == 7 /* set_buffer_transform */ ||
                                    opcode == 8 /* set_buffer_scale */ || opcode == 9 /* damage_buffer */ ||
                                    opcode == 10 /* offset */)) return;
-    if (o->kind == WLK_REGION) return;               /* add/subtract: nothing to clip against yet */
+    if (o->kind == WLK_REGION) {
+        /* A REGION IS NOT DECORATION -- IT DECIDES WHERE CLICKS GO (M2249).
+         * wl_region.add(x,y,w,h) is opcode 1. Tracked as a bounding box,
+         * which is enough for the one question the input path asks: does this
+         * surface accept a pointer here, and does it accept one anywhere at
+         * all. subtract() is deliberately not modelled -- a box that is too
+         * generous delivers an event a real compositor also would, whereas
+         * treating a set region as empty would silently swallow input, and
+         * that is the failure this is here to end. */
+        if (opcode == 1 && alen >= 16) {
+            int rx = (int)rd32(args), ry = (int)rd32(args + 4);
+            int rw = (int)rd32(args + 8), rh = (int)rd32(args + 12);
+            if (rw > 0 && rh > 0) {
+                if (!o->rgn_any) { o->rgn_x = rx; o->rgn_y = ry; o->rgn_w = rw; o->rgn_h = rh; o->rgn_any = 1; }
+                else {
+                    int x0 = o->rgn_x < rx ? o->rgn_x : rx;
+                    int y0 = o->rgn_y < ry ? o->rgn_y : ry;
+                    int x1 = (o->rgn_x + o->rgn_w) > (rx + rw) ? (o->rgn_x + o->rgn_w) : (rx + rw);
+                    int y1 = (o->rgn_y + o->rgn_h) > (ry + rh) ? (o->rgn_y + o->rgn_h) : (ry + rh);
+                    o->rgn_x = x0; o->rgn_y = y0; o->rgn_w = x1 - x0; o->rgn_h = y1 - y0;
+                }
+            }
+        }
+        return;
+    }
     if (o->kind == WLK_XDG_POSITIONER) return;       /* the whole interface is setters */
     if (o->kind == WLK_XDG_SURFACE && opcode == 3 /* set_window_geometry */) return;
     /* wl_surface.frame HAD NO DISPATCH AT ALL (M2042).
@@ -2767,6 +2829,13 @@ static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *o
             if (nnext < 16) { next[nnext].id = o->id; next[nnext].x = ax; next[nnext].y = ay; nnext++; }
             if (!o->base || !o->width || !o->height) continue;      /* unmapped: not hittable */
             if (x >= ax && y >= ay && x < ax + (int)o->width && y < ay + (int)o->height) {
+                /* ...unless the client said this surface takes no input there
+                 * (M2249). An empty input region is a client telling the
+                 * compositor "my pixels are here but my clicks are not". */
+                if (o->in_rgn_set && !o->in_any) continue;
+                if (o->in_rgn_set && o->in_any &&
+                    (x - ax < o->in_x || y - ay < o->in_y ||
+                     x - ax >= o->in_x + o->in_w || y - ay >= o->in_y + o->in_h)) continue;
                 best = o->id; bx = ax; by = ay;                     /* deeper wins */
             }
         }
