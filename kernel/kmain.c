@@ -296,6 +296,7 @@ static void ext2_cache_drop_hook(void *ctx, uint64_t lba, uint32_t n) {
 static int ext2_raw_read_hook(void *ctx, uint64_t lba, uint32_t n, void *buf) {
     return blockdev_read_raw((int)(intptr_t)ctx, lba, n, buf);
 }
+static volatile int g_wlmt;                   /* -append wlmt: multi-threaded libwayland in the test client (M2265) */
 static volatile int g_ffnowr;                 /* -append ffnowr: disable WebRender (M2264) */
 static volatile int g_ffe10s;                 /* -append ffe10s: do NOT force E10S off (M2252) */
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
@@ -895,7 +896,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "ffurl")) g_ffurl = 1;
         if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */
         if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;
-        if (cmdline_has(cl, "ffnowr")) g_ffnowr = 1;   /* no WebRender: no renderer-owned Wayland queue (M2264) */   /* leave content processes ENABLED (M2252) */
+        if (cmdline_has(cl, "ffnowr")) g_ffnowr = 1;
+        if (cmdline_has(cl, "wlmt")) g_wlmt = 1;   /* the test client, Gecko-shaped: two threads on one display (M2265) */   /* no WebRender: no renderer-owned Wayland queue (M2264) */   /* leave content processes ENABLED (M2252) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
@@ -1857,6 +1859,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     app_run_linux_sync("/disk2/lxwlraw", 0, 0, 60000);
                 }
                 kprintf("[wl] spawning a real libwayland client...\n");
+                /* -append wlmt: run the test client the way GECKO drives
+                 * libwayland -- a second thread owning prepare_read/
+                 * read_events while the main thread dispatches (M2265). If
+                 * input stops arriving with that one change, Firefox's
+                 * failure is reproduced in a client we control. */
+                if (g_wlmt) {
+                    static const char *av_mt[] = { "--mtread" };
+                    app_spawn_linux_from_file_argv("/disk2/lxwl", av_mt, 1);
+                } else
                 app_spawn_linux_from_file("/disk2/lxwl");
                 /* Wait for a surface, then FALL THROUGH to the desktop: the
                  * window manager is what draws it, so the display has to come

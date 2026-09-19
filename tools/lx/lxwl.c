@@ -21,6 +21,8 @@
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <poll.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include "xdg-shell-client-protocol.h"
@@ -166,7 +168,26 @@ static const struct wl_registry_listener reg_listener = { on_global, on_global_r
  * finished -- these are the only way to see which call did not return. */
 #define STEP(msg) do { printf("LXWL-STEP: " msg "\n"); fflush(stdout); } while (0)
 
-int main(void) {
+/* Gecko's shape: a thread that owns the read side of the display while
+ * another dispatches. Uses the documented multi-thread API exactly. */
+static void *mt_reader(void *arg) {
+    struct wl_display *d = (struct wl_display *)arg;
+    for (;;) {
+        while (wl_display_prepare_read(d) != 0)
+            wl_display_dispatch_pending(d);
+        wl_display_flush(d);
+        struct pollfd pfd = { .fd = wl_display_get_fd(d), .events = POLLIN };
+        int pr = poll(&pfd, 1, 200);
+        if (pr > 0) wl_display_read_events(d);
+        else        wl_display_cancel_read(d);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int mtread = 0;
+    for (int i = 1; i < argc; i++)
+        if (argv[i][0] == '-' && argv[i][1] == '-' && argv[i][2] == 'm') mtread = 1;
     /* WAYLAND_DEBUG=1 in the environment makes libwayland log every message
      * both ways -- the only view into its own parsing, and what finally showed
      * this client receiving every byte and dispatching none of them. */
@@ -414,6 +435,29 @@ int main(void) {
          * This is the same defect as waiting a fixed 500 ms for a marker,
          * which this suite has already been fixed for twice. Wait on the
          * CONDITION, with a real clock as the bound. */
+        /* THE ONE THING FIREFOX DOES THAT THIS PROBE DID NOT (M2265).
+         *
+         * Firefox's GDK receives ZERO events under this compositor while this
+         * client receives them all, and every layer between the two has been
+         * measured identical -- delivery, surface, coordinates, modifiers,
+         * epoll re-arm (2843/2843). The remaining difference is that Gecko
+         * drives libwayland from TWO THREADS: a renderer that pumps its own
+         * event queue, and a main thread where GDK's seat proxies live.
+         * libwayland coordinates those with prepare_read/read_events and a
+         * condvar, and that whole path is untested here.
+         *
+         * So test it. `--mtread` spawns a second thread doing exactly that
+         * dance in a loop while the main thread dispatches as before. If the
+         * main thread stops seeing input, Firefox's failure is reproduced in
+         * 400 lines we control instead of 30 million we do not. */
+        if (mtread) {
+            pthread_t th;
+            if (pthread_create(&th, 0, mt_reader, dpy) == 0) {
+                pthread_detach(th);
+                printf("LXWL-MT: a second thread is now doing prepare_read/read_events\n");
+                fflush(stdout);
+            }
+        }
         {   struct timespec t0, now;
             clock_gettime(CLOCK_MONOTONIC, &t0);
             for (;;) {

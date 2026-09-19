@@ -274,7 +274,7 @@ XDG_SHELL_XML ?= /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 
 $(LXROOT)/lxwl: tools/lx/lxwl.c tools/lx/gen/xdg-shell-client-protocol.h tools/lx/gen/xdg-shell-protocol.c
 	@mkdir -p $(LXROOT)
-	@if [ -f tools/lx/gen/xdg-shell-protocol.c ]; then 	    $(CC) -O2 -Itools/lx/gen -o $@ $< tools/lx/gen/xdg-shell-protocol.c -lwayland-client -lwayland-cursor -lxkbcommon && 	    echo "  HOSTCC  $@ (a REAL libwayland client + xdg-shell -- the same path Firefox uses)"; 	 else echo "  SKIP    $@ (no xdg-shell bindings)"; fi
+	@if [ -f tools/lx/gen/xdg-shell-protocol.c ]; then 	    $(CC) -O2 -Itools/lx/gen -o $@ $< tools/lx/gen/xdg-shell-protocol.c -lwayland-client -lwayland-cursor -lxkbcommon -lpthread && 	    echo "  HOSTCC  $@ (a REAL libwayland client + xdg-shell -- the same path Firefox uses)"; 	 else echo "  SKIP    $@ (no xdg-shell bindings)"; fi
 
 $(LXROOT)/lxstress: tools/lx/lxstress.c
 	@mkdir -p $(LXROOT)
