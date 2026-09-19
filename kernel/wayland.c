@@ -141,6 +141,7 @@ static int ksnprint_u(char *out, unsigned v) {
     for (int i = 0; i < n; i++) out[i] = t[n - 1 - i];
     return n;
 }
+#define WL_SURFACE_EV_ENTER      0   /* wl_surface.enter(output) -- M2247 */
 #define WL_POINTER_EV_AXIS       4
 #define WL_POINTER_EV_FRAME      5
 #define WL_KEYBOARD_EV_KEYMAP    0
@@ -327,6 +328,8 @@ struct wl_client {
     uint32_t pointer, keyboard;    /* the client's wl_pointer / wl_keyboard, 0 = not asked for */
     uint32_t surface;              /* the surface input is delivered to */
     /* POINTER FOCUS IS A SUBSURFACE, NOT THE TOPLEVEL (M2245). */
+    uint32_t output;               /* the client's wl_output, for wl_surface.enter (M2247) */
+    uint32_t surf_entered;         /* the surface we have already told is on that output */
     uint32_t ptr_surface;          /* the surface wl_pointer.enter last named */
     int      ptr_ox, ptr_oy;       /* ...and its offset inside the window */
     int      ptr_in, kbd_in;       /* enter() already sent. Pointer focus follows the CURSOR and
@@ -1235,6 +1238,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         kprintf("[wl] bind %s -> id %u\n",
                 (name >= 1 && name <= (uint32_t)WL_NGLOBAL) ? g_globals[name - 1].iface : "?", nid);
         if (kind == WLK_OUTPUT) {
+            c->output = nid;                          /* remember it: wl_surface.enter needs it (M2247) */
             /* A monitor announces itself IMMEDIATELY on bind and ends with
              * `done`: a toolkit treats the description as incomplete until it
              * arrives, so an output that never sends one is an output that
@@ -2607,6 +2611,27 @@ void wl_frame_tick(void) {
             if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = ci; }
         }
         if (best >= 0 && barea) wl_kbd_enter(&g_cl[best]);   /* no-ops if already entered */
+        /* AND TELL EVERY MAPPED TOPLEVEL WHICH OUTPUT IT IS ON (M2247).
+         *
+         * wl_surface.enter is how a client learns its surface is actually on a
+         * display -- it is where GTK gets the scale factor, and a toolkit that
+         * never receives one can treat the window as not yet on screen. This
+         * compositor advertised wl_output, answered the bind, and then never
+         * associated a single surface with it.
+         *
+         * Sent once per client, from the same steady tick that grants keyboard
+         * focus, because both answer the same question: this window is real
+         * and it is visible. */
+        for (int ci2 = 0; ci2 < WL_MAXCLIENT; ci2++) {
+            struct wl_client *cc = &g_cl[ci2];
+            if (!cc->used || !cc->surface || !cc->output) continue;
+            if (cc->surf_entered == cc->surface) continue;
+            uint8_t ob[4]; wr32(ob, cc->output);
+            wl_send(cc, cc->surface, WL_SURFACE_EV_ENTER, ob, 4);
+            cc->surf_entered = cc->surface;
+            kprintf("[wl] surface %u is on output %u (wl_surface.enter)\n",
+                    cc->surface, cc->output);
+        }
     }
     uint32_t ms = (uint32_t)timer_ms();
     for (int i = 0; i < WL_MAXCLIENT; i++) {

@@ -2170,7 +2170,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * direct than asking Firefox to narrate. (The concurrent
                      * session made this point and it is the right one.) */
                     if (g_ffnavlog)
-                        app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5");
+                        /* WIDGET, BECAUSE THE QUESTION IS NOW INPUT (M2247).
+                         * DocumentChannel answered the navigation question
+                         * back in M2132 and has nothing to say about a click.
+                         * Widget/nsWindow are the two modules M2114 recorded
+                         * as actually producing output in this environment --
+                         * an unrecognised name voids the whole spec, so this
+                         * is not the place to guess. */
+                        app_set_next_env("MOZ_LOG=timestamp,sync,Widget:5,nsWindow:5");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per

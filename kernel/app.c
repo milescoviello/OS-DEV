@@ -668,7 +668,20 @@ static char g_pend_arg[128];             /* arg for the next app_spawn, copied i
 static char g_pend_lxargs[LX_PEND_ARGS][LX_PEND_ARGLEN];
 static void app_stop_siblings(struct app *a);   /* end every OTHER thread of a dying process (M1999) */
 static int  g_pend_lxargc;
-#define LX_PEND_ENV 4
+/* FOUR WAS NOT ENOUGH, AND OVERFLOW WAS SILENT (M2247).
+ *
+ * app_set_next_env walks this array for a free slot and RETURNS QUIETLY when
+ * there is none. The Firefox spawn queues five variables when ffmozlog is on
+ * -- G_MESSAGES_DEBUG, GIO_USE_VFS, MOZ_LOG, MOZ_FORCE_DISABLE_E10S,
+ * MOZ_DISABLE_CONTENT_SANDBOX -- so one of them was dropped on the floor with
+ * no trace, and which one depended on the order they happened to be written
+ * in. That is how an environment variable can be "set" in the source and
+ * absent in the process.
+ *
+ * Sixteen, and say so when it is full: a diagnostic that silently fails to be
+ * enabled is worse than no diagnostic, because you spend the next hour
+ * believing the program had nothing to say. */
+#define LX_PEND_ENV 16
 static const char *g_pend_env_extra[LX_PEND_ENV];
 /* WHERE THE NEXT SPAWNED LINUX PROCESS'S OUTPUT GOES, and whose child it is.
  *
@@ -13736,6 +13749,8 @@ static void app_fd_release(struct app *a) {
 void app_set_next_env(const char *e) {
     for (int k = 0; k < LX_PEND_ENV; k++)
         if (!g_pend_env_extra[k]) { g_pend_env_extra[k] = e; return; }
+    kprintf("[lx] env queue FULL (%d): '%s' will NOT be in the next process's "
+            "environment\n", LX_PEND_ENV, e ? e : "?");
 }
 
 static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_vm) {
