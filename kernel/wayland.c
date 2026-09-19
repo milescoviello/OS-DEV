@@ -2263,7 +2263,8 @@ void wl_fs_health_line(void) {
                 "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED | "
                 "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired | "
                 "blockdev refusals by reason: idx %lu nohook %lu zerocount %lu LBA>=cap %lu "
-                "ovf %lu past-cap %lu driver %lu BADIDX %lu (last cap-refusal: lba %lu vs cap %lu; last bad index %d against g_ndev %d)\n",
+                "ovf %lu past-cap %lu driver %lu BADIDX %lu (last cap-refusal: lba %lu vs cap %lu; "
+                "last bad index %d against g_ndev %d) | blockdev_init x%lu, %lu re-reg skipped\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
