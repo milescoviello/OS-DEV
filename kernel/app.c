@@ -12787,7 +12787,20 @@ static void epoll_rearm_edge(struct app *a, int fd) {
  * allocates GDK_ENTER_NOTIFY / GDK_MOTION_NOTIFY / GDK_BUTTON_PRESS for the
  * same click. zenity's GLib loop has timers and re-polls on its own; a client
  * that blocks with no timeout waits for a wake-up that never comes. */
-void app_unix_peer_ready(int obj) { epoll_note_peer_ready(12, obj); }
+unsigned long g_peerready_calls, g_peerready_hits;
+void app_unix_peer_ready(int obj) {
+    g_peerready_calls++;
+    /* Did it MATCH anything? A re-arm that finds no fd is indistinguishable
+     * from one that works, which is how a fix gets believed (M2263). */
+    for (int i = 0; i < MAX_APPS; i++) {
+        if (!apps[i].used) continue;
+        for (int fd = 0; fd < APP_NFD; fd++)
+            if (apps[i].fd[fd].used && apps[i].fd[fd].type == 12 &&
+                apps[i].fd[fd].obj == obj) { g_peerready_hits++; goto found; }
+    }
+found:
+    epoll_note_peer_ready(12, obj);
+}
 
 static void epoll_note_peer_ready(int fdtype, int obj) {
     /* NOTHING TO DO IF NOBODY IS ASLEEP IN A POLL (M2208). This walks 32 x

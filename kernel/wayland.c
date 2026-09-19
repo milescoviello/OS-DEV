@@ -2383,6 +2383,7 @@ void wl_fs_health_line(void) {
         extern unsigned g_axis_sent;
         extern unsigned g_ptr_enter_sid, g_ptr_enters; extern int g_ptr_enter_root;
         extern unsigned g_ptr_enter_by[];
+        extern unsigned long g_peerready_calls, g_peerready_hits;
         char ent[80]; int en = 0;
         for (int q = 0; q < WL_MAXCLIENT && en < 68; q++) {
             if (!g_cl[q].used) continue;
@@ -2454,6 +2455,7 @@ void wl_fs_health_line(void) {
                 "keys: %lu dequeued, %lu forwarded to wayland, focus kind %d, "
                 "%lu SENT on the wire to %d client(s) with a wl_keyboard, %lu axis event(s) | "
                 "clients [slot/Toplevel/Pointer/Keyboard]: %s | ptr fwd: %lu motion, %lu BUTTON | "
+                "peer-ready: %lu calls, %lu MATCHED an fd | "
                 "%u enter(s) | per-client enter surface/root: %s\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
@@ -2479,6 +2481,7 @@ void wl_fs_health_line(void) {
                 g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts,
                 g_dk_keys, g_dk_fwd, g_dk_focus_kind,
                 (unsigned long)wl_keys_sent(), kbclients, (unsigned long)g_axis_sent, who, g_dk_mot, g_dk_btn,
+                g_peerready_calls, g_peerready_hits,
                 g_ptr_enters, ent); }
 }
 
