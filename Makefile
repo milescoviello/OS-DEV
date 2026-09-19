@@ -175,6 +175,33 @@ $(DISK): $(BUILD)/mkfatfs $(BUILD)/dltest.so $(BUILD)/dlbase.so $(BUILD)/dlext.s
 # -nostdlib keeps this one freestanding so it tests the ABI and the loader in
 # isolation, with none of libc's auxv/TLS startup in the way.
 LXROOT  := $(BUILD)/lxroot
+# THE IN-GUEST CLAUDE CREDENTIAL IS A PREREQUISITE, NOT A RECIPE LINE (M2239).
+#
+# M2181 already copied $(HOME)/.claude/.credentials.json into the image "live
+# from the host's session" -- but it did it inside the $(LXROOT)/.tools-staged
+# recipe, and that is a STAMP. Once the stamp is current make skips the whole
+# recipe, so the copy ran once and never again. Measured cost: `claude -p`
+# exited 1 on 3 of 3 eight-core boots with
+#     Failed to authenticate: OAuth session expired and could not be refreshed
+# against a twelve-hour-stale file whose access token had expired AND whose
+# refresh token the host had since rotated away -- so the guest presented a
+# spent token and was correctly refused. Not an OS bug; a stale copy.
+#
+# A live refresh inside a cached rule is not a live refresh. Expressed as a
+# dependency instead, make's own timestamp comparison does the work: a newer
+# host credential rebuilds the image, and nothing else has to remember.
+# Local only -- build/ is gitignored and the file never leaves this machine.
+# CLAUDE_CREDS= to opt out.
+CLAUDE_CREDS_SRC := $(if $(CLAUDE_CREDS_OPTOUT),,$(wildcard $(HOME)/.claude/.credentials.json))
+ifneq ($(CLAUDE_CREDS_SRC),)
+EXT2_CREDS := $(LXROOT)/root/.claude/.credentials.json
+$(EXT2_CREDS): $(CLAUDE_CREDS_SRC)
+	@mkdir -p $(dir $@)
+	@cp -f $< $@ && chmod 600 $@
+	@echo "  CREDS   in-guest Claude login refreshed from the host's live session"
+else
+EXT2_CREDS :=
+endif
 LXFLAGS := -static-pie -nostdlib -nostartfiles -fno-stack-protector \
            -fno-asynchronous-unwind-tables -O2
 $(LXROOT)/hellofree: tools/lx/hellofree.c
@@ -711,7 +738,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/.src-staged
+$(BUILD)/ext2.img: $(EXT2_CREDS) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \
