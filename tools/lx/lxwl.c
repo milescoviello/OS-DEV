@@ -184,6 +184,7 @@ static void *mt_reader(void *arg) {
     return 0;
 }
 
+static int n_loops;
 int main(int argc, char **argv) {
     int mtread = 0;
     for (int i = 1; i < argc; i++)
@@ -464,7 +465,27 @@ int main(int argc, char **argv) {
                 if (n_motion >= 1 && n_buttons >= 1 && n_keys >= 1) break;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 if (now.tv_sec - t0.tv_sec > 45) break;       /* outlast the desktop's startup, without adding two minutes to every suite run */
-                int d = wl_display_dispatch(dpy);
+                /* WITH A READER THREAD, THE MAIN THREAD MUST NOT READ
+                 * (M2268). wl_display_dispatch both reads the fd AND
+                 * dispatches; calling it while another thread owns
+                 * prepare_read/read_events is a MISUSE of libwayland, not a
+                 * model of Gecko -- and the hang it produced said nothing
+                 * about Firefox. The correct shape, and the one Gecko uses,
+                 * is: the reader thread reads and distributes, every other
+                 * thread only dispatches what is already queued for it.
+                 *
+                 * Counted, so "dispatching and receiving nothing" can be told
+                 * from "blocked forever" -- the distinction the host control
+                 * could not make, because both of its arms hung for want of
+                 * input rather than for want of a wake-up. */
+                int d;
+                if (mtread) { d = wl_display_dispatch_pending(dpy); n_loops++; usleep(20000); }
+                else          d = wl_display_dispatch(dpy);
+                if ((n_loops % 250) == 249) {
+                    printf("LXWL-MT: main thread still dispatching, %d loops, %d motion\n",
+                           n_loops, n_motion);
+                    fflush(stdout);
+                }
                 if (d < 0) {
                     printf("LXWL-INPUT: dispatch failed (err %d) after %d motion\n",
                            wl_display_get_error(dpy), n_motion);
