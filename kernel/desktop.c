@@ -1883,7 +1883,7 @@ static int wlpid_seen[16], nwlpid_seen;
  * places a keystroke can die: never dequeued by the desktop, dequeued but the
  * focused window is not a Wayland client, or forwarded and ignored by the
  * client. Without these, all three look the same from a screenshot. */
-unsigned long g_dk_keys, g_dk_fwd;
+unsigned long g_dk_keys, g_dk_fwd, g_dk_mot, g_dk_btn;
 int g_dk_focus_kind = -2;
 static int focus_index(void) {
     for (int i = win_count - 1; i >= 0; i--)
@@ -2654,8 +2654,8 @@ void desktop_run(void) {
                  * useless -- the client happily acts on a click it should
                  * never have seen. */
                 if (rx >= 0 && ry >= 0 && rx < sw3 && ry < sh3) {
-                    if (mx != prev_x || my != prev_y) wl_post_motion(rx, ry);
-                    if ((btn & 1) != (prev_btn & 1)) wl_post_button(rx, ry, 0x110, btn & 1);   /* BTN_LEFT */
+                    if (mx != prev_x || my != prev_y) { g_dk_mot++; wl_post_motion(rx, ry); }
+                    if ((btn & 1) != (prev_btn & 1)) { g_dk_btn++; wl_post_button(rx, ry, 0x110, btn & 1); }   /* BTN_LEFT */
                     if ((btn & 2) != (prev_btn & 2)) wl_post_button(rx, ry, 0x111, (btn & 2) ? 1 : 0);  /* BTN_RIGHT */
                 } else if (mx != prev_x || my != prev_y) {
                     wl_post_pointer_leave();

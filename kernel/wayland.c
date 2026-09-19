@@ -134,6 +134,13 @@ extern int app_memfd_mapper_at(int mfd, unsigned long off, uint64_t *out_va, uin
 #define WL_POINTER_EV_LEAVE      1
 #define WL_POINTER_EV_MOTION     2
 #define WL_POINTER_EV_BUTTON     3
+static int ksnprint_u(char *out, unsigned v) {
+    char t[12]; int n = 0;
+    if (!v) { out[0] = '0'; return 1; }
+    while (v && n < 11) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    for (int i = 0; i < n; i++) out[i] = t[n - 1 - i];
+    return n;
+}
 #define WL_POINTER_EV_AXIS       4
 #define WL_POINTER_EV_FRAME      5
 #define WL_KEYBOARD_EV_KEYMAP    0
@@ -2297,9 +2304,20 @@ void wl_fs_health_line(void) {
         extern unsigned long g_e2_gd_pio_good, g_e2_gd_pio_same, g_e2_gd_pio_fail;
         extern unsigned long g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short;
         extern unsigned long g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts;
-        extern unsigned long g_dk_keys, g_dk_fwd; extern int g_dk_focus_kind;
+        extern unsigned long g_dk_keys, g_dk_fwd, g_dk_mot, g_dk_btn; extern int g_dk_focus_kind;
         unsigned wl_keys_sent(void);
         extern unsigned g_axis_sent;
+        extern unsigned g_ptr_enter_sid, g_ptr_enters; extern int g_ptr_enter_root;
+        extern unsigned g_ptr_enter_by[];
+        char ent[80]; int en = 0;
+        for (int q = 0; q < WL_MAXCLIENT && en < 68; q++) {
+            if (!g_cl[q].used) continue;
+            en += ksnprint_u(ent + en, (unsigned)q); ent[en++] = ':';
+            en += ksnprint_u(ent + en, g_ptr_enter_by[q]);
+            ent[en++] = '/'; en += ksnprint_u(ent + en, g_cl[q].surface);
+            ent[en++] = ' ';
+        }
+        ent[en] = 0;
         /* WHICH client is getting these? The one with the toplevel -- the one
          * whose window the user is looking at -- must have a pointer and a
          * keyboard bound, or we are broadcasting input to content processes
@@ -2343,7 +2361,8 @@ void wl_fs_health_line(void) {
                 "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx | "
                 "keys: %lu dequeued, %lu forwarded to wayland, focus kind %d, "
                 "%lu SENT on the wire to %d client(s) with a wl_keyboard, %lu axis event(s) | "
-                "clients [slot/Toplevel/Pointer/Keyboard]: %s\n",
+                "clients [slot/Toplevel/Pointer/Keyboard]: %s | ptr fwd: %lu motion, %lu BUTTON | "
+                "%u enter(s) | per-client enter surface/root: %s\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
@@ -2367,7 +2386,8 @@ void wl_fs_health_line(void) {
                 g_tab_lastx, g_tab_lasty, g_tab_lastbtn,
                 g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts,
                 g_dk_keys, g_dk_fwd, g_dk_focus_kind,
-                (unsigned long)wl_keys_sent(), kbclients, (unsigned long)g_axis_sent, who); }
+                (unsigned long)wl_keys_sent(), kbclients, (unsigned long)g_axis_sent, who, g_dk_mot, g_dk_btn,
+                g_ptr_enters, ent); }
 }
 
 int wl_page_probe(uint32_t want) {
@@ -2631,6 +2651,11 @@ void wl_server_task(void) {
  * dropped, which looks exactly like input not working. */
 static unsigned g_keys_sent, g_ptr_sent;
 unsigned g_axis_sent;   /* wl_pointer.axis events actually put on the wire (M2245) */
+/* WHICH surface pointer focus actually landed on (M2245). The hit-test falls
+ * back to the toplevel when it finds nothing, and a fallback that fires every
+ * time is indistinguishable from the bug it was meant to fix. */
+unsigned g_ptr_enter_sid, g_ptr_enters; int g_ptr_enter_root;
+unsigned g_ptr_enter_by[WL_MAXCLIENT];   /* ...and which surface EACH client was told (M2246) */
 unsigned wl_keys_sent(void)    { return g_keys_sent; }
 unsigned wl_pointer_sent(void) { return g_ptr_sent; }
 
@@ -2654,6 +2679,30 @@ static uint32_t wl_fixed(int v) { return (uint32_t)(v * 256); }
  * Same generation walk as wl_layers_of, for the same reason it uses one: the
  * parent links come from the client and a client can make a cycle. Deeper
  * hits win, which is what "topmost" means for a subsurface tree. */
+/* WHAT THE TREE ACTUALLY LOOKS LIKE (M2246). The hit-test fell back to the
+ * toplevel every time while Firefox was committing 1280x960 frames into
+ * "surface 18, subsurface" -- so either that surface is not reachable from
+ * c->surface by parent links, or it is not shaped the way the walk assumes.
+ * Guessing has cost two rounds; print the tree once. */
+static void wl_dump_tree(struct wl_client *c) {
+    /* PER CLIENT, not once globally (M2246). A single static latch dumped the
+     * first client to take pointer focus -- which is lxwl, the 64x32 test
+     * client -- and never the browser, so the one tree that mattered was the
+     * one it could not print. */
+    static unsigned char dumped[WL_MAXCLIENT];
+    int ci = (int)(c - g_cl);
+    if (ci < 0 || ci >= WL_MAXCLIENT || dumped[ci]) return;
+    dumped[ci] = 1;
+    kprintf("[wl] surface tree of the client with the toplevel (root=%u):\n", c->surface);
+    for (int j = 0; j < c->nobj; j++) {
+        struct wl_object *o = &c->obj[j];
+        if (!o->id || o->kind != WLK_SURFACE) continue;
+        kprintf("[wl]   surface %u parent %u at %d,%d size %ux%u %s role %d\n",
+                o->id, o->parent, o->sub_x, o->sub_y, o->width, o->height,
+                o->base ? "MAPPED" : "unmapped", (int)o->role);
+    }
+}
+
 static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *oy) {
     struct wl_object *root = 0;
     for (int j = 0; j < c->nobj; j++)
@@ -2693,8 +2742,27 @@ static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *o
 static void wl_ptr_enter(struct wl_client *c, int x, int y) {
     if (!c->surface || !c->pointer) return;
     int ox = 0, oy = 0;
+    if (c->surface) wl_dump_tree(c);
     uint32_t want = wl_surface_at(c, x, y, &ox, &oy);
-    if (!want) { want = c->surface; ox = oy = 0; }
+    if (!want) {
+        /* DO NOT ENTER AN UNMAPPED SURFACE (M2246).
+         *
+         * The fallback handed the client its toplevel id whatever state that
+         * surface was in, and the per-client instrument shows two of Firefox's
+         * helper processes being told `enter` on surface 12 -- which the tree
+         * dump reports as `size 0x0 unmapped`. wl_pointer.enter names the
+         * surface the pointer is OVER, and a surface with no buffer is not
+         * under anything; libwayland is entitled to treat that as a protocol
+         * error and drop the connection, which would take the client's input
+         * with it and look exactly like a client that ignores the mouse.
+         *
+         * If there is nothing mapped under the cursor, say nothing. */
+        struct wl_object *root = 0;
+        for (int j = 0; j < c->nobj; j++)
+            if (c->obj[j].id == c->surface) { root = &c->obj[j]; break; }
+        if (!root || !root->base || !root->width || !root->height) return;
+        want = c->surface; ox = oy = 0;
+    }
     if (c->ptr_in && c->ptr_surface == want) return;
     if (c->ptr_in) {                                   /* crossed into another surface: leave first */
         uint8_t lv[8]; int q = 0;
@@ -2710,6 +2778,16 @@ static void wl_ptr_enter(struct wl_client *c, int x, int y) {
     wl_send(c, c->pointer, WL_POINTER_EV_ENTER, b, p);
     if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
     c->ptr_in = 1; c->ptr_surface = want; c->ptr_ox = ox; c->ptr_oy = oy;
+    /* PER CLIENT (M2246). A single global last-value has four writers here --
+     * the broadcast loop visits every client -- so it always showed whichever
+     * one happened to be last, which is a content process whose surfaces are
+     * all unmapped. It read "hit-test found nothing" while the browser's
+     * hit-test was very likely succeeding. Same rule as M2221: a global is
+     * only a measurement if the caller is its only writer. */
+    {   int ci = (int)(c - g_cl);
+        if (ci >= 0 && ci < WL_MAXCLIENT) g_ptr_enter_by[ci] = want; }
+    g_ptr_enter_sid = want; g_ptr_enter_root = (want == c->surface);
+    g_ptr_enters++;
 }
 
 static void wl_kbd_enter(struct wl_client *c) {
