@@ -2385,6 +2385,11 @@ void wl_fs_health_line(void) {
             ent[en++] = '/'; en += ksnprint_u(ent + en, g_cl[q].surface);
             ent[en++] = 'p'; en += ksnprint_u(ent + en, g_cl[q].pointer);
             ent[en++] = 'k'; en += ksnprint_u(ent + en, g_cl[q].keyboard);
+            /* BYTES STILL IN OUR OUTPUT BUFFER (M2261). wl_flush_locked stops
+             * on a full socket ring and leaves the remainder queued, retried
+             * only by the NEXT send. If a client's queue is persistently
+             * non-zero, events we believe we delivered are sitting here. */
+            ent[en++] = 'q'; en += ksnprint_u(ent + en, (unsigned)g_cl[q].outlen);
             /* AN ID THAT MEANS TWO THINGS (M2248). Object ids are unique per
              * CONNECTION; if our table ever holds one id as both a surface and
              * a pointer, every lookup after that is a coin toss. Flag it here
