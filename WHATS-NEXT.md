@@ -1,5 +1,73 @@
 # What's next
 
+> **(M2252-M2276) THE 8-CORE CORRUPTION IS CURED, CLAUDE CODE RUNS ON EIGHT
+> CORES, AND THE FIREFOX INPUT HUNT COST NINE FALSE NEGATIVES.**
+>
+> **The filesystem bug that ate this campaign is gone.** Three 8-core boots,
+> the same workload that produced it for weeks:
+>
+> | | before (M2236) | now |
+> |---|---|---|
+> | inode tables rejected | 88-132 | **0 / 0 / 0** |
+> | distrust events | 152-581 | **0 / 0 / 0** |
+> | bad block pointers | 3-95 | **0 / 0 / 0** |
+> | `LBA>=cap` refusals | 18-98 | **0 / 0 / 0** |
+> | GDT blocks read back invalid | 495 | **0 / 0 / 0** |
+>
+> M2240's PIO discriminator, built to settle "wrong-sector read or bad
+> write?", reports `0 DISK-WAS-FINE, 0 disk really bad`. The question is moot.
+>
+> **PHASE 7, ON EIGHT CORES.** `claude -p` answers correctly and exits 0 --
+> and `claude-bash` (the Bash tool running a command inside OS-DEV) and
+> `claude-edit` (Claude editing a file in OS-DEV's own source tree) both pass.
+> That is the north star this campaign is named for. Timing is an inference
+> from an absence and a sound one: app_run_linux_sync prints a heartbeat every
+> 60 s, the failing boots printed `t=180s`/`t=240s`, and these print **none**
+> -- under a minute, start to answer, including ld.so over an 83-library
+> closure and a network round trip.
+>
+> Two enablers, both "live" things that were quietly stale:
+> **M2239** -- the in-guest Claude credential was copied by a rule guarded by
+> a STAMP FILE, so the "live refresh" ran once and never again while printing
+> a reassuring message every build. It is a real make prerequisite now.
+> **M2253** -- MOZ_LOG was gated on `ffnavlog` while every run passed
+> `ffmozlog`. Hours of "Gecko has nothing to say" came from never asking it.
+>
+> **"ALL FEATURES" IS NOW A DEFINITION** (`tools/featurematrix.sh`): six rows,
+> one boot and one log marker each -- claude-ask, claude-bash, claude-edit,
+> ff-local, ff-net, gtk-input. **6/6 on eight cores, no crashes.** Firefox
+> INPUT is deliberately not a row: no log line can prove it, and a row that
+> cannot fail is worse than the gap it hides.
+>
+> **FIREFOX INPUT: still broken, and the hunt is the lesson.** Sixteen real
+> bugs were fixed on the way -- among them `wl_region`/set_input_region never
+> implemented (Firefox declares its content subsurface takes NO input), input
+> BROADCAST to all four of Firefox's connections, no modifiers forwarded at
+> all (so no shortcut worked in ANY Wayland app), no `wl_pointer.axis` (no
+> scrolling), and **two focus rules for one question** (M2275): the window
+> manager hit-tests the topmost VISIBLE window while the compositor delivered
+> to the BIGGEST surface, so coordinates for one window went to another
+> client and the pointed-at client received only the enter.
+>
+> **And nine times a null result was read as a finding.** Each had a
+> different mundane cause: no input driven; the wrong window; a window hidden
+> behind another; an instrument not enabled; a test on a page with no
+> scrollbar; a `static` latch that dumped the wrong client; a global with
+> four writers; a click sent too early; and -- the one that cost a whole day
+> -- **the wrong toolkit**: zenity links libgtk-4, Firefox links libgtk-3, so
+> "a real GTK client works, therefore it is Gecko" compared two different
+> Wayland backends. One `ldd` would have caught it.
+>
+> The control that finally settles it is `tools/lx/lxgtk3.c` -- GTK 3.24.52,
+> the exact library Firefox links. It responds to a click. Firefox, given 12
+> clicks on a plain HTML link 40 s after mapping with forwarding confirmed
+> (`ptr fwd: 13 motion, 24 BUTTON`), changes 0 pixels and sends 0
+> `set_cursor`. So the fault is above GTK3, inside Gecko -- said at last on a
+> comparable control.
+>
+> → **Never accept "nothing happened" until the stimulus is proven to have
+> arrived.**
+
 > **(M2239-M2251) THE USER COULD NOT CLICK, SCROLL OR TYPE -- EIGHT BUGS, AND
 > A GTK APP'S BUTTON NOW WORKS.**
 >
