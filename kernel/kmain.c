@@ -296,6 +296,7 @@ static void ext2_cache_drop_hook(void *ctx, uint64_t lba, uint32_t n) {
 static int ext2_raw_read_hook(void *ctx, uint64_t lba, uint32_t n, void *buf) {
     return blockdev_read_raw((int)(intptr_t)ctx, lba, n, buf);
 }
+static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
@@ -890,7 +891,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
         if (cmdline_has(cl, "ffurl")) g_ffurl = 1;
-        if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */   /* URL from a file in the image, never from the source tree (M2241) */
+        if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */
+        if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
@@ -2210,7 +2212,24 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     unsigned long trunc0 = lx_path_truncations();
                     kprintf("[ff] spawning FIREFOX against our compositor "
                             "(content in the PARENT process: MOZ_FORCE_DISABLE_E10S)...\n");
-                    int spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
+                    /* A GTK CLIENT THAT STARTS IN SECONDS (M2250).
+                     *
+                     * Every input hypothesis so far has cost a three-minute
+                     * Firefox boot to test, which is the wrong debugging loop
+                     * for a binary search through a protocol. zenity is GTK --
+                     * the same GDK Wayland backend Firefox drives -- in 130 KB
+                     * that draws a dialog with a button. If its button
+                     * responds to a click, GTK input works here and the fault
+                     * is Gecko's; if it does not, the bug reproduces in
+                     * something small enough to instrument on both sides. */
+                    int spid;
+                    if (g_lxgtk) {
+                        static const char *av_z[] = { "--info", "--text=OSDEV-GTK-CLICK-ME" };
+                        kprintf("[ff] spawning ZENITY (GTK) instead of Firefox: the same toolkit, "
+                                "seconds instead of minutes\n");
+                        spid = app_spawn_linux_from_file_argv("/disk2/usr/bin/zenity", av_z, 2);
+                    } else
+                    spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
                     /* A HEARTBEAT, because silence is ambiguous (M1996).
                      * Firefox spends minutes relocating an 83-library closure
