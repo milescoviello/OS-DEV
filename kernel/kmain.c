@@ -304,6 +304,8 @@ static volatile int g_lxgtk3;                 /* -append lxgtk3: a GTK3 client, 
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
 static volatile int g_gtksub;                 /* -append gtksub: lxgtk3 + Gecko's empty-input-region subsurface (M2297) */
+static volatile int g_ffimsimple;             /* -append ffimsimple: force GTK's pass-through input method (M2300) */
+static volatile int g_ffimlog;                /* -append ffimlog: MOZ_LOG IMEHandler + KeyboardHandler (M2300) */
 static volatile int g_ffin;                   /* -append ffin: file:///ffinput.html, the page that makes input visible (M2296) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
@@ -925,6 +927,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxgtk3")) g_lxgtk3 = 1;   /* the GTK3 control -- the toolkit Firefox actually uses (M2272) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
+        if (cmdline_has(cl, "ffimsimple")) g_ffimsimple = 1;   /* GTK_IM_MODULE=gtk-im-context-simple (M2300) */
+        if (cmdline_has(cl, "ffimlog"))    g_ffimlog = 1;      /* Gecko's IME + keyboard log (M2300) */
         if (cmdline_has(cl, "ffin"))       g_ffin = 1;                    /* the CSS-only input probe page (M2296) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
@@ -2317,6 +2321,41 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * unlistened), or absent (the event is sitting in a queue
                      * nobody pumps). */
                     if (g_wlspy) app_set_next_env("WAYLAND_DEBUG=1");
+                    /* TYPING IS THE LAST THING FIREFOX IGNORES (M2300).
+                     *
+                     * M2298 fixed pointer, clicks and scroll -- the compositor
+                     * was addressing a wl_pointer nobody listened on. Keys now
+                     * reach GDK's wl_keyboard and are dispatched, and still no
+                     * text appears, while the SAME keystrokes on the SAME boot
+                     * reach a GTK 3.24 client with correct keysyms and a raw
+                     * libwayland client turns them into text. So the loss is
+                     * Gecko's, above GDK.
+                     *
+                     * The sharpest difference: lxgtk3 handles key-press-event
+                     * directly, and Gecko routes every key through
+                     * IMContextWrapper -> gtk_im_context_filter_keypress()
+                     * first. Nothing here sets GTK_IM_MODULE, and
+                     * gschemas.compiled is missing from the image so GSettings
+                     * cannot answer either -- so which module GTK picked is
+                     * currently unknown, and one of the candidates
+                     * (gtk-im-context-wayland) speaks zwp_text_input_v3, which
+                     * this compositor does not implement. A key handed to a
+                     * protocol nobody answers is a key that vanishes exactly
+                     * like this.
+                     *
+                     * Two arms, because a fix that works for an unknown reason
+                     * is not a fix:
+                     *   -append ffimsimple  force the module that just passes
+                     *                       keys through
+                     *   -append ffimlog     make Gecko say what it did with
+                     *                       the key instead of guessing */
+                    if (g_ffimsimple) {
+                        app_set_next_env("GTK_IM_MODULE=gtk-im-context-simple");
+                        app_set_next_env("XMODIFIERS=@im=none");
+                        kprintf("[ff] GTK_IM_MODULE forced to gtk-im-context-simple\n");
+                    }
+                    if (g_ffimlog)
+                        app_set_next_env("MOZ_LOG=timestamp,sync,IMEHandler:5,KeyboardHandler:5,Widget:5");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per

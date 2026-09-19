@@ -144,6 +144,24 @@ static int ksnprint_u(char *out, unsigned v) {
 unsigned long g_inpreg_calls, g_inpreg_obj;   /* set_input_region: total, and how many named a region OBJECT (M2249) */
 #define WL_SURFACE_EV_ENTER      0   /* wl_surface.enter(output) -- M2247 */
 #define WL_POINTER_EV_AXIS       4
+/* A MOUSE WHEEL IS DISCRETE, AND SAYING SO IS THE WHOLE DIFFERENCE (M2301).
+ *
+ * This compositor sent a bare wl_pointer.axis and nothing else. A toolkit
+ * reads that as a SMOOTH scroll -- a trackpad gesture measured in pixels --
+ * and GTK divides the 24.8 value by 10, so our ten-units-per-notch became
+ * 1.0 pixel per notch. Twelve wheel clicks moved the page twelve pixels,
+ * which is indistinguishable from not scrolling and is exactly what the
+ * probe measured: 21 px of screen change on a page with 5200 px to scroll.
+ *
+ * axis_source says WHERE the scroll came from (0 = a wheel), axis_discrete
+ * says it arrived in whole notches, and axis_stop ends the gesture so the
+ * toolkit does not wait for more. All three are version 5, which is why they
+ * are sent per resource -- the two seats Firefox binds are at 5 and 7. */
+#define WL_POINTER_EV_AXIS_SOURCE   6
+#define WL_POINTER_EV_AXIS_STOP     7
+#define WL_POINTER_EV_AXIS_DISCRETE 8
+#define WL_AXIS_SOURCE_WHEEL        0
+#define WL_AXIS_VERTICAL            0
 #define WL_POINTER_EV_FRAME      5
 #define WL_KEYBOARD_EV_KEYMAP    0
 #define WL_KEYBOARD_EV_ENTER     1
@@ -3113,6 +3131,34 @@ static void wl_ptr_bcast(struct wl_client *c, uint16_t opcode,
         if (c->ptrv[i] >= 5) wl_send(c, c->ptrs[i], WL_POINTER_EV_FRAME, 0, 0);
     }
 }
+/* ONE WHEEL NOTCH, PER RESOURCE (M2301).
+ *
+ * A wheel click is not one event, it is a group: axis_source says it came
+ * from a wheel, axis_discrete says how many notches, axis carries the value,
+ * axis_stop ends the gesture, and frame closes the group. All but `axis` are
+ * version 5, so this cannot be composed out of wl_ptr_bcast calls -- that
+ * would either frame after every part (splitting one notch into four
+ * gestures) or drop the axis entirely for a version 4 resource. A per
+ * resource loop is the only shape that is correct for both. */
+static void wl_ptr_wheel(struct wl_client *c, int ticks_down, uint32_t t) {
+    uint8_t sb[4], db[8], ab[12], tb[8];
+    wr32(sb, WL_AXIS_SOURCE_WHEEL);
+    wr32(db, WL_AXIS_VERTICAL);      wr32(db + 4, (uint32_t)(int32_t)ticks_down);
+    wr32(ab, t); wr32(ab + 4, WL_AXIS_VERTICAL);
+    wr32(ab + 8, (uint32_t)(int32_t)(ticks_down * 2560));   /* 10.0 per notch, 24.8 fixed */
+    wr32(tb, t); wr32(tb + 4, WL_AXIS_VERTICAL);
+    for (int i = 0; i < c->nptr; i++) {
+        if (c->ptrv[i] >= 5) {
+            wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS_SOURCE,   sb, 4);
+            wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS_DISCRETE, db, 8);
+        }
+        wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS, ab, 12);
+        if (c->ptrv[i] >= 5) {
+            wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS_STOP, tb, 8);
+            wl_send(c, c->ptrs[i], WL_POINTER_EV_FRAME, 0, 0);
+        }
+    }
+}
 static void wl_kbd_bcast(struct wl_client *c, uint16_t opcode,
                          const uint8_t *body, int n) {
     for (int i = 0; i < c->nkbd; i++) wl_send(c, c->kbds[i], opcode, body, n);
@@ -3285,11 +3331,7 @@ void wl_post_axis(int x, int y, int ticks_down) {
         struct wl_client *c = &g_cl[i];
         if (i != focus || !c->used || !c->nptr) continue;
         wl_ptr_enter(c, x, y);
-        uint8_t b[12]; int p = 0;
-        wr32(b + p, wl_now_ms()); p += 4;
-        wr32(b + p, 0);           p += 4;      /* axis 0 = vertical scroll */
-        wr32(b + p, (uint32_t)(int32_t)(ticks_down * 2560)); p += 4;   /* 24.8 fixed */
-        wl_ptr_bcast(c, WL_POINTER_EV_AXIS, b, p);
+        wl_ptr_wheel(c, ticks_down, wl_now_ms());
         g_ptr_sent++;
         g_axis_sent++;
     }

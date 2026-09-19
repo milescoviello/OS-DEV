@@ -1945,8 +1945,37 @@ static void lx_dispatch_body(struct registers *r) {
              * component; reporting EEXIST is what lets it continue. */
             struct statx ex;
             if (vfs_stat(path, &ex) == 0) { r->rax = (uint64_t)-(long)LX_EEXIST; break; }
-            kprintf("[linuxabi] mkdir(%s) failed\n", path);
-            r->rax = (uint64_t)-(long)LX_ENOENT;
+            /* SAY WHICH FAILURE THIS IS (M2301).
+             *
+             * vfs_mkdir collapses every cause to -1 and this returned ENOENT
+             * for all of them -- which to a caller means "a parent component
+             * is missing", a specific and often wrong claim. Node's recursive
+             * mkdir believes it and walks back up creating parents that are
+             * already there; Claude Code hits this creating its per-project
+             * directory and loses session history and memory with it:
+             *
+             *   [linuxabi] mkdir(/disk2/root/.claude/projects/-/memory) failed
+             *
+             * One stat of the parent separates the two worlds, and they need
+             * opposite fixes. If the parent is genuinely absent, ENOENT is
+             * right and the caller's own mkdir -p will handle it. If the
+             * parent is there, the filesystem refused a directory it should
+             * have made, and reporting ENOENT sends the caller somewhere that
+             * cannot help. */
+            char par[VFS_PATH_MAX]; int pe = 0;
+            while (path[pe] && pe < (int)sizeof par - 1) { par[pe] = path[pe]; pe++; }
+            par[pe] = 0;
+            while (pe > 1 && par[pe - 1] != '/') pe--;
+            if (pe > 1) pe--;                       /* drop the slash, keep "/" itself */
+            par[pe] = 0;
+            struct statx pst;
+            int parent_there = (pe > 0 && vfs_stat(par, &pst) == 0);
+            kprintf("[linuxabi] mkdir(%s) FAILED -- parent '%s' %s\n", path, par,
+                    parent_there ? "EXISTS, so the filesystem refused a directory it "
+                                   "should have created (reporting EIO, not ENOENT)"
+                                 : "is missing (ENOENT is correct; the caller should "
+                                   "create it first)");
+            r->rax = (uint64_t)-(long)(parent_there ? LX_EIO : LX_ENOENT);
             break;
         }
         r->rax = 0;

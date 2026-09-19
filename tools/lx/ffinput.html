@@ -27,24 +27,43 @@
   them: the hover band is at y=300..600 of the DOCUMENT, full width.
 -->
 <style>
+  /* NORMAL FLOW, NOT position:absolute (M2301). The first version laid the
+   * band, the box and the colour bands out absolutely, which takes them out
+   * of flow -- the document had almost no in-flow height, no scrollbar
+   * appeared, and the wheel arm was testing a page that could not scroll.
+   * That is the "scrolled a document with no scrollbar" trap this file was
+   * written to stop making, made again inside the fix for it. Everything is
+   * in flow now, so the document is genuinely ~5000px tall. */
   html,body { margin:0; padding:0; font:16px monospace; background:#101820; color:#e6f1ff; }
   #hit {
-    position:absolute; top:300px; left:0; width:100%; height:300px;
+    width:100%; height:300px; box-sizing:border-box;
     background:#334; display:flex; align-items:center; justify-content:center;
     font-size:40px; border:8px solid #667;
   }
   #hit:hover  { background:#00ff66; color:#000; }
   #hit:active { background:#ff00cc; color:#fff; }
-  #typed { position:absolute; top:640px; left:40px; width:600px; height:60px;
-           font-size:28px; background:#001; color:#0f0; border:6px solid #445; }
+  #typed { display:block; margin:20px 0 20px 40px; width:600px; height:60px;
+           font-size:28px; background:#001; color:#0f0; border:6px solid #00cccc; }
+  /* The UNFOCUSED border is a colour nothing else on the page uses, so the
+   * harness can find the box the same way it finds the band instead of
+   * guessing an offset below it. It guessed `band_bottom + 70`, and when the
+   * band sat lower the click missed and the arm reported "no focus ring" --
+   * a flake that looks exactly like the bug. (M2301) */
   #typed:focus { border-color:#ffdd00; outline:none; }
+  /* AN UNMISSABLE TYPING ORACLE (M2301). Reading "did text appear" off a
+   * whole-screen pixel count cannot work: five glyphs are a few hundred
+   * pixels, which is the same order as a mouse cursor being redrawn. The
+   * moment the field holds ANY text the placeholder stops showing, so this
+   * turns the whole 600x60 box bright red -- 36000 px that nothing else on
+   * the page can produce. */
+  #typed:not(:placeholder-shown) { background:#ff0000; color:#000; }
   .band { height:400px; }
 </style>
 <h1 style="margin:20px">OSDEV INPUT PROBE</h1>
 <p style="margin:0 20px">hover band at document y=300..600 &middot; text box at y=640 &middot; body is 6000px tall</p>
 <div id="hit">HOVER ME</div>
 <input id="typed" placeholder="type here">
-<div style="position:absolute;top:760px;left:0;width:100%">
+<div>
   <div class="band" style="background:#7a1f1f">1</div>
   <div class="band" style="background:#1f7a3a">2</div>
   <div class="band" style="background:#1f3a7a">3</div>

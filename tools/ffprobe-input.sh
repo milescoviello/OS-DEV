@@ -129,15 +129,30 @@ set -- $(px active 255 0 204)
 printf '%-26s %s\n' "BUTTON HELD (:active)" "$1 px MAGENTA  $( [ "$1" -gt 50000 ] && echo '<-- BUTTON WORKS' || echo '(band did not change)')"
 up; sleep 2
 
-# The text box sits 40px below the band in the document.
-TY=$(( (BAND_Y1 + 70) * 32767 / 960 ))
+# FIND THE TEXT BOX, DO NOT GUESS AN OFFSET BELOW THE BAND. `BAND_Y1 + 70`
+# missed whenever the band sat lower -- the page's vertical position moves
+# with Firefox's notification bars -- and a missed click reports "no focus
+# ring", which is indistinguishable from the bug. Its unfocused border is
+# #00cccc, a colour nothing else on the page uses.
+shot findbox
+set -- $(px findbox 0 204 204)
+BOX_N=$1; BOX_Y0=$2; BOX_Y1=$3
+echo "    text box border (#00cccc): $BOX_N px, rows $BOX_Y0..$BOX_Y1"
+if [ "${BOX_N:-0}" -lt 500 ]; then
+    echo "    WARNING: text box not found -- the click below is aimed at a guess"
+    TY=$(( (BAND_Y1 + 70) * 32767 / 960 ))
+else
+    TY=$(( ((BOX_Y0 + BOX_Y1) / 2) * 32767 / 960 ))
+fi
 move 8000 $TY; sleep 2; down; sleep 1; up; sleep 3; shot focus
 set -- $(px focus 255 221 0)
 printf '%-26s %s\n' "TEXT BOX CLICK (:focus)" "$1 px YELLOW RING  $( [ "$1" -gt 2000 ] && echo '<-- KEYBOARD FOCUS WORKS' || echo '(no focus ring)')"
 
 for c in o s d e v; do key $c; sleep 1; done
 sleep 3; shot typed
-printf '%-26s %s\n' "TYPED o s d e v" "$(python3 - "$S/focus.ppm" "$S/typed.ppm" <<'PY'
+set -- $(px typed 255 0 0)
+printf '%-26s %s\n' "TYPED o s d e v" "$1 px RED (field not empty)  $( [ "$1" -gt 20000 ] && echo '<-- TYPING WORKS' || echo '(field still shows its placeholder)')"
+printf '%-26s %s\n' "  (whole-screen delta)" "$(python3 - "$S/focus.ppm" "$S/typed.ppm" <<'PY'
 import sys
 def rd(p):
     d=open(p,'rb').read(); f=d.split(b'\n',3); w,h=map(int,f[1].split()); return w,h,f[3]
@@ -147,13 +162,30 @@ print("%d px changed %s" % (n, "<-- KEYSTROKES PAINTED" if n>300 else "(nothing 
 PY
 )"
 
-move 16383 $AY; sleep 1
+# PARK THE POINTER, THEN TAKE THE BASELINE (M2301).
+#
+# This compared the post-scroll shot against `hover`, which was taken with
+# the band lit bright green. Any later shot differs from it by the whole
+# 374000-pixel band regardless of whether the page moved, so the arm reported
+# "SCROLL WORKS" on a page that had not scrolled at all. A baseline has to be
+# taken in the same state as the thing it is compared with.
+move 16383 $AY; sleep 4; shot prescroll
+# AND PROVE THE PAGE CAN SCROLL AT ALL BEFORE ASKING WHETHER IT DID. A wheel
+# arm on an unscrollable document cannot fail, which is how the first cut of
+# this page shipped: everything was position:absolute, so the document had
+# almost no in-flow height, no scrollbar existed, and "the page did not move"
+# was the correct behaviour rather than a bug.
+SB=$(python3 tools/scrollbar-px.py "$S/prescroll.ppm")
+echo "    right-edge scrollbar: $SB px of non-background"
+if [ "${SB:-0}" -lt 100 ]; then
+    echo "    WARNING: no scrollbar -- the wheel arm below CANNOT FAIL, ignore it"
+fi
 j=0; while [ $j -lt 12 ]; do
     qmp '{"type":"btn","data":{"down":true,"button":"wheel-down"}}'
     qmp '{"type":"btn","data":{"down":false,"button":"wheel-down"}}'
     j=$((j+1)); done
 sleep 4; shot scrolled
-printf '%-26s %s\n' "WHEEL DOWN x12" "$(python3 - "$S/hover.ppm" "$S/scrolled.ppm" <<'PY'
+printf '%-26s %s\n' "WHEEL DOWN x12" "$(python3 - "$S/prescroll.ppm" "$S/scrolled.ppm" <<'PY'
 import sys
 def rd(p):
     d=open(p,'rb').read(); f=d.split(b'\n',3); w,h=map(int,f[1].split()); return w,h,f[3]
