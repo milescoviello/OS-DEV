@@ -1193,6 +1193,7 @@ static void wl_toplevel_configure(struct wl_client *c, struct wl_object *o, uint
 }
 
 static void wl_kbd_enter(struct wl_client *c);   /* focus is granted on map, not on a keypress (M2113) */
+static int wl_focus_client(void);   /* the WM-named client, area rule as fallback (M2275/M2281) */
 /* See the M2190 note in the commit path: the high-water mark of page-coloured
  * pixels over EVERY commit, so a paint that happened between two 15-second
  * samples is still reported. */
@@ -2695,13 +2696,21 @@ void wl_frame_tick(void) {
      * A compositor gives focus when a window is mapped, not when a key
      * arrives. The biggest mapped window gets it, which is the same rule the
      * rest of this file uses to decide which window is the real one. */
-    {   int best = -1; uint64_t barea = 0;
-        for (int ci = 0; ci < WL_MAXCLIENT; ci++) {
-            if (!g_cl[ci].used) continue;
-            uint32_t w = 0, h = 0; wl_client_extent(ci, &w, &h);
-            if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = ci; }
-        }
-        if (best >= 0 && barea) wl_kbd_enter(&g_cl[best]);   /* no-ops if already entered */
+    {   /* THE SAME TWO-RULES BUG, FOR THE KEYBOARD (M2281).
+         *
+         * M2275 made the window manager the authority for POINTER delivery,
+         * because the compositor's "biggest surface" heuristic and the WM's
+         * "topmost visible window" are unrelated rules that disagree while
+         * windows are appearing. This site was left on the old rule, so
+         * keyboard FOCUS could be granted to one client while the WM was
+         * sending that client's keystrokes to another -- and Firefox runs
+         * four connections for the heuristic to choose between.
+         *
+         * One authority, both devices. The area rule stays only as the
+         * fallback for when nothing has been focused yet, which is exactly
+         * what wl_focus_client already encodes. */
+        int best = wl_focus_client();
+        if (best >= 0) wl_kbd_enter(&g_cl[best]);   /* no-ops if already entered */
         /* AND TELL EVERY MAPPED TOPLEVEL WHICH OUTPUT IT IS ON (M2247).
          *
          * wl_surface.enter is how a client learns its surface is actually on a
