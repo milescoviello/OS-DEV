@@ -1797,20 +1797,50 @@ static void make_app_window(app_t *a) {
  * KEYCODES. This is the minimal honest mapping for the letters and the few
  * keys a demo actually presses -- a full layout belongs with a real xkb
  * keymap, which is the next piece of this. (M1983) */
-static unsigned desktop_key_to_evdev(int ch) {
-    static const unsigned row1[] = { 16,17,18,19,20,21,22,23,24,25 };   /* q..p */
-    static const unsigned row2[] = { 30,31,32,33,34,35,36,37,38 };      /* a..l */
-    static const unsigned row3[] = { 44,45,46,47,48,49,50 };            /* z..m */
+/* THE WHOLE US LAYOUT, AND WHETHER IT NEEDS SHIFT (M2244).
+ *
+ * The old table covered letters, digits, space, Enter and Escape, and returned
+ * 0 -- not a valid evdev code -- for everything else. So a Wayland client
+ * received NOTHING for `.`, `/`, `:`, `-`, backspace or tab.
+ *
+ * That is not a rough edge, it is the difference between a browser you can use
+ * and one you cannot: **there was no way to type a URL**. It is also why my own
+ * attempt to verify input by typing `/miles` (Firefox's quick-find) proved
+ * nothing -- the `/` was silently dropped before it ever left the desktop, so
+ * a working key path and a broken one looked identical.
+ *
+ * Shifted characters need the modifier sent too. The desktop's cooked layer
+ * has no modifier state (see M1920: modifiers live in the raw scancode layer),
+ * so a client told "apostrophe" when the user typed `"` gets the wrong
+ * character. Returning the shift requirement alongside the keycode lets the
+ * caller bracket the press with LEFTSHIFT, which is what a real keyboard
+ * sends. */
+#define EV_LEFTSHIFT 42
+static unsigned desktop_key_to_evdev_shift(int ch, int *need_shift) {
     static const char *r1 = "qwertyuiop", *r2 = "asdfghjkl", *r3 = "zxcvbnm";
-    int c2 = (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch;
+    static const unsigned row1[] = { 16,17,18,19,20,21,22,23,24,25 };
+    static const unsigned row2[] = { 30,31,32,33,34,35,36,37,38 };
+    static const unsigned row3[] = { 44,45,46,47,48,49,50 };
+    /* (unshifted, shifted) sharing one keycode, US layout. */
+    static const char  *unsh = "1234567890-=[]\\;',./`";
+    static const char  *shft = "!@#$%^&*()_+{}|:\"<>?~";
+    static const unsigned pun[] = { 2,3,4,5,6,7,8,9,10,11,12,13,26,27,43,39,40,51,52,53,41 };
+    int sh = 0;
+    int c2 = ch;
+    if (ch >= 'A' && ch <= 'Z') { c2 = ch + 32; sh = 1; }
+    if (need_shift) *need_shift = sh;
     for (int i = 0; r1[i]; i++) if (r1[i] == c2) return row1[i];
     for (int i = 0; r2[i]; i++) if (r2[i] == c2) return row2[i];
     for (int i = 0; r3[i]; i++) if (r3[i] == c2) return row3[i];
-    if (c2 >= '1' && c2 <= '9') return (unsigned)(2 + (c2 - '1'));
-    if (c2 == '0')  return 11;
-    if (c2 == ' ')  return 57;
-    if (c2 == '\n') return 28;                    /* Enter */
-    if (c2 == 27)   return 1;                     /* Escape */
+    for (int i = 0; unsh[i]; i++) if (unsh[i] == c2) return pun[i];
+    for (int i = 0; shft[i]; i++)
+        if (shft[i] == c2) { if (need_shift) *need_shift = 1; return pun[i]; }
+    if (c2 == ' ')   return 57;
+    if (c2 == '\n')  return 28;                   /* Enter */
+    if (c2 == '\r')  return 28;
+    if (c2 == 27)    return 1;                    /* Escape */
+    if (c2 == '\b' || c2 == 127) return 14;       /* Backspace */
+    if (c2 == '\t')  return 15;                   /* Tab */
     return 0;
 }
 
@@ -2544,8 +2574,22 @@ void desktop_run(void) {
                      * presses treats every key as held down forever. The value
                      * is an evdev keycode, which is what the protocol carries
                      * -- not the character. (M1983) */
-                    wl_post_key(desktop_key_to_evdev(k), 1);
-                    wl_post_key(desktop_key_to_evdev(k), 0);
+                    int nsh = 0;
+                    unsigned ev = desktop_key_to_evdev_shift(k, &nsh);
+                    if (!ev) {
+                        /* AN UNMAPPED KEY MUST NOT BE SILENT (M2244). Sending
+                         * keycode 0 is indistinguishable, from the client's
+                         * side, from sending nothing -- and that is exactly
+                         * how `/` went missing without a trace. */
+                        static int moaned;
+                        if (moaned < 8) { moaned++;
+                            kprintf("[desktop] key %d has no evdev mapping -- NOT forwarded\n", k); }
+                    } else {
+                        if (nsh) wl_post_key(EV_LEFTSHIFT, 1);
+                        wl_post_key(ev, 1);
+                        wl_post_key(ev, 0);
+                        if (nsh) wl_post_key(EV_LEFTSHIFT, 0);
+                    }
                 }
             }
         }
