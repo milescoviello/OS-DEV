@@ -159,6 +159,10 @@ static void keyboard_handler(struct registers *r) {
     if (sc == 0x41) { input_push(0x1E); return; }   /* F7 -> WM: toggle window switcher */
     if (sc == 0x42) { input_push(0x1A); return; }   /* F8 -> WM: close focused window */
     if (sc == 0x43) { input_push(0x19); return; }   /* F9 -> WM: toggle Apps menu    */
+    if (sc == 0x44) { input_push(0x0B); return; }   /* F10 -- no WM action; forwarded to the focused app (M2293) */
+    if (sc == 0x57) { input_push(0x0C); return; }   /* F11 -- likewise. Both were DROPPED here entirely, so
+                                                     * fullscreen in a browser was not a key that did nothing,
+                                                     * it was a key that did not exist. */
     if (sc == 0x58) { input_push(0x1C); return; }   /* F12 -> WM: screenshot         */
     if (sc == 0x0F && shift_down) { input_push(0x9B); return; }   /* Shift+Tab -> backtab (editor: dedent) */
     if (sc < 128) {

@@ -1867,6 +1867,36 @@ static unsigned desktop_key_to_evdev_shift(int ch, int *need_shift) {
     if (c2 == 0x12) return 108;                   /* KEY_DOWN  (<DOWN> = 116) */
     if (c2 == 0x13) return 105;                   /* KEY_LEFT  (<LEFT> = 113) */
     if (c2 == 0x14) return 106;                   /* KEY_RIGHT (<RGHT> = 114) */
+    /* NAVIGATION AND FUNCTION KEYS (M2293) -- same omission as the arrows,
+     * one round later. Page Up and Page Down are how a person scrolls a web
+     * page from the keyboard, Home/End jump to the top and bottom of it, and
+     * F5/F6/F11/F12 are reload, address bar, fullscreen and developer tools.
+     * None of them had an entry here, so a Wayland client received nothing
+     * for any of them.
+     *
+     * Checked against kernel/include/xkbmap.h, the keymap this compositor
+     * actually ships, rather than assumed: an xkb keycode is the evdev code
+     * plus 8, and it declares <HOME> = 110, <PGUP> = 112, <END> = 115,
+     * <PGDN> = 117, <DELE> = 119, <FK01> = 67 ... <FK10> = 76, <FK11> = 95,
+     * <FK12> = 96. A table that disagreed with the keymap would deliver the
+     * wrong key and be nearly invisible. */
+    if (c2 == 0x01) return 102;                   /* KEY_HOME     (<HOME> = 110) */
+    if (c2 == 0x05) return 107;                   /* KEY_END      (<END>  = 115) */
+    if (c2 == 0x15) return 104;                   /* KEY_PAGEUP   (<PGUP> = 112) */
+    if (c2 == 0x16) return 109;                   /* KEY_PAGEDOWN (<PGDN> = 117) */
+    if (c2 == 0x04) return 111;                   /* KEY_DELETE   (<DELE> = 119) */
+    if (c2 == 0x1D) return 59;                    /* F1  (<FK01> = 67) */
+    if (c2 == 0x0E) return 60;                    /* F2  */
+    if (c2 == 0x18) return 61;                    /* F3  */
+    if (c2 == 0x0F) return 62;                    /* F4  */
+    if (c2 == 0x10) return 63;                    /* F5  -- reload */
+    if (c2 == 0x17) return 64;                    /* F6  -- address bar */
+    if (c2 == 0x1E) return 65;                    /* F7  */
+    if (c2 == 0x1A) return 66;                    /* F8  */
+    if (c2 == 0x19) return 67;                    /* F9  */
+    if (c2 == 0x0B) return 68;                    /* F10 (<FK10> = 76) */
+    if (c2 == 0x0C) return 87;                    /* F11 -- fullscreen (<FK11> = 95) */
+    if (c2 == 0x1C) return 88;                    /* F12 -- developer tools (<FK12> = 96) */
     return 0;
 }
 
@@ -2494,7 +2524,36 @@ void desktop_run(void) {
             if (alt_down && (k == '\t' || k == 0x9B || k == 0x0F)) continue;  /* Alt+Tab / Alt+Shift+Tab / Alt+F4 */
             if (super_down && k >= '1' && k <= '9') continue;                   /* Super+N */
             if ((super_down || (ctrl_down && alt_down)) && k >= 0x11 && k <= 0x14) continue;  /* arrows */
-            if (k == 0x1D) {                    /* F1: toggle the keyboard-shortcut help overlay */
+            /* THE FUNCTION KEYS BELONG TO THE FOCUSED APP (M2293).
+             *
+             * Every one of F1-F9 and F12 was bound to a window-manager action
+             * at a time when nothing running here wanted them, and F10/F11
+             * were not encoded by the cooked layer at all -- so in a browser,
+             * reload (F5), the address bar (F6), fullscreen (F11) and the
+             * developer tools (F12) were all unreachable, and pressing them
+             * minimized or snapped the window instead. That is not Firefox
+             * ignoring a key; it is the key never being offered.
+             *
+             * It also cost a measurement: a run that drove `f11` at Firefox
+             * and saw nothing produced exactly the null result "Firefox
+             * ignores keyboard input" would have produced. The key died two
+             * layers below Firefox.
+             *
+             * So when the focused window is a Wayland client, F1-F12 go to
+             * it, bracketed with the real modifiers by the ordinary path
+             * below. SUPER is the escape hatch: Super+F3 still minimizes,
+             * Super+F12 still screenshots, and Alt+F4 still closes because
+             * that chord is consumed in the raw pass before any of this. */
+            int fk_to_client = 0;
+            if (!super_down) switch (k) {
+            case 0x1D: case 0x0E: case 0x18: case 0x0F: case 0x10:
+            case 0x17: case 0x1E: case 0x1A: case 0x19: case 0x1C: {
+                int fi2 = focus_index();
+                if (fi2 >= 0 && windows[fi2].kind == KIND_WAYLAND) fk_to_client = 1;
+                break; }
+            default: break;
+            }
+            if (!fk_to_client && k == 0x1D) {   /* F1: toggle the keyboard-shortcut help overlay */
                 int o = help_open; close_overlays(); help_open = !o; dirty = 1;   /* one overlay at a time */
                 continue;
             }
@@ -2502,7 +2561,7 @@ void desktop_run(void) {
                 if (k == 27) { help_open = 0; dirty = 1; }
                 continue;
             }
-            if (k == 0x1E) {                    /* F7: toggle the Alt-Tab window switcher overlay */
+            if (!fk_to_client && k == 0x1E) {                    /* F7: toggle the Alt-Tab window switcher overlay */
                 int o = sw_open; close_overlays(); sw_open = !o;          /* one overlay at a time */
                 sw_alt = 0;                                               /* F7-opened: Enter commits, not Alt-release */
                 if (sw_open) sw_sel = win_count - 1;                      /* start on the focused (topmost) window */
@@ -2523,7 +2582,7 @@ void desktop_run(void) {
                 dirty = 1;
                 continue;                       /* swallow all keys while the switcher is up */
             }
-            if (k == 0x19) {                    /* F9: toggle the Apps menu (keyboard) */
+            if (!fk_to_client && k == 0x19) {                    /* F9: toggle the Apps menu (keyboard) */
                 int o = menu_open; close_overlays(); menu_open = !o; menu_sel = 0; dirty = 1;   /* one overlay at a time */
                 continue;
             }
@@ -2546,15 +2605,15 @@ void desktop_run(void) {
                 }
                 continue;                       /* swallow all keys while the menu is up */
             }
-            if (k == 0x0E) {                    /* F2: cycle focus to the next window */
+            if (!fk_to_client && k == 0x0E) {                    /* F2: cycle focus to the next window */
                 if (win_count > 1) { raise_window(0); dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1; dirty = 1; }
                 continue;
             }
-            if (k == 0x0F) {                    /* F4: maximize/restore focused window */
+            if (!fk_to_client && k == 0x0F) {                    /* F4: maximize/restore focused window */
                 if (win_count > 0) { toggle_maximize(win_count - 1); dirty = 1; }
                 continue;
             }
-            if (k == 0x18) {                    /* F3: minimize the focused window to its chip */
+            if (!fk_to_client && k == 0x18) {                    /* F3: minimize the focused window to its chip */
                 int vis = 0;                    /* never hide the LAST visible window */
                 for (int i = 0; i < win_count; i++) if (!windows[i].minimized) vis++;
                 if (vis > 1) {
@@ -2565,17 +2624,17 @@ void desktop_run(void) {
                 }
                 continue;
             }
-            if (k == 0x10 || k == 0x17) {       /* F5/F6: snap focused window left/right */
+            if (!fk_to_client && (k == 0x10 || k == 0x17)) {  /* F5/F6: snap focused window left/right */
                 if (win_count > 0) { snap_window(win_count - 1, k == 0x17); dirty = 1; }
                 continue;
             }
-            if (k == 0x1A) {                    /* F8: close the focused window */
+            if (!fk_to_client && k == 0x1A) {                    /* F8: close the focused window */
                 if (close_focused_window()) {
                     dragging = resizing = selecting = bselecting = sbdrag = bsbdrag = -1; dirty = 1;
                 }
                 continue;
             }
-            if (k == 0x1C) {                    /* F12: screenshot to SHOT0.PNG, SHOT1.PNG, ... */
+            if (!fk_to_client && k == 0x1C) {                    /* F12: screenshot to SHOT0.PNG, SHOT1.PNG, ... */
                 static int shot_n;              /* auto-incrementing so a shot never overwrites the last */
                 char name[16]; int q = 0;
                 name[q++]='S'; name[q++]='H'; name[q++]='O'; name[q++]='T';
