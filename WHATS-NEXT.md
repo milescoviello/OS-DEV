@@ -1,5 +1,79 @@
 # What's next
 
+> **(M2298-M2301) FIREFOX RESPONDS TO THE MOUSE. The compositor was
+> addressing a `wl_pointer` nobody was listening on.**
+>
+> `struct wl_client` held **one** `wl_pointer` id and **one** `wl_keyboard`
+> id per connection, overwritten by whichever `wl_seat.get_pointer` arrived
+> last. **Firefox binds `wl_seat` twice on one connection** -- GDK's registry
+> at version 5, Gecko's own `nsWaylandDisplay` registry at version 7 -- and
+> derives a pointer and keyboard from each. Every event went to Gecko's copy,
+> which has no listener, and libwayland discarded it where we could not see.
+>
+> ```
+>  -> wl_registry#2.bind(6,"wl_seat",5,#11)  -> wl_pointer#9   (has a listener)
+>  -> wl_registry#17.bind(6,"wl_seat",7,#24) -> wl_pointer#27  (none)
+>     discarded wl_pointer#27.enter(5, wl_surface#32, 1160.0, 1.0)
+>     discarded wl_pointer#27.button(6, 56750, 272, 1)
+> ```
+>
+> 42 pointer events, every one discarded; `wl_pointer#9` addressed zero
+> times. **"Firefox consumes every byte and answers nothing" was two true
+> statements about two different proxies**, which is why four days of
+> eliminating compositor hypotheses could never see it -- and why the GTK3
+> control, which binds the seat once, could never reproduce it. A seat's
+> events now go to **every** resource derived from it, with a per-resource
+> version, which is what wlroots and Mutter do.
+>
+> The instrument that cracked it: **`GDK_DEBUG=events` was a dead
+> instrument** -- `GDK_NOTE()` compiles to nothing without `G_ENABLE_DEBUG`
+> and the strings are not in the host's libgdk at all, a one-command check
+> that was never run. `WAYLAND_DEBUG` is always compiled in; `-append wlspy`
+> turns it on and Firefox answered on the first boot.
+>
+> **Measured, seen on screen, re-run independently before pushing:**
+>
+> | | before | after |
+> |---|---|---|
+> | hover (pointer motion alone) | 0 px | **354609 px bright green** |
+> | click -> `:focus` ring | 0 px | **8136 px** |
+> | scroll | - | **still broken** |
+> | typing | - | **still broken** |
+>
+> **THREE OF MY OWN TESTS COULD NOT HAVE SHOWN A POSITIVE (M2301).** This is
+> the part worth keeping. The scroll arm diffed against a frame taken with
+> the band lit green, so any later frame differed by the whole 374000-pixel
+> band and it reported `SCROLL WORKS` on a page that never moved -- I
+> reported that as working. The probe page, written to stop testing
+> unscrollable documents, laid itself out `position:absolute` and therefore
+> had no in-flow height. And the typing arm counted whole-screen pixels,
+> where five glyphs are the same order as a redrawn mouse cursor. All four
+> arms now assert their own preconditions, find their targets by colour, and
+> print a warning when an arm cannot fail.
+>
+> **The wheel was never a wheel.** We sent a bare `wl_pointer.axis` with no
+> `axis_source`, `axis_discrete` or `axis_stop`, which a toolkit reads as a
+> smooth trackpad scroll in pixels -- GTK divides by 10, so ten units per
+> notch became **1.0 pixel per notch**. Fixed as a per-resource group,
+> because everything but `axis` is version 5 and the two binds sit at 5 and
+> 7. **It did not fix scrolling**, and saying so is the point.
+>
+> **Where the two remaining failures are.** libwayland's trace shows
+> `wl_pointer#9.axis` x12 and `wl_keyboard#16.key` x13 **dispatched** to the
+> proxies GDK listens on. Delivery is correct end to end; GDK receives all
+> four event kinds; Gecko acts on motion and button and ignores axis and key.
+> Gecko's own log confirms it is not filtering: `OnKeyEvent(), succeeded,
+> filterThisEvent=false`, and a caret advances one offset per keystroke while
+> the field on screen still shows its placeholder. Both remaining failures
+> are above our layer.
+>
+> **A bookkeeping note, recorded rather than tidied away:** commit
+> `0d708818` carries the M2300 message but also contains all of M2301's
+> changes -- a `git add -A` in the M2300 step had already staged them. The
+> M2301 content commit came out empty and only its badge landed. The code is
+> all present and pushed; the commit message simply under-describes its
+> contents, and this block is the record of what is actually in there.
+
 > **(M2298) THE FIREFOX INPUT BUG IS OURS, AND IT IS ONE WORD WIDE:
 > `uint32_t pointer` SHOULD HAVE BEEN AN ARRAY.**
 >
