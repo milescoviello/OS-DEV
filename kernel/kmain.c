@@ -296,6 +296,7 @@ static void ext2_cache_drop_hook(void *ctx, uint64_t lba, uint32_t n) {
 static int ext2_raw_read_hook(void *ctx, uint64_t lba, uint32_t n, void *buf) {
     return blockdev_read_raw((int)(intptr_t)ctx, lba, n, buf);
 }
+static volatile int g_ffe10s;                 /* -append ffe10s: do NOT force E10S off (M2252) */
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
@@ -892,6 +893,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         }
         if (cmdline_has(cl, "ffurl")) g_ffurl = 1;
         if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */
+        if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;   /* leave content processes ENABLED (M2252) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
@@ -2199,7 +2201,22 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * remaining work is child-process startup. If it still does
                      * not, the renderer itself is blocked on something and the
                      * child processes were never the reason. */
-                    app_set_next_env("MOZ_FORCE_DISABLE_E10S=1");
+                    /* E10S OFF IS NOT HOW FIREFOX IS NORMALLY RUN (M2252).
+                     *
+                     * MOZ_FORCE_DISABLE_E10S puts content in the PARENT
+                     * process, which was the right call while the question was
+                     * whether child processes could start at all. It is also a
+                     * configuration Mozilla barely ships, and Gecko routes
+                     * input differently when the content lives in the parent
+                     * -- so an input path that works for every normal Firefox
+                     * user might simply not be the one we are exercising.
+                     *
+                     * zenity (M2250) proves the compositor delivers clicks to
+                     * a GTK client, so the remaining difference is inside
+                     * Gecko; this is the largest non-default thing we do to
+                     * it. `-append ffe10s` leaves E10S alone so both arms can
+                     * be measured instead of argued about. */
+                    if (!g_ffe10s) app_set_next_env("MOZ_FORCE_DISABLE_E10S=1");
                     app_set_next_env("MOZ_DISABLE_CONTENT_SANDBOX=1");
                     /* Snapshot the unaligned-madvise count HERE so the
                      * heartbeat can report Firefox's OWN calls as a delta
