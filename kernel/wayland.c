@@ -2245,6 +2245,8 @@ void wl_fs_health_line(void) {
         extern unsigned long g_e2_sb_retried, g_e2_sb_retry_ok, g_e2_holes;
         extern unsigned long g_e2_bad_itable, g_e2_bad_ptrs, g_e2_distrust;
         extern unsigned long g_e2_itable_reread, g_e2_itable_differed, g_e2_itable_secondgood;
+        extern uint64_t g_e2_itable_lba;
+        extern unsigned char g_e2_itable_saw[8];
         extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
         extern unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;
         extern unsigned long g_memfd_remapped, g_memfd_unretired;
@@ -2258,7 +2260,8 @@ void wl_fs_health_line(void) {
         extern uint64_t ata_dma_short_count(void);
         uint64_t atretr = 0, atfail = 0; ata_error_counts(&atretr, &atfail);
         kprintf("[fs] superblock: %lu readfail %lu BADMAGIC %lu badfield, %lu retried %lu "
-                "RETRY-OK | %lu itable (re-read %lu: %lu DIFFERED, %lu then VALID) %lu badptr "
+                "RETRY-OK | %lu itable (re-read %lu: %lu DIFFERED, %lu then VALID; last from LBA %lu, "
+                "bytes %02x %02x %02x %02x %02x %02x %02x %02x) %lu badptr "
                 "%lu hole(s) | distrust %lu | refused: "
                 "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED | "
                 "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired | "
@@ -2268,7 +2271,10 @@ void wl_fs_health_line(void) {
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
-                g_e2_itable_secondgood, g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
+                g_e2_itable_secondgood, (unsigned long)g_e2_itable_lba,
+                g_e2_itable_saw[0], g_e2_itable_saw[1], g_e2_itable_saw[2], g_e2_itable_saw[3],
+                g_e2_itable_saw[4], g_e2_itable_saw[5], g_e2_itable_saw[6], g_e2_itable_saw[7],
+                g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
                 g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust,
                 g_fill_cachedrop, g_fill_cachedrop_ok,
                 (unsigned long)atretr, (unsigned long)atfail,

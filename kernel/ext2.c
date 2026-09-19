@@ -73,6 +73,8 @@ unsigned long g_e2_bad_itable, g_e2_bad_groups;
  * means the storage path handed back bytes that were not the sector asked for;
  * agreement means the block number itself was wrong. */
 unsigned long g_e2_itable_reread, g_e2_itable_differed, g_e2_itable_secondgood;
+uint64_t      g_e2_itable_lba;        /* the absolute LBA the rejected descriptor came from (M2234) */
+unsigned char g_e2_itable_saw[8];     /* and the first eight bytes of it */
 unsigned int  g_e2_bad_itable_2nd;
 /* EVERY REASON THIS VOLUME COULD NOT BE BELIEVED, IN ONE COUNTER (M2213).
  *
@@ -294,6 +296,24 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
                                                 + gdbyte / SECSZ, 1);
             int rr = rdsec(v, gdblk, gdbyte / SECSZ, again);
             if (rr >= 0) second = e_rd32(again + (gdbyte % SECSZ) + 8);
+            /* AND WHAT THE SECTOR ACTUALLY CONTAINED (M2234).
+             *
+             * The host says build/ext2.img is exactly what this code expects:
+             * block_size 4096, gdt_block 1 at LBA 8, and the descriptors there
+             * are valid (inode_table[0] = 4, [1] = 32772, against 819200
+             * blocks). The kernel asks for the right sector, on a disk holding
+             * the right bytes, and gets values like 1986357347 and 1848538223
+             * back -- which decode to ASCII ("csfv", "on.n"), so it is reading
+             * FILE DATA.
+             *
+             * Which sector, and what was in it, are the two facts that have
+             * been missing all along. Record the absolute LBA asked for and
+             * the first eight bytes returned; text tells us it is a data
+             * block, and the LBA tells us whether the request or the answer
+             * went astray. */
+            g_e2_itable_lba = v->start + (uint64_t)gdblk * (v->block_size / SECSZ)
+                              + gdbyte / SECSZ;
+            for (int q = 0; q < 8; q++) g_e2_itable_saw[q] = sec[(gdbyte % SECSZ) + q];
             g_e2_itable_reread++;
             if (rr >= 0 && second != inode_table) g_e2_itable_differed++;
             if (rr >= 0 && second && (!v->blocks_count || second < v->blocks_count))
