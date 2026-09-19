@@ -591,6 +591,14 @@ int wl_client_pid(int ci) {
     return unix_peer_pid(g_cl[ci].ep);
 }
 
+static int wl_client_has_shell(int ci) {
+    if (!wl_client_used(ci)) return 0;
+    struct wl_client *c = &g_cl[ci];
+    for (int j = 0; j < c->nobj; j++)
+        if (c->obj[j].id && c->obj[j].kind == WLK_XDG_WM_BASE) return 1;
+    return 0;
+}
+
 int wl_client_window_ready(int ci) {
     if (!wl_client_used(ci)) return 0;
     struct wl_client *c = &g_cl[ci];
@@ -601,7 +609,33 @@ int wl_client_window_ready(int ci) {
         if (o->kind == WLK_XDG_WM_BASE) has_shell = 1;
         if (o->kind == WLK_SURFACE && o->role == WLR_TOPLEVEL) return 1;
     }
-    return !has_shell;
+    if (has_shell) return 0;
+    /* THE SHELL-LESS FALLBACK WAS PER-CLIENT, AND THAT IS WHY NOTHING COULD BE
+     * CLICKED (M2243).
+     *
+     * `return !has_shell` admits any client that never bound xdg_wm_base. It
+     * exists for tools/lx/lxwl, our own raw test client, which binds no shell
+     * and is what this compositor was first proven against. But FIREFOX'S
+     * CONTENT PROCESSES EACH CONNECT AS THEIR OWN CLIENT -- five of them in a
+     * normal boot -- and they create surfaces without ever binding a shell.
+     * So each one passed this test and got its own desktop window, opened
+     * cascaded ON TOP of the browser and painted black.
+     *
+     * desktop.c delivers every key and every click to windows[win_count - 1],
+     * the topmost window. So input was never lost: it was being handed,
+     * correctly and precisely, to an empty surface sitting over the page. From
+     * the outside that is indistinguishable from a frozen desktop, and it is
+     * what "i cant click or scroll or anything / or type" was.
+     *
+     * The rule a compositor actually wants is global, not per-client: a
+     * surface with no role is not a window, and the fallback is only
+     * defensible when NOTHING on this display speaks xdg_shell. That keeps
+     * lxwl working when it runs alone -- the case the fallback was written for
+     * -- and excludes every roleless surface the moment a real toolkit is
+     * present. */
+    for (int k = 0; k < WL_MAXCLIENT; k++)
+        if (k != ci && wl_client_has_shell(k)) return 0;
+    return 1;
 }
 
 const char *wl_client_title_of(int ci) {
@@ -2257,6 +2291,9 @@ void wl_fs_health_line(void) {
         extern unsigned long g_bd_wr_refused; extern uint64_t g_bd_wr_ref_lba;
         extern unsigned long g_e2_gd_badread, g_e2_gd_reread_ok, g_e2_gd_writeref;
         extern unsigned long g_e2_gd_pio_good, g_e2_gd_pio_same, g_e2_gd_pio_fail;
+        extern unsigned long g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short;
+        extern unsigned long g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts;
+        extern int g_tab_lastx, g_tab_lasty, g_tab_lastbtn;
         extern uint64_t g_bd_fail_cap4, g_bd_fail_lba4;
         /* Declared here rather than in ata.h, the same way app.c's fault
          * report reaches them: they are diagnostics, not driver API. */
@@ -2274,7 +2311,9 @@ void wl_fs_health_line(void) {
                 "last bad index %d against g_ndev %d) | blockdev_init x%lu, %lu re-reg skipped | "
                 "writes: %lu total, %lu BELOW LBA 32, %lu REFUSED out-of-range (last lba %lu) | "
                 "gdt: %lu bad on read, %lu fixed by re-read, %lu REFUSED at write; "
-                "PIO says: %lu DISK-WAS-FINE (recovered), %lu disk really bad, %lu read failed\n",
+                "PIO says: %lu DISK-WAS-FINE (recovered), %lu disk really bad, %lu read failed | "
+                "tablet: %lu polls, %lu reports, %lu err, %lu short, last %d,%d btn %d | "
+                "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
@@ -2293,7 +2332,10 @@ void wl_fs_health_line(void) {
                 g_bd_badidx, g_bd_badndev, g_bd_init_calls, g_bd_reg_skipped,
                 g_bd_wr_total, g_bd_wtrip_n, g_bd_wr_refused, (unsigned long)g_bd_wr_ref_lba,
                 g_e2_gd_badread, g_e2_gd_reread_ok, g_e2_gd_writeref,
-                g_e2_gd_pio_good, g_e2_gd_pio_same, g_e2_gd_pio_fail); }
+                g_e2_gd_pio_good, g_e2_gd_pio_same, g_e2_gd_pio_fail,
+                g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short,
+                g_tab_lastx, g_tab_lasty, g_tab_lastbtn,
+                g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts); }
 }
 
 int wl_page_probe(uint32_t want) {

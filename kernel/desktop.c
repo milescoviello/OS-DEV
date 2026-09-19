@@ -1723,6 +1723,7 @@ static int ctx_desktop_action(int row) {
 
 /* Give a freshly-spawned app a window (called by the WM as it drains the
  * spawn queue, so apps launched from anywhere get a window here). */
+static int wl_window_open;   /* a Wayland client has a desktop window (declared here: make_app_window needs it, M2243) */
 static void make_app_window(app_t *a) {
     if (win_count >= MAX_WINDOWS) return;
     /* A PROGRAM RUNNING INSIDE SOMEONE ELSE'S WINDOW DOES NOT GET ITS OWN
@@ -1761,6 +1762,28 @@ static void make_app_window(app_t *a) {
     if (y < m / 2) y = m / 2;
     windows[win_count++] = (window_t){ x, y, aw, ah,
         THEME_PANEL, app_title(a), KIND_APP, a, 0,0,0,0,0,0,0, 0,{0},0, 0, {0} };  /* maximized,sx,sy,sw,sh,fsel,fconfirm, editing,editbuf,editlen, minimized */
+    /* A GRAPHICAL APP'S HELPER PROCESSES DO NOT GET THE SCREEN (M2243).
+     *
+     * Firefox spawns several children, and each one the desktop sees gets a
+     * terminal window for its stdout, opened cascaded ON TOP of the browser
+     * and painted black. Input goes to the topmost visible window, so the
+     * browser became unreachable: "i cant click or scroll or anything".
+     *
+     * wl_hide_console_for_clients() handles the children that connect to the
+     * compositor themselves, by pid. It cannot handle the ones that never
+     * connect -- and those are exactly the ones left covering the page.
+     *
+     * So once a Wayland client owns a window, a newly spawned program's
+     * console opens MINIMIZED. Its output is still captured, its window is
+     * still in the taskbar one click away, and the graphical application that
+     * owns the display keeps it. Before any Wayland window exists this changes
+     * nothing, which is the ordinary desktop case (the Shell still opens
+     * normally at boot, long before a browser). */
+    if (wl_window_open) {
+        windows[win_count - 1].minimized = 1;
+        kprintf("[desktop] '%s' (pid %d) opens MINIMIZED: a Wayland client owns the display\n",
+                app_title(a) ? app_title(a) : "?", app_pid_of(a));
+    }
 }
 
 /* Open a window for a Wayland client's surface (M1980).
@@ -1791,7 +1814,6 @@ static unsigned desktop_key_to_evdev(int ch) {
     return 0;
 }
 
-static int wl_window_open;
 /* A PROCESS THAT DRAWS ITS OWN WINDOW DOES NOT NEED A TERMINAL ON TOP OF IT
  * (M2202).
  *
@@ -1808,23 +1830,47 @@ static int wl_window_open;
  * entry stays, the output is still there, and one click brings it back -- and
  * do it ONCE per pid, so a person who restores it keeps it. */
 static int wlpid_seen[16], nwlpid_seen;
+/* The topmost window the user can actually see -- the one that owns input.
+ * -1 when every window is minimized (or there are none), which is the only
+ * case where a keystroke legitimately has nowhere to go. (M2243) */
+static int focus_index(void) {
+    for (int i = win_count - 1; i >= 0; i--)
+        if (!windows[i].minimized) return i;
+    return -1;
+}
 static void wl_hide_console_for_clients(void) {
     for (int ci = 0; ci < wl_client_count(); ci++) {
         if (!wl_client_used(ci)) continue;
         int pid = wl_client_pid(ci);
         if (pid <= 0) continue;
+        /* SCAN EVERY TIME, NOT ONCE PER PID (M2243).
+         *
+         * This used to `continue` as soon as the pid was already known, so the
+         * window scan below ran exactly once per process -- on the iteration
+         * that first saw the Wayland connection. A process that connects to
+         * the compositor BEFORE the desktop gets round to opening a terminal
+         * window for its stdout therefore keeps that window forever: the pid
+         * was already "known" by the time the window existed.
+         *
+         * That is the ordinary case for Firefox's children, and it is what the
+         * user was looking at -- a black window titled
+         * `/disk2/usr/lib64/firefo` sitting on top of the page. Input goes to
+         * the topmost window, so every click and keystroke went into it.
+         *
+         * The latch now only suppresses the repeated LOG LINE; the scan itself
+         * is unconditional and costs one pass over at most MAX_WINDOWS. */
         int known = 0;
         for (int i = 0; i < nwlpid_seen; i++) if (wlpid_seen[i] == pid) { known = 1; break; }
-        if (known) continue;
-        if (nwlpid_seen < (int)(sizeof wlpid_seen / sizeof wlpid_seen[0]))
+        if (!known && nwlpid_seen < (int)(sizeof wlpid_seen / sizeof wlpid_seen[0]))
             wlpid_seen[nwlpid_seen++] = pid;
         for (int i = 0; i < win_count; i++) {
             if (windows[i].kind != KIND_APP || !windows[i].app) continue;
             if (app_pid_of((app_t *)windows[i].app) != pid) continue;
             if (windows[i].minimized) continue;
             windows[i].minimized = 1;
-            kprintf("[desktop] pid %d is a Wayland client, so its terminal window is "
-                    "minimized -- it draws its own\n", pid);
+            if (!known)
+                kprintf("[desktop] pid %d is a Wayland client, so its terminal window is "
+                        "minimized -- it draws its own\n", pid);
         }
     }
 }
@@ -2103,6 +2149,31 @@ static int in_rect(int px, int py, int x, int y, int w, int h) {
 }
 
 void desktop_run(void) {
+    /* THE WINDOW MANAGER MUST NOT BE SCHEDULED LIKE A BATCH JOB (M2243).
+     *
+     * This loop IS the user interface: it polls the tablet, drains the
+     * keyboard, hit-tests windows and forwards pointer and key events to
+     * Wayland clients. Every one of those happens once per iteration.
+     *
+     * Measured with Firefox up on one core: `tablet: 9 polls, 0 reports`.
+     * NINE iterations of this loop in a whole run -- roughly 0.15 Hz. Input
+     * was not broken, it was being SAMPLED once every several seconds, which
+     * from the outside is a desktop that ignores the mouse entirely. That is
+     * what "i cant click or scroll or anything / or type" was measuring.
+     *
+     * The cause is ordinary CFS fairness: Firefox runs dozens of threads, all
+     * SCHED_OTHER at nice 0, and the window manager is one more runnable task
+     * among them. Fair shares are exactly wrong here -- the WM needs LATENCY,
+     * not throughput.
+     *
+     * nice -20 rather than SCHED_FIFO/RR deliberately. The loop ends in
+     * idle_hlt(), so it sleeps whenever there is nothing to do and cannot
+     * monopolise anything; what the weight buys is being picked PROMPTLY on
+     * wake, because a task that has consumed almost no CPU has the smallest
+     * vruntime. A real-time class would give the same latency and would also
+     * let any future spin in this loop lock the machine out. */
+    task_set_nice(-20);
+
     /* The framebuffer is ours from here. Kernel log lines drawn into it scroll
      * the whole desktop up a row at a time -- see console_gfx_release. (M2011) */
     console_gfx_release();
@@ -2454,10 +2525,16 @@ void desktop_run(void) {
                 if (fb_save_png(name) == 0) { beep(1800, 30); if (shot_n < 999) shot_n++; }   /* PNG: ~9 KB vs ~576 KB BMP */
                 continue;
             }
-            if (win_count > 0) {                          /* with NO windows there's no focus target -> swallow the key; else windows[win_count-1] is windows[-1] = BSS garbage -> a wild app_key() call (mirrors the F-key guards above) */
-                window_t *top = &windows[win_count - 1];
-                if (top->minimized) { /* no visible focused window: swallow the key */ }
-                else if (top->kind == KIND_APP && top->app) { app_sel_clear((app_t *)top->app); app_key((app_t *)top->app, (char)k); dirty = 1; }
+            /* THE TOPMOST WINDOW MAY BE MINIMIZED, AND THEN THE KEY WAS
+             * SWALLOWED (M2243). Minimizing a window does not remove it from
+             * `windows[]`, so windows[win_count-1] can be a hidden console --
+             * and this used to answer "no visible focused window" and drop the
+             * keystroke, with a perfectly good browser visible underneath it.
+             * Focus belongs to the topmost window the user can actually SEE. */
+            int fi = focus_index();
+            if (fi >= 0) {
+                window_t *top = &windows[fi];
+                if (top->kind == KIND_APP && top->app) { app_sel_clear((app_t *)top->app); app_key((app_t *)top->app, (char)k); dirty = 1; }
                 else if (top->kind == KIND_BROWSER && top->app) { browser_key((browser_t *)top->app, k); dirty = 1; }
                 else if (top->kind == KIND_FILES) { files_key(top, k); dirty = 1; }
                 else if (top->kind == KIND_WAYLAND) {
@@ -2480,8 +2557,9 @@ void desktop_run(void) {
          * undoing the integer upscale) + buttons, plus relative motion for
          * mouselook, so apps (and games like DOOM) can use the mouse */
         int rdx, rdy; mouse_read_rel(&rdx, &rdy);   /* always drain so it can't pile up */
-        if (win_count > 0) {
-            window_t *fw = &windows[win_count - 1];
+        int fmi = focus_index();
+        if (fmi >= 0) {
+            window_t *fw = &windows[fmi];
             uint32_t *cb; int gw, gh;
             if (!fw->minimized && fw->kind == KIND_APP && fw->app &&
                 app_gfx_get((app_t *)fw->app, &cb, &gw, &gh)) {

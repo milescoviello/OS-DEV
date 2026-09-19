@@ -543,20 +543,46 @@ int usb_tablet_init(void) {
     return 0;
 }
 
+/* IS THE TABLET ACTUALLY DELIVERING? (M2243)
+ *
+ * "tablet ready: ep1 maxp=8 (absolute pointer)" says the ENUMERATION worked.
+ * It says nothing about whether a single report has ever arrived, and with the
+ * cursor not moving those are the two cases that need separating: a schedule
+ * that never completes a TD, versus reports that arrive and are decoded wrong.
+ * Same rule as everywhere else in this tree -- verify DELIVERY, not
+ * programming. */
+unsigned long g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short;
+int g_tab_lastx, g_tab_lasty, g_tab_lastbtn;
+/* ...and if it is not delivering, WHY: the TD's own status word plus whether
+ * the controller's frame counter is advancing at all. A stuck FRNUM means the
+ * schedule is not running; an ACTIVE TD with a moving FRNUM means the device
+ * is NAKing, which for an interrupt endpoint means "no data". (M2243) */
+unsigned long g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts;
+
 void usb_tablet_poll(void) {
     if (!ready)
         return;
+    g_tab_polls++;
+    g_tab_cs    = int_td->cs;
+    g_tab_elem  = qh_int->element;
+    g_tab_frnum = rd(REG_FRNUM);
+    g_tab_cmd   = rd(REG_CMD);
+    g_tab_sts   = rd(REG_STS);
     if (int_td->cs & TD_ACTIVE)
         return;                              /* no new report yet */
 
     int actlen = (int)((int_td->cs & 0x7FF) + 1) & 0x7FF;  /* 0x7FF -> 0 */
+    if (int_td->cs & TD_ERRMASK) g_tab_errs++;
+    else if (actlen < 5)         g_tab_short++;
     if ((int_td->cs & TD_ERRMASK) == 0 && actlen >= 5) {
+        g_tab_reports++;
         /* QEMU tablet report: [buttons][x_lo][x_hi][y_lo][y_hi][wheel] */
         int buttons = report_buf[0] & 0x07;
         int rx = report_buf[1] | (report_buf[2] << 8);
         int ry = report_buf[3] | (report_buf[4] << 8);
         int x = rx * (fb_width() - 1) / 32767;
         int y = ry * (fb_height() - 1) / 32767;
+        g_tab_lastx = x; g_tab_lasty = y; g_tab_lastbtn = buttons;
         mouse_set_abs(x, y, buttons);
         if (actlen >= 6 && report_buf[5])         /* 6th byte: signed wheel delta (+up / -down) */
             mouse_add_wheel((int)(int8_t)report_buf[5]);
