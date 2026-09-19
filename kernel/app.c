@@ -7420,12 +7420,36 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
         if (saved && live != saved) {
             g_fsbase_wrong++;
             if (g_fsbase_wrong <= 8) {
+                /* NAME THE WRITER (M2294). M2089 recorded which tid last wrote
+                 * this core's FS_BASE and the global ordinal of that write,
+                 * precisely so this report could say who zeroed it -- and then
+                 * the report never printed either field, so five milestones of
+                 * "the write of that zero is still unfound" were spent looking
+                 * at an answer the kernel already had. An instrument that is
+                 * recorded and not read is not an instrument.
+                 *
+                 * Read it like this: `stamp` is the fs_seq at which THIS
+                 * thread's base was last installed. If it equals this core's
+                 * last write then nothing has run here since we were switched
+                 * in -- so the MSR was zeroed by something that is not
+                 * load_fs_base, and the three `mov fs, ax` stubs are the only
+                 * candidates. If it is older, an ordinary task ran here after
+                 * us and we were resumed without our base being restored,
+                 * which is a scheduler path missing its tail. */
+                int wtid = -1; uint64_t wseq = 0, nowseq = 0, stamp = 0; int scored = -1;
+                task_fs_base_last(&wtid, &wseq, &nowseq);
+                task_fs_base_stamp(&stamp, &scored);
                 kprintf("[fault] ** FS_BASE IS WRONG, not merely zero: tid %d has saved base %p "
                         "and the live MSR says %p (core %d last loaded %p). Every TLS access this "
                         "thread makes reads ANOTHER thread's variables, so the pointers it "
-                        "computes belong to someone else. CR2 %lx err %lx. **\n",
+                        "computes belong to someone else. CR2 %lx err %lx. "
+                        "This core's last FS write was by tid %d at fs_seq %lu; my base was last "
+                        "installed at fs_seq %lu on core %d; %lu FS write(s) have happened "
+                        "anywhere since then. **\n",
                         task_current_id(), (void *)saved, (void *)live, core, (void *)cached,
-                        (unsigned long)cr2, (unsigned long)err);
+                        (unsigned long)cr2, (unsigned long)err,
+                        wtid, (unsigned long)wseq, (unsigned long)stamp, scored,
+                        (unsigned long)(nowseq - stamp));
             }
             task_set_fs_base(saved);           /* re-assert, and re-sync the per-core shadow */
             return 1;                          /* retry: the access may have been through %fs */

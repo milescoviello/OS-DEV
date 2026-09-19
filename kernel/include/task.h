@@ -78,6 +78,13 @@ typedef struct task {
     struct registers *uframe;  /* most recent ring-3 trap frame (for /proc/<pid>/regs); valid while stopped (M1119) */
     struct registers *start_frame;  /* a thread's initial ring-3 frame: iret'd to once at startup, then freed (M1138) */
     uint64_t      fs_base;     /* per-thread %fs base for TLS; 0 = unused (restored on switch, M1140) */
+    /* WHEN THIS THREAD'S BASE WAS LAST ACTUALLY LOADED, and on which core
+     * (M2294). The per-core `fs_last_*` says who wrote the MSR last; this
+     * says when WE were last written. Together they decide the only question
+     * that matters when the two disagree: did somebody overwrite our base
+     * after we were switched in, or were we never loaded at all? */
+    uint64_t      fs_stamp;
+    int           fs_core;
     uint64_t      robust;      /* userspace robust_t* (held robust locks); walked on exit (M1141) */
     uint64_t      clear_child_tid;  /* set_tid_address: zeroed + FUTEX_WAKE'd on exit (pthread_join) (M1226) */
     /* PER-THREAD SIGNAL STATE (M2075).
@@ -192,6 +199,7 @@ const char *task_name_of(task_t *t);       /* ...and read it back; "" if the thr
 uint64_t task_fs_base_live_value(void);                                  /* the CPU's real FS base, read straight from the MSR (M2013) */
 void    task_fs_base_live(uint64_t *live, uint64_t *cached, int *core);  /* the CPU's real FS base vs what we think we loaded (M2013) */
 void    task_fs_base_last(int *tid, uint64_t *seq, uint64_t *now);       /* WHO last wrote this core's FS_BASE, and when (M2089) */
+void    task_fs_base_stamp(uint64_t *seq, int *core);                   /* when THIS thread's base was last loaded, and where (M2294) */
 uint64_t task_nswitch_of(task_t *t);                                     /* has this task ever been switched in? (M2089) */
 void    task_kernel_enter(void);   /* a syscall began: a stop aimed here must wait (M2093) */
 void    task_kernel_leave(void);   /* ...and is honoured here, where no lock is held. May not return. */

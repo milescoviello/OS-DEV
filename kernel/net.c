@@ -225,6 +225,32 @@ void net_rx_service(void) {
 static void park_put(const uint8_t *f, int len);   /* the TCP park ring, defined with the TCP demux below */
 static void udpq_put(const uint8_t *f, int len);   /* the UDP datagram queue */
 static uint64_t g_udpq_foreign;   /* datagrams addressed to some other host, dropped rather than queued (M2124) */
+/* WHERE THE DATAGRAMS WENT (M2294). The `[udpq] FILED:` line is capped at ten
+ * so it cannot flood a boot log, which means that by the time a waiter is
+ * missing its reply the log has nothing to say about the port it is waiting
+ * on. A reply that arrived and was filed for the wrong port, one that was
+ * evicted, and one that never came are three different bugs that looked
+ * identical. This ring is small, uncapped, and printed in the miss report. */
+static uint64_t g_udpq_evicted; static uint16_t g_udpq_evict_port;
+#define UDPQ_RECENT 12
+static uint16_t g_udpq_recent[UDPQ_RECENT]; static unsigned g_udpq_recent_n;
+static const char *udpq_recent_str(void) {
+    static char b[96];
+    int p = 0;
+    unsigned n = g_udpq_recent_n < UDPQ_RECENT ? g_udpq_recent_n : UDPQ_RECENT;
+    for (unsigned i = 0; i < n && p < (int)sizeof b - 8; i++) {
+        unsigned idx = (g_udpq_recent_n - n + i) % UDPQ_RECENT;
+        unsigned v = g_udpq_recent[idx];
+        char t[8]; int q = 0;
+        if (!v) t[q++] = '0';
+        while (v) { t[q++] = (char)('0' + v % 10); v /= 10; }
+        while (q) b[p++] = t[--q];
+        b[p++] = ' ';
+    }
+    if (!p) { b[p++] = '('; b[p++] = 'n'; b[p++] = 'o'; b[p++] = 'n'; b[p++] = 'e'; b[p++] = ')'; }
+    b[p] = 0;
+    return b;
+}
 static uint64_t g_udp_tx_fail;    /* datagrams nic_send refused, which used to be reported as SENT (M2125) */
 uint64_t net_udp_foreign(void) { return g_udpq_foreign; }
 /* 16 -> 48 (M2022): same reasoning as PARK_N. This ring holds the protocols
@@ -1055,6 +1081,16 @@ static void udpq_put(const uint8_t *f, int len) {
     if (slot < 0) {                                /* full: evict the oldest */
         uint64_t oldest = ~0ull; slot = 0;
         for (int i = 0; i < UDPQ_N; i++) if (g_udpq[i].at < oldest) { oldest = g_udpq[i].at; slot = i; }
+        /* AND SAY SO (M2294). Eviction is how a DNS reply that arrived gets
+         * destroyed before its waiter looks, and it happened silently: there
+         * was no counter, so a run could not distinguish "the reply never
+         * came" from "the reply came and we threw it away". Those need
+         * opposite fixes. */
+        g_udpq_evicted++; g_udpq_evict_port = g_udpq[slot].dport;
+        if (g_udpq_evicted <= 8)
+            kprintf("[udpq] EVICTED a %d-byte datagram for port %u to make room -- the queue "
+                    "holds %d and they were all younger than the TTL\n",
+                    g_udpq[slot].len, g_udpq[slot].dport, UDPQ_N);
     }
     for (int i = 0; i < plen; i++) g_udpq[slot].buf[i] = udp[8 + i];
     /* len == 0 is this table's "slot free" marker, so a zero-length datagram
@@ -1070,6 +1106,8 @@ static void udpq_put(const uint8_t *f, int len) {
      * is filed but never matched, and one that never arrives, look identical
      * from the waiter's side. DHCP's port 67/68 traffic is excluded because it
      * is the only broadcast this stack keeps and it would drown the rest. */
+    g_udpq_recent[g_udpq_recent_n % UDPQ_RECENT] = g_udpq[slot].dport;
+    g_udpq_recent_n++;
     if (g_udpq[slot].dport >= 1024) {
         static int told;
         if (told < 10) { told++;
@@ -1183,13 +1221,15 @@ int net_udp_readable(uint16_t sport) {
             kprintf("[udpq] 300 misses on port %u, and in that window: %lu frame(s) came off the "
                     "card, this pump took %lu of them, %lu were addressed to another host; "
                     "%lu went to SOME OTHER consumer; %lu tx failed; %lu ARP request(s) for us "
-                    "answered since boot; frames TAKEN %lu vs demux-FILED %lu (a gap is a "
-                    "consumer destroying somebody else's datagram)\n",
+                    "answered since boot; frames TAKEN %lu, of which %lu were UDP filed for a "
+                    "port; UDP queue: %lu datagram(s) EVICTED to make room (last for port %u), "
+                    "recently filed for ports %s\n",
                     sport, (unsigned long)rx, (unsigned long)pf,
                     (unsigned long)(g_udpq_foreign - fo0),
                     (unsigned long)(rx > pf ? rx - pf : 0),
+                    (unsigned long)g_udp_tx_fail, (unsigned long)g_arp_answered,
                     (unsigned long)g_rx_taken, (unsigned long)g_rx_filed,
-                    (unsigned long)g_udp_tx_fail, (unsigned long)g_arp_answered);
+                    (unsigned long)g_udpq_evicted, g_udpq_evict_port, udpq_recent_str());
         }
     }
     return 0;

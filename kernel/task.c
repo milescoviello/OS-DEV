@@ -304,6 +304,14 @@ static void load_fs_base(uint64_t b) {
     loaded_fs_base[c] = b;
     fs_last_tid[c] = current ? current->id : -1;
     fs_last_seq[c] = __atomic_add_fetch(&fs_seq, 1, __ATOMIC_RELAXED);
+    /* AND STAMP THE THREAD ITSELF (M2294). Both switch sites set `current`
+     * to the incoming task before running this tail, so `current` here is
+     * the thread whose base was just installed. Recording it on the task is
+     * what lets a fault say "nothing has written this core's FS_BASE since I
+     * was switched in" -- which would mean the MSR was zeroed by something
+     * that is not load_fs_base at all -- as distinct from "another task ran
+     * here after me", which is an ordinary switch this code failed to undo. */
+    if (current) { current->fs_stamp = fs_last_seq[c]; current->fs_core = c; }
 }
 /* The tid that last wrote this core's FS_BASE, and the global ordinal of that
  * write -- so the report can say whether anything at all has happened on this
@@ -313,6 +321,10 @@ void task_fs_base_last(int *tid, uint64_t *seq, uint64_t *now) {
     if (tid) *tid = fs_last_tid[c];
     if (seq) *seq = fs_last_seq[c];
     if (now) *now = __atomic_load_n(&fs_seq, __ATOMIC_RELAXED);
+}
+void task_fs_base_stamp(uint64_t *seq, int *core) {
+    if (seq)  *seq  = current ? current->fs_stamp : 0;
+    if (core) *core = current ? current->fs_core : -1;
 }
 /* Set the CURRENT thread's TLS base (live + saved for restore). M1140. */
 void task_set_fs_base(uint64_t b) { current->fs_base = b; load_fs_base(b); }

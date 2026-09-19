@@ -42,6 +42,10 @@ esac
 # log costs about 26 s of time-to-page ([[instrument-caused-the-failure]]).
 #   MOZLOG=1 tools/ffinput.sh
 if [ "${MOZLOG:-0}" = 1 ]; then AP="$AP ffnavlog"; fi
+# Anything else worth appending for one experiment, e.g. EXTRA=ffalone to make
+# Firefox the only Wayland client so focus cannot be ambiguous.
+[ -n "${EXTRA:-}" ] && AP="$AP $EXTRA"
+true
 
 # WAIT FOR THE FILE TO STOP GROWING. `qm monitor screendump` returns before
 # QEMU has finished writing, and the first run copied a 1280x960 header with
@@ -101,10 +105,18 @@ echo "==> booting ($AP, $CORES cores, cap ${CAP}s) in the background"
 WAIT=full NOBUILD=${NOBUILD:-1} APPEND="$AP" CORES=$CORES CAP=$CAP tools/pve-run.sh >"$S/ffin/run.txt" 2>&1 &
 RUN=$!
 
-echo "==> waiting for the browser window"
+# WAIT FOR A FRESH LOG, NOT JUST FOR THE MARKER. pve-run.sh spends about
+# forty seconds stopping the VM, syncing 3.2 GB and starting it again -- and
+# for all of that time $D/boot.log still holds the PREVIOUS run. The first
+# version of this loop matched that and reported `window at ~0s`, so the
+# settle timer started before the VM had booted. A marker that can be
+# satisfied by the last experiment is not a marker.
+T0=$(date -u +%s)
+echo "==> waiting for the browser window (in a log newer than $T0)"
 i=0
 while [ $i -lt 300 ]; do
-    if $SSH "grep -aqE 'desktop window for client slot [0-9]+: .*(Mozilla Firefox|Firefox)' $D/boot.log 2>/dev/null"; then break; fi
+    if $SSH "[ \"\$(stat -c %Y $D/boot.log 2>/dev/null || echo 0)\" -ge $T0 ] && \
+             grep -aqE 'desktop window for client slot [0-9]+: .*(Mozilla Firefox|Firefox)' $D/boot.log 2>/dev/null"; then break; fi
     sleep 5; i=$((i+5))
 done
 [ $i -lt 300 ] || { echo "NO WINDOW in ${i}s -- nothing to drive. See $D/boot.log"; wait $RUN; exit 1; }

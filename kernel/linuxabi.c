@@ -460,6 +460,9 @@ static int g_lx_statfail;     /* rate-limit the failed-path report (M1992) */   
  * The iovec limit was 16, and exceeding it abandoned the message with
  * ENETUNREACH, which on a Unix socket is not a thing that can happen. */
 #define LX_MSG_STAGE 8192
+/* sendmsg carried descriptors but the socket took no bytes, so they were NOT
+ * queued -- the caller will retry the whole message (M2295). */
+unsigned long g_scm_held_back;
 #define LX_MSG_IOV   64
 static long lx_fd_err(long rc) {
     if (rc == APP_FD_EAGAIN) return -(long)LX_EAGAIN;
@@ -2668,6 +2671,14 @@ static void lx_dispatch_body(struct registers *r) {
             if (!gbuf) { err = -(long)LX_ENOMEM; break; }
             unsigned long tot = 0;
             int clamped = 0;
+            /* Parsed from msg_control, passed to the peer only once the byte
+             * write has been accepted -- M2295, see below. Per message. */
+            /* COPIED, not pointed at: deferring the pass to after the write
+             * means dereferencing this across a call that can sleep, and the
+             * caller's msg_control is user memory another thread may unmap in
+             * between. 64 is app_scm_capacity(); the capacity check below
+             * refuses anything larger before we get here. */
+            int pend_fds[64]; int pend_nfd = 0;
             /* A DATAGRAM SOCKET IS THE ONE THAT CANNOT BE SHORT-WRITTEN. Told
              * apart by the descriptor's own type and by whether a destination
              * address came with the message, which is the only way a caller
@@ -2699,8 +2710,8 @@ static void lx_dispatch_body(struct registers *r) {
                 if (clamped) break;
             }
             if (err) { kfree(gbuf); break; }
-            /* SCM_RIGHTS: hand any descriptors in msg_control to the peer
-             * BEFORE the bytes, so they are already queued when it reads.
+            /* SCM_RIGHTS: the descriptors in msg_control travel with the
+             * bytes -- and "with" is the whole of M2295. See below.
              *
              *   struct cmsghdr { u64 cmsg_len; int cmsg_level; int cmsg_type; }
              *   then the payload -- for SCM_RIGHTS, an array of ints.
@@ -2758,24 +2769,46 @@ static void lx_dispatch_body(struct registers *r) {
                         err = -(long)LX_EAGAIN;
                         break;
                     }
-                    int passed = 0;
-                    for (int q = 0; q < nfd; q++) {
-                        if (app_unix_send_fd((int)a1, fds[q]) != 0) {
-                            kprintf("[sock] SCM_RIGHTS: could not pass fd %d (%d of %d done)\n",
-                                    fds[q], passed, nfd);
-                            break;
-                        }
-                        passed++;
-                        if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: passed fd %d\n", fds[q]);
+                    /* QUEUE THEM AFTER THE BYTES GO, NOT BEFORE (M2295).
+                     *
+                     * This loop ran here, ahead of the write, on the reasoning
+                     * in the old comment: "hand them to the peer BEFORE the
+                     * bytes, so they are already queued when it reads." The
+                     * word that breaks it is *when*. The write below is on a
+                     * non-blocking socket and can return EAGAIN with the ring
+                     * full, in which case sendmsg() reports EAGAIN and the
+                     * caller RETRIES THE WHOLE MESSAGE -- cmsg included,
+                     * because from its side nothing was sent. The descriptors
+                     * were already in the queue, so they go in a second time.
+                     *
+                     * Chromium's IPC channel, which is what Firefox's content
+                     * processes speak, counts the descriptors it receives
+                     * against the count in each message header. Duplicates are
+                     * a protocol violation, it closes the channel, and the
+                     * content process prints
+                     *
+                     *     Exiting due to channel error.
+                     *
+                     * and exits 0, which the parent reports as "Gah. Your tab
+                     * just crashed." That is what loading a real HTTPS page
+                     * did here, with the kernel leaving the evidence right
+                     * next to it: `[scm] connection 4 died with 2
+                     * descriptor(s) still in flight` -- two nobody ever
+                     * claimed, because they were the second copy.
+                     *
+                     * Linux attaches descriptors to the skb the bytes are in,
+                     * so they arrive with the read that first touches those
+                     * bytes and cannot arrive without them. Ordering the two
+                     * operations the other way round gets the same guarantee
+                     * for the failure that matters: no bytes, no descriptors.
+                     * A SHORT write still passes them once, which is correct
+                     * -- the fds belong to the first byte, and the caller
+                     * resends the remainder with no cmsg. */
+                    if (nfd > (int)(sizeof pend_fds / sizeof pend_fds[0])) {
+                        kfree(gbuf); err = -(long)LX_EINVAL; break;
                     }
-                    if (passed != nfd) {
-                        /* Capacity said yes and a send still failed -- a bad fd
-                         * in the caller's array, which is EBADF and not
-                         * something to paper over with a byte count. */
-                        kfree(gbuf);
-                        err = -(long)LX_EBADF;
-                        break;
-                    }
+                    for (int q = 0; q < nfd; q++) pend_fds[q] = fds[q];
+                    pend_nfd = nfd;
                 }
             }
             long sn;
@@ -2788,6 +2821,40 @@ static void lx_dispatch_body(struct registers *r) {
             } else {
                 sn = app_fd_write((int)a1, gbuf, tot);   /* connected socket */
                 if (sn < 0) err = lx_fd_err(sn);         /* EAGAIN / EPIPE / EBADF, as it really was */
+            }
+            /* ...and only now, with at least one byte accepted, do the
+             * descriptors go (M2295). */
+            if (pend_nfd > 0) {
+                if (!err && sn > 0) {
+                    int passed = 0;
+                    for (int q = 0; q < pend_nfd; q++) {
+                        if (app_unix_send_fd((int)a1, pend_fds[q]) != 0) {
+                            kprintf("[sock] SCM_RIGHTS: could not pass fd %d (%d of %d done)\n",
+                                    pend_fds[q], passed, pend_nfd);
+                            break;
+                        }
+                        passed++;
+                        if (g_lx_systrace) kprintf("[sock] SCM_RIGHTS: passed fd %d\n", pend_fds[q]);
+                    }
+                    if (passed != pend_nfd) {
+                        /* Capacity said yes and a send still failed -- a bad fd
+                         * in the caller's array, which is EBADF and not
+                         * something to paper over with a byte count. */
+                        kfree(gbuf);
+                        err = -(long)LX_EBADF;
+                        break;
+                    }
+                } else {
+                    /* Nothing went -- EAGAIN on a full ring, or an error. The
+                     * caller will retry the whole message, cmsg and all, so
+                     * queueing here is what would duplicate them. Counted,
+                     * because this is the exact window the bug lived in and a
+                     * run should be able to say how often it opened. (The
+                     * first cut of this guard read `!err &&` on the OUTER
+                     * test, which skipped the count for EAGAIN -- the one
+                     * case it exists to measure.) */
+                    g_scm_held_back++;
+                }
             }
             kfree(gbuf);
             if (err) break;

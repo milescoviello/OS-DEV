@@ -1,5 +1,69 @@
 # What's next
 
+> **(M2291-M2295) FIREFOX READS EVERY INPUT EVENT AND ANSWERS NOTHING --
+> measured, not inferred -- AND TWO REAL BUGS FELL OUT OF FINALLY ASKING.**
+>
+> The evidence table this campaign had been reasoning from said "bytes leave
+> our buffer: `q0` on every client after a click", and that row was doing work
+> it could not do. `q` is OUR queue; `unix_send` copies into a **64 KiB** ring
+> in the kernel, and a whole click burst is about 1.5 KiB. A client that has
+> not touched its socket since it started leaves `q` at 0, exactly like one
+> reading every byte.
+>
+> **M2292** counts both ends per client -- bytes sent, messages received back,
+> bytes still unread in the ring, and how many distinct threads have read it:
+>
+> ```
+> 1:5248s/472m/0u    before a click and a scroll
+> 1:5984s/472m/0u    after
+> ```
+>
+> 736 bytes of pointer, keyboard and axis events, **every one consumed**, and
+> not one message back. Firefox reads its input and does nothing with it.
+> Four days of "it must be the compositor" end there.
+>
+> **M2293 -- NO FUNCTION KEY COULD REACH ANY APPLICATION.** F1-F9 and F12 were
+> bound to window-manager actions in the keyboard IRQ handler back when
+> nothing here wanted them; F10 and F11 had no cooked encoding at all and were
+> dropped where they arrived. Page Up, Page Down, Home, End and Delete had no
+> evdev mapping. So in a browser, reload, the address bar, fullscreen, the
+> developer tools and *scrolling a page from the keyboard* were not keys that
+> did nothing -- they were keys that did not exist. Now they go to a focused
+> Wayland client, with Super as the escape hatch for the WM's own bindings.
+> `tests/run-fkey-test.sh` asserts on the GDK keyvals a real GTK 3.24 client
+> computed from our keymap: F11 65480, Page_Down 65366, F5 65474, Home 65360.
+>
+> **M2295 -- LOADING A REAL HTTPS PAGE CRASHED THE TAB, and it was ours.**
+> `sendmsg` queued SCM_RIGHTS descriptors to the peer BEFORE writing the
+> bytes, on the reasoning that they should be "already queued when it reads".
+> The socket is non-blocking: when the write returns EAGAIN the caller retries
+> the whole message, cmsg included, and the descriptors go in **a second
+> time**. Chromium's IPC counts descriptors against each message header,
+> rejects the duplicates, and the content process prints `Exiting due to
+> channel error` -- which the parent renders as *"Gah. Your tab just
+> crashed."* The kernel had left the evidence beside it: `[scm] connection 4
+> died with 2 descriptor(s) still in flight`. Descriptors now go only once the
+> socket has taken at least one byte, which is what Linux's attach-to-the-skb
+> semantics give you.
+>
+> **M2291** stops an expired OAuth token being reported as a Claude failure:
+> every measurement series runs `NOBUILD=1` (correct -- a rebuild mid-series
+> changes the pinned kernel digest) and that also skipped the credential
+> restage. Thirty-five minutes of VM time once went into measuring the clock.
+>
+> Two instruments died on inspection this round and both had been load-bearing:
+> "Firefox sends zero `wl_pointer.set_cursor`" is not evidence about motion,
+> because the cursor **theme** is missing from the image (`/usr/share/icons/
+> default` -> ENOENT; only Adwaita is staged) and GTK3 has no cursor surface
+> to set. And `poll()` refusing `nfds > 256` was a plausible whole-event-loop
+> killer until it was instrumented: `biggest nfds seen 15, 0 REFUSED`. Wrong
+> limit, fixed anyway, not the bug.
+>
+> **Still open:** Firefox consumes input and does not act on it. Everything
+> below GDK is now measured rather than argued, and the reader-thread census
+> exists to test the remaining hypothesis -- that libwayland's shared-display
+> read distributes messages into a queue GDK's seat proxies are not on.
+
 > **(M2252-M2276) THE 8-CORE CORRUPTION IS CURED, CLAUDE CODE RUNS ON EIGHT
 > CORES, AND THE FIREFOX INPUT HUNT COST NINE FALSE NEGATIVES.**
 >

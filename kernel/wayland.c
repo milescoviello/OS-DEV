@@ -2549,10 +2549,13 @@ void wl_fs_health_line(void) {
         }
         io[n] = 0;
         extern unsigned long g_poll_nfds_refused; extern long g_poll_nfds_high;
+        extern unsigned long g_scm_held_back;
         kprintf("[wlio] per-client Ns sent / Nm msgs received / Nu UNREAD in the "
                 "ring / Nt distinct reader threads #last-tid (ring holds %d): %s "
-                "| poll: biggest nfds seen %ld, %lu call(s) REFUSED for too many fds\n",
-                cap, io, g_poll_nfds_high, g_poll_nfds_refused);
+                "| poll: biggest nfds seen %ld, %lu REFUSED for too many fds "
+                "| scm: %lu sendmsg(s) carried descriptors the socket could not "
+                "take, so they were NOT queued twice\n",
+                cap, io, g_poll_nfds_high, g_poll_nfds_refused, g_scm_held_back);
     }
 }
 
