@@ -168,6 +168,8 @@ static int rdblks(ext2_t *v, uint32_t blk, uint32_t n, uint8_t *buf) {
  * test sets nothing and the retry below simply re-reads. */
 static void (*ext2_dropc)(void *ctx, uint64_t lba, uint32_t n);
 void ext2_set_cache_drop(void (*fn)(void *, uint64_t, uint32_t)) { ext2_dropc = fn; }
+static int (*ext2_rawrd)(void *ctx, uint64_t lba, uint32_t n, void *buf);
+void ext2_set_raw_read(int (*fn)(void *, uint64_t, uint32_t, void *)) { ext2_rawrd = fn; }
 
 /* WHY THE SUPERBLOCK WAS NOT BELIEVED (M2220). Every one of these used to be a
  * bare `return -1` with no ioerr and no counter, so the fault handler's
@@ -1058,6 +1060,7 @@ static int wrblk(ext2_t *v, uint32_t blk, const uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     return v->write(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
 }
+static int wrsec(ext2_t *v, uint32_t blk, uint32_t secoff, const uint8_t *buf);  /* defined below; gd_write needs it (M2240) */
 /* A GROUP DESCRIPTOR BLOCK IS PROVABLY VALID OR PROVABLY NOT -- SO NEVER WRITE
  * ONE BACK UNCHECKED (M2237).
  *
@@ -1105,6 +1108,23 @@ static int gd_desc_ok(const ext2_t *v, const uint8_t *d) {
  * block is padding and is legitimately zero, so checking it would reject every
  * healthy filesystem -- the bug that a "validate the whole block" first cut
  * would have shipped. */
+/* The same question about ONE SECTOR of the block (M2240). Needed because the
+ * independent PIO second opinion must not put another 4096-byte buffer on the
+ * stack: gd_read is called from alloc_block, which already carries
+ * `uint8_t gd[4096], bm[4096]` -- 8 KiB of a 16 KiB kernel stack before
+ * anything it calls. M2217 double-faulted on exactly that arithmetic and
+ * M2238 is about the instrument that hid it. 512 bytes, and only the
+ * descriptors that actually live in this sector. */
+static int gd_sector_ok(const ext2_t *v, uint32_t gdblk, uint32_t secoff, const uint8_t *sec) {
+    uint32_t per = v->block_size / 32;
+    if (gdblk < v->gdt_block) return 0;
+    uint32_t base = (gdblk - v->gdt_block) * per + secoff * (SECSZ / 32);
+    for (uint32_t k = 0; k < SECSZ / 32; k++) {
+        if (v->groups && base + k >= v->groups) break;
+        if (!gd_desc_ok(v, sec + k * 32)) return 0;
+    }
+    return 1;
+}
 static int gd_block_ok(const ext2_t *v, uint32_t gdblk, const uint8_t *gd) {
     uint32_t per = v->block_size / 32;
     if (gdblk < v->gdt_block) return 0;
@@ -1118,31 +1138,77 @@ static int gd_block_ok(const ext2_t *v, uint32_t gdblk, const uint8_t *gd) {
 unsigned long g_e2_gd_badread;     /* descriptor blocks read back invalid */
 unsigned long g_e2_gd_reread_ok;   /* ...and fixed by dropping the cache and asking again */
 unsigned long g_e2_gd_writeref;    /* descriptor blocks REFUSED at the write */
+/* THE DISCRIMINATOR (M2240): a PIO read, no cache and no DMA. */
+unsigned long g_e2_gd_pio_good;    /* ...and the independent path returned a VALID block: the disk is FINE
+                                    * and the cache/DMA path lied. Recovered from -- we use the good bytes. */
+unsigned long g_e2_gd_pio_same;    /* ...and the independent path agrees it is bad: the DISK holds this. */
+unsigned long g_e2_gd_pio_fail;    /* ...and the independent read itself failed. */
 
-static int gd_read(ext2_t *v, uint32_t gdblk, uint8_t *gd) {
+static int gd_read(ext2_t *v, uint32_t gdblk, uint8_t *gd, uint32_t goff) {
     if (rdblk(v, gdblk, gd) < 0) return -1;
     if (gd_block_ok(v, gdblk, gd)) return 0;
     /* Drop the cached sectors and ask the disk, the same recovery read_inode
      * has used since M2232. A transient is worth one retry; a poisoned disk
      * will simply fail twice. */
     g_e2_gd_badread++;
+    uint32_t spb = v->block_size / SECSZ;
     if (ext2_dropc) {
-        uint32_t spb = v->block_size / SECSZ;
         ext2_dropc(v->ctx, v->start + (uint64_t)gdblk * spb, spb);
         if (rdblk(v, gdblk, gd) >= 0 && gd_block_ok(v, gdblk, gd)) {
             g_e2_gd_reread_ok++;
             return 0;
         }
     }
+    /* ASK A DIFFERENT MECHANISM (M2240).
+     *
+     * The re-read above went through the same cache install and the same DMA
+     * engine, so its agreement proves nothing: 495 bad reads in one boot and 0
+     * of them "fixed" is equally consistent with a wrong platter and with a
+     * path that returns the same wrong thing twice. ext2_rawrd is PIO with no
+     * cache, which makes this a comparison of two independent mechanisms
+     * rather than two runs of one.
+     *
+     * And if the independent read is GOOD, that is not merely a diagnosis --
+     * those are the right bytes and we use them. A filesystem that can tell
+     * which of two answers is valid should not return the invalid one. */
+    if (ext2_rawrd) {
+        uint8_t sec[SECSZ];
+        uint32_t so = goff / SECSZ;
+        if (ext2_rawrd(v->ctx, v->start + (uint64_t)gdblk * spb + so, 1, sec) >= 0) {
+            if (gd_sector_ok(v, gdblk, so, sec)) {
+                for (uint32_t k = 0; k < SECSZ; k++) gd[so * SECSZ + k] = sec[k];
+                g_e2_gd_pio_good++;
+                return 0;                  /* recovered: the disk was never wrong */
+            }
+            g_e2_gd_pio_same++;            /* the disk really holds this */
+        } else {
+            g_e2_gd_pio_fail++;
+        }
+    }
     v->ioerr = 1; g_e2_distrust++;
     return -1;
 }
-static int gd_write(ext2_t *v, uint32_t gdblk, const uint8_t *gd) {
-    if (!gd_block_ok(v, gdblk, gd)) {
+/* WRITE BACK ONLY THE SECTOR THAT CHANGED (M2240).
+ *
+ * These six callers change two bytes of a free count and the original code
+ * wrote all 4096 back, which is 8 ATA commands for 2 bytes and -- far worse --
+ * puts seven sectors nobody touched on the disk on the strength of one read.
+ * Measured: 43196 to 100061 writes below LBA 32 in a single boot, every one of
+ * them a whole block. Scoping the write to the descriptor's own sector cuts
+ * that 8x, narrows a lost update between two cores from a block to a sector,
+ * and makes the M2240 recovery coherent -- a sector repaired by the PIO read
+ * is exactly the sector written back.
+ *
+ * Validated at the sector, for the same reason: refusing on the strength of a
+ * descriptor in a sector this write does not touch would refuse a correct
+ * update. */
+static int gd_write(ext2_t *v, uint32_t gdblk, const uint8_t *gd, uint32_t goff) {
+    uint32_t so = goff / SECSZ;
+    if (!gd_sector_ok(v, gdblk, so, gd + so * SECSZ)) {
         g_e2_gd_writeref++; v->ioerr = 1; g_e2_distrust++;
         return -1;                                     /* do NOT commit garbage */
     }
-    return wrblk(v, gdblk, gd);
+    return wrsec(v, gdblk, so, gd + so * SECSZ);
 }
 /* The write counterpart of rdsec (M2212): one sector of a block. */
 static int wrsec(ext2_t *v, uint32_t blk, uint32_t secoff, const uint8_t *buf) {
@@ -1168,7 +1234,7 @@ static uint32_t alloc_block(ext2_t *v) {
     uint32_t gd_per_block = v->block_size / 32;
     for (uint32_t g = 0; g < v->groups; g++) {
         uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-        if (gd_read(v, gdblk, gd) < 0) return 0;
+        if (gd_read(v, gdblk, gd, goff) < 0) return 0;
         if (e_rd16(gd + goff + 12) == 0) continue;             /* no free blocks in this group */
         uint32_t bbm = e_rd32(gd + goff + 0);
         if (rdblk(v, bbm, bm) < 0) return 0;
@@ -1180,7 +1246,7 @@ static uint32_t alloc_block(ext2_t *v) {
                 bm[i >> 3] |= (uint8_t)(1 << (i & 7));
                 if (wrblk(v, bbm, bm) < 0) return 0;
                 e_wr16(gd + goff + 12, e_rd16(gd + goff + 12) - 1);
-                if (gd_write(v, gdblk, gd) < 0 || sb_dec(v, 12) < 0) return 0;
+                if (gd_write(v, gdblk, gd, goff) < 0 || sb_dec(v, 12) < 0) return 0;
                 return v->first_data_block + g * v->blocks_per_group + i;
             }
         }
@@ -1205,7 +1271,7 @@ static uint32_t alloc_run(ext2_t *v, uint32_t n) {
     uint32_t gd_per_block = v->block_size / 32;
     for (uint32_t g = 0; g < v->groups; g++) {
         uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-        if (gd_read(v, gdblk, gd) < 0) return 0;
+        if (gd_read(v, gdblk, gd, goff) < 0) return 0;
         if (e_rd16(gd + goff + 12) < n) continue;              /* group lacks n free blocks */
         uint32_t bbm = e_rd32(gd + goff + 0);
         if (rdblk(v, bbm, bm) < 0) return 0;
@@ -1220,7 +1286,7 @@ static uint32_t alloc_run(ext2_t *v, uint32_t n) {
                     for (uint32_t j = 0; j < n; j++) { uint32_t b = startbit + j; bm[b >> 3] |= (uint8_t)(1 << (b & 7)); }
                     if (wrblk(v, bbm, bm) < 0) return 0;
                     e_wr16(gd + goff + 12, (uint16_t)(e_rd16(gd + goff + 12) - n));
-                    if (gd_write(v, gdblk, gd) < 0 || sb_sub(v, 12, n) < 0) return 0;
+                    if (gd_write(v, gdblk, gd, goff) < 0 || sb_sub(v, 12, n) < 0) return 0;
                     return v->first_data_block + g * v->blocks_per_group + startbit;
                 }
             } else run = 0;
@@ -1235,7 +1301,7 @@ static uint32_t alloc_inode(ext2_t *v) {
     uint32_t gd_per_block = v->block_size / 32;
     for (uint32_t g = 0; g < v->groups; g++) {
         uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-        if (gd_read(v, gdblk, gd) < 0) return 0;
+        if (gd_read(v, gdblk, gd, goff) < 0) return 0;
         if (e_rd16(gd + goff + 14) == 0) continue;             /* no free inodes in this group */
         uint32_t ibm = e_rd32(gd + goff + 4);
         if (rdblk(v, ibm, bm) < 0) return 0;
@@ -1245,7 +1311,7 @@ static uint32_t alloc_inode(ext2_t *v) {
                 bm[i >> 3] |= (uint8_t)(1 << (i & 7));
                 if (wrblk(v, ibm, bm) < 0) return 0;
                 e_wr16(gd + goff + 14, e_rd16(gd + goff + 14) - 1);
-                if (gd_write(v, gdblk, gd) < 0 || sb_dec(v, 16) < 0) return 0;
+                if (gd_write(v, gdblk, gd, goff) < 0 || sb_dec(v, 16) < 0) return 0;
                 return g * v->inodes_per_group + i + 1;
             }
         }
@@ -1480,13 +1546,13 @@ static int free_block(ext2_t *v, uint32_t blk) {
     uint8_t gd[4096], bm[4096];
     uint32_t gd_per_block = v->block_size / 32;
     uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-    if (gd_read(v, gdblk, gd) < 0) return -1;
+    if (gd_read(v, gdblk, gd, goff) < 0) return -1;
     uint32_t bbm = e_rd32(gd + goff + 0);
     if (rdblk(v, bbm, bm) < 0) return -1;
     bm[idx >> 3] &= (uint8_t)~(1 << (idx & 7));
     if (wrblk(v, bbm, bm) < 0) return -1;
     e_wr16(gd + goff + 12, e_rd16(gd + goff + 12) + 1);
-    if (gd_write(v, gdblk, gd) < 0) return -1;
+    if (gd_write(v, gdblk, gd, goff) < 0) return -1;
     uint8_t sb[1024];
     if (rd_sb(v, sb) < 0) return -1;
     e_wr32(sb + 12, e_rd32(sb + 12) + 1);
@@ -1580,13 +1646,13 @@ static int free_inode_num(ext2_t *v, uint32_t ino) {
     uint8_t gd[4096], bm[4096];
     uint32_t gd_per_block = v->block_size / 32;
     uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-    if (gd_read(v, gdblk, gd) < 0) return -1;
+    if (gd_read(v, gdblk, gd, goff) < 0) return -1;
     uint32_t ibm = e_rd32(gd + goff + 4);
     if (rdblk(v, ibm, bm) < 0) return -1;
     bm[idx >> 3] &= (uint8_t)~(1 << (idx & 7));
     if (wrblk(v, ibm, bm) < 0) return -1;
     e_wr16(gd + goff + 14, e_rd16(gd + goff + 14) + 1);
-    if (gd_write(v, gdblk, gd) < 0) return -1;
+    if (gd_write(v, gdblk, gd, goff) < 0) return -1;
     uint8_t sb[1024];
     if (rd_sb(v, sb) < 0) return -1;
     e_wr32(sb + 16, e_rd32(sb + 16) + 1);
@@ -1724,9 +1790,9 @@ static void grp_dirs(ext2_t *v, uint32_t ino, int delta) {
     uint32_t g = (ino - 1) / v->inodes_per_group;
     uint8_t gd[4096]; uint32_t gd_per_block = v->block_size / 32;
     uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-    if (gd_read(v, gdblk, gd) < 0) return;
+    if (gd_read(v, gdblk, gd, goff) < 0) return;
     e_wr16(gd + goff + 16, (uint16_t)(e_rd16(gd + goff + 16) + delta));
-    gd_write(v, gdblk, gd);
+    gd_write(v, gdblk, gd, goff);
 }
 
 /* Create a directory `path`: a fresh dir inode whose single block holds "." (->

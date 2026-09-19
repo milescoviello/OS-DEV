@@ -73,6 +73,7 @@ int  blockdev_ready(void);      /* the table as it stands; probes only if nothin
  * FAT32 volume is read by kernel/fat32.c directly via ATA, NOT through this
  * layer, so this write path cannot corrupt it. */
 int blockdev_write(int i, uint64_t lba, uint32_t count, const void *buf);
+int blockdev_read_raw(int i, uint64_t lba, uint32_t count, void *buf);   /* bypasses the block cache AND DMA: an independent second opinion (M2240) */
 
 /* Format the buffer-cache statistics (entries, hits, misses, writes, hit rate)
  * into `out` (capacity `max`) as text lines; returns the byte length. Backs the

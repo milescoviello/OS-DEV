@@ -3259,6 +3259,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * owner key this transport uses. The ctx it gets is the one it passed
      * down, which for a mounted volume is the blockdev index. */
     ext2_set_cache_drop(ext2_cache_drop_hook);
+    ext2_set_raw_read(blockdev_read_raw);   /* an independent, cache-and-DMA-free second opinion (M2240) */
 
     /* Bring up a USB HID boot keyboard, sharing the one UHCI controller with the
      * tablet + mass-storage above (skipping the tablet's port, using the shared

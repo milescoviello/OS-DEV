@@ -423,6 +423,29 @@ static int is_ata_backed(int i) { return g_dev[i].read == ata_bd_read; }
  * knowledge blockdev has and ext2 does not: an ATA-backed device is cached by
  * the driver under BCACHE_OWNER_ATA and every other one under
  * BCACHE_OWNER_BLK (M1885 -- one coherent copy per sector, never both). */
+/* A READ THAT BYPASSES BOTH THE BLOCK CACHE AND DMA (M2240).
+ *
+ * The question M2237 could not answer: when a group descriptor block reads
+ * back invalid, is the DISK wrong or is the PATH TO IT wrong? Dropping the
+ * cache and re-reading does not separate them -- it still goes through the
+ * same cache install and the same DMA engine, so agreement between the two
+ * reads is equally consistent with "the platter holds this" and with "this
+ * path returns the same wrong thing twice". Measured: 495 bad reads, 0 fixed
+ * by the re-read, which is exactly the ambiguous answer.
+ *
+ * ata_read_drive_pio exists for precisely this (M2091): it takes ata_lock and
+ * calls the PIO transfer directly, consulting no cache and programming no bus
+ * master. Two independent mechanisms reading one sector is a discriminator
+ * where two runs of one mechanism is not. */
+int blockdev_read_raw(int i, uint64_t lba, uint32_t count, void *buf) {
+    if (i < 0 || i >= g_ndev || !buf || count == 0) return -1;
+    if (g_dev[i].sectors && (lba >= g_dev[i].sectors ||
+                             count > g_dev[i].sectors - lba)) return -1;
+    if (is_ata_backed(i))
+        return ata_read_drive_pio((int)(intptr_t)g_dev[i].ctx, (uint32_t)lba, count, buf);
+    return raw_read(i, lba, count, buf);      /* no independent path on this transport */
+}
+
 void blockdev_drop_cache(int i, uint64_t lba, uint32_t count) {
     if (i < 0 || i >= g_ndev || !count) return;
     if (is_ata_backed(i)) bcache_inval_range(BCACHE_OWNER_ATA((int)(intptr_t)g_dev[i].ctx), lba, count);
