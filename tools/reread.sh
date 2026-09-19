@@ -19,11 +19,14 @@ while [ "$i" -le "$N" ]; do
     WAIT=full NOBUILD=1 APPEND="ffwl lxout nonetdemo" CORES=$CORES CAP=$CAP tools/pve-run.sh >/dev/null 2>&1
     L=build/ablogs/reread-r$i.log
     scp -q root@"${PVE_HOST:-192.168.1.5}":/root/osdev/boot.log "$L"
-    printf 'reread r%s: page=%s crashed=%s refused=%s itable=%s\n  %s\n' "$i" \
+    printf 'reread r%s: page=%s crashed=%s refused=%s itable=%s\n  %s\n  gdt-at-mount: %s\n' "$i" \
       "$(grep -ac 'VERDICT: the PAGE is on screen' "$L")" \
       "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \
       "$(grep -ac 'DEVICE failure, not an\|mapping is EXECUTABLE' "$L")" \
       "$(grep -ao 'inode tables rejected [0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
-      "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //')" | tee -a "$OUT"
+      "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //')" \
+      "$(grep -a 'ext2 GDT self-test' "$L" | tail -1 | sed -E 's/.*self-test: //')" | tee -a "$OUT"
+    echo "  low-LBA writes seen:" | tee -a "$OUT"
+    grep -a '^\[bdwr\]' "$L" | head -8 | sed 's/^/    /' | tee -a "$OUT"
     i=$((i+1))
 done

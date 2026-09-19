@@ -577,9 +577,54 @@ int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
     return 0;
 }
 
+/* WHO WRITES OVER THE GROUP DESCRIPTOR TABLE? (M2236)
+ *
+ * Three facts, each cheap, that together move this from a read bug to a write
+ * bug:
+ *
+ *   1. The rejected descriptor comes from LBA 8 -- the right sector.
+ *   2. Dropping the block cache and reading LBA 8 AGAIN, from the disk,
+ *      returns the SAME wrong bytes (`re-read 90: 0 DIFFERED`).
+ *   3. Those eight bytes -- 78 00 1a 42 22 00 11 1b -- appear NOWHERE in
+ *      build/ext2.img. Searched all 3355443200 bytes of it, and all of
+ *      fat.img: zero hits.
+ *
+ * (3) kills "the read returned some other sector's data", which is what every
+ * theory so far assumed. Bytes that are on no disk were never read off one.
+ * And (2) says the disk now holds them -- the VM runs with `-snapshot`, so a
+ * guest write persists for the rest of the boot and a re-read finds it.
+ *
+ * Put together: something in this kernel WROTE those bytes onto LBA 8. ext2 is
+ * mounted read-write and Firefox writes constantly to its profile, so there is
+ * no shortage of candidate writers -- but a write landing on the group
+ * descriptor table is a wrong ADDRESS, not wrong data, and nothing in the tree
+ * records where writes go.
+ *
+ * So record it. Every filesystem's metadata that matters lives in the first
+ * few sectors of its volume, which makes "below LBA 32" a tripwire that costs
+ * one comparison per write and fires on exactly the thing being hunted. The
+ * legitimate writers show up here too -- ext2 does rewrite the group
+ * descriptor's free counts -- and that is the point: a list of who writes here
+ * with what is what distinguishes them from the one that should not. */
+#define BD_WTRIP_LBA 32
+unsigned long g_bd_wtrip_n;        /* writes below BD_WTRIP_LBA, any device */
+unsigned long g_bd_wr_total;       /* every write, so "no writes at all" is visible */
+static int    g_bd_wtrip_shown;
+
 int blockdev_write(int i, uint64_t lba, uint32_t count, const void *buf) {
     if (i < 0 || i >= g_ndev) return -1;                   /* bound i before it indexes blk_lock/bcache */
     int r;
+    g_bd_wr_total++;
+    if (lba < BD_WTRIP_LBA) {
+        const unsigned char *tp = (const unsigned char *)buf;
+        g_bd_wtrip_n++;
+        if (g_bd_wtrip_shown < 32) {
+            g_bd_wtrip_shown++;
+            kprintf("[bdwr] dev %d lba %lu x%lu task %d <- %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    i, (unsigned long)lba, (unsigned long)count, task_current_id(),
+                    tp[0], tp[1], tp[2], tp[3], tp[4], tp[5], tp[6], tp[7]);
+        }
+    }
     if (is_ata_backed(i)) {
         /* ATA path: ata_write_drive already invalidates the ATA-owner cache under
          * ata_lock (and we keep no BLK-owner copy for ATA — see bread), so no

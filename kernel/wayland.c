@@ -2253,6 +2253,7 @@ void wl_fs_health_line(void) {
         extern unsigned long g_bd_fail_n[9];
         extern int g_bd_badidx, g_bd_badndev;
         extern unsigned long g_bd_init_calls, g_bd_reg_skipped;
+        extern unsigned long g_bd_wtrip_n, g_bd_wr_total;
         extern uint64_t g_bd_fail_cap4, g_bd_fail_lba4;
         /* Declared here rather than in ata.h, the same way app.c's fault
          * report reaches them: they are diagnostics, not driver API. */
@@ -2267,7 +2268,8 @@ void wl_fs_health_line(void) {
                 "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired | "
                 "blockdev refusals by reason: idx %lu nohook %lu zerocount %lu LBA>=cap %lu "
                 "ovf %lu past-cap %lu driver %lu BADIDX %lu (last cap-refusal: lba %lu vs cap %lu; "
-                "last bad index %d against g_ndev %d) | blockdev_init x%lu, %lu re-reg skipped\n",
+                "last bad index %d against g_ndev %d) | blockdev_init x%lu, %lu re-reg skipped | "
+                "writes: %lu total, %lu BELOW LBA 32\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
@@ -2283,7 +2285,8 @@ void wl_fs_health_line(void) {
                 g_bd_fail_n[1], g_bd_fail_n[2], g_bd_fail_n[3], g_bd_fail_n[4],
                 g_bd_fail_n[5], g_bd_fail_n[6], g_bd_fail_n[7], g_bd_fail_n[8],
                 (unsigned long)g_bd_fail_lba4, (unsigned long)g_bd_fail_cap4,
-                g_bd_badidx, g_bd_badndev, g_bd_init_calls, g_bd_reg_skipped); }
+                g_bd_badidx, g_bd_badndev, g_bd_init_calls, g_bd_reg_skipped,
+                g_bd_wr_total, g_bd_wtrip_n); }
 }
 
 int wl_page_probe(uint32_t want) {
