@@ -2349,8 +2349,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                         kprintf("[ff] spawning ZENITY (GTK) instead of Firefox: the same toolkit, "
                                 "seconds instead of minutes\n");
                         spid = app_spawn_linux_from_file_argv("/disk2/usr/bin/zenity", av_z, 2);
-                    } else
-                    spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
+                    } else {
+                        spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
+                    }
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
                     /* A HEARTBEAT, because silence is ambiguous (M1996).
                      * Firefox spends minutes relocating an 83-library closure

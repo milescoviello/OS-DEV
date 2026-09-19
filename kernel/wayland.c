@@ -2382,7 +2382,7 @@ void wl_fs_health_line(void) {
         extern unsigned long g_dk_keys, g_dk_fwd, g_dk_mot, g_dk_btn; extern int g_dk_focus_kind;
         unsigned wl_keys_sent(void);
         extern unsigned g_axis_sent;
-        extern unsigned g_ptr_enter_sid, g_ptr_enters; extern int g_ptr_enter_root;
+        extern unsigned g_ptr_enters;   /* the per-client array below is what is printed (M2246) */
         extern unsigned g_ptr_enter_by[];
         extern unsigned long g_peerready_calls, g_peerready_hits;
         char ent[80]; int en = 0;
