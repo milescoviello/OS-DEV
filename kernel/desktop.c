@@ -2016,8 +2016,17 @@ static void wl_window_poll(void) {
                                            THEME_PANEL, wl_client_title_of(ci), KIND_WAYLAND,
                                            (void *)(long)(ci + 1),
                                            0,0,0,0,0,0,0, 0,{0},0, 0, {0} };
-        kprintf("[wl] desktop window for client slot %d: %ux%u ('%s')\n",
-                ci, sw2, sh2, wl_client_title_of(ci));
+        /* WHERE IT IS, not just how big (M2297). A harness that wants to
+         * click a client's button has to know where the window landed, and
+         * this line gave it only a size -- so every input experiment aimed at
+         * a guessed coordinate, and the ones that missed reported "the client
+         * ignored the click". The content origin is the window origin plus
+         * the border and titlebar, which is what a click has to be measured
+         * from, so print that too rather than making every caller re-derive
+         * it from constants it cannot see. */
+        kprintf("[wl] desktop window for client slot %d: %ux%u at %d,%d "
+                "(content origin %d,%d) ('%s')\n",
+                ci, sw2, sh2, x, y, x + 6, y + TITLEBAR_H + 6, wl_client_title_of(ci));
         wl_window_open = 1;
     }
 }

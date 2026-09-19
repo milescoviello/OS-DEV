@@ -3,13 +3,15 @@
 # OS-DEV
 
 **A from-scratch x86_64 operating system** — kernel, TLS 1.3, a JavaScript
-engine, and a sandboxed web browser — written in C and a little assembly.
+engine, a sandboxed web browser and a Wayland compositor — written in C and a
+little assembly. It **compiles its own kernel inside itself**, and its Linux
+ABI layer runs unmodified Linux binaries: GCC, Node.js, Claude Code, Firefox.
 Developed under QEMU; boots on real hardware through GRUB.
 
 [![Milestones](https://img.shields.io/badge/milestones-2296-blue)](WHATS-NEXT.md)
-[![Tests](https://img.shields.io/badge/tests-136%20suites-brightgreen)](tests/README.md)
+[![Tests](https://img.shields.io/badge/tests-111%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
-[![From scratch](https://img.shields.io/badge/from--scratch-~101k%20lines-orange)](#status)
+[![From scratch](https://img.shields.io/badge/from--scratch-~135k%20lines-orange)](#status)
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ![Demo: the desktop, the Apps menu, DOOM running as a windowed ring-3 process, and the from-scratch browser fetching a page over real HTTPS](docs/osdev-demo.gif)
@@ -19,7 +21,8 @@ Developed under QEMU; boots on real hardware through GRUB.
 ## Status
 
 A mature hobby OS that goes from power-on to a graphical, mouse- and
-keyboard-driven **desktop** and hosts real **ring-3 programs as windows**. It is
+keyboard-driven **desktop** and hosts real **ring-3 programs as windows** — its
+own, and, through a Linux ABI compatibility layer, other people's. It is
 developed and run under QEMU; it also boots via GRUB / Multiboot2 (see the honest
 caveats below).
 
@@ -54,6 +57,16 @@ caveats below).
   Math/JSON/String/Array standard library) that renders real pages and runs page
   `<script>` against a minimal live DOM; and from-scratch **PNG / GIF / JPEG /
   SVG / BMP** decoders.
+- **Running other people's binaries:** a second syscall entry path implementing
+  the **Linux x86-64 ABI**, translating into the native syscall layer — enough
+  that unmodified dynamically-linked Linux programs run as windowed ring-3
+  processes here: busybox, a real **GCC toolchain** (OS-DEV compiles its own
+  kernel, in OS-DEV, and boots it), **Node.js**, **Claude Code**, and
+  **Firefox**. Firefox draws through **our own Wayland compositor** — written
+  from scratch inside the window manager, not a ported X server — so OS-DEV
+  stays in charge of windows, focus and input. *This is a bolt-on, and the
+  point of it is precisely that it runs software nobody here wrote; everything
+  above is still self-made.* See [the frontier](#the-current-frontier-running-other-peoples-software-m1933-).
 - **Security hardening:** every syscall pointer argument is validated by a
   PTE_USER page-table walk; the kernel image is **W^X** (`.text` read-only +
   executable, `.rodata` / `.data` / `.bss` / heap / stacks **non-executable**);
@@ -119,8 +132,22 @@ caveats below).
   spinning). The one piece with no steady-state driver is the short-lived
   **compute job pool** (`smp_parallel_for`), used at boot for parallel TLS
   chain-link verification and a self-test but not called afterwards.
-- **Lines of code:** roughly **71k** of from-scratch kernel C and **~31k** of
-  from-scratch userspace C. The bundled DOOM / Quake / emulators add **~133k**
+- **Firefox renders, but does not respond to input.** This is the one known
+  broken thing in the compatibility layer and it is not close to resolved. The
+  page lays out and paints correctly over HTTPS; pointer motion, clicks,
+  typing and scrolling reach the process and produce no reaction. What is
+  measured rather than assumed: the compositor forwards the events, Firefox
+  **consumes every byte off the socket** (a per-client counter tracks bytes
+  sent against bytes still unread in the kernel ring), and it sends nothing
+  back. A GTK 3.24 test client — the same library Firefox links — clicks and
+  types fine on the same boot, including when given Gecko's own structure of
+  a subsurface with an empty input region. Ruled out by measurement: delivery,
+  the surface targeted, input regions, pointer focus, WebRender, the `poll()`
+  descriptor limit, multi-threaded socket reads, keyboard activation and the
+  `ACTIVATED` toplevel state. The fault is somewhere above GDK and is being
+  worked.
+- **Lines of code:** roughly **103k** of from-scratch kernel C and **~31k** of
+  from-scratch userspace C. The bundled DOOM / Quake / emulators add **~120k**
   lines of vendored third-party code — most of the raw line count is theirs, not
   this project's. This project's own code is MIT-licensed (**[LICENSE](LICENSE)**);
   the vendored code keeps its own license unchanged — see **[NOTICE](NOTICE)**.
@@ -402,12 +429,27 @@ user-stack overflow, an NX violation, and a SMEP violation and assert each one
 faults — protections that are tested, not just claimed. (See "Honest caveats"
 above for exactly what's still ring-0.)
 
-### The current frontier: self-hosting (M1933-)
+### The current frontier: running other people's software (M1933-)
 
 The active campaign is the long-term goal in `GOALS.md` taken seriously:
-**develop OS-DEV inside OS-DEV.** The end state is an in-guest toolchain running
-under a **Linux ABI compatibility layer**, so that unmodified static Linux
-binaries — busybox, a real GCC, eventually Node — run here.
+**develop OS-DEV inside OS-DEV.** That meant a **Linux ABI compatibility
+layer** so unmodified Linux binaries run here — and it has largely landed:
+
+| | |
+|---|---|
+| ext2 as a real read-write root filesystem | **done** (M1933-1937) |
+| the `syscall` instruction speaking Linux | **done** (M1938) |
+| busybox | **done** |
+| a real GCC toolchain in-guest | **done** |
+| **self-hosting** — OS-DEV compiles its own kernel, in OS-DEV, and boots it | **done** (Phase 5) |
+| Node.js, over real sockets and DNS | **done** (M1964-1967) |
+| **Claude Code**, authenticating and editing this source tree from inside OS-DEV | **done** — 6/6 eight-core boots answer in under 60 s, and its Bash and file-edit tools both work |
+| a from-scratch **Wayland compositor** in the window manager | **done** (M1977-1981) |
+| **Firefox rendering real pages** in an OS-DEV window | **done** (M2200-2211) |
+| Firefox responding to mouse and keyboard | **not working** — see the caveat below |
+
+**To be unambiguous about what this does and does not change:** the OS is, and
+stays, overwhelmingly **self-made**.
 
 **To be unambiguous about what this does and does not change:** the OS is, and
 stays, overwhelmingly **self-made**. The kernel, every driver, the TLS 1.3 stack

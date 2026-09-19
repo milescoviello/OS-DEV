@@ -12,6 +12,33 @@ below are what comes *after* it, and each adds large subsystems.
 
 ---
 
+## Update (2026-09-19): goals 1 and 3 are DONE
+
+This file was written when all three goals were ahead. Two of them have
+landed, so read everything below it as history rather than as a plan.
+
+- **Goal 1, a web browser — done twice over.** OS-DEV has its own from-scratch
+  browser with its own JavaScript engine and its own TLS 1.3 stack, running
+  in ring 3. And **Firefox itself now runs here and renders real pages over
+  HTTPS**, through a from-scratch **Wayland compositor** built into the window
+  manager. (Firefox does not yet respond to mouse or keyboard — the one known
+  broken thing, tracked in WHATS-NEXT.md.)
+- **Goal 3, run Claude Code — done, including the hard version.** Not just
+  "it starts": `claude -p` authenticates over the real network and answers
+  correctly on 6 of 6 eight-core boots in under 60 seconds each, its **Bash
+  tool executes commands inside OS-DEV**, and it **edits files in OS-DEV's own
+  source tree from inside OS-DEV**. The self-hosting prerequisite landed on the
+  way: OS-DEV compiles its own kernel, in OS-DEV, and boots the result.
+- **Goal 2, play music from the NAS** — unchanged; the audio drivers and the
+  network stack both exist, nobody has wired the two together.
+
+The estimate below of "a multi-year stretch" for goal 3 was wrong about the
+timescale and right about the route: the Linux ABI compatibility layer was
+exactly the tractable path, and it is what got there. Worth keeping visible
+rather than quietly editing, because the reasoning is what made the call.
+
+---
+
 ## Update (2026-09-10): goal 3 is now an active campaign, with a route
 
 "Run Claude Code" has stopped being a distant north star and become the thing

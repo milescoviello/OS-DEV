@@ -303,6 +303,7 @@ static volatile int g_ffe10s;                 /* -append ffe10s: do NOT force E1
 static volatile int g_lxgtk3;                 /* -append lxgtk3: a GTK3 client, the toolkit Firefox uses (M2272) */
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
+static volatile int g_gtksub;                 /* -append gtksub: lxgtk3 + Gecko's empty-input-region subsurface (M2297) */
 static volatile int g_ffin;                   /* -append ffin: file:///ffinput.html, the page that makes input visible (M2296) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
@@ -902,7 +903,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * spawns Firefox is this one, and a URL with no spawn is not a mode. */
         if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") ||
             cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl") ||
-            cmdline_has(cl, "ffin")) {
+            cmdline_has(cl, "ffin") || cmdline_has(cl, "gtksub")) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
         /* -append ffalone: Firefox as the ONLY Wayland client (M2287).
@@ -919,6 +920,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;
         if (cmdline_has(cl, "ffnowr")) g_ffnowr = 1;
         if (cmdline_has(cl, "wlmt")) g_wlmt = 1;   /* the test client, Gecko-shaped: two threads on one display (M2265) */   /* no WebRender: no renderer-owned Wayland queue (M2264) */   /* leave content processes ENABLED (M2252) */
+        if (cmdline_has(cl, "gtksub")) { g_lxgtk3 = 1; g_gtksub = 1; }   /* the control, in Gecko's shape (M2297) */
         if (cmdline_has(cl, "lxgtk3")) g_lxgtk3 = 1;   /* the GTK3 control -- the toolkit Firefox actually uses (M2272) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
@@ -2367,8 +2369,26 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * Wayland backends -- so the zenity result never
                          * applied to Firefox at all. This is the arm that
                          * does. */
-                        kprintf("[ff] spawning the GTK3 control instead of Firefox\n");
-                        spid = app_spawn_linux_from_file("/disk2/lxgtk3");
+                        /* -append gtksub: THE SAME CONTROL, IN GECKO'S SHAPE
+                         * (M2297). lxgtk3 responds to a click and Firefox does
+                         * not, on the same compositor and the same
+                         * libgtk-3.so.0. The difference the compositor's log
+                         * shows is that Gecko paints into a SUBSURFACE with an
+                         * EMPTY input region, created outside GDK, sitting in
+                         * front of everything. --subsurface makes lxgtk3 do
+                         * exactly that, so the same binary is its own control:
+                         * if the button stops responding, Firefox's bug is
+                         * reproduced in a hundred lines instead of thirty
+                         * million. */
+                        static const char *av_sub[] = { "--subsurface" };
+                        if (g_gtksub) {
+                            kprintf("[ff] spawning the GTK3 control WITH Gecko's "
+                                    "empty-input-region subsurface in front of it\n");
+                            spid = app_spawn_linux_from_file_argv("/disk2/lxgtk3", av_sub, 1);
+                        } else {
+                            kprintf("[ff] spawning the GTK3 control instead of Firefox\n");
+                            spid = app_spawn_linux_from_file("/disk2/lxgtk3");
+                        }
                     } else if (g_lxgtk) {
                         static const char *av_z[] = { "--info", "--text=OSDEV-GTK-CLICK-ME" };
                         kprintf("[ff] spawning ZENITY (GTK) instead of Firefox: the same toolkit, "

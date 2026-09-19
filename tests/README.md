@@ -2,9 +2,13 @@
 
 Host-side regression + fuzz tests for the from-scratch parsers that run
 **kernel-side on untrusted input** (a malicious web server, an on-path attacker,
-or page scripts) on a **16 KB stack with no guard page** — where an out-of-bounds
-access is silent kernel memory corruption. Each suite compiles the *real* kernel
-source on the host under **ASan + UBSan** and exercises it with crafted edge
+or page scripts) — where an out-of-bounds access is silent kernel memory
+corruption. (That framing predates M1495: kernel task stacks are now mapped in
+a dedicated VA window with **unmapped guard pages on both sides**, so an
+overflow faults cleanly instead of eating a neighbour. The fuzzing still
+matters — a guard page catches a runaway stack, not a heap overread.)
+
+Each suite compiles the *real* kernel source on the host under **ASan + UBSan** and exercises it with crafted edge
 cases + deterministic fuzzing.
 
 ## Runtime
@@ -230,3 +234,54 @@ real TLS 1.3 HTTPS GET to example.com — full handshake, chain validation to a
 trusted root, and `CertificateVerify` — so a regression that breaks the live
 handshake is caught even though there's no committed record-layer fuzzer. See
 [../docs/422-untrusted-input-security-audit.md](../docs/422-untrusted-input-security-audit.md).
+
+## Input tests, and why they are shaped the way they are
+
+Three tools exist for the question "did that keystroke / click actually reach
+the program", and the reason they are this elaborate is that the simple
+versions kept producing confident wrong answers.
+
+- **`run-fkey-test.sh`** — can a function key reach an application at all?
+  Until M2293 the answer was no, twice over: F1-F9 and F12 were bound to
+  window-manager actions in the keyboard IRQ handler, and F10/F11 had no
+  cooked encoding, so they were dropped where they arrived. The oracle is
+  `lxgtk3`, a GTK 3.24 client — the same library Firefox links — printing the
+  **GDK keyval** it received, so the assertion is on a value a real toolkit
+  computed from our keymap rather than on our own encoding: F11 65480,
+  Page_Down 65366, F5 65474, Home 65360. Revert proof: drop the
+  `!fk_to_client &&` guards in `kernel/desktop.c` and all four vanish.
+
+- **`../tools/ffprobe-input.sh`** with `../tools/lx/ffinput.html`
+  (`-append ffin`) — does a browser ACT on input? The page is pure CSS with
+  no JavaScript to disable: a full-width band turns **bright green on
+  `:hover` alone** (so pointer motion is testable with no click at all),
+  magenta on `:active`, a text box takes a thick yellow `:focus` ring, and
+  the body is 6000px of solid colour bands so any scroll repaints most of the
+  screen.
+
+- **`../tools/gtksub-ab.sh`** — A/B the GTK3 control against itself with
+  Gecko's structure bolted on (a subsurface with an empty input region), so
+  the toolkit and the build are held constant by construction.
+
+Four rules these encode, each paid for:
+
+1. **Aim at something that can react.** The first input test clicked a fixed
+   screen coordinate; on example.com it landed on blank page, and the scroll
+   arm ran on a document shorter than the window. Both correctly produced no
+   change on screen — which is exactly what a browser *ignoring* input
+   produces. `ffprobe-input.sh` finds the band by its resting colour in a
+   screendump and aims at the centre of it, and `gtksub-ab.sh` reads the
+   window's position from the compositor's own log line.
+2. **Refuse to measure if the stimulus cannot land.** If the band is not on
+   screen the probe stops and prints why — tab-crash pages, IPC channel
+   errors, lost-descriptor warnings — instead of clicking into space and
+   reporting a zero.
+3. **Poll for the precondition, never sleep a guessed settle time.** A fixed
+   40 s wait once declared the page absent while the window manager was still
+   showing "waiting for a client to commit a surface".
+4. **The log you grep must be one this run wrote.** `pve-run.sh` spends the
+   better part of a minute stopping the VM and syncing before it starts
+   anything, so a marker check can match the *previous* boot. Every one of
+   these compares `boot.log`'s mtime against the run's start time first. And
+   if the test drives a guest binary you changed, `make build/ext2.img` has to
+   run — `NOBUILD=1` skips it, and a stale control is not a control.

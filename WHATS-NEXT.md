@@ -1,7 +1,9 @@
 # What's next
 
-> **(M2291-M2295) FIREFOX READS EVERY INPUT EVENT AND ANSWERS NOTHING --
-> measured, not inferred -- AND TWO REAL BUGS FELL OUT OF FINALLY ASKING.**
+> **(M2291-M2297) FIREFOX READS EVERY INPUT EVENT AND ANSWERS NOTHING --
+> AND THE TEST THAT FIRST SAID SO COULD NOT HAVE SAID ANYTHING ELSE.**
+> *(The header of the sub-block below said "measured, not inferred". Read the
+> correction at the end before believing any elimination in between.)*
 >
 > The evidence table this campaign had been reasoning from said "bytes leave
 > our buffer: `q0` on every client after a click", and that row was doing work
@@ -60,9 +62,78 @@
 > limit, fixed anyway, not the bug.
 >
 > **Still open:** Firefox consumes input and does not act on it. Everything
-> below GDK is now measured rather than argued, and the reader-thread census
-> exists to test the remaining hypothesis -- that libwayland's shared-display
-> read distributes messages into a queue GDK's seat proxies are not on.
+> below GDK is now measured rather than argued.
+>
+> **(M2296-M2297) CORRECTION, AND THE THREE ELIMINATIONS THAT FOLLOWED.**
+>
+> The block above claims the input result was "measured, not inferred". It was
+> not, and the correction is worth more than the claim. The test driving it
+> clicked a fixed screen coordinate and spun a wheel at whatever page was
+> loaded -- on example.com that click landed on **blank page**, and the
+> document was **shorter than the window** so there was nothing to scroll.
+> Both arms correctly produced no change on screen, which is exactly what a
+> browser ignoring input produces. Cropping the diff by region is what broke
+> it open: `urlbar=0 content=470 titlebar=0`, and 470 px in the content area
+> is a mouse cursor being redrawn.
+>
+> So `tools/lx/ffinput.html` (`-append ffin`) exists now: pure CSS, nothing
+> that can be disabled. A full-width 300px band turns **bright green on
+> `:hover` with no click at all**, magenta on `:active`, a text box takes a
+> thick yellow `:focus` ring, and the body is 6000px of solid colour bands so
+> any scroll repaints most of the screen. `tools/ffprobe-input.sh` drives it
+> and **finds its target**: it locates the band by its resting colour in a
+> screendump, aims at the centre, polls until the page has actually painted
+> rather than sleeping a guessed settle time, and if the band never appears it
+> stops and prints why -- tab-crash pages, IPC channel errors, lost-descriptor
+> warnings -- instead of clicking into space and reporting a null.
+>
+> The conclusion survives, and is now earned. Page rendered, 374785 px of
+> band, cursor provably on the word HOVER ME:
+>
+> ```
+> HOVER (motion only)     0 px BRIGHT GREEN
+> BUTTON HELD (:active)   0 px MAGENTA
+> TEXT BOX CLICK (:focus) 0 px YELLOW RING
+> TYPED o s d e v         100 px changed
+> WHEEL DOWN x12          37928 px  (a notification bar appearing, not the page)
+> ```
+>
+> It also invalidated every earlier negative, because all of them were taken
+> with a page that could not have shown a positive. Retaken against this probe:
+> **`ffnowr`** (no WebRender, so no renderer-owned Wayland queue) and
+> **`ffptroot`** (pointer focus forced to the toplevel) are both identical to
+> baseline. **`ffalone`** turned out to be broken itself -- it sets
+> `g_wltest = 0` and the Firefox spawn lives inside that block, so it removes
+> the browser rather than isolating it; written at M2287, run for the first
+> time here.
+>
+> And the sharpest one, M2297: the GTK3 control was given **Gecko's own
+> shape** -- a subsurface with an empty input region, created outside GDK,
+> covering the window, which is what the compositor log shows Firefox doing --
+> and `LXGTK3-CLICKED` still fires. Same binary both arms, so the toolkit and
+> the build are held constant by construction, which is the mistake M2250 made
+> by using zenity (GTK4) as a GTK3 control. Not the subsurface either.
+>
+> Two process fixes came out of it, both from the same root: **a control whose
+> binary is stale is not a control.** `lxgtk3` had been built by hand and was
+> not a make target, and the first run of the A/B used `NOBUILD=1` throughout
+> -- which skips `make build/ext2.img` -- so arm B ran the build from before
+> `--subsurface` existed, ignored the argument, and printed the same CLICKED
+> as arm A while testing nothing. The kernel had even logged that it passed
+> the flag. `lxgtk3` is a make target now, and the window-creation log line
+> carries the window's **position and content origin** so a harness can aim
+> from the compositor's own report instead of a guess.
+>
+> **A descriptor-loss bug I wrote myself (M2295, fixed in M2296).** M2295
+> moved SCM_RIGHTS descriptors to be queued *after* the byte write, to stop a
+> duplication on EAGAIN retry that I had reasoned my way to and never
+> observed. Firefox named the consequence on the first run:
+> `Message needs unreceived descriptors ... num_handles:1 num_fds:0`, then
+> `Exiting due to channel error`. Bytes and descriptors sit in two queues with
+> no ordering between them, so whichever goes second can be missed -- choosing
+> a side cannot fix it. M2296 makes the message all-or-nothing instead:
+> reserve the ring space first, and if the payload will not fit return EAGAIN
+> having queued nothing and written nothing.
 
 > **(M2252-M2276) THE 8-CORE CORRUPTION IS CURED, CLAUDE CODE RUNS ON EIGHT
 > CORES, AND THE FIREFOX INPUT HUNT COST NINE FALSE NEGATIVES.**

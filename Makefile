@@ -522,7 +522,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxpollout $(LXROOT)/lxpty $(LXROOT)/lxshcow $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxpollout $(LXROOT)/lxpty $(LXROOT)/lxshcow $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai $(LXROOT)/lxgtk3
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
@@ -601,6 +601,16 @@ $(LXROOT)/ffpage.html: tools/lx/ffpage.html
 # and a scroll each change a large, known region of the screen. See the
 # comment at the top of the file for why the previous input tests could not
 # fail honestly.
+# THE GTK3 CONTROL, WHICH WAS BUILT BY HAND AND THEREFORE NOT REBUILT (M2297).
+# It links the host's real libgtk-3.so.0 -- the same one Firefox uses -- so it
+# cannot be static; the closure is already in the image because Firefox needs
+# it. It is a make target now because a control that silently keeps an old
+# binary is worse than no control.
+$(LXROOT)/lxgtk3: tools/lx/lxgtk3.c
+	@mkdir -p $(LXROOT)
+	@$(CC) -O2 -o $@ $< $$(pkg-config --cflags --libs gtk+-3.0) -lwayland-client
+	@echo "  CC      $@ (GTK3 control, dynamic against the host's libgtk-3)"
+
 $(LXROOT)/ffinput.html: tools/lx/ffinput.html
 	@mkdir -p $(LXROOT)
 	@cp $< $@
