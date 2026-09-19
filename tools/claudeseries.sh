@@ -42,8 +42,9 @@ while [ "$i" -le "$N" ]; do
         tools/pve-run.sh >/dev/null 2>&1
     L=$LOGS/claude-$MODE-c$CORES-r$i.log
     scp -q root@"${PVE_HOST:-192.168.1.5}":/root/osdev/boot.log "$L"
-    printf '%s r%s: exit=%-4s bashok=%s crashed=%s | %s\n' "$MODE" "$i" \
+    printf '%s r%s: exit=%-4s t=%-5s bashok=%s crashed=%s | %s\n' "$MODE" "$i" \
       "$(grep -ao 'claude -p -> -\?[0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
+      "$(awk '/claude -p ->/{print last; exit} /\[runsync\] t=/{match($0,/t=[0-9]+s/); last=substr($0,RSTART+2,RLENGTH-2)}' "$L")" \
       "$(grep -aq 'OSDEV-BASH-OK' "$L" && echo YES || echo no)" \
       "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \
       "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //; s/\| refused.*//' \
