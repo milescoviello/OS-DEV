@@ -170,6 +170,20 @@ static const struct wl_registry_listener reg_listener = { on_global, on_global_r
 
 /* Gecko's shape: a thread that owns the read side of the display while
  * another dispatches. Uses the documented multi-thread API exactly. */
+/* WHAT THE READER THREAD ACTUALLY ACHIEVES (M2270).
+ *
+ * The discriminating question needs no host control. Once read_events()
+ * succeeds, libwayland distributes the events to each proxy's queue entirely
+ * in USERSPACE -- the kernel is not involved again. So:
+ *
+ *   reader reads fine, main thread still gets nothing  -> my threading
+ *      pattern is wrong, and this is not an OS-DEV bug at all;
+ *   reader's poll never fires, or read_events fails    -> the kernel's
+ *      recvmsg/poll on the Wayland fd IS the bug, and it is ours.
+ *
+ * Two counters settle which, inside OS-DEV, with input this harness can
+ * already deliver to the exact pixel. */
+int mt_polls, mt_reads, mt_readfail, mt_cancels;
 static void *mt_reader(void *arg) {
     struct wl_display *d = (struct wl_display *)arg;
     for (;;) {
@@ -178,8 +192,13 @@ static void *mt_reader(void *arg) {
         wl_display_flush(d);
         struct pollfd pfd = { .fd = wl_display_get_fd(d), .events = POLLIN };
         int pr = poll(&pfd, 1, 200);
-        if (pr > 0) wl_display_read_events(d);
-        else        wl_display_cancel_read(d);
+        if (pr > 0) {
+            mt_polls++;
+            if (wl_display_read_events(d) == 0) mt_reads++; else mt_readfail++;
+        } else {
+            mt_cancels++;
+            wl_display_cancel_read(d);
+        }
     }
     return 0;
 }
@@ -490,8 +509,9 @@ int main(int argc, char **argv) {
                      * events are being read and never distributed to this
                      * thread's queue -- which needs no input to observe, and
                      * so can be compared against a real compositor. */
-                    printf("LXWL-MT: main thread dispatching: %d loops, %d EVENTS, %d motion\n",
-                           n_loops, n_disp, n_motion);
+                    printf("LXWL-MT: main %d loops %d EVENTS %d motion | reader: %d polls-ready, "
+                           "%d reads OK, %d read FAIL, %d timeouts\n",
+                           n_loops, n_disp, n_motion, mt_polls, mt_reads, mt_readfail, mt_cancels);
                     fflush(stdout);
                 }
                 if (d < 0) {
