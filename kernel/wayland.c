@@ -134,6 +134,7 @@ extern int app_memfd_mapper_at(int mfd, unsigned long off, uint64_t *out_va, uin
 #define WL_POINTER_EV_LEAVE      1
 #define WL_POINTER_EV_MOTION     2
 #define WL_POINTER_EV_BUTTON     3
+#define WL_POINTER_EV_AXIS       4
 #define WL_POINTER_EV_FRAME      5
 #define WL_KEYBOARD_EV_KEYMAP    0
 #define WL_KEYBOARD_EV_ENTER     1
@@ -318,6 +319,9 @@ struct wl_client {
     uint32_t serial;               /* configure serials, monotonic per client */
     uint32_t pointer, keyboard;    /* the client's wl_pointer / wl_keyboard, 0 = not asked for */
     uint32_t surface;              /* the surface input is delivered to */
+    /* POINTER FOCUS IS A SUBSURFACE, NOT THE TOPLEVEL (M2245). */
+    uint32_t ptr_surface;          /* the surface wl_pointer.enter last named */
+    int      ptr_ox, ptr_oy;       /* ...and its offset inside the window */
     int      ptr_in, kbd_in;       /* enter() already sent. Pointer focus follows the CURSOR and
                                     * keyboard focus follows the WINDOW -- they are separate in
                                     * Wayland, and a client ignores input for a surface it has
@@ -2295,6 +2299,25 @@ void wl_fs_health_line(void) {
         extern unsigned long g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts;
         extern unsigned long g_dk_keys, g_dk_fwd; extern int g_dk_focus_kind;
         unsigned wl_keys_sent(void);
+        extern unsigned g_axis_sent;
+        /* WHICH client is getting these? The one with the toplevel -- the one
+         * whose window the user is looking at -- must have a pointer and a
+         * keyboard bound, or we are broadcasting input to content processes
+         * and none of it reaches the browser. (M2245) */
+        char who[64]; int wn = 0;
+        for (int q = 0; q < WL_MAXCLIENT && wn < 56; q++) {
+            if (!g_cl[q].used) continue;
+            int tl = 0;
+            for (int j = 0; j < g_cl[q].nobj; j++)
+                if (g_cl[q].obj[j].id && g_cl[q].obj[j].kind == WLK_SURFACE &&
+                    g_cl[q].obj[j].role == WLR_TOPLEVEL) tl = 1;
+            who[wn++] = (char)('0' + q);
+            who[wn++] = tl ? 'T' : '-';
+            who[wn++] = g_cl[q].pointer ? 'P' : '-';
+            who[wn++] = g_cl[q].keyboard ? 'K' : '-';
+            who[wn++] = ' ';
+        }
+        who[wn] = 0;
         int kbclients = 0;
         for (int q = 0; q < WL_MAXCLIENT; q++) if (g_cl[q].used && g_cl[q].keyboard) kbclients++;
         extern int g_tab_lastx, g_tab_lasty, g_tab_lastbtn;
@@ -2319,7 +2342,8 @@ void wl_fs_health_line(void) {
                 "tablet: %lu polls, %lu reports, %lu err, %lu short, last %d,%d btn %d | "
                 "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx | "
                 "keys: %lu dequeued, %lu forwarded to wayland, focus kind %d, "
-                "%lu SENT on the wire to %d client(s) with a wl_keyboard\n",
+                "%lu SENT on the wire to %d client(s) with a wl_keyboard, %lu axis event(s) | "
+                "clients [slot/Toplevel/Pointer/Keyboard]: %s\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
                 g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
@@ -2343,7 +2367,7 @@ void wl_fs_health_line(void) {
                 g_tab_lastx, g_tab_lasty, g_tab_lastbtn,
                 g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts,
                 g_dk_keys, g_dk_fwd, g_dk_focus_kind,
-                (unsigned long)wl_keys_sent(), kbclients); }
+                (unsigned long)wl_keys_sent(), kbclients, (unsigned long)g_axis_sent, who); }
 }
 
 int wl_page_probe(uint32_t want) {
@@ -2606,6 +2630,7 @@ void wl_server_task(void) {
  * without entering first sends events that are correctly parsed and silently
  * dropped, which looks exactly like input not working. */
 static unsigned g_keys_sent, g_ptr_sent;
+unsigned g_axis_sent;   /* wl_pointer.axis events actually put on the wire (M2245) */
 unsigned wl_keys_sent(void)    { return g_keys_sent; }
 unsigned wl_pointer_sent(void) { return g_ptr_sent; }
 
@@ -2615,16 +2640,76 @@ static uint32_t wl_now_ms(void) { return (uint32_t)timer_ms(); }
  * a plain integer puts the pointer at 1/256th of where it should be. */
 static uint32_t wl_fixed(int v) { return (uint32_t)(v * 256); }
 
+/* THE DEEPEST MAPPED SURFACE UNDER A POINT (M2245).
+ *
+ * wl_pointer.enter names THE SURFACE THE POINTER IS OVER. This compositor
+ * always named c->surface -- the xdg_toplevel's surface -- which is correct
+ * only for a client that draws directly into its toplevel. GTK does not:
+ * Firefox's toplevel carries no buffer and every pixel the user sees is in a
+ * SUBSURFACE (2947 subsurface events in one boot). A toolkit told the pointer
+ * entered a surface that is not the one under the cursor maps the event to no
+ * widget, which is exactly what "clicking does nothing" looks like from
+ * outside while every event is demonstrably on the wire.
+ *
+ * Same generation walk as wl_layers_of, for the same reason it uses one: the
+ * parent links come from the client and a client can make a cycle. Deeper
+ * hits win, which is what "topmost" means for a subsurface tree. */
+static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *oy) {
+    struct wl_object *root = 0;
+    for (int j = 0; j < c->nobj; j++)
+        if (c->obj[j].id == c->surface) { root = &c->obj[j]; break; }
+    if (!root) return 0;
+    uint32_t best = 0; int bx = 0, by = 0;
+    if (root->base && root->width && root->height &&
+        x >= 0 && y >= 0 && x < (int)root->width && y < (int)root->height) {
+        best = root->id; bx = 0; by = 0;
+    }
+    struct { uint32_t id; int x, y; } gen[16], next[16];
+    int ngen = 1; gen[0].id = root->id; gen[0].x = 0; gen[0].y = 0;
+    for (int depth = 0; depth < 4 && ngen; depth++) {
+        int nnext = 0;
+        for (int j = 0; j < c->nobj; j++) {
+            struct wl_object *o = &c->obj[j];
+            if (!o->id || o->kind != WLK_SURFACE || !o->parent) continue;
+            int px = 0, py = 0, isChild = 0;
+            for (int g = 0; g < ngen; g++)
+                if (o->parent == gen[g].id) { isChild = 1; px = gen[g].x; py = gen[g].y; break; }
+            if (!isChild) continue;
+            int ax = px + o->sub_x, ay = py + o->sub_y;
+            if (nnext < 16) { next[nnext].id = o->id; next[nnext].x = ax; next[nnext].y = ay; nnext++; }
+            if (!o->base || !o->width || !o->height) continue;      /* unmapped: not hittable */
+            if (x >= ax && y >= ay && x < ax + (int)o->width && y < ay + (int)o->height) {
+                best = o->id; bx = ax; by = ay;                     /* deeper wins */
+            }
+        }
+        for (int k = 0; k < nnext; k++) gen[k] = next[k];
+        ngen = nnext;
+    }
+    if (ox) *ox = bx;
+    if (oy) *oy = by;
+    return best;
+}
+
 static void wl_ptr_enter(struct wl_client *c, int x, int y) {
-    if (c->ptr_in || !c->surface || !c->pointer) return;
+    if (!c->surface || !c->pointer) return;
+    int ox = 0, oy = 0;
+    uint32_t want = wl_surface_at(c, x, y, &ox, &oy);
+    if (!want) { want = c->surface; ox = oy = 0; }
+    if (c->ptr_in && c->ptr_surface == want) return;
+    if (c->ptr_in) {                                   /* crossed into another surface: leave first */
+        uint8_t lv[8]; int q = 0;
+        wr32(lv + q, ++c->serial);   q += 4;
+        wr32(lv + q, c->ptr_surface); q += 4;
+        wl_send(c, c->pointer, WL_POINTER_EV_LEAVE, lv, q);
+    }
     uint8_t b[16]; int p = 0;
     wr32(b + p, ++c->serial); p += 4;
-    wr32(b + p, c->surface);  p += 4;
-    wr32(b + p, wl_fixed(x)); p += 4;
-    wr32(b + p, wl_fixed(y)); p += 4;
+    wr32(b + p, want);        p += 4;
+    wr32(b + p, wl_fixed(x - ox)); p += 4;
+    wr32(b + p, wl_fixed(y - oy)); p += 4;
     wl_send(c, c->pointer, WL_POINTER_EV_ENTER, b, p);
     if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
-    c->ptr_in = 1;
+    c->ptr_in = 1; c->ptr_surface = want; c->ptr_ox = ox; c->ptr_oy = oy;
 }
 
 static void wl_kbd_enter(struct wl_client *c) {
@@ -2672,10 +2757,14 @@ void wl_post_motion(int x, int y) {
         struct wl_client *c = &g_cl[i];
         if (!c->used || !c->pointer) continue;
         wl_ptr_enter(c, x, y);
+        /* RELATIVE TO THE SURFACE THAT WAS ENTERED, not to the window (M2245).
+         * enter() now names the subsurface under the cursor, so motion has to
+         * be expressed in that surface's coordinates or the toolkit places the
+         * pointer at an offset from where it really is. */
         uint8_t b[12]; int p = 0;
         wr32(b + p, wl_now_ms()); p += 4;
-        wr32(b + p, wl_fixed(x)); p += 4;
-        wr32(b + p, wl_fixed(y)); p += 4;
+        wr32(b + p, wl_fixed(x - c->ptr_ox)); p += 4;
+        wr32(b + p, wl_fixed(y - c->ptr_oy)); p += 4;
         wl_send(c, c->pointer, WL_POINTER_EV_MOTION, b, p);
         if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
         g_ptr_sent++;
@@ -2695,6 +2784,38 @@ void wl_post_button(int x, int y, unsigned button, int pressed) {
         wl_send(c, c->pointer, WL_POINTER_EV_BUTTON, b, p);
         if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
         g_ptr_sent++;
+    }
+}
+
+/* SCROLLING (M2245).
+ *
+ * The desktop's wheel handler routed a tick to KIND_BROWSER and to KIND_APP,
+ * and had no case for KIND_WAYLAND at all -- so a Wayland client, which is to
+ * say Firefox, was never told the wheel had moved. There was no wl_post_axis
+ * in the tree to tell it with. "i cant click or scroll or anything": the
+ * scroll half of that was not a bug in delivery, it was a feature that did
+ * not exist.
+ *
+ * wl_pointer.axis carries (time, axis, value) with value in 24.8 FIXED point,
+ * and axis 0 is the vertical scroll. Toolkits treat ~10.0 as one notch, so a
+ * tick is 10 << 8 = 2560, POSITIVE meaning the surface content moves up (the
+ * user scrolls down) -- the opposite sign to this desktop's `up` flag, which
+ * is the kind of inversion that is invisible until someone scrolls the wrong
+ * way. */
+void wl_post_axis(int x, int y, int ticks_down) {
+    if (!ticks_down) return;
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        struct wl_client *c = &g_cl[i];
+        if (!c->used || !c->pointer) continue;
+        wl_ptr_enter(c, x, y);
+        uint8_t b[12]; int p = 0;
+        wr32(b + p, wl_now_ms()); p += 4;
+        wr32(b + p, 0);           p += 4;      /* axis 0 = vertical scroll */
+        wr32(b + p, (uint32_t)(int32_t)(ticks_down * 2560)); p += 4;   /* 24.8 fixed */
+        wl_send(c, c->pointer, WL_POINTER_EV_AXIS, b, p);
+        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        g_ptr_sent++;
+        g_axis_sent++;
     }
 }
 

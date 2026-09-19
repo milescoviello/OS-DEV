@@ -2673,7 +2673,13 @@ void desktop_run(void) {
             for (int i = win_count - 1; i >= 0; i--) {
                 window_t *w = &windows[i];
                 if (w->minimized || !in_rect(mx, my, w->x, w->y, w->w, w->h)) continue;
-                if (w->kind == KIND_BROWSER && w->app) {
+                if (w->kind == KIND_WAYLAND) {
+                    /* Surface-relative, like every other pointer event (M2245). */
+                    int rx = mx - (w->x + 6), ry = my - (w->y + TITLEBAR_H + 6);
+                    if (rx < 0) rx = 0;
+                    if (ry < 0) ry = 0;
+                    wl_post_axis(rx, ry, up ? -ticks : ticks);
+                } else if (w->kind == KIND_BROWSER && w->app) {
                     for (int t = 0; t < ticks * 3; t++) browser_key((browser_t *)w->app, up ? 0x11 : 0x12);
                     dirty = 1;
                 } else if (w->kind == KIND_APP && w->app) {
