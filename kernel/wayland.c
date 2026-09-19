@@ -1753,9 +1753,11 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         }
         static int shown;
         if (shown < 12) { shown++;
-            kprintf("[wl] set_input_region on surface %u -> %s\n", o->id,
+            kprintf("[wl] set_input_region on surface %u (%ux%u) -> %s [%d,%d %dx%d]\n",
+                    o->id, o->width, o->height,
                     !rid ? "NULL (whole surface)"
-                         : (o->in_any ? "a region WITH area" : "an EMPTY region -- takes no input")); }
+                         : (o->in_any ? "a region WITH area" : "an EMPTY region -- takes no input"),
+                    o->in_x, o->in_y, o->in_w, o->in_h); }
         return;
     }
     if (o->kind == WLK_SURFACE && (opcode == WL_SURFACE_DAMAGE || opcode == 4 /* set_opaque_region */ ||
@@ -2847,6 +2849,29 @@ static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *o
     return best;
 }
 
+/* INPUT GOES TO ONE CLIENT, NOT ALL OF THEM (M2251).
+ *
+ * wl_post_* looped over every client with a pointer or keyboard and sent each
+ * of them enter + the event. With a single-client app that is invisible. With
+ * Firefox it means FOUR connections are simultaneously told they hold pointer
+ * and keyboard focus -- the parent, and three helper processes that are
+ * showing nothing. zenity, one client, acts on a click; Firefox, four, acts on
+ * none, and this is the only structural difference between them on our side.
+ *
+ * A Wayland seat has exactly one focused surface at a time. Pick the client
+ * whose mapped toplevel is biggest -- the same rule wl_frame_tick already uses
+ * to grant keyboard focus and the window manager uses to decide which window
+ * is the real one -- and send to that one alone. */
+static int wl_focus_client(void) {
+    int best = -1; uint64_t barea = 0;
+    for (int i = 0; i < WL_MAXCLIENT; i++) {
+        if (!g_cl[i].used) continue;
+        uint32_t w = 0, h = 0; wl_client_extent(i, &w, &h);
+        if ((uint64_t)w * h > barea) { barea = (uint64_t)w * h; best = i; }
+    }
+    return barea ? best : -1;
+}
+
 static void wl_ptr_enter(struct wl_client *c, int x, int y) {
     if (!c->surface || !c->pointer) return;
     int ox = 0, oy = 0;
@@ -2953,9 +2978,11 @@ void wl_post_pointer_leave(void) {
 }
 
 void wl_post_motion(int x, int y) {
+    int focus = wl_focus_client();
+    if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (!c->used || !c->pointer) continue;
+        if (i != focus || !c->used || !c->pointer) continue;
         wl_ptr_enter(c, x, y);
         /* RELATIVE TO THE SURFACE THAT WAS ENTERED, not to the window (M2245).
          * enter() now names the subsurface under the cursor, so motion has to
@@ -2972,9 +2999,11 @@ void wl_post_motion(int x, int y) {
 }
 
 void wl_post_button(int x, int y, unsigned button, int pressed) {
+    int focus = wl_focus_client();
+    if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (!c->used || !c->pointer) continue;
+        if (i != focus || !c->used || !c->pointer) continue;
         wl_ptr_enter(c, x, y);
         uint8_t b[16]; int p = 0;
         wr32(b + p, ++c->serial);  p += 4;
@@ -3003,10 +3032,12 @@ void wl_post_button(int x, int y, unsigned button, int pressed) {
  * is the kind of inversion that is invisible until someone scrolls the wrong
  * way. */
 void wl_post_axis(int x, int y, int ticks_down) {
+    int focus = wl_focus_client();
+    if (focus < 0) return;
     if (!ticks_down) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (!c->used || !c->pointer) continue;
+        if (i != focus || !c->used || !c->pointer) continue;
         wl_ptr_enter(c, x, y);
         uint8_t b[12]; int p = 0;
         wr32(b + p, wl_now_ms()); p += 4;
@@ -3020,9 +3051,11 @@ void wl_post_axis(int x, int y, int ticks_down) {
 }
 
 void wl_post_key(unsigned keycode, int pressed) {
+    int focus = wl_focus_client();
+    if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (!c->used || !c->keyboard) continue;
+        if (i != focus || !c->used || !c->keyboard) continue;
         wl_kbd_enter(c);
         uint8_t b[16]; int p = 0;
         wr32(b + p, ++c->serial); p += 4;
