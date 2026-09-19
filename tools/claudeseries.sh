@@ -46,8 +46,11 @@ while [ "$i" -le "$N" ]; do
       "$(grep -ao 'claude -p -> -\?[0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
       "$(grep -aq 'OSDEV-BASH-OK' "$L" && echo YES || echo no)" \
       "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \
-      "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //; s/\| refused.*//')" \
+      "$(grep -a '^\[fs\] superblock' "$L" | tail -1 | sed -E 's/^\[fs\] //; s/\| refused.*//' \
+         | grep . || echo 'NO [fs] LINE -- that health line is printed by the ffshow watcher, which these modes do not start')" \
       | tee -a "$OUT"
+    grep -a 'ext2 GDT self-test' "$L" | tail -1 | sed 's/^/  /' | tee -a "$OUT"
+    grep -aE '^\[lxask\]|^\[lxclaude\]' "$L" | tail -4 | sed 's/^/  /' | tee -a "$OUT"
     i=$((i+1))
 done
 echo "==> $OUT"
