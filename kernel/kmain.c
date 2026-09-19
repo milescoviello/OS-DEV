@@ -257,6 +257,7 @@ static volatile int g_fatjournal_test;        /* -append fatjournaltest: prove a
  * often enough. The probes still run in their own boots, which is where the
  * test suites ask for them. */
 static volatile int g_noprobes;
+static volatile int g_force_probes;           /* -append probes: run the ABI battery even on a demo boot (M2283) */
 static volatile int g_lxfull_test;            /* -append lxfulltest: the whole Linux demo set (only useful under -cpu max) (M1954) */
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
@@ -857,6 +858,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * console dragged that boot past any sensible wait budget. They only do
          * useful work under -cpu max anyway, so only that boot launches them. */
         if (cmdline_has(cl, "noprobes"))   g_noprobes = 1;                /* ABI up, probe suite skipped (M2103) */
+        /* ...and the other direction (M2283). M2278 turned the battery OFF
+         * for the Claude demos so a stress probe could not decide whether
+         * the north star ran. But the freeze that motivated it (M2277) only
+         * appears on those heavier boots, and M2282 could not reproduce it
+         * with the probes alone -- so debugging it needs the combination the
+         * switch now forbids. `probes` forces them back on; it is parsed
+         * AFTER every flag that sets g_noprobes so it always wins. */
+        if (cmdline_has(cl, "probes"))     g_force_probes = 1;
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
@@ -942,6 +951,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxedit")) { g_lxabi_test = 1; g_lxask = 1; g_lxedit = 1;  g_noprobes = 1;}   /* the file-EDIT demo (M2170) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1;  g_noprobes = 1;}
+        if (g_force_probes) g_noprobes = 0;   /* `probes` beats every skip (M2283) */
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
