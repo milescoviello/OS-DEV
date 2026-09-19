@@ -299,6 +299,7 @@ static int ext2_raw_read_hook(void *ctx, uint64_t lba, uint32_t n, void *buf) {
 static volatile int g_wlmt;                   /* -append wlmt: multi-threaded libwayland in the test client (M2265) */
 static volatile int g_ffnowr;                 /* -append ffnowr: disable WebRender (M2264) */
 static volatile int g_ffe10s;                 /* -append ffe10s: do NOT force E10S off (M2252) */
+static volatile int g_lxgtk3;                 /* -append lxgtk3: a GTK3 client, the toolkit Firefox uses (M2272) */
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
@@ -898,6 +899,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;
         if (cmdline_has(cl, "ffnowr")) g_ffnowr = 1;
         if (cmdline_has(cl, "wlmt")) g_wlmt = 1;   /* the test client, Gecko-shaped: two threads on one display (M2265) */   /* no WebRender: no renderer-owned Wayland queue (M2264) */   /* leave content processes ENABLED (M2252) */
+        if (cmdline_has(cl, "lxgtk3")) g_lxgtk3 = 1;   /* the GTK3 control -- the toolkit Firefox actually uses (M2272) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
@@ -2288,7 +2290,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * is Gecko's; if it does not, the bug reproduces in
                      * something small enough to instrument on both sides. */
                     int spid;
-                    if (g_lxgtk) {
+                    if (g_lxgtk3) {
+                        /* THE GTK3 CONTROL (M2272). zenity is GTK4 and
+                         * Firefox is GTK3 -- different toolkits, different
+                         * Wayland backends -- so the zenity result never
+                         * applied to Firefox at all. This is the arm that
+                         * does. */
+                        kprintf("[ff] spawning the GTK3 control instead of Firefox\n");
+                        spid = app_spawn_linux_from_file("/disk2/lxgtk3");
+                    } else if (g_lxgtk) {
                         static const char *av_z[] = { "--info", "--text=OSDEV-GTK-CLICK-ME" };
                         kprintf("[ff] spawning ZENITY (GTK) instead of Firefox: the same toolkit, "
                                 "seconds instead of minutes\n");
