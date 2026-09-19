@@ -296,6 +296,7 @@ static void ext2_cache_drop_hook(void *ctx, uint64_t lba, uint32_t n) {
 static int ext2_raw_read_hook(void *ctx, uint64_t lba, uint32_t n, void *buf) {
     return blockdev_read_raw((int)(intptr_t)ctx, lba, n, buf);
 }
+static volatile int g_ffnowr;                 /* -append ffnowr: disable WebRender (M2264) */
 static volatile int g_ffe10s;                 /* -append ffe10s: do NOT force E10S off (M2252) */
 static volatile int g_lxgtk;                  /* -append lxgtk: run zenity (GTK) instead of Firefox, for a fast input loop (M2250) */
 static volatile int g_ffurl;                  /* -append ffurl: the URL comes from /disk2/ffurl.txt, which is NOT in the repo (M2241) */
@@ -893,7 +894,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         }
         if (cmdline_has(cl, "ffurl")) g_ffurl = 1;
         if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */
-        if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;   /* leave content processes ENABLED (M2252) */
+        if (cmdline_has(cl, "ffe10s")) g_ffe10s = 1;
+        if (cmdline_has(cl, "ffnowr")) g_ffnowr = 1;   /* no WebRender: no renderer-owned Wayland queue (M2264) */   /* leave content processes ENABLED (M2252) */
         if (cmdline_has(cl, "lxgtk")) g_lxgtk = 1;   /* a tiny GTK client instead of Firefox (M2250) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
@@ -2236,6 +2238,22 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * it. `-append ffe10s` leaves E10S alone so both arms can
                      * be measured instead of argued about. */
                     if (!g_ffe10s) app_set_next_env("MOZ_FORCE_DISABLE_E10S=1");
+                    /* -append ffnowr: TAKE THE RENDERER'S OWN WAYLAND QUEUE
+                     * OUT OF THE PICTURE (M2264).
+                     *
+                     * M2263 localised the input failure to libwayland's
+                     * per-proxy event queues inside Gecko: the renderer pumps
+                     * its own queue, which is exactly why frame callbacks and
+                     * configure work and the page keeps painting, while the
+                     * queue GDK's seat proxies live on is never dispatched.
+                     * WebRender is what runs that separate renderer thread.
+                     * Turning it off is the one lever this side of the ABI
+                     * that can test the hypothesis instead of reasoning about
+                     * it. */
+                    if (g_ffnowr) {
+                        app_set_next_env("MOZ_WEBRENDER=0");
+                        app_set_next_env("MOZ_ACCELERATED=0");
+                    }
                     app_set_next_env("MOZ_DISABLE_CONTENT_SANDBOX=1");
                     /* Snapshot the unaligned-madvise count HERE so the
                      * heartbeat can report Firefox's OWN calls as a delta
