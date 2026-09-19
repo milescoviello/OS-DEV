@@ -57,16 +57,16 @@ fi
 [ "$L" = "$R" ] || { echo "FATAL: the node does not have this build." >&2; exit 1; }
 
 echo "==> booting VM $VMID ($CORES core(s), ${MEM}M, -append \"$APPEND\") -- NOT stopping it"
-# A PS/2 MOUSE, NOT A USB TABLET (M2241).
+# THE USB TABLET, ON PURPOSE (M2242).
 #
-# Proxmox gives every VM `usb-tablet` as its pointer and NO PS/2 mouse:
-#     usb-tablet,id=tablet,bus=uhci.0,port=1
-# kernel/desktop.c reads the i8042, so every click the user made went to a
-# device nothing in this OS consumes -- and because the desktop focuses a
-# window on click, that killed TYPING too. One cause, both symptoms, and it
-# looked like "the desktop is frozen".
-# `--tablet 0` makes Proxmox attach a PS/2 mouse instead.
-$SSH "qm set $VMID --tablet 0" >/dev/null 2>&1 || true
+# M2241 turned it OFF, which was exactly backwards. A usb-tablet is an
+# ABSOLUTE pointing device -- that is why Proxmox defaults to it -- and this
+# OS already has a driver that prefers it (usb_tablet_init -> mouse_set_abs),
+# falling back to the relative PS/2 mouse only when no tablet is found.
+# Forcing PS/2 made the guest cursor drift from the console cursor, so clicks
+# landed somewhere other than where the user pointed: "the mouse isnt in the
+# same place its offset weird". Absolute input is the fix, not the problem.
+$SSH "qm set $VMID --tablet 1" >/dev/null 2>&1 || true
 $SSH "qm set $VMID --memory $MEM --cores $CORES --args \
   '-snapshot -kernel $PVE_DIR/kernel32.elf -append \"$APPEND\" \
    -drive file=$PVE_DIR/fat.img,format=raw,if=ide,index=0 \

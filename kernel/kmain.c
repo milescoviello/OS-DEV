@@ -881,10 +881,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * run on a watcher thread (ffshow_watch_task) printing the same series
          * to COM1. `ffhold` is the escape hatch for the rare boot that dies
          * before the desktop starts and therefore needs the log ON SCREEN. */
-        if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") || cmdline_has(cl, "ffnet")) {
-        if (cmdline_has(cl, "ffurl")) { g_ffurl = 1; }   /* URL from a file in the image, never from the source tree (M2241) */
+        /* `ffurl` SELECTS A URL, SO IT MUST ALSO SELECT THE MODE (M2241).
+         * The first cut set g_ffurl and nothing else, so `-append ffurl`
+         * booted to a desktop with no browser in it at all -- the flag that
+         * spawns Firefox is this one, and a URL with no spawn is not a mode. */
+        if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") ||
+            cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl")) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
+        if (cmdline_has(cl, "ffurl")) g_ffurl = 1;   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
@@ -1989,8 +1994,18 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                 /* Length and scheme only: enough to prove the
                                  * file was read and parsed, without printing
                                  * the address to a console someone may share. */
-                                kprintf("[ff] URL from /disk2/ffurl.txt: %d chars, scheme %.5s\n",
-                                        (int)__builtin_strlen(urlbuf), urlbuf);
+                                /* kprintf HAS NO PRECISION (M2241). `%.5s`
+                                 * printed the four characters "%.5s"
+                                 * literally -- console.c's 's' case copies to
+                                 * the NUL and never parses a `.N`. So say the
+                                 * scheme with a comparison instead of asking
+                                 * the formatter for something it does not
+                                 * implement. */
+                                int is_tls = urlbuf[0]=='h'&&urlbuf[1]=='t'&&urlbuf[2]=='t'&&
+                                             urlbuf[3]=='p'&&urlbuf[4]=='s';
+                                kprintf("[ff] URL from /disk2/ffurl.txt: %d chars, %s\n",
+                                        (int)__builtin_strlen(urlbuf),
+                                        is_tls ? "https" : "not https");
                             }
                         }
                         if (!have_url)
