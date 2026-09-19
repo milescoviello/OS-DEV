@@ -889,7 +889,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl")) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
-        if (cmdline_has(cl, "ffurl")) g_ffurl = 1;   /* URL from a file in the image, never from the source tree (M2241) */
+        if (cmdline_has(cl, "ffurl")) g_ffurl = 1;
+        if (cmdline_has(cl, "ffptroot")) { extern int g_ptr_focus_root; g_ptr_focus_root = 1; }   /* pointer focus on the toplevel (M2248) */   /* URL from a file in the image, never from the source tree (M2241) */
         if (cmdline_has(cl, "ffnet"))      g_ffnet = 1;                   /* ...against a REAL URL (M2210) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */

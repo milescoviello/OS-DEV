@@ -2319,6 +2319,19 @@ void wl_fs_health_line(void) {
             en += ksnprint_u(ent + en, (unsigned)q); ent[en++] = ':';
             en += ksnprint_u(ent + en, g_ptr_enter_by[q]);
             ent[en++] = '/'; en += ksnprint_u(ent + en, g_cl[q].surface);
+            ent[en++] = 'p'; en += ksnprint_u(ent + en, g_cl[q].pointer);
+            ent[en++] = 'k'; en += ksnprint_u(ent + en, g_cl[q].keyboard);
+            /* AN ID THAT MEANS TWO THINGS (M2248). Object ids are unique per
+             * CONNECTION; if our table ever holds one id as both a surface and
+             * a pointer, every lookup after that is a coin toss. Flag it here
+             * rather than reasoning about whether it can happen. */
+            {   int dup = 0;
+                for (int j1 = 0; j1 < g_cl[q].nobj && !dup; j1++)
+                    for (int j2 = j1 + 1; j2 < g_cl[q].nobj && !dup; j2++)
+                        if (g_cl[q].obj[j1].id && g_cl[q].obj[j1].id == g_cl[q].obj[j2].id &&
+                            g_cl[q].obj[j1].kind != g_cl[q].obj[j2].kind) dup = 1;
+                if (dup) ent[en++] = '!';
+            }
             ent[en++] = ' ';
         }
         ent[en] = 0;
@@ -2681,6 +2694,7 @@ unsigned g_axis_sent;   /* wl_pointer.axis events actually put on the wire (M224
  * time is indistinguishable from the bug it was meant to fix. */
 unsigned g_ptr_enter_sid, g_ptr_enters; int g_ptr_enter_root;
 unsigned g_ptr_enter_by[WL_MAXCLIENT];   /* ...and which surface EACH client was told (M2246) */
+int g_ptr_focus_root;   /* -append ffptroot: give pointer focus to the TOPLEVEL, not the subsurface (M2248) */
 unsigned wl_keys_sent(void)    { return g_keys_sent; }
 unsigned wl_pointer_sent(void) { return g_ptr_sent; }
 
@@ -2769,6 +2783,20 @@ static void wl_ptr_enter(struct wl_client *c, int x, int y) {
     int ox = 0, oy = 0;
     if (c->surface) wl_dump_tree(c);
     uint32_t want = wl_surface_at(c, x, y, &ox, &oy);
+    /* WHICH SURFACE SHOULD OWN POINTER FOCUS -- BOTH ARMS, TESTABLE (M2248).
+     *
+     * M2245 changed this from the toplevel to the deepest mapped subsurface,
+     * which is what the protocol says. But GTK normally declares an EMPTY
+     * INPUT REGION on the subsurfaces it renders into (wl_surface.
+     * set_input_region, which this compositor ignores), and a surface with an
+     * empty input region must NOT receive pointer events -- they belong to
+     * the parent. If Firefox does that, "deepest wins" is exactly wrong here.
+     *
+     * The toplevel arm was last tried when the window manager ran at 0.15 Hz,
+     * a black console covered the page and there was no axis event, so it was
+     * never a fair test of anything. `-append ffptroot` runs it under today's
+     * conditions instead of arguing about it. */
+    if (g_ptr_focus_root) { want = 0; }
     if (!want) {
         /* DO NOT ENTER AN UNMAPPED SURFACE (M2246).
          *
