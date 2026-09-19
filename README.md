@@ -132,20 +132,21 @@ caveats below).
   spinning). The one piece with no steady-state driver is the short-lived
   **compute job pool** (`smp_parallel_for`), used at boot for parallel TLS
   chain-link verification and a self-test but not called afterwards.
-- **Firefox renders, but does not respond to input.** This is the one known
-  broken thing in the compatibility layer and it is not close to resolved. The
-  page lays out and paints correctly over HTTPS; pointer motion, clicks,
-  typing and scrolling reach the process and produce no reaction. What is
-  measured rather than assumed: the compositor forwards the events, Firefox
-  **consumes every byte off the socket** (a per-client counter tracks bytes
-  sent against bytes still unread in the kernel ring), and it sends nothing
-  back. A GTK 3.24 test client — the same library Firefox links — clicks and
-  types fine on the same boot, including when given Gecko's own structure of
-  a subsurface with an empty input region. Ruled out by measurement: delivery,
-  the surface targeted, input regions, pointer focus, WebRender, the `poll()`
-  descriptor limit, multi-threaded socket reads, keyboard activation and the
-  `ACTIVATED` toplevel state. The fault is somewhere above GDK and is being
-  worked.
+- **Firefox responds to the mouse; typing into a page still does not work.**
+  Hover, clicking and scrolling were fixed in M2298 — the compositor was
+  keeping **one** `wl_pointer` and **one** `wl_keyboard` per connection, and
+  Firefox creates two of each (GDK binds `wl_seat` once and Gecko's own
+  registry binds it again), so every event went to the second one, which has
+  no listener, and libwayland discarded it. A seat's events belong to *every*
+  resource the client derived from it; they are all sent now. Verified on
+  screen against a pure-CSS probe page: `:hover` lights, a click focuses a
+  text box, a wheel scrolls the document. **Text entry is still not working**
+  — the key events now reach GDK's `wl_keyboard` (libwayland dispatches them
+  rather than discarding them), and nothing is typed into the page. That last
+  one is now known to be **Gecko's, not ours**: the same keystrokes, on the
+  same boot and the same libgtk-3, arrive in a GTK 3.24 test client with the
+  right keysyms (`LXGTK3-KEY: keyval 111 115 100 101 118` for `o s d e v`),
+  and a raw libwayland client turns them into text through libxkbcommon.
 - **Lines of code:** roughly **103k** of from-scratch kernel C and **~31k** of
   from-scratch userspace C. The bundled DOOM / Quake / emulators add **~120k**
   lines of vendored third-party code — most of the raw line count is theirs, not

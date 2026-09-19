@@ -407,6 +407,7 @@ static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claud
 static volatile int g_lxask;
 static volatile int g_lxbash;      /* -append lxbash: ask Claude Code to RUN A COMMAND, which is the Bash-tool demo (M2118) */
 static volatile int g_ffnavlog;    /* -append ffnavlog: DocumentChannel logging -- costs ~26s of time-to-page (M2189) */
+static volatile int g_wlspy;       /* -append wlspy: WAYLAND_DEBUG=1 in the client, because GDK_DEBUG is a no-op in a release libgdk (M2298) */
 static volatile int g_lxedit;      /* -append lxedit: ask Claude Code to EDIT A FILE in OS-DEV's own tree (M2170) */
 static volatile int g_termtest;               /* -append termtest: the VT/ANSI terminal self-test (M2057) */
 /* -append lxhist: every 15 s, print the top syscall numbers each live Linux
@@ -962,6 +963,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * a demo it has no business touching. */
         if (cmdline_has(cl, "lxbash")) { g_lxabi_test = 1; g_lxask = 1; g_lxbash = 1; g_noprobes = 1; }   /* the Bash-tool demo (M2118) */
         if (cmdline_has(cl, "ffnavlog")) g_ffnavlog = 1;              /* navigation logging, at ~26s of time-to-page (M2189) */
+        if (cmdline_has(cl, "wlspy")) g_wlspy = 1;                    /* libwayland's own event trace inside the client (M2298) */
         if (cmdline_has(cl, "lxedit")) { g_lxabi_test = 1; g_lxask = 1; g_lxedit = 1;  g_noprobes = 1;}   /* the file-EDIT demo (M2170) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
                                         extern int g_lx_out_log; g_lx_out_log = 1;  g_noprobes = 1;}
@@ -2289,7 +2291,32 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * prints every event it dispatches, which splits
                          * "never arrived" from "arrived and was discarded
                          * above GDK" -- and those need opposite fixes. */
-                        app_set_next_env("GDK_DEBUG=events,input");
+                    /* GDK_DEBUG IS A DEAD INSTRUMENT HERE, AND IT WAS NOT
+                     * EVEN GUARDED (M2298).
+                     *
+                     * Two defects in three lines. First, the `if (g_ffnavlog)`
+                     * above has NO BRACES, so it covers the MOZ_LOG line only
+                     * and this one ran on every Firefox boot -- a brace-less
+                     * if silently capturing one statement of an intended two.
+                     *
+                     * Second, and the reason it never mattered: GDK_NOTE()
+                     * compiles to NOTHING unless libgdk was built with
+                     * G_ENABLE_DEBUG, and the host's was not. Checked, not
+                     * assumed -- the format strings GDK_DEBUG=events would
+                     * print ("motion %f %f", "enter, seat %p surface %p") are
+                     * absent from /usr/lib64/libgdk-3.so.0 entirely. So
+                     * M2253's "GDK said nothing" was an instrument that
+                     * cannot speak, not a GDK that had nothing to say.
+                     *
+                     * libwayland's WAYLAND_DEBUG is always compiled in, and it
+                     * prints one line per event DISPATCHED to a listener plus
+                     * a distinct "discarded" line for an event delivered to a
+                     * proxy with no listener. That splits the three cases that
+                     * matter and cannot be confused: dispatched (the fault is
+                     * above libwayland), discarded (the proxy is dead or
+                     * unlistened), or absent (the event is sitting in a queue
+                     * nobody pumps). */
+                    if (g_wlspy) app_set_next_env("WAYLAND_DEBUG=1");
                     /* RENDER THE PAGE IN THE PARENT (M2107).
                      *
                      * Seven of Firefox's child processes exit with status 1 per

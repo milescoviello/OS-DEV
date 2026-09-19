@@ -255,6 +255,10 @@ static const struct wl_global g_globals[] = {
  * anything, and running out mid-handshake presents as a client that stops
  * talking. (M1986) */
 #define WL_MAXOBJ 512
+/* How many wl_pointer / wl_keyboard resources one connection may hold. Firefox
+ * needs two of each (GDK's and Gecko's); eight is room for a toolkit that
+ * rebinds without leaving slack for a client that leaks them. (M2298) */
+#define WL_MAXSEATRES 8
 struct wl_object {
     uint32_t id;                   /* 0 = a FREE slot (see obj_free) */
     int      kind;
@@ -342,7 +346,41 @@ struct wl_client {
     int      inlen;                /* bytes accumulated but not yet consumed */
     uint32_t registry;             /* the client's wl_registry object id, 0 = none yet */
     uint32_t serial;               /* configure serials, monotonic per client */
-    uint32_t pointer, keyboard;    /* the client's wl_pointer / wl_keyboard, 0 = not asked for */
+    uint32_t pointer, keyboard;    /* the MOST RECENT wl_pointer / wl_keyboard, 0 = not asked for.
+                                    * Kept only so get_keyboard can address the keymap it is
+                                    * replying to; input goes to ptrs[]/kbds[], see below. */
+    /* EVERY wl_pointer AND wl_keyboard THE CLIENT MADE (M2298).
+     *
+     * THE FIREFOX INPUT BUG, and it is a compositor bug, not Gecko's. A
+     * client may bind wl_seat as many times as it likes, and every resource
+     * it derives from those binds is entitled to the seat's events -- that is
+     * what "resource" means in this protocol. Firefox binds it TWICE, and its
+     * own WAYLAND_DEBUG says so:
+     *
+     *   -> wl_registry#2.bind(6, "wl_seat", 5, new id #11)    <- GDK's registry
+     *   -> wl_seat#11.get_pointer(new id wl_pointer#9)        <- GDK's, WITH a listener
+     *   -> wl_seat#11.get_keyboard(new id wl_keyboard#16)
+     *   -> wl_registry#17.bind(6, "wl_seat", 7, new id #24)   <- Gecko's OWN registry
+     *   -> wl_seat#24.get_pointer(new id wl_pointer#27)       <- no listener on this one
+     *   -> wl_seat#24.get_keyboard(new id wl_keyboard#28)
+     *
+     * With one slot per client the second bind OVERWROTE the first, so every
+     * motion, button, axis and key went to #27/#28 -- proxies Gecko creates
+     * and never listens to -- and libwayland threw them away where we could
+     * not see it:
+     *
+     *   [Default Queue] discarded wl_pointer#27.enter(5, wl_surface#32, ...)
+     *   [Default Queue] discarded wl_pointer#27.button(6, 56750, 272, 1)
+     *
+     * "discarded" is libwayland's word for an event delivered to a proxy with
+     * no implementation. Which is why every measurement said the bytes were
+     * consumed and nothing happened: both were true. GDK's wl_pointer#9, the
+     * only one that turns an event into a GdkEvent, was never sent anything.
+     *
+     * The GTK3 control binds the seat once, so it could never reproduce this
+     * -- the control was right about GTK3 and silent about the real defect. */
+    uint32_t ptrs[WL_MAXSEATRES]; uint8_t ptrv[WL_MAXSEATRES]; int nptr;
+    uint32_t kbds[WL_MAXSEATRES]; uint8_t kbdv[WL_MAXSEATRES]; int nkbd;
     uint32_t surface;              /* the surface input is delivered to */
     /* POINTER FOCUS IS A SUBSURFACE, NOT THE TOPLEVEL (M2245). */
     uint32_t output;               /* the client's wl_output, for wl_surface.enter (M2247) */
@@ -353,7 +391,11 @@ struct wl_client {
                                     * keyboard focus follows the WINDOW -- they are separate in
                                     * Wayland, and a client ignores input for a surface it has
                                     * not been told it has. */
-    uint32_t seat_version;         /* what the client bound wl_seat at: wl_pointer.frame is v5, wl_keyboard.repeat_info is v4 (M1998) */
+    /* SUPERSEDED BY THE PER-RESOURCE VERSION IN ptrv[]/kbdv[] (M2298). Kept
+     * only as the last-bound value for the log; nothing gates an opcode on it
+     * any more, because two binds of the same seat can be at two versions --
+     * Firefox's are 5 and 7 -- and one number cannot answer for both. */
+    uint32_t seat_version;
     char     title[64];            /* the most recent xdg_toplevel.set_title, as a fallback */
     /* TITLES ARE PER TOPLEVEL, not per client (M2058). Firefox names every
      * window it owns, and one `title` for the whole connection means the
@@ -1032,6 +1074,40 @@ static void wl_give_role(struct wl_client *c, uint32_t sid, int role, uint32_t r
 /* A surface whose role object is destroyed is unmapped: it is no longer a
  * window, a popup or anything else, and a compositor that keeps drawing it
  * shows a window the client has already taken down. */
+/* --- the seat's RESOURCES, all of them (M2298) ---------------------------- *
+ *
+ * wl_seat is not a singleton from the client's side: each bind makes a new
+ * resource, each get_pointer/get_keyboard makes another, and the seat's events
+ * go to EVERY one of them. Keeping a single id per connection quietly made the
+ * compositor deliver to whichever was created last -- see the long note on
+ * `ptrs` in struct wl_client for what that did to Firefox.
+ *
+ * add() is idempotent on the id so a re-request cannot double-send. */
+static void wl_seat_res_add(struct wl_client *c, uint32_t id, uint32_t ver, int kbd) {
+    if (!id) return;
+    uint32_t *v = kbd ? c->kbds : c->ptrs;
+    uint8_t  *w = kbd ? c->kbdv : c->ptrv;
+    int      *n = kbd ? &c->nkbd : &c->nptr;
+    for (int i = 0; i < *n; i++) if (v[i] == id) { w[i] = (uint8_t)ver; return; }
+    if (*n >= WL_MAXSEATRES) {
+        kprintf("[wl] client ep %d has %d %s resources already -- NOT tracking id %u, "
+                "it will receive no input\n", c->ep, *n, kbd ? "keyboard" : "pointer", id);
+        return;
+    }
+    v[*n] = id; w[*n] = (uint8_t)ver; (*n)++;
+}
+static void wl_seat_res_del(struct wl_client *c, uint32_t id, int kbd) {
+    uint32_t *v = kbd ? c->kbds : c->ptrs;
+    uint8_t  *w = kbd ? c->kbdv : c->ptrv;
+    int      *n = kbd ? &c->nkbd : &c->nptr;
+    for (int i = 0; i < *n; i++)
+        if (v[i] == id) {
+            for (int j = i; j < *n - 1; j++) { v[j] = v[j + 1]; w[j] = w[j + 1]; }
+            (*n)--;
+            return;
+        }
+}
+
 static void wl_role_gone(struct wl_client *c, struct wl_object *role) {
     struct wl_object *sf = wl_role_surface(c, role);
     if (!sf) return;
@@ -1129,8 +1205,16 @@ static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
             for (int i = 0; i < (int)(sizeof c->tl_title / sizeof c->tl_title[0]); i++)
                 if (c->tl_title[i].tl == id) { c->tl_title[i].tl = 0; c->tl_title[i].s[0] = 0; }
         break;
-    case WLK_POINTER:  if (c->pointer  == id) { c->pointer  = 0; c->ptr_in = 0; } break;
-    case WLK_KEYBOARD: if (c->keyboard == id) { c->keyboard = 0; c->kbd_in = 0; } break;
+    case WLK_POINTER:
+        wl_seat_res_del(c, id, 0);
+        if (c->pointer  == id) { c->pointer  = c->nptr ? c->ptrs[c->nptr - 1] : 0; }
+        if (!c->nptr) c->ptr_in = 0;
+        break;
+    case WLK_KEYBOARD:
+        wl_seat_res_del(c, id, 1);
+        if (c->keyboard == id) { c->keyboard = c->nkbd ? c->kbds[c->nkbd - 1] : 0; }
+        if (!c->nkbd) c->kbd_in = 0;
+        break;
     default: break;
     }
     /* NOBODY MAY STILL NAME IT. The id is about to be handed back out, so a
@@ -1170,6 +1254,7 @@ static void wl_client_release(struct wl_client *c) {
     }
     c->nobj = 0; c->inlen = 0; c->outlen = 0; c->registry = 0;
     c->surface = 0; c->pointer = 0; c->keyboard = 0; c->ptr_in = 0; c->kbd_in = 0;
+    c->nptr = 0; c->nkbd = 0;
     if (freed)
         kprintf("[wl] client ep %d released %d shared-memory reference(s) on disconnect\n", c->ep, freed);
     unix_close(c->ep);
@@ -1514,13 +1599,28 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         return;
     }
     if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_POINTER && alen >= 4) {
-        c->pointer = rd32(args); obj_add(c, c->pointer, WLK_POINTER);
-        kprintf("[wl] client asked the seat for a POINTER (id %u)\n", c->pointer);
+        c->pointer = rd32(args);
+        struct wl_object *po = obj_add(c, c->pointer, WLK_POINTER);
+        /* THE VERSION IS THE SEAT'S, PER RESOURCE (M2298). Two binds of the
+         * same global can be at different versions -- Firefox's are 5 and 7 --
+         * and wl_pointer.frame only exists from 5. One c->seat_version for the
+         * whole connection would send a v3 proxy an opcode it has no slot for,
+         * which libwayland treats as a fatal protocol error. */
+        if (po) po->version = o->version ? o->version : 1;
+        wl_seat_res_add(c, c->pointer, o->version ? o->version : 1, 0);
+        kprintf("[wl] client ep %d asked the seat for a POINTER (id %u, seat v%u) "
+                "-- it now holds %d pointer resource(s)\n",
+                c->ep, c->pointer, o->version, c->nptr);
         return;
     }
     if (o->kind == WLK_SEAT && opcode == WL_SEAT_GET_KEYBOARD && alen >= 4) {
-        c->keyboard = rd32(args); obj_add(c, c->keyboard, WLK_KEYBOARD);
-        kprintf("[wl] client asked the seat for a KEYBOARD (id %u)\n", c->keyboard);
+        c->keyboard = rd32(args);
+        struct wl_object *ko = obj_add(c, c->keyboard, WLK_KEYBOARD);
+        if (ko) ko->version = o->version ? o->version : 1;
+        wl_seat_res_add(c, c->keyboard, o->version ? o->version : 1, 1);
+        kprintf("[wl] client ep %d asked the seat for a KEYBOARD (id %u, seat v%u) "
+                "-- it now holds %d keyboard resource(s)\n",
+                c->ep, c->keyboard, o->version, c->nkbd);
         /* THE KEYMAP (M1984). wl_keyboard.keymap is (format, fd, size), and a
          * client that never receives one cannot turn a keycode into a
          * character at all -- GTK, and therefore Firefox, does no text input
@@ -1550,7 +1650,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         }
         uint8_t ri[8];
         wr32(ri + 0, 25); wr32(ri + 4, 400); /* repeat: 25/s after 400 ms */
-        if (c->seat_version >= 4)      /* repeat_info arrived in wl_keyboard version 4 */
+        if ((o->version ? o->version : 1) >= 4)   /* repeat_info arrived in wl_keyboard version 4 */
             wl_send(c, c->keyboard, WL_KEYBOARD_EV_REPEAT, ri, 8);
         return;
     }
@@ -2409,8 +2509,23 @@ void wl_fs_health_line(void) {
             en += ksnprint_u(ent + en, (unsigned)q); ent[en++] = ':';
             en += ksnprint_u(ent + en, g_ptr_enter_by[q]);
             ent[en++] = '/'; en += ksnprint_u(ent + en, g_cl[q].surface);
-            ent[en++] = 'p'; en += ksnprint_u(ent + en, g_cl[q].pointer);
-            ent[en++] = 'k'; en += ksnprint_u(ent + en, g_cl[q].keyboard);
+            /* ALL of them, not the last one (M2298). `p27` was the whole
+             * bug printed in two characters and read as a fact: Firefox's
+             * pointer is 27 -- when Firefox's pointer was ALSO 9, and 9 was
+             * the one with a listener on it. A census that shows one member
+             * of a set cannot show that the set has two. */
+            ent[en++] = 'p';
+            for (int r = 0; r < g_cl[q].nptr && en < 170; r++) {
+                if (r) ent[en++] = '+';
+                en += ksnprint_u(ent + en, g_cl[q].ptrs[r]);
+            }
+            if (!g_cl[q].nptr) ent[en++] = '-';
+            ent[en++] = 'k';
+            for (int r = 0; r < g_cl[q].nkbd && en < 170; r++) {
+                if (r) ent[en++] = '+';
+                en += ksnprint_u(ent + en, g_cl[q].kbds[r]);
+            }
+            if (!g_cl[q].nkbd) ent[en++] = '-';
             /* BYTES STILL IN OUR OUTPUT BUFFER (M2261). wl_flush_locked stops
              * on a full socket ring and leaves the remainder queued, retried
              * only by the NEXT send. If a client's queue is persistently
@@ -2434,8 +2549,8 @@ void wl_fs_health_line(void) {
          * whose window the user is looking at -- must have a pointer and a
          * keyboard bound, or we are broadcasting input to content processes
          * and none of it reaches the browser. (M2245) */
-        char who[64]; int wn = 0;
-        for (int q = 0; q < WL_MAXCLIENT && wn < 56; q++) {
+        char who[96]; int wn = 0;
+        for (int q = 0; q < WL_MAXCLIENT && wn < 80; q++) {
             if (!g_cl[q].used) continue;
             int tl = 0;
             for (int j = 0; j < g_cl[q].nobj; j++)
@@ -2443,13 +2558,13 @@ void wl_fs_health_line(void) {
                     g_cl[q].obj[j].role == WLR_TOPLEVEL) tl = 1;
             who[wn++] = (char)('0' + q);
             who[wn++] = tl ? 'T' : '-';
-            who[wn++] = g_cl[q].pointer ? 'P' : '-';
-            who[wn++] = g_cl[q].keyboard ? 'K' : '-';
+            who[wn++] = (char)('0' + (g_cl[q].nptr > 9 ? 9 : g_cl[q].nptr)); who[wn++] = 'P';
+            who[wn++] = (char)('0' + (g_cl[q].nkbd > 9 ? 9 : g_cl[q].nkbd)); who[wn++] = 'K';
             who[wn++] = ' ';
         }
         who[wn] = 0;
         int kbclients = 0;
-        for (int q = 0; q < WL_MAXCLIENT; q++) if (g_cl[q].used && g_cl[q].keyboard) kbclients++;
+        for (int q = 0; q < WL_MAXCLIENT; q++) if (g_cl[q].used && g_cl[q].nkbd) kbclients++;
         extern int g_tab_lastx, g_tab_lasty, g_tab_lastbtn;
         extern uint64_t g_bd_fail_cap4, g_bd_fail_lba4;
         /* Declared here rather than in ata.h, the same way app.c's fault
@@ -2473,7 +2588,7 @@ void wl_fs_health_line(void) {
                 "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx | "
                 "keys: %lu dequeued, %lu forwarded to wayland, focus kind %d, "
                 "%lu SENT on the wire to %d client(s) with a wl_keyboard, %lu axis event(s) | "
-                "clients [slot/Toplevel/Pointer/Keyboard]: %s | ptr fwd: %lu motion, %lu BUTTON | "
+                "clients [slot/Toplevel/nPointer/nKeyboard]: %s | ptr fwd: %lu motion, %lu BUTTON | "
                 "peer-ready: %lu calls, %lu MATCHED an fd | "
                 "%u enter(s) | per-client enter surface/root: %s\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
@@ -2582,7 +2697,7 @@ int wl_page_probe(uint32_t want) {
             uint32_t y = y0 + (uint32_t)((uint64_t)gy * (wh - y0) / WL_PROBE_GRID);
             /* Topmost layer covering the point wins: wl_layers writes parents
              * first, so the LAST match is the one actually visible. */
-            const uint32_t *px = 0; uint32_t got = 0; int found = 0;
+            uint32_t got = 0; int found = 0;
             for (int i = 0; i < nl; i++) {
                 if (!L[i].px) continue;
                 if ((int)x < L[i].x || (int)y < L[i].y) continue;
@@ -2590,7 +2705,7 @@ int wl_page_probe(uint32_t want) {
                 if (lx >= L[i].w || ly >= L[i].h) continue;
                 uint32_t v = L[i].px[ly * (L[i].stride / 4) + lx];
                 if (L[i].format == 0 && !(v >> 24)) continue;      /* transparent: not what is shown (M2115) */
-                px = L[i].px; got = v; found = 1;
+                got = v; found = 1;
             }
             sampled++;
             if (!found) { uncovered++; continue; }
@@ -2986,8 +3101,25 @@ static int wl_focus_client(void) {
     return barea ? best : -1;
 }
 
+/* ONE EVENT, EVERY RESOURCE (M2298). wl_pointer.frame is version 5, and two
+ * binds of the same seat can sit at different versions, so the gate is per
+ * resource and not per connection. `frame` closes a logical event group, so
+ * it is sent after whatever the caller just sent -- not as an event of its
+ * own. */
+static void wl_ptr_bcast(struct wl_client *c, uint16_t opcode,
+                         const uint8_t *body, int n) {
+    for (int i = 0; i < c->nptr; i++) {
+        wl_send(c, c->ptrs[i], opcode, body, n);
+        if (c->ptrv[i] >= 5) wl_send(c, c->ptrs[i], WL_POINTER_EV_FRAME, 0, 0);
+    }
+}
+static void wl_kbd_bcast(struct wl_client *c, uint16_t opcode,
+                         const uint8_t *body, int n) {
+    for (int i = 0; i < c->nkbd; i++) wl_send(c, c->kbds[i], opcode, body, n);
+}
+
 static void wl_ptr_enter(struct wl_client *c, int x, int y) {
-    if (!c->surface || !c->pointer) return;
+    if (!c->surface || !c->nptr) return;
     int ox = 0, oy = 0;
     if (c->surface) wl_dump_tree(c);
     uint32_t want = wl_surface_at(c, x, y, &ox, &oy);
@@ -3029,15 +3161,14 @@ static void wl_ptr_enter(struct wl_client *c, int x, int y) {
         uint8_t lv[8]; int q = 0;
         wr32(lv + q, ++c->serial);   q += 4;
         wr32(lv + q, c->ptr_surface); q += 4;
-        wl_send(c, c->pointer, WL_POINTER_EV_LEAVE, lv, q);
+        wl_ptr_bcast(c, WL_POINTER_EV_LEAVE, lv, q);
     }
     uint8_t b[16]; int p = 0;
     wr32(b + p, ++c->serial); p += 4;
     wr32(b + p, want);        p += 4;
     wr32(b + p, wl_fixed(x - ox)); p += 4;
     wr32(b + p, wl_fixed(y - oy)); p += 4;
-    wl_send(c, c->pointer, WL_POINTER_EV_ENTER, b, p);
-    if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
+    wl_ptr_bcast(c, WL_POINTER_EV_ENTER, b, p);
     c->ptr_in = 1; c->ptr_surface = want; c->ptr_ox = ox; c->ptr_oy = oy;
     /* PER CLIENT (M2246). A single global last-value has four writers here --
      * the broadcast loop visits every client -- so it always showed whichever
@@ -3052,12 +3183,12 @@ static void wl_ptr_enter(struct wl_client *c, int x, int y) {
 }
 
 static void wl_kbd_enter(struct wl_client *c) {
-    if (c->kbd_in || !c->surface || !c->keyboard) return;
+    if (c->kbd_in || !c->surface || !c->nkbd) return;
     uint8_t b[16]; int p = 0;
     wr32(b + p, ++c->serial); p += 4;
     wr32(b + p, c->surface);  p += 4;
     wr32(b + p, 0);           p += 4;          /* keys: an empty array (none held) */
-    wl_send(c, c->keyboard, WL_KEYBOARD_EV_ENTER, b, p);
+    wl_kbd_bcast(c, WL_KEYBOARD_EV_ENTER, b, p);
     /* modifiers must follow enter: a client that never gets one keeps whatever
      * modifier state it had from a previous focus. All clear, group 0.
      *
@@ -3071,7 +3202,7 @@ static void wl_kbd_enter(struct wl_client *c) {
     wr32(m + p, 0); p += 4;                    /* mods_latched */
     wr32(m + p, 0); p += 4;                    /* mods_locked */
     wr32(m + p, 0); p += 4;                    /* group */
-    wl_send(c, c->keyboard, WL_KEYBOARD_EV_MODIFIERS, m, p);
+    wl_kbd_bcast(c, WL_KEYBOARD_EV_MODIFIERS, m, p);
     c->kbd_in = 1;
 }
 
@@ -3081,7 +3212,7 @@ static void wl_kbd_enter(struct wl_client *c) {
 void wl_post_pointer_leave(void) {
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (!c->used || !c->pointer || !c->ptr_in) continue;
+        if (!c->used || !c->nptr || !c->ptr_in) continue;
         /* LEAVE THE SURFACE WE ENTERED, not the root (M2292). Since M2245
          * enter() names the subsurface under the cursor, which for Firefox is
          * not `surface` at all -- so this told the client the pointer had left
@@ -3089,8 +3220,7 @@ void wl_post_pointer_leave(void) {
         uint8_t b[8]; int p = 0;
         wr32(b + p, ++c->serial);  p += 4;
         wr32(b + p, c->ptr_surface ? c->ptr_surface : c->surface); p += 4;
-        wl_send(c, c->pointer, WL_POINTER_EV_LEAVE, b, p);
-        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
+        wl_ptr_bcast(c, WL_POINTER_EV_LEAVE, b, p);
         c->ptr_in = 0; c->ptr_surface = 0;
     }
 }
@@ -3100,7 +3230,7 @@ void wl_post_motion(int x, int y) {
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (i != focus || !c->used || !c->pointer) continue;
+        if (i != focus || !c->used || !c->nptr) continue;
         wl_ptr_enter(c, x, y);
         /* RELATIVE TO THE SURFACE THAT WAS ENTERED, not to the window (M2245).
          * enter() now names the subsurface under the cursor, so motion has to
@@ -3110,8 +3240,7 @@ void wl_post_motion(int x, int y) {
         wr32(b + p, wl_now_ms()); p += 4;
         wr32(b + p, wl_fixed(x - c->ptr_ox)); p += 4;
         wr32(b + p, wl_fixed(y - c->ptr_oy)); p += 4;
-        wl_send(c, c->pointer, WL_POINTER_EV_MOTION, b, p);
-        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
+        wl_ptr_bcast(c, WL_POINTER_EV_MOTION, b, p);
         g_ptr_sent++;
     }
 }
@@ -3121,15 +3250,14 @@ void wl_post_button(int x, int y, unsigned button, int pressed) {
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (i != focus || !c->used || !c->pointer) continue;
+        if (i != focus || !c->used || !c->nptr) continue;
         wl_ptr_enter(c, x, y);
         uint8_t b[16]; int p = 0;
         wr32(b + p, ++c->serial);  p += 4;
         wr32(b + p, wl_now_ms());  p += 4;
         wr32(b + p, button);       p += 4;     /* evdev: BTN_LEFT is 0x110 */
         wr32(b + p, pressed ? 1u : 0u); p += 4;
-        wl_send(c, c->pointer, WL_POINTER_EV_BUTTON, b, p);
-        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
+        wl_ptr_bcast(c, WL_POINTER_EV_BUTTON, b, p);
         g_ptr_sent++;
     }
 }
@@ -3155,14 +3283,13 @@ void wl_post_axis(int x, int y, int ticks_down) {
     if (!ticks_down) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (i != focus || !c->used || !c->pointer) continue;
+        if (i != focus || !c->used || !c->nptr) continue;
         wl_ptr_enter(c, x, y);
         uint8_t b[12]; int p = 0;
         wr32(b + p, wl_now_ms()); p += 4;
         wr32(b + p, 0);           p += 4;      /* axis 0 = vertical scroll */
         wr32(b + p, (uint32_t)(int32_t)(ticks_down * 2560)); p += 4;   /* 24.8 fixed */
-        wl_send(c, c->pointer, WL_POINTER_EV_AXIS, b, p);
-        if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);
+        wl_ptr_bcast(c, WL_POINTER_EV_AXIS, b, p);
         g_ptr_sent++;
         g_axis_sent++;
     }
@@ -3173,14 +3300,14 @@ void wl_post_key(unsigned keycode, int pressed) {
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
-        if (i != focus || !c->used || !c->keyboard) continue;
+        if (i != focus || !c->used || !c->nkbd) continue;
         wl_kbd_enter(c);
         uint8_t b[16]; int p = 0;
         wr32(b + p, ++c->serial); p += 4;
         wr32(b + p, wl_now_ms()); p += 4;
         wr32(b + p, keycode);     p += 4;      /* evdev keycode, NOT a character */
         wr32(b + p, pressed ? 1u : 0u); p += 4;
-        wl_send(c, c->keyboard, WL_KEYBOARD_EV_KEY, b, p);
+        wl_kbd_bcast(c, WL_KEYBOARD_EV_KEY, b, p);
         g_keys_sent++;
     }
 }
@@ -3199,6 +3326,7 @@ int wl_compositor_poll(void) {
         c->used = 1; c->ep = ep; c->inlen = 0; c->outlen = 0; c->registry = 0; c->nobj = 0;
         c->serial = 0; c->title[0] = 0;
         c->pointer = c->keyboard = c->surface = 0;
+        c->nptr = c->nkbd = 0;
         c->ptr_in = c->kbd_in = 0;
         c->seat_version = 0;
         for (unsigned t = 0; t < sizeof c->tl_title / sizeof c->tl_title[0]; t++)

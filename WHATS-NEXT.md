@@ -1,5 +1,130 @@
 # What's next
 
+> **(M2298) THE FIREFOX INPUT BUG IS OURS, AND IT IS ONE WORD WIDE:
+> `uint32_t pointer` SHOULD HAVE BEEN AN ARRAY.**
+>
+> Firefox binds `wl_seat` **twice** on one connection -- GDK's registry binds
+> it at version 5, and Gecko's own `nsWaylandDisplay` registry binds it again
+> at version 7 -- and derives a `wl_pointer` and a `wl_keyboard` from each.
+> `struct wl_client` held exactly one id for each, set by whichever request
+> came last, so the compositor addressed every motion, button, axis and key to
+> Gecko's copy. Gecko puts no listener on that proxy, and libwayland throws an
+> event for an unlistened proxy away without telling the compositor anything.
+> Both halves of "it consumes the bytes and does nothing" were true at once,
+> and neither one pointed at the cause.
+>
+> The evidence is the client's own libwayland, via `WAYLAND_DEBUG=1`
+> (`-append wlspy`). Before:
+>
+> ```
+>  -> wl_registry#2.bind(6, "wl_seat", 5, new id #11)     <- GDK
+>  -> wl_seat#11.get_pointer(new id wl_pointer#9)
+>  -> wl_registry#17.bind(6, "wl_seat", 7, new id #24)    <- Gecko
+>  -> wl_seat#24.get_pointer(new id wl_pointer#27)
+>     discarded wl_pointer#27.enter(5, wl_surface#32, ...)
+>     discarded wl_pointer#27.button(6, 56750, 272, 1)
+> ```
+>
+> Forty-two pointer events, every one of them `discarded`, and `wl_pointer#9`
+> -- the only one that becomes a `GdkEvent` -- addressed zero times.
+>
+> **The fix:** a seat's events go to *every* resource the client derived from
+> it, which is what the protocol means by "resource" and what wlroots and
+> Mutter both do. `ptrs[]`/`kbds[]` with a per-resource version (the two binds
+> are at different versions, and `wl_pointer.frame` only exists from 5, so one
+> `seat_version` per connection cannot answer for both).
+>
+> **Measured on screen**, against the pure-CSS probe page, same boot, same
+> build, before -> after:
+>
+> ```
+> HOVER (motion only)          0 -> 374727 px BRIGHT GREEN
+> BUTTON HELD (:active)        0 ->      0 px          (see below)
+> TEXT BOX CLICK (:focus)      0 ->   8136 px YELLOW RING
+> TYPED o s d e v             47 ->     41 px          (still nothing)
+> WHEEL DOWN x12           37852 -> 422656 px
+> ```
+>
+> and Firefox starts talking back: seven `wl_pointer.set_cursor` requests
+> where the campaign's headline number had been "0 messages received back".
+>
+> **GDK_DEBUG WAS A DEAD INSTRUMENT ALL ALONG.** M2253 read `GDK_DEBUG=events`
+> producing nothing as "GDK has nothing to say". `GDK_NOTE()` compiles to
+> *nothing* unless libgdk was built with `G_ENABLE_DEBUG`, and the host's was
+> not -- the format strings it would print are absent from the `.so` entirely,
+> which is a one-command check nobody ran. It was also being set unconditionally
+> by a **brace-less `if (g_ffnavlog)`** that only covered the line above it.
+> `WAYLAND_DEBUG` is always compiled in, and it answered on the first boot.
+>
+> **STILL OPEN: typing.** Keys now reach GDK's `wl_keyboard#16` and are
+> *dispatched* rather than discarded, and no text appears.
+>
+> Two things about it are established rather than guessed, both from GTK
+> 3.24's own source (`gdk/wayland/gdkdevice-wayland.c`, `gdkkeys-wayland.c`):
+>
+> 1. `keyboard_handle_key` calls `deliver_key_event` **synchronously** -- so
+>    the theory that our back-to-back press/release (same `wl_now_ms()`
+>    timestamp, both dispatched in one `wl_display_dispatch_pending`) lets the
+>    release cancel the press through the key-repeat `GSource` is **wrong**.
+>    Checked before it cost a boot.
+> 2. `deliver_key_event` has exactly one early exit before it builds the
+>    GdkEvent: `if (sym == XKB_KEY_NoSymbol) return;`. So a GDK that failed to
+>    load our keymap drops every key with no diagnostic at all.
+>
+> And `_gdk_wayland_keymap_update_from_fd` has exactly one **silent** failure
+> branch: `mmap (NULL, size, PROT_READ, MAP_SHARED, fd, 0)` returning
+> MAP_FAILED, which `return`s with no message. The other branch -- the keymap
+> not compiling -- prints `Got invalid keymap from compositor`, and that
+> string is NOT in the boot log. So if GDK has no keymap, it is that mmap.
+> Note lxwl mmaps the same descriptor in the same boot and succeeds
+> (`LXWL-XKB: compiled the compositor's keymap (7138 bytes, 127 keycodes)`),
+> but it asks for **MAP_PRIVATE**, and GTK asks for **MAP_SHARED**.
+>
+> What the **raw** libwayland client proves, in `tests/run-wayland-tests.sh`
+> on every run: `pressing 'a' arrived as wl_keyboard.key evdev keycode 30` and
+> `libxkbcommon turned that keycode into keysym 'a' and the text "a" -- real
+> text input`. So the wire format, the keymap handoff over SCM_RIGHTS and the
+> keycode numbering are all good; whatever is dropping the keystroke is inside
+> GDK or above it. (That suite has two failures, both **pre-existing** and
+> checked against commit e3b1d2a6 in a scratch worktree: a pointer-coordinate
+> assertion that M2245 invalidated when it moved pointer focus to the
+> subsurface, and a memfd retired-buffer check.)
+>
+> **The measurement that had never been taken -- and now has.** The GTK3
+> control had never been sent a key: `LXGTK3-RESULT: 1 enter, 2 motion, 0
+> button, **0 key**` in both M2297 arms, because the harness only ever
+> clicked. (The README's claim that the control "clicks and types fine" was
+> never measured.) Sending it five keystrokes, on this kernel:
+>
+> ```
+> LXGTK3: gtk 3.24.52, backend wayland
+> LXGTK3-KEY: keyval 111        <- 'o'
+> LXGTK3-KEY: keyval 115        <- 's'
+> LXGTK3-KEY: keyval 100        <- 'd'
+> LXGTK3-KEY: keyval 101        <- 'e'
+> LXGTK3-KEY: keyval 118        <- 'v'
+> ```
+>
+> Five for five, correct keysyms. So **GDK loads our keymap and delivers key
+> events correctly here** -- the MAP_SHARED mmap works, `xkb_state_key_get_
+> one_sym` returns real symbols, and the back-to-back press/release is fine.
+> The raw client works, the GTK3 client works, and Firefox does not: the
+> typing fault is **Gecko's own, above GDK**, which is the first time that has
+> been shown rather than assumed.
+>
+> The sharpest difference left is that lxgtk3 handles `key-press-event`
+> directly while Gecko routes every key through **`IMContextWrapper` ->
+> `gtk_im_context_filter_keypress()`** first. An IM context that swallows the
+> key would look exactly like this and would not touch the mouse at all. Next
+> boot: `MOZ_LOG=IMEHandler:5,KeyboardHandler:5` with keystrokes in the SAME
+> run, and an arm with `GTK_IM_MODULE=gtk-im-context-simple`.
+>
+> (The boot log for the lxgtk3 keystroke run was overwritten minutes later by
+> a concurrent session that started `tools/claude-tui.sh` against the same
+> VM 122 and `/root/osdev` -- the split recorded in the shared-tree note. The
+> lines above were read off the live log; re-run `scratchpad/gtk3keys.sh` to
+> retake it.)
+
 > **(M2291-M2297) FIREFOX READS EVERY INPUT EVENT AND ANSWERS NOTHING --
 > AND THE TEST THAT FIRST SAID SO COULD NOT HAVE SAID ANYTHING ELSE.**
 > *(The header of the sub-block below said "measured, not inferred". Read the
