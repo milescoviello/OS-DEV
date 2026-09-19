@@ -1058,6 +1058,92 @@ static int wrblk(ext2_t *v, uint32_t blk, const uint8_t *buf) {
     uint32_t spb = v->block_size / SECSZ;
     return v->write(v->ctx, v->start + (uint64_t)blk * spb, spb, buf);
 }
+/* A GROUP DESCRIPTOR BLOCK IS PROVABLY VALID OR PROVABLY NOT -- SO NEVER WRITE
+ * ONE BACK UNCHECKED (M2237).
+ *
+ * Six places in this file do the same thing: read the whole 4096-byte group
+ * descriptor block, change two bytes of a free count, and write all 4096 back.
+ *
+ *     if (rdblk(v, gdblk, gd) < 0) return 0;
+ *     e_wr16(gd + goff + 12, e_rd16(gd + goff + 12) - 1);
+ *     if (wrblk(v, gdblk, gd) < 0 || sb_dec(v, 12) < 0) return 0;
+ *
+ * That `< 0` catches a read that FAILED. The entire failure this campaign has
+ * been chasing is a read that SUCCEEDS and returns the wrong bytes -- and this
+ * shape takes those wrong bytes and commits them to the disk. One transient
+ * bad read of LBA 8 becomes a permanently corrupt group descriptor table, and
+ * every inode lookup in the filesystem fails from then on.
+ *
+ * That is what the evidence says happened. The rejected descriptor came from
+ * the right sector (LBA 8); dropping the block cache and reading it again from
+ * the DISK returned the same wrong bytes; and those bytes appear nowhere in
+ * either disk image, so they were never read off a disk in the first place.
+ * Bytes that are on no disk, that are now on the disk, were written there.
+ *
+ * It also explains the wild LBAs. `bg_block_bitmap` and `bg_inode_bitmap` are
+ * read straight out of the descriptor and handed to rdblk/wrblk with no range
+ * check, so a corrupt descriptor turns into reads -- and writes -- at block
+ * numbers like 1109917816. That is the `LBA>=cap` refusal count in the boot
+ * log, and blockdev_write does not bound its LBA at all.
+ *
+ * The fix is the rule this codebase keeps relearning: REJECT A PROVABLY-INVALID
+ * VALUE WHERE IT IS PRODUCED. A descriptor carries three block pointers whose
+ * valid range is known exactly, so "is this a descriptor block?" is decidable
+ * with no I/O and no heuristic. Validate on the way in, and REFUSE on the way
+ * out -- refusing a write is always safe here, because the only thing lost is
+ * a free-count update, while the thing prevented is an unrecoverable
+ * filesystem. */
+static int gd_desc_ok(const ext2_t *v, const uint8_t *d) {
+    uint32_t bb = e_rd32(d + 0), ib = e_rd32(d + 4), it = e_rd32(d + 8);
+    if (!v->blocks_count) return 1;                    /* nothing to check against */
+    if (!bb || bb >= v->blocks_count) return 0;
+    if (!ib || ib >= v->blocks_count) return 0;
+    if (!it || it >= v->blocks_count) return 0;
+    return 1;
+}
+/* Validate every descriptor this block actually holds. Past v->groups the
+ * block is padding and is legitimately zero, so checking it would reject every
+ * healthy filesystem -- the bug that a "validate the whole block" first cut
+ * would have shipped. */
+static int gd_block_ok(const ext2_t *v, uint32_t gdblk, const uint8_t *gd) {
+    uint32_t per = v->block_size / 32;
+    if (gdblk < v->gdt_block) return 0;
+    uint32_t base = (gdblk - v->gdt_block) * per;
+    for (uint32_t k = 0; k < per; k++) {
+        if (v->groups && base + k >= v->groups) break;
+        if (!gd_desc_ok(v, gd + k * 32)) return 0;
+    }
+    return 1;
+}
+unsigned long g_e2_gd_badread;     /* descriptor blocks read back invalid */
+unsigned long g_e2_gd_reread_ok;   /* ...and fixed by dropping the cache and asking again */
+unsigned long g_e2_gd_writeref;    /* descriptor blocks REFUSED at the write */
+
+static int gd_read(ext2_t *v, uint32_t gdblk, uint8_t *gd) {
+    if (rdblk(v, gdblk, gd) < 0) return -1;
+    if (gd_block_ok(v, gdblk, gd)) return 0;
+    /* Drop the cached sectors and ask the disk, the same recovery read_inode
+     * has used since M2232. A transient is worth one retry; a poisoned disk
+     * will simply fail twice. */
+    g_e2_gd_badread++;
+    if (ext2_dropc) {
+        uint32_t spb = v->block_size / SECSZ;
+        ext2_dropc(v->ctx, v->start + (uint64_t)gdblk * spb, spb);
+        if (rdblk(v, gdblk, gd) >= 0 && gd_block_ok(v, gdblk, gd)) {
+            g_e2_gd_reread_ok++;
+            return 0;
+        }
+    }
+    v->ioerr = 1; g_e2_distrust++;
+    return -1;
+}
+static int gd_write(ext2_t *v, uint32_t gdblk, const uint8_t *gd) {
+    if (!gd_block_ok(v, gdblk, gd)) {
+        g_e2_gd_writeref++; v->ioerr = 1; g_e2_distrust++;
+        return -1;                                     /* do NOT commit garbage */
+    }
+    return wrblk(v, gdblk, gd);
+}
 /* The write counterpart of rdsec (M2212): one sector of a block. */
 static int wrsec(ext2_t *v, uint32_t blk, uint32_t secoff, const uint8_t *buf) {
     if (!v->write) return -1;
@@ -1082,7 +1168,7 @@ static uint32_t alloc_block(ext2_t *v) {
     uint32_t gd_per_block = v->block_size / 32;
     for (uint32_t g = 0; g < v->groups; g++) {
         uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-        if (rdblk(v, gdblk, gd) < 0) return 0;
+        if (gd_read(v, gdblk, gd) < 0) return 0;
         if (e_rd16(gd + goff + 12) == 0) continue;             /* no free blocks in this group */
         uint32_t bbm = e_rd32(gd + goff + 0);
         if (rdblk(v, bbm, bm) < 0) return 0;
@@ -1094,7 +1180,7 @@ static uint32_t alloc_block(ext2_t *v) {
                 bm[i >> 3] |= (uint8_t)(1 << (i & 7));
                 if (wrblk(v, bbm, bm) < 0) return 0;
                 e_wr16(gd + goff + 12, e_rd16(gd + goff + 12) - 1);
-                if (wrblk(v, gdblk, gd) < 0 || sb_dec(v, 12) < 0) return 0;
+                if (gd_write(v, gdblk, gd) < 0 || sb_dec(v, 12) < 0) return 0;
                 return v->first_data_block + g * v->blocks_per_group + i;
             }
         }
@@ -1119,7 +1205,7 @@ static uint32_t alloc_run(ext2_t *v, uint32_t n) {
     uint32_t gd_per_block = v->block_size / 32;
     for (uint32_t g = 0; g < v->groups; g++) {
         uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-        if (rdblk(v, gdblk, gd) < 0) return 0;
+        if (gd_read(v, gdblk, gd) < 0) return 0;
         if (e_rd16(gd + goff + 12) < n) continue;              /* group lacks n free blocks */
         uint32_t bbm = e_rd32(gd + goff + 0);
         if (rdblk(v, bbm, bm) < 0) return 0;
@@ -1134,7 +1220,7 @@ static uint32_t alloc_run(ext2_t *v, uint32_t n) {
                     for (uint32_t j = 0; j < n; j++) { uint32_t b = startbit + j; bm[b >> 3] |= (uint8_t)(1 << (b & 7)); }
                     if (wrblk(v, bbm, bm) < 0) return 0;
                     e_wr16(gd + goff + 12, (uint16_t)(e_rd16(gd + goff + 12) - n));
-                    if (wrblk(v, gdblk, gd) < 0 || sb_sub(v, 12, n) < 0) return 0;
+                    if (gd_write(v, gdblk, gd) < 0 || sb_sub(v, 12, n) < 0) return 0;
                     return v->first_data_block + g * v->blocks_per_group + startbit;
                 }
             } else run = 0;
@@ -1149,7 +1235,7 @@ static uint32_t alloc_inode(ext2_t *v) {
     uint32_t gd_per_block = v->block_size / 32;
     for (uint32_t g = 0; g < v->groups; g++) {
         uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-        if (rdblk(v, gdblk, gd) < 0) return 0;
+        if (gd_read(v, gdblk, gd) < 0) return 0;
         if (e_rd16(gd + goff + 14) == 0) continue;             /* no free inodes in this group */
         uint32_t ibm = e_rd32(gd + goff + 4);
         if (rdblk(v, ibm, bm) < 0) return 0;
@@ -1159,7 +1245,7 @@ static uint32_t alloc_inode(ext2_t *v) {
                 bm[i >> 3] |= (uint8_t)(1 << (i & 7));
                 if (wrblk(v, ibm, bm) < 0) return 0;
                 e_wr16(gd + goff + 14, e_rd16(gd + goff + 14) - 1);
-                if (wrblk(v, gdblk, gd) < 0 || sb_dec(v, 16) < 0) return 0;
+                if (gd_write(v, gdblk, gd) < 0 || sb_dec(v, 16) < 0) return 0;
                 return g * v->inodes_per_group + i + 1;
             }
         }
@@ -1394,13 +1480,13 @@ static int free_block(ext2_t *v, uint32_t blk) {
     uint8_t gd[4096], bm[4096];
     uint32_t gd_per_block = v->block_size / 32;
     uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-    if (rdblk(v, gdblk, gd) < 0) return -1;
+    if (gd_read(v, gdblk, gd) < 0) return -1;
     uint32_t bbm = e_rd32(gd + goff + 0);
     if (rdblk(v, bbm, bm) < 0) return -1;
     bm[idx >> 3] &= (uint8_t)~(1 << (idx & 7));
     if (wrblk(v, bbm, bm) < 0) return -1;
     e_wr16(gd + goff + 12, e_rd16(gd + goff + 12) + 1);
-    if (wrblk(v, gdblk, gd) < 0) return -1;
+    if (gd_write(v, gdblk, gd) < 0) return -1;
     uint8_t sb[1024];
     if (rd_sb(v, sb) < 0) return -1;
     e_wr32(sb + 12, e_rd32(sb + 12) + 1);
@@ -1494,13 +1580,13 @@ static int free_inode_num(ext2_t *v, uint32_t ino) {
     uint8_t gd[4096], bm[4096];
     uint32_t gd_per_block = v->block_size / 32;
     uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-    if (rdblk(v, gdblk, gd) < 0) return -1;
+    if (gd_read(v, gdblk, gd) < 0) return -1;
     uint32_t ibm = e_rd32(gd + goff + 4);
     if (rdblk(v, ibm, bm) < 0) return -1;
     bm[idx >> 3] &= (uint8_t)~(1 << (idx & 7));
     if (wrblk(v, ibm, bm) < 0) return -1;
     e_wr16(gd + goff + 14, e_rd16(gd + goff + 14) + 1);
-    if (wrblk(v, gdblk, gd) < 0) return -1;
+    if (gd_write(v, gdblk, gd) < 0) return -1;
     uint8_t sb[1024];
     if (rd_sb(v, sb) < 0) return -1;
     e_wr32(sb + 16, e_rd32(sb + 16) + 1);
@@ -1638,9 +1724,9 @@ static void grp_dirs(ext2_t *v, uint32_t ino, int delta) {
     uint32_t g = (ino - 1) / v->inodes_per_group;
     uint8_t gd[4096]; uint32_t gd_per_block = v->block_size / 32;
     uint32_t gdblk = v->gdt_block + g / gd_per_block, goff = (g % gd_per_block) * 32;
-    if (rdblk(v, gdblk, gd) < 0) return;
+    if (gd_read(v, gdblk, gd) < 0) return;
     e_wr16(gd + goff + 16, (uint16_t)(e_rd16(gd + goff + 16) + delta));
-    wrblk(v, gdblk, gd);
+    gd_write(v, gdblk, gd);
 }
 
 /* Create a directory `path`: a fresh dir inode whose single block holds "." (->

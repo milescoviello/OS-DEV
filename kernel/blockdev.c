@@ -609,11 +609,31 @@ int blockdev_read(int i, uint64_t lba, uint32_t count, void *buf) {
 #define BD_WTRIP_LBA 32
 unsigned long g_bd_wtrip_n;        /* writes below BD_WTRIP_LBA, any device */
 unsigned long g_bd_wr_total;       /* every write, so "no writes at all" is visible */
+unsigned long g_bd_wr_refused;     /* writes refused for an out-of-range LBA (M2237) */
+uint64_t      g_bd_wr_ref_lba;     /* ...and the last such LBA */
 static int    g_bd_wtrip_shown;
 
 int blockdev_write(int i, uint64_t lba, uint32_t count, const void *buf) {
     if (i < 0 || i >= g_ndev) return -1;                   /* bound i before it indexes blk_lock/bcache */
     int r;
+    /* A WRITE HAS NO BOUND AT ALL, AND A READ HAS EIGHT (M2237).
+     *
+     * blockdev_read refuses an out-of-range LBA for seven distinct reasons and
+     * counts each one. blockdev_write checks the device index and nothing
+     * else -- so a block number produced by corrupt metadata goes straight to
+     * the driver as a write. ext2 reads bg_block_bitmap out of a group
+     * descriptor and hands it to wrblk unchecked, which is exactly how a
+     * single bad descriptor turns into a write at sector 8879342544.
+     *
+     * The asymmetry is the whole point: a refused read costs one failed
+     * lookup, while an unbounded write is corruption somewhere nobody is
+     * looking. The cheaper side was the one that got the checks. */
+    if (g_dev[i].sectors && (lba >= g_dev[i].sectors ||
+                             count > g_dev[i].sectors - lba)) {
+        g_bd_wr_refused++;
+        g_bd_wr_ref_lba = lba;
+        return -1;
+    }
     g_bd_wr_total++;
     if (lba < BD_WTRIP_LBA) {
         const unsigned char *tp = (const unsigned char *)buf;

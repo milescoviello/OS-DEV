@@ -30,10 +30,38 @@ static uint8_t g_img[2 * 1024 * 1024];      /* the (mutable, fuzzed) working ima
 static long    g_img_bytes;
 
 /* blk_read_fn: serve 512-byte sectors from g_img; OOB -> error (the disk edge). */
+/* A READ THAT SUCCEEDS AND RETURNS THE WRONG BYTES (M2237).
+ *
+ * Every fault this harness could previously inject was a read that FAILED, or
+ * an image that was corrupt on disk. The failure the kernel actually suffers
+ * is neither: the disk is pristine, the read returns 0, and the bytes in the
+ * buffer are not the ones on the platter. Nothing downstream can tell.
+ *
+ * Arm it for one read of one LBA. It scribbles the RETURNED BUFFER and leaves
+ * g_img alone, which is the whole point -- the disk stays correct unless the
+ * driver writes the garbage back to it. */
+static uint64_t g_inject_lba   = ~0ull;
+static uint32_t g_inject_count = 0;     /* match the COUNT too: read_inode reads the same
+                                         * LBA one SECTOR at a time and already rejects a
+                                         * wild descriptor, so without this it eats the
+                                         * injection and the write path never sees it */
+static int      g_inject_left  = 0;
+
 static int bd_read(void *ctx, uint64_t lba, uint32_t count, void *buf) {
     (void)ctx;
     if ((lba + count) * SECSZ > (uint64_t)g_img_bytes) return -1;
     memcpy(buf, g_img + lba * SECSZ, (size_t)count * SECSZ);
+    if (g_inject_left && lba == g_inject_lba && count == g_inject_count) {
+        g_inject_left--;
+        /* Corrupt ONLY bg_inode_table (+8), leaving both bitmap pointers
+         * valid. That is the production shape -- the boot log rejects inode
+         * tables, not bitmaps -- and it is the only shape that reaches the
+         * write-back: scribbling the bitmap pointers too makes the allocator
+         * fail on the bitmap read first and the descriptor is never rewritten,
+         * so the test would pass for a reason that has nothing to do with the
+         * fix. (It did, on the first cut.) */
+        memset((uint8_t *)buf + 8, 0xA5, 4);
+    }
     return 0;
 }
 static int bd_write(void *ctx, uint64_t lba, uint32_t count, const void *buf) {
@@ -600,6 +628,85 @@ int main(int argc, char **argv) {
             if (memcmp(back, orig, sizeof orig)) { fprintf(stderr, "FAIL convert: the original 20000 bytes did not survive conversion\n"); return 1; }
             if (memcmp(back + sizeof orig, add, sizeof add)) { fprintf(stderr, "FAIL convert: appended bytes wrong\n"); return 1; }
             printf("pwrite convert (M1934): appended to an extent-mapped file -- rebuilt as indirect, all 20000 original bytes intact\n");
+        }
+    }
+
+    /* --- M2237: one wrong-bytes read must not become a corrupt disk --------
+     *
+     * Six places in ext2.c read the whole group descriptor block, change two
+     * bytes of a free count, and write all of it back. The `< 0` they check
+     * catches a read that failed; it cannot catch a read that succeeded with
+     * the wrong bytes -- and that shape commits those bytes to the disk, so
+     * ONE transient bad read permanently destroys the group descriptor table
+     * and every inode lookup after it.
+     *
+     * That is what an 8-core Firefox boot shows: a descriptor rejected from
+     * LBA 8, the same wrong bytes still there after dropping the cache and
+     * re-reading from the disk, and those bytes present nowhere in either
+     * disk image. Bytes that are on no disk, and are now on the disk, were
+     * written there.
+     *
+     * Reload the golden image, snapshot the descriptor block, inject exactly
+     * one bad read of it during an allocation, and require the disk to be
+     * untouched. */
+    {   FILE *gf = fopen(argv[1], "rb");
+        if (gf) {
+            g_img_bytes = (long)fread(g_img, 1, sizeof g_img, gf);
+            fclose(gf);
+
+            ext2_t gv;
+            if (ext2_open(bd_read, 0, 0, &gv) < 0) { fprintf(stderr, "FAIL gdt: reopen\n"); return 1; }
+            uint32_t spb  = gv.block_size / SECSZ;
+            uint64_t gdlba = (uint64_t)gv.gdt_block * spb;
+
+            /* (a) the validator is a real discriminator, not a rubber stamp:
+             *     it must accept the genuine block and reject a wild one. */
+            static uint8_t gdcopy[4096];
+            memcpy(gdcopy, g_img + gdlba * SECSZ, gv.block_size);
+            if (!gd_block_ok(&gv, gv.gdt_block, gdcopy)) {
+                fprintf(stderr, "FAIL gdt: the REAL descriptor block was rejected\n"); return 1;
+            }
+            memset(gdcopy, 0xA5, 32);
+            if (gd_block_ok(&gv, gv.gdt_block, gdcopy)) {
+                fprintf(stderr, "FAIL gdt: a descriptor with three wild block pointers was ACCEPTED\n"); return 1;
+            }
+            printf("gdt (M2237): ok   -- gd_block_ok accepts the real descriptor block and rejects a wild one\n");
+
+            /* (b) the one that matters. */
+            static uint8_t before[4096];
+            memcpy(before, g_img + gdlba * SECSZ, gv.block_size);
+            unsigned long bad0 = g_e2_gd_badread;
+
+            g_inject_lba = gdlba; g_inject_count = spb; g_inject_left = 1;
+            uint8_t payload[64];
+            for (int k = 0; k < 64; k++) payload[k] = (uint8_t)k;
+            (void)ext2_write_path(bd_read, bd_write, 0, 0, "/POISON.BIN", payload, sizeof payload);
+            g_inject_left = 0;
+
+            if (memcmp(before, g_img + gdlba * SECSZ, gv.block_size) != 0) {
+                fprintf(stderr, "FAIL gdt: ONE wrong-bytes read was written back -- the descriptor "
+                                "block on disk is now corrupt (this is the M2237 bug)\n");
+                return 1;
+            }
+            if (g_e2_gd_badread == bad0) {
+                fprintf(stderr, "FAIL gdt: the injected bad read was never noticed, so this test "
+                                "is not exercising the check it claims to\n");
+                return 1;
+            }
+            printf("gdt (M2237): ok   -- one wrong-bytes read of the descriptor block did NOT reach the disk (%lu caught)\n",
+                   g_e2_gd_badread - bad0);
+
+            /* (c) refusing must not wedge the volume: the very next allocation,
+             *     with no injection, has to work and read back byte-exact. */
+            if (ext2_write_path(bd_read, bd_write, 0, 0, "/AFTER.BIN", payload, sizeof payload) != (long)sizeof payload) {
+                fprintf(stderr, "FAIL gdt: the volume was unusable after a refused descriptor write\n"); return 1;
+            }
+            uint8_t rb2[64];
+            if (ext2_read_path(bd_read, 0, 0, "/AFTER.BIN", rb2, sizeof rb2) != (long)sizeof rb2 ||
+                memcmp(rb2, payload, sizeof payload)) {
+                fprintf(stderr, "FAIL gdt: /AFTER.BIN did not read back\n"); return 1;
+            }
+            printf("gdt (M2237): ok   -- the next allocation still succeeds and reads back byte-exact\n");
         }
     }
 
