@@ -22,6 +22,7 @@ int  unix_ref(int ep);                                         /* another descri
 int  unix_close(int ep);                                       /* close one endpoint; wakes the peer; 0/-1 */
 int  unix_wait_any(const int *eps, int n);                     /* poll/epoll: index of first readable ep (blocks once); -1 (M1170) */
 int  unix_socketpair(int *a, int *b);                          /* socketpair(2): a pre-connected endpoint pair, no path; 0/-1 (M1254) */
+void unix_peer_readers(int ep, int *ntid, int *lasttid, unsigned long *calls);  /* how many distinct threads on the PEER side have read (M2292) */
 int  unix_ep_conn(int ep);                                     /* connection index behind an endpoint (SCM_RIGHTS key); -1 invalid (M1265) */
 int  unix_readable(int ep);      /* non-blocking: is there data (or a closed peer)? for poll/epoll (M1965) */
 int  unix_writable(int ep);      /* non-blocking: would a send block? for poll/epoll POLLOUT (M2202) */

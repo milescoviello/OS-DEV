@@ -121,6 +121,23 @@ struct uconn {
      *
      * Woken by unix_recv, which is the only thing that creates space. */
     task_t *a_wwaiter, *b_wwaiter;
+    /* WHICH THREADS READ THIS CONNECTION (M2292).
+     *
+     * libwayland lets any number of threads share one wl_display: one of them
+     * wins wl_display_read_events(), drains the socket, and DISTRIBUTES the
+     * messages into each proxy's event queue, after which every other thread
+     * dispatches its own queue. If that distribution does not reach the queue
+     * GDK's seat proxies live on, the bytes are gone from the socket -- so
+     * the compositor sees them consumed -- and no handler ever runs. That
+     * failure is invisible from outside and it is exactly what Firefox looks
+     * like here: every byte taken, nothing done.
+     *
+     * A single-threaded client reads with one tid. Recording the distinct
+     * readers per connection is the cheapest way to tell those two worlds
+     * apart, and it costs one comparison on a path that already holds the
+     * lock. */
+    int rd_tid[2][4], rd_ntid[2], rd_lasttid[2];
+    unsigned long rd_calls[2];
 };
 static struct uconn conns[U_CONN];
 
@@ -376,6 +393,12 @@ long unix_recv(int ep, void *buf, unsigned long max) {
         fl = usock_irq_save();
         *mw = 0;
     }
+    {   int tid = task_current_id();
+        c->rd_lasttid[s] = tid; c->rd_calls[s]++;
+        int seen = 0;
+        for (int i = 0; i < c->rd_ntid[s]; i++) if (c->rd_tid[s][i] == tid) { seen = 1; break; }
+        if (!seen && c->rd_ntid[s] < 4) c->rd_tid[s][c->rd_ntid[s]++] = tid;
+    }
     int got = rget(rx, (unsigned char *)buf, (int)max);
     /* DRAINING IS WHAT CREATES SPACE, so this is where a blocked writer gets
      * woken (M2090). Without it unix_send_ex's wait never ends and a full ring
@@ -584,6 +607,19 @@ int unix_wait_any(const int *eps, int n) {
 /* The connection index behind an endpoint — the per-connection key SCM_RIGHTS
  * fd-passing uses so a sendfd on one end is received on the other. -1 if the
  * endpoint is invalid. (M1265) */
+/* Per-connection reader census, for the side that is NOT ours: given the
+ * compositor's endpoint, report who on the client side has been reading. */
+void unix_peer_readers(int ep, int *ntid, int *lasttid, unsigned long *calls) {
+    uint64_t fl = usock_irq_save();
+    int s; struct uconn *c = ep_conn(ep, &s);
+    if (!c) { usock_irq_restore(fl); if (ntid) *ntid = -1; return; }
+    int o = s ? 0 : 1;                       /* the OTHER side: the client's */
+    if (ntid)    *ntid    = c->rd_ntid[o];
+    if (lasttid) *lasttid = c->rd_lasttid[o];
+    if (calls)   *calls   = c->rd_calls[o];
+    usock_irq_restore(fl);
+}
+
 int unix_ep_conn(int ep) {
     int s; struct uconn *c = ep_conn(ep, &s);
     return c ? (ep >> 1) : -1;

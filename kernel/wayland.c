@@ -329,6 +329,16 @@ struct wl_client {
      * however slow the client is. */
     uint8_t  out[WL_OUTBUF];
     int      outlen;
+    /* EVERY BYTE WE HANDED TO unix_send (M2292). Paired with the ring's
+     * occupancy it says what the client has actually CONSUMED -- see the
+     * [wlio] line in wl_fs_health_line for why `outlen` alone cannot. */
+    unsigned long sent;
+    /* AND WHAT IT HAS SAID BACK (M2292). Firefox runs four connections; the
+     * global g_nmsg cannot tell a connection that has gone quiet from three
+     * busy ones around it. Gecko's renderer owns its own wl_display, so
+     * "frame callbacks are answered" may be describing a different socket
+     * entirely from the one GDK's seat proxies live on. Per client, then. */
+    unsigned long nin;
     int      inlen;                /* bytes accumulated but not yet consumed */
     uint32_t registry;             /* the client's wl_registry object id, 0 = none yet */
     uint32_t serial;               /* configure serials, monotonic per client */
@@ -863,6 +873,7 @@ static void wl_flush_locked(struct wl_client *c) {
         long n = unix_send(c->ep, c->out, (unsigned long)c->outlen);
         if (n <= 0) break;                       /* ring full, or the peer is gone */
         sent_any = 1;
+        c->sent += (unsigned long)n;
         if (n >= c->outlen) { c->outlen = 0; break; }
         for (int i = 0; i + (int)n < c->outlen; i++) c->out[i] = c->out[i + (int)n];
         c->outlen -= (int)n;
@@ -1209,6 +1220,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     const uint8_t *args = m + 8;
     int alen = len - 8;
     g_nmsg++;
+    c->nin++;
 
     if (obj == WL_DISPLAY_ID && opcode == WL_DISPLAY_GET_REGISTRY && alen >= 4) {
         c->registry = rd32(args);
@@ -2385,8 +2397,14 @@ void wl_fs_health_line(void) {
         extern unsigned g_ptr_enters;   /* the per-client array below is what is printed (M2246) */
         extern unsigned g_ptr_enter_by[];
         extern unsigned long g_peerready_calls, g_peerready_hits;
-        char ent[80]; int en = 0;
-        for (int q = 0; q < WL_MAXCLIENT && en < 68; q++) {
+        /* 80 WAS TOO SMALL FOR ITS OWN GUARD (M2292): the loop admitted an
+         * entry at en=67 and then wrote about twenty-two bytes without
+         * checking again, so four clients could run off the end of a stack
+         * buffer -- inside the diagnostics, which is the worst place to
+         * corrupt a frame because it only fires when something is already
+         * wrong. Sized for what it holds. */
+        char ent[192]; int en = 0;
+        for (int q = 0; q < WL_MAXCLIENT && en < 160; q++) {
             if (!g_cl[q].used) continue;
             en += ksnprint_u(ent + en, (unsigned)q); ent[en++] = ':';
             en += ksnprint_u(ent + en, g_ptr_enter_by[q]);
@@ -2484,6 +2502,58 @@ void wl_fs_health_line(void) {
                 (unsigned long)wl_keys_sent(), kbclients, (unsigned long)g_axis_sent, who, g_dk_mot, g_dk_btn,
                 g_peerready_calls, g_peerready_hits,
                 g_ptr_enters, ent); }
+
+    /* WHAT THE CLIENT HAS ACTUALLY TAKEN OFF THE SOCKET (M2292).
+     *
+     * `q0` has been read three separate times in this campaign as "the events
+     * reached Firefox", and it does not say that. `q` is OUR queue: wl_send
+     * appends to it and wl_flush_locked drains it into unix_send, which
+     * copies into a 64 KiB ring inside the kernel. A client that has not
+     * called read() since it started still leaves q at 0, because a whole
+     * click burst -- 13 motions, 24 buttons, their frames -- is about 1.5 KiB,
+     * two percent of that ring. The one row of the evidence table that was
+     * supposed to prove delivery proved only that we let go of the bytes.
+     *
+     * So count both ends. `sent` is every byte handed to unix_send; `unread`
+     * is what is still sitting in the ring. The difference is what the guest
+     * process has genuinely consumed, and it is the last hop we can see:
+     *
+     *   unread climbs by a click's worth and STAYS  -> nobody is reading that
+     *      socket, and that is ours: a poll/epoll/futex or scheduling fault
+     *      in the thread that owns the fd.
+     *   unread returns to 0                         -> Gecko read the events
+     *      and did nothing with them, and the fault is above us.
+     *
+     * Two numbers, and they separate the two halves of a question this
+     * campaign has spent four days unable to answer. */
+    {   char io[192]; int n = 0;
+        int cap = unix_ring_bytes();
+        for (int q = 0; q < WL_MAXCLIENT && n < 150; q++) {
+            if (!g_cl[q].used) continue;
+            int room = unix_txroom(g_cl[q].ep);
+            int unread = room < 0 ? -1 : cap - room;
+            n += ksnprint_u(io + n, (unsigned)q); io[n++] = ':';
+            n += ksnprint_u(io + n, (unsigned)g_cl[q].sent); io[n++] = 's';
+            io[n++] = '/';
+            n += ksnprint_u(io + n, (unsigned)g_cl[q].nin); io[n++] = 'm';
+            io[n++] = '/';
+            if (unread < 0) { io[n++] = 'X'; }
+            else n += ksnprint_u(io + n, (unsigned)unread);
+            io[n++] = 'u'; io[n++] = '/';
+            /* AND WHO IS READING IT (M2292). */
+            {   int nt = 0, lt = 0; unsigned long rc = 0;
+                unix_peer_readers(g_cl[q].ep, &nt, &lt, &rc);
+                n += ksnprint_u(io + n, (unsigned)(nt < 0 ? 0 : nt)); io[n++] = 't';
+                n += ksnprint_u(io + n, (unsigned)lt); io[n++] = '#'; }
+            io[n++] = ' ';
+        }
+        io[n] = 0;
+        extern unsigned long g_poll_nfds_refused; extern long g_poll_nfds_high;
+        kprintf("[wlio] per-client Ns sent / Nm msgs received / Nu UNREAD in the "
+                "ring / Nt distinct reader threads #last-tid (ring holds %d): %s "
+                "| poll: biggest nfds seen %ld, %lu call(s) REFUSED for too many fds\n",
+                cap, io, g_poll_nfds_high, g_poll_nfds_refused);
+    }
 }
 
 int wl_page_probe(uint32_t want) {
@@ -3009,12 +3079,16 @@ void wl_post_pointer_leave(void) {
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
         if (!c->used || !c->pointer || !c->ptr_in) continue;
+        /* LEAVE THE SURFACE WE ENTERED, not the root (M2292). Since M2245
+         * enter() names the subsurface under the cursor, which for Firefox is
+         * not `surface` at all -- so this told the client the pointer had left
+         * a surface it was never on, and left the real one entered forever. */
         uint8_t b[8]; int p = 0;
-        wr32(b + p, ++c->serial); p += 4;
-        wr32(b + p, c->surface);  p += 4;
+        wr32(b + p, ++c->serial);  p += 4;
+        wr32(b + p, c->ptr_surface ? c->ptr_surface : c->surface); p += 4;
         wl_send(c, c->pointer, WL_POINTER_EV_LEAVE, b, p);
         if (c->seat_version >= 5) wl_send(c, c->pointer, WL_POINTER_EV_FRAME, 0, 0);  /* frame arrived in wl_pointer version 5 */
-        c->ptr_in = 0;
+        c->ptr_in = 0; c->ptr_surface = 0;
     }
 }
 

@@ -1265,6 +1265,12 @@ static int poll_report_ok(void) {
     return 0;
 }
 static int g_poll_reports;
+/* See the poll case for why this is 4096 and not 256, and why the high-water
+ * mark is worth a global: it is the only way to know whether the old limit
+ * was ever anywhere near being hit. */
+#define LX_POLL_NFDS_MAX 4096
+unsigned long g_poll_nfds_refused;
+long g_poll_nfds_high;
 
 /* HOW MANY SYSCALLS THIS THREAD HAS MADE (M2066). Per-task, so a thread that
  * dies young can say how far it got -- "exited after 6 syscalls" is a failed
@@ -3287,7 +3293,18 @@ static void lx_dispatch_body(struct registers *r) {
         /* struct pollfd { int fd; short events; short revents; } -- 8 bytes,
          * same on both sides. */
         long nfds = (long)r->rsi;
-        if (nfds < 0 || nfds > 256) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        /* 256 WAS AN INVENTED LIMIT (M2292). Nothing here is sized by nfds --
+         * the loop below reads and writes the caller's own array in place --
+         * so the refusal bought no safety and cost correctness: Linux allows
+         * up to RLIMIT_NOFILE, and a program that legitimately polls more
+         * than 256 descriptors got EINVAL. GLib answers a failed poll by
+         * warning and dispatching NOTHING, which presents as an event loop
+         * that runs forever and never delivers an event -- indistinguishable,
+         * from outside, from a toolkit ignoring input. Counted, because a
+         * limit nobody can see fire is a limit nobody can rule out. */
+        if (nfds > LX_POLL_NFDS_MAX) g_poll_nfds_refused++;
+        if (nfds > g_poll_nfds_high) g_poll_nfds_high = nfds;
+        if (nfds < 0 || nfds > LX_POLL_NFDS_MAX) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         if (nfds && !vmm_user_ok(r->rdi, (uint64_t)nfds * 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         long timeout;
         if (r->rax == LXS_poll_) timeout = (long)r->rdx;
