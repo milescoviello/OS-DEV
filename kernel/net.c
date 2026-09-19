@@ -148,11 +148,21 @@ static int arp_maybe_reply(const uint8_t *buf, int len) {
  * A reply is owed by the MACHINE, not by whichever loop happened to be
  * polling. */
 static uint64_t g_arp_answered;
+/* WHERE DO THE FRAMES GO? (M2290)
+ *
+ * The [udpq] miss report says "281 went to SOME OTHER consumer", but it
+ * infers that by subtracting ONE pump's counter from the NIC total, so every
+ * legitimate second pump is indistinguishable from a leak. These two count
+ * the thing that actually matters: every frame handed to a consumer, and
+ * every frame the demux filed for its owner. A gap between them is a frame
+ * that a consumer took and destroyed -- which for a DNS reply is exactly the
+ * EAI_AGAIN the Claude edit demo keeps hitting. */
+uint64_t g_rx_taken, g_rx_filed;
 static int rx_next(uint8_t *buf, int max) {
     for (int guard = 0; guard < 64; guard++) {         /* bounded: never spin on a flood */
         int len = nic_receive(buf, max);
         if (len <= 0) return len;
-        if (!arp_maybe_reply(buf, len)) return len;
+        if (!arp_maybe_reply(buf, len)) { g_rx_taken++; return len; }
         g_arp_answered++;
     }
     return 0;
@@ -265,7 +275,7 @@ static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
     if (len < 34) return 1;
     uint8_t proto = f[14 + 9];
     if (proto == 6)  { park_put(f, len); return 1; }           /* TCP: its connection's */
-    if (proto == 17) { udpq_put(f, len); return 1; }           /* UDP: its port's */
+    if (proto == 17) { g_rx_filed++; udpq_put(f, len); return 1; }   /* UDP: its port's */
     if (want_tcp)    { oring_put(f, len); return 1; }          /* ICMP etc: park for ping */
     return 0;                                                  /* ICMP, and the caller wants it */
 }
@@ -1173,10 +1183,12 @@ int net_udp_readable(uint16_t sport) {
             kprintf("[udpq] 300 misses on port %u, and in that window: %lu frame(s) came off the "
                     "card, this pump took %lu of them, %lu were addressed to another host; "
                     "%lu went to SOME OTHER consumer; %lu tx failed; %lu ARP request(s) for us "
-                    "answered since boot\n",
+                    "answered since boot; frames TAKEN %lu vs demux-FILED %lu (a gap is a "
+                    "consumer destroying somebody else's datagram)\n",
                     sport, (unsigned long)rx, (unsigned long)pf,
                     (unsigned long)(g_udpq_foreign - fo0),
                     (unsigned long)(rx > pf ? rx - pf : 0),
+                    (unsigned long)g_rx_taken, (unsigned long)g_rx_filed,
                     (unsigned long)g_udp_tx_fail, (unsigned long)g_arp_answered);
         }
     }
