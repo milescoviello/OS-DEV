@@ -1552,7 +1552,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              *
              * Use what the lease says. It is the one address on the network
              * that something has actually promised to answer on. */            if (ns && (ns[0] | ns[1] | ns[2] | ns[3])) {
-                char rc_buf[64]; int n = 0;
+                char rc_buf[128]; int n = 0;   /* nameserver line + the options line (M2284) */
                 const char *pfx = "nameserver ";
                 for (int i = 0; pfx[i]; i++) rc_buf[n++] = pfx[i];
                 for (int o = 0; o < 4; o++) {
@@ -1562,6 +1562,26 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     rc_buf[n++] = (char)('0' + v % 10);
                     rc_buf[n++] = (o == 3) ? '\n' : '.';
                 }
+                /* AND RESOLVER OPTIONS, BECAUSE ONE LOST PACKET SHOULD NOT
+                 * FAIL A BOOT (M2284).
+                 *
+                 * With no `options` line glibc uses its defaults -- timeout 5,
+                 * attempts 2 -- against the single nameserver the lease gave
+                 * us. One dropped UDP query therefore costs five seconds and
+                 * gets one retry, and if that is also unlucky getaddrinfo
+                 * returns EAI_AGAIN. Measured: one boot in three of the Phase
+                 * 7 demo failed with
+                 *     API Error: Can't reach the API server -- check your
+                 *     internet or DNS (EAI_AGAIN)
+                 * which is not Claude failing, not authentication, and not
+                 * the OS's own network stack -- it is a name lookup given one
+                 * short retry and no second chance.
+                 *
+                 * Shorter timeout, more attempts, and single-request so the A
+                 * and AAAA queries go one after the other rather than as a
+                 * pair whose loss looks like a server that is down. */
+                const char *opts = "options timeout:2 attempts:5 single-request\n";
+                for (int i = 0; opts[i]; i++) rc_buf[n++] = opts[i];
                 rc_buf[n] = 0;
                 vfs_mkdir("/disk2/etc");
                 if (vfs_write("/disk2/etc/resolv.conf", rc_buf, (unsigned long)n) >= 0)
