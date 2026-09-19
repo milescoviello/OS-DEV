@@ -1,5 +1,116 @@
 # What's next
 
+> **(M2231-M2238) THE RESIDUAL ext2 CORRUPTION WAS A WRITE, NOT A READ --
+> ext2 READ-MODIFY-WRITES THE WHOLE GROUP DESCRIPTOR BLOCK 19723 TIMES A BOOT.**
+>
+> M2229 fixed the big one. What was left still rejected 91-132 inode tables on
+> every 8-core boot, and four more theories were about to die the same way the
+> first four did -- because every one of them assumed the storage path had
+> handed back **some other sector's** bytes.
+>
+> Nobody had checked whether the bytes existed at all.
+>
+> ```
+> the rejected descriptor read:  78 00 1a 42 22 00 11 1b
+> build/ext2.img (3355443200 bytes)  ->  0 hits
+> build/fat.img    (67108864 bytes)  ->  0 hits
+> ```
+>
+> **Bytes that are on no disk in the machine were never read off one.** With
+> two facts already in hand -- the LBA asked for was right (8), and dropping
+> the block cache and re-reading *from the disk* returned the same bytes
+> (M2232, and M2220's drop is owner-key aware so it really does bypass the
+> cache) -- the only account left is that this kernel **wrote** them. The VM
+> runs `-snapshot`, so a guest write persists for the rest of the boot.
+>
+> **THE MECHANISM.** Six functions in `kernel/ext2.c` share one shape --
+> `alloc_block`, `alloc_run`, `alloc_inode`, `free_block`, `free_inode_num`,
+> `grp_dirs`:
+>
+> ```c
+> if (rdblk(v, gdblk, gd) < 0) return 0;               /* read 4096 bytes  */
+> e_wr16(gd + goff + 12, e_rd16(gd + goff + 12) - 1);  /* change two       */
+> if (wrblk(v, gdblk, gd) < 0 || sb_dec(v, 12) < 0) return 0;  /* write all back */
+> ```
+>
+> That `< 0` catches a read that **failed**. The failure this whole campaign
+> has been chasing is a read that **succeeds and returns the wrong bytes** --
+> and this shape commits those bytes to the disk. **One** transient bad read
+> destroys the group descriptor table for the rest of the boot. 132 rejections
+> in a boot need not mean 132 bad reads; one is enough. `grp_dirs` is the site
+> that needs nothing else to go wrong -- it touches no bitmap, so there is no
+> wild pointer to fail on first.
+>
+> **Three instruments, each one line, settled it (M2235, M2236):**
+>
+> ```
+> gdt-at-mount: block 1 (LBA 8) -> inode_table[0]=4 [1]=32772 of 819200 blocks;
+>               first bytes 02 00 00 00 03 00 00 00      <- PERFECT, before any load
+> [bdwr] dev 1 lba 8 x8 task 0 <- 02 00 00 00 03 00 00 00 <- and we write it, repeatedly
+> writes: 53275 total, 19723 BELOW LBA 32
+> ```
+>
+> The mount-time self-test separates "it never read correctly" from "it stops
+> reading correctly under load", and those need opposite investigations. The
+> write tripwire -- one comparison per write, because every filesystem's
+> metadata lives in its first few sectors -- says who writes there and what
+> with. **19723 rewrites of the metadata region per boot is 19723 chances to
+> commit a bad read.** And the garbage differs run to run (`78 00 1a 42...` vs
+> `00 00 c6 be...`), which is what "whatever was in the buffer" looks like, not
+> a fixed wrong sector.
+>
+> **THE FIX (M2237)** is the rule this codebase keeps relearning: **reject a
+> provably-invalid value where it is PRODUCED.** A group descriptor carries
+> three block pointers whose valid range is known exactly, so "is this a
+> descriptor block?" is decidable with no I/O and no heuristic. `gd_read`
+> validates on the way in (and drops the cache for one retry); `gd_write`
+> **refuses** on the way out. Refusing is always safe here -- what is lost is a
+> free-count update, what is prevented is an unrecoverable filesystem.
+> **An error check is not a validity check.**
+>
+> Two things the validator had to get right, both of which a first cut got
+> wrong: past `v->groups` a descriptor block is legitimate **padding** and must
+> not be checked, or every healthy volume is rejected; and the check belongs on
+> the **whole block**, because the write rewrites the whole block.
+>
+> **And the asymmetry underneath.** `blockdev_read` refuses an out-of-range LBA
+> for seven counted reasons. `blockdev_write` checked the device index and
+> **nothing else** -- so a block number produced by corrupt metadata went
+> straight to the driver as a write, which is where the `LBA>=cap` refusals
+> come from (ext2 reads `bg_block_bitmap` out of the descriptor and hands it to
+> `wrblk` unchecked). The cheaper side had all the checks; the unbounded one is
+> corruption where nobody is looking.
+>
+> **THE TEST expresses a fault the harness previously could not:** a read that
+> **returns 0 with the wrong bytes**, scribbling the returned buffer and
+> leaving the image alone. Proven by reverting -- with the checks removed the
+> run fails with *"ONE wrong-bytes read was written back -- the descriptor
+> block on disk is now corrupt"*. Two earlier cuts of that test passed while
+> exercising nothing, and both are recorded in the source: matching only the
+> **LBA** let `read_inode`'s sector-sized read of the same LBA eat the one-shot
+> injection, and scribbling all **32 bytes** made the allocator fail on the
+> wild bitmap pointer before it ever reached the write-back. **A test that
+> passes can still be exercising nothing** -- assert that the injected fault
+> was *noticed*, not just that the outcome was good.
+>
+> **M2231** removes the last reason to re-probe: `blockdev_ready()` returns the
+> existing device table if there is one, so listing `/proc/partitions` stops
+> rebuilding the machine's storage topology.
+>
+> **M2238, a companion instrument failure.** `task_stack_watch` bounded its
+> sample with the `STACK_SIZE` **literal**, but `task_create_stack` takes a
+> size -- 64 KiB for `net_rx_service`, 256 KiB for the browser worker. Every
+> sample from a bigger stack was silently discarded, so it reported
+> `15776 byte(s) free ... of 16384 (3% used)` in a kernel where `alloc_block`
+> alone puts **8 KiB** in one frame. Those two numbers cannot both be true, and
+> when an instrument and the thing it measures disagree the instrument is the
+> suspect. Bound by the task's own `kstack_top`, report the real extent, and
+> **count the discarded samples** -- a low-water mark with no population behind
+> it is the same failure as a health line that only prints on success (M2225).
+>
+> **M2233** adds `tools/claudeseries.sh`, because the goal names two programs
+> and every measurement in this arc has been of one of them.
+
 > **(M2227-M2230) THE 8-CORE FIREFOX CRASH WAS READING `/proc/partitions`.**
 >
 > ```
