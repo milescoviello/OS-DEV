@@ -2244,6 +2244,7 @@ void wl_fs_health_line(void) {
     {   extern unsigned long g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield;
         extern unsigned long g_e2_sb_retried, g_e2_sb_retry_ok, g_e2_holes;
         extern unsigned long g_e2_bad_itable, g_e2_bad_ptrs, g_e2_distrust;
+        extern unsigned long g_e2_itable_reread, g_e2_itable_differed, g_e2_itable_secondgood;
         extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
         extern unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;
         extern unsigned long g_memfd_remapped, g_memfd_unretired;
@@ -2257,14 +2258,16 @@ void wl_fs_health_line(void) {
         extern uint64_t ata_dma_short_count(void);
         uint64_t atretr = 0, atfail = 0; ata_error_counts(&atretr, &atfail);
         kprintf("[fs] superblock: %lu readfail %lu BADMAGIC %lu badfield, %lu retried %lu "
-                "RETRY-OK | %lu itable %lu badptr %lu hole(s) | distrust %lu | refused: "
+                "RETRY-OK | %lu itable (re-read %lu: %lu DIFFERED, %lu then VALID) %lu badptr "
+                "%lu hole(s) | distrust %lu | refused: "
                 "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED | "
                 "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired | "
                 "blockdev refusals by reason: idx %lu nohook %lu zerocount %lu LBA>=cap %lu "
                 "ovf %lu past-cap %lu driver %lu BADIDX %lu (last cap-refusal: lba %lu vs cap %lu; last bad index %d against g_ndev %d)\n",
                 g_e2_sb_readfail, g_e2_sb_badmagic, g_e2_sb_badfield,
                 g_e2_sb_retried, g_e2_sb_retry_ok,
-                g_e2_bad_itable, g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
+                g_e2_bad_itable, g_e2_itable_reread, g_e2_itable_differed,
+                g_e2_itable_secondgood, g_e2_bad_ptrs, g_e2_holes, g_e2_distrust,
                 g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust,
                 g_fill_cachedrop, g_fill_cachedrop_ok,
                 (unsigned long)atretr, (unsigned long)atfail,
