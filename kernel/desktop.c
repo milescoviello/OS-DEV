@@ -1853,6 +1853,16 @@ static unsigned desktop_key_to_evdev_shift(int ch, int *need_shift) {
      * <RGHT> = 114, and an xkb keycode is the evdev code plus 8 -- so 103,
      * 108, 105 and 106. A table that disagreed with the keymap we ship would
      * translate to the wrong key and be very hard to see. */
+    /* Ctrl+letter arrives COOKED as 0x81..0x9A (keyboard.c), which this table
+     * did not know, so every Ctrl shortcut was dropped here even once the
+     * modifier itself was being forwarded (M2254). Map it back to the letter;
+     * the caller sends KEY_LEFTCTRL around it. */
+    if (c2 >= 0x81 && c2 <= 0x9A) {
+        int letter = 'a' + (c2 - 0x81);
+        for (int i = 0; r1[i]; i++) if (r1[i] == letter) return row1[i];
+        for (int i = 0; r2[i]; i++) if (r2[i] == letter) return row2[i];
+        for (int i = 0; r3[i]; i++) if (r3[i] == letter) return row3[i];
+    }
     if (c2 == 0x11) return 103;                   /* KEY_UP    (<UP>   = 111) */
     if (c2 == 0x12) return 108;                   /* KEY_DOWN  (<DOWN> = 116) */
     if (c2 == 0x13) return 105;                   /* KEY_LEFT  (<LEFT> = 113) */
@@ -2610,10 +2620,31 @@ void desktop_run(void) {
                         if (moaned < 8) { moaned++;
                             kprintf("[desktop] key %d has no evdev mapping -- NOT forwarded\n", k); }
                     } else {
+                        /* MODIFIERS WERE NEVER FORWARDED AT ALL (M2254).
+                         *
+                         * The cooked layer hands us a character and drops the
+                         * modifier state (M1920: modifiers live in the raw
+                         * scancode layer), so a Wayland client saw a bare 'l'
+                         * where the user pressed Ctrl+L. That is not a missing
+                         * nicety -- it means NO keyboard shortcut works in any
+                         * Wayland application: no Ctrl+L, Ctrl+T, Ctrl+W,
+                         * Ctrl+C, nothing.
+                         *
+                         * desktop.c already tracks ctrl_down/alt_down/
+                         * super_down for its own chords, from the raw layer
+                         * that still has them. Bracket the keypress with the
+                         * real modifier keycodes, which is what a keyboard
+                         * sends and what xkb expects to see. */
+                        if (ctrl_down)  wl_post_key(29, 1);   /* KEY_LEFTCTRL */
+                        if (alt_down)   wl_post_key(56, 1);   /* KEY_LEFTALT  */
+                        if (super_down) wl_post_key(125, 1);  /* KEY_LEFTMETA */
                         if (nsh) wl_post_key(EV_LEFTSHIFT, 1);
                         wl_post_key(ev, 1);
                         wl_post_key(ev, 0);
                         if (nsh) wl_post_key(EV_LEFTSHIFT, 0);
+                        if (super_down) wl_post_key(125, 0);
+                        if (alt_down)   wl_post_key(56, 0);
+                        if (ctrl_down)  wl_post_key(29, 0);
                     }
                 }
             }
