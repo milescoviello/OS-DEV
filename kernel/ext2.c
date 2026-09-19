@@ -277,8 +277,21 @@ static int read_inode(ext2_t *v, uint32_t ino, uint8_t *out) {
              *
              * On the failure path only: one extra sector read per rejection,
              * and a rejection is already a disaster. */
+            /* DROP THE CACHE FIRST (M2232). The first cut of this re-read
+             * went through the SAME block cache, so a poisoned entry gives
+             * the same bytes twice and "0 DIFFERED" proves nothing -- it
+             * cannot tell "the disk really holds this" from "the cache
+             * remembers something else". Two boots reported exactly that: 168
+             * re-reads, 0 differed. Dropping the two sectors first makes the
+             * second read go to the disk, which is the comparison the
+             * experiment was supposed to be making.
+             *
+             * (The superblock path has done this since M2220; this one was
+             * written first and never caught up.) */
             uint8_t again[SECSZ];
             uint32_t second = 0;
+            if (ext2_dropc) ext2_dropc(v->ctx, v->start + (uint64_t)gdblk * (v->block_size / SECSZ)
+                                                + gdbyte / SECSZ, 1);
             int rr = rdsec(v, gdblk, gdbyte / SECSZ, again);
             if (rr >= 0) second = e_rd32(again + (gdbyte % SECSZ) + 8);
             g_e2_itable_reread++;
