@@ -921,11 +921,27 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnojit"))  g_lx_env_cmdline[0] = "BUN_JSC_useJIT=0";
         if (cmdline_has(cl, "lxnogc"))   g_lx_env_cmdline[1] = "BUN_JSC_useConcurrentGC=0";
         if (cmdline_has(cl, "lxnogen"))  g_lx_env_cmdline[2] = "BUN_JSC_useGenerationalGC=0";   /* what each Linux process is actually doing (M2066) */
-        if (cmdline_has(cl, "lxbash")) { g_lxabi_test = 1; g_lxask = 1; g_lxbash = 1; }   /* the Bash-tool demo (M2118) */
+        /* THE PHASE 7 DEMO IS NOT GATED ON A 120-THREAD STRESS PROBE (M2278).
+         *
+         * lxask/lxbash/lxedit set g_lxabi_test, which runs the whole ABI
+         * probe battery FIRST -- forty-odd programs ending in a 120-thread
+         * TLS stress test. Measured over six 8-core boots: the demo answered
+         * correctly in under 60 s on four of them, and the other two never
+         * reached it, because that probe froze the machine in concurrent
+         * mmap (M2277). So the reliability of the north-star demo was being
+         * set by scaffolding that has nothing to do with it.
+         *
+         * ffwl has skipped the battery since M2103 for exactly this reason.
+         * The probes still run on their own flags and in `make check`; they
+         * simply no longer stand between a boot and the thing it is for.
+         * This does NOT paper over M2277 -- that freeze is a real allocator
+         * bug and is still open -- it stops one bug's blast radius covering
+         * a demo it has no business touching. */
+        if (cmdline_has(cl, "lxbash")) { g_lxabi_test = 1; g_lxask = 1; g_lxbash = 1; g_noprobes = 1; }   /* the Bash-tool demo (M2118) */
         if (cmdline_has(cl, "ffnavlog")) g_ffnavlog = 1;              /* navigation logging, at ~26s of time-to-page (M2189) */
-        if (cmdline_has(cl, "lxedit")) { g_lxabi_test = 1; g_lxask = 1; g_lxedit = 1; }   /* the file-EDIT demo (M2170) */
+        if (cmdline_has(cl, "lxedit")) { g_lxabi_test = 1; g_lxask = 1; g_lxedit = 1;  g_noprobes = 1;}   /* the file-EDIT demo (M2170) */
         if (cmdline_has(cl, "lxask")) { g_lxabi_test = 1; g_lxask = 1;                 /* ONE claude -p, the Phase 7 demo (M2056) */
-                                        extern int g_lx_out_log; g_lx_out_log = 1; }
+                                        extern int g_lx_out_log; g_lx_out_log = 1;  g_noprobes = 1;}
         if (cmdline_has(cl, "lxbuildtest")) { g_lxabi_test = 1; g_lxbuild_test = 1; }   /* the Phase 5 demo: minutes of in-guest compiling, its own boot (M1961) */
         if (cmdline_has(cl, "lxgcctest"))  { g_lxabi_test = 1; g_lxgcc_test = 1; }            /* its OWN boot: compiling kernel/elf.c under TCG is minutes of work, and piling it onto lxtooltest made that boot flaky (M1960) */
         if (cmdline_has(cl, "lxmmaptrace")) g_lx_mmap_trace = 1;        /* trace every Linux mmap/mprotect (M1955) */
