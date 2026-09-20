@@ -2342,6 +2342,10 @@ void desktop_run(void) {
         app_t *na;
         while (win_count < MAX_WINDOWS && (na = app_take_pending())) { make_app_window(na); dirty = 1; }
         { int before = win_count; wl_window_poll(); if (win_count != before) dirty = 1; }
+        /* A CLIENT PAINTED -> THE SCENE CHANGED (M2306). Without this the
+         * compositor held Firefox's new frames and never presented them
+         * until an unrelated event happened to force a redraw. */
+        if (wl_content_dirty()) dirty = 1;
         { int nb = nwlpid_seen; wl_hide_console_for_clients(); if (nwlpid_seen != nb) dirty = 1; }
 
         /* open browser windows requested by the shell (`browse <url>`) */

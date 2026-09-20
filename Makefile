@@ -80,7 +80,23 @@ MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
 CLAUDE_BIN ?= $(shell readlink -f "$$(command -v claude 2>/dev/null)" 2>/dev/null)
 # Firefox's install directory. Staged whole -- see the rule below for why.
 FIREFOX_DIR ?= $(firstword $(wildcard /usr/lib64/firefox /usr/lib/firefox))
-EXT2SIZE := 3200M   # 512M -> 1500M -> 2200M -> 3200M: Node (102 MB + 21 libs), the 195 MB toolchain+source tree, and Bun (93 MB + 36 libs, M2073)
+EXT2SIZE := 3900M   # 512M -> 1500M -> 2200M -> 3200M -> 3900M (M2305/M2307).
+# AND NOT ONE BYTE OVER 4 GiB UNTIL THE 32-BIT OFFSET BUG IS FIXED (M2307).
+# 5200M was tried and it CORRUPTED THE FILESYSTEM: inode-table errors went
+# from 0 to 115 in one boot and Firefox died with SIGSEGV. 5200 MiB is
+# 1331200 blocks x 4096 = 5.45e9 bytes, past 2^32, so any byte offset this
+# driver computes in 32 bits wraps -- which reads an inode table from the
+# wrong place and looks exactly like the corruption M2236-M2252 cured.
+# 3900M stays under the boundary and still leaves ~700 MB free against the
+# 3.1 GB staged closure, where 3200M left 313 BLOCKS.
+# 3200M WAS 100% FULL: 3.1 GB staged into a 3.2 GB image left 313 free blocks
+# of 819200, and nothing said so. Every runtime write then failed -- Firefox
+# could not create a single profile directory, so SessionStore retried the
+# same mkdir ~10000 times per boot, which is what "everything is so slow"
+# actually was. The staged closure only grows (Firefox, Bun, Node, the source
+# tree), so this now carries ~2 GB of headroom for profiles, caches and
+# anything the guest writes at runtime, and the rule below REFUSES to build an
+# image that starts out nearly full.
 ifneq ($(MKE2FS),)
 EXT2IMG   := $(BUILD)/ext2.img
 EXT2FLAGS := -drive file=$(BUILD)/ext2.img,format=raw,if=ide
@@ -778,6 +794,13 @@ $(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged 
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \
 	        -d $(LXROOT) $@ >/dev/null 2>&1
 	@echo "  MKE2FS  $@ ($(EXT2SIZE), 4K blocks, classic ext2, Linux binaries staged in)"
+	@# A FULL IMAGE MUST SAY SO AT BUILD TIME (M2305). It stayed silently at
+	@# 0.0% free for who knows how many milestones, and the symptom that
+	@# surfaced was an unusable desktop and a filesystem "refusing a directory
+	@# it should have created". Free space is one dumpe2fs away; not checking
+	@# it is the same shape as every other instrument this campaign has had to
+	@# add after the fact.
+	@python3 -c "import struct,sys; f=open('$@','rb'); f.seek(1024); sb=f.read(1024); 	 tb,fb=struct.unpack_from('<I',sb,4)[0],struct.unpack_from('<I',sb,12)[0]; 	 ti,fi=struct.unpack_from('<I',sb,0)[0],struct.unpack_from('<I',sb,16)[0]; 	 mb=fb*4096//1048576; 	 print('  SPACE   %d MB free (%.1f%%), %d inodes free' % (mb, 100.0*fb/tb, fi)); 	 sys.exit(0 if mb >= 500 else 1)" || 	  { echo '  FATAL   the image is nearly full before the guest has written a byte.'; 	    echo '          Raise EXT2SIZE in the Makefile -- a full ext2 makes every'; 	    echo '          runtime mkdir/write fail, which presents as a hung desktop.'; exit 1; }
 
 $(BUILD)/%.o: %.c Makefile
 	@mkdir -p $(dir $@)

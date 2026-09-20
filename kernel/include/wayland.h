@@ -35,6 +35,7 @@ unsigned wl_messages_handled(void);
 unsigned wl_globals_sent(void);
 unsigned wl_unhandled_count(void);  /* distinct requests we had no handler for (M1998) */
 unsigned wl_commits(void);      /* surfaces committed with a readable buffer (M1979) */
+int      wl_content_dirty(void);/* edge: a client has painted since the last call (M2306) */
 unsigned wl_surfaces(void);     /* wl_compositor.create_surface, ever -- the first thing a client must do to draw (M2081) */
 unsigned wl_roles(void);        /* surfaces given a role: toplevel/popup/subsurface/cursor (M2081) */
 unsigned wl_destroys(void);     /* objects released back to a client's table (M2058) */

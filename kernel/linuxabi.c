@@ -1940,7 +1940,9 @@ static void lx_dispatch_body(struct registers *r) {
         /* A build creates its output tree before compiling anything, so
          * without this `mkdir -p o/kernel` failed with "Function not
          * implemented" and the very first object file stopped the build. */
-        if (vfs_mkdir(path) != 0) {
+        long mk = vfs_mkdir(path);
+        if (mk == -2) { r->rax = (uint64_t)-(long)LX_EEXIST; break; }   /* the name is there (M2304) */
+        if (mk != 0) {
             /* Already there is SUCCESS for mkdir -p, which retries per
              * component; reporting EEXIST is what lets it continue. */
             struct statx ex;
@@ -1970,7 +1972,17 @@ static void lx_dispatch_body(struct registers *r) {
             par[pe] = 0;
             struct statx pst;
             int parent_there = (pe > 0 && vfs_stat(par, &pst) == 0);
-            kprintf("[linuxabi] mkdir(%s) FAILED -- parent '%s' %s\n", path, par,
+            /* AND DO NOT LET A RETRY LOOP MELT THE MACHINE THROUGH THE
+             * SERIAL PORT (M2304): 6441 of these in one boot, each a
+             * blocking UART write. First eight, then one in 256. */
+            static unsigned long mkfail;
+            if (++mkfail <= 8 || (mkfail % 256) == 0)
+            /* WHICH of ext2_mkdir_path's failures this was (M2305): -13 no
+             * free inode, -14 no free block, -17 the PARENT could not take
+             * another entry, and so on. Guessing between them has been wrong
+             * three times in a row. */
+            kprintf("[linuxabi] mkdir(%s) FAILED (#%lu, rc %ld) -- parent '%s' %s\n",
+                    path, mkfail, mk, par,
                     parent_there ? "EXISTS, so the filesystem refused a directory it "
                                    "should have created (reporting EIO, not ENOENT)"
                                  : "is missing (ENOENT is correct; the caller should "

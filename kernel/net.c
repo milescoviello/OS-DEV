@@ -158,14 +158,81 @@ static uint64_t g_arp_answered;
  * that a consumer took and destroyed -- which for a DNS reply is exactly the
  * EAI_AGAIN the Claude edit demo keeps hitting. */
 uint64_t g_rx_taken, g_rx_filed;
+/* UDP FOR US, COUNTED WHERE IT COMES OFF THE CARD (M2303).
+ *
+ * The taken/filed pair could not answer the question it was built for:
+ * `taken` counts EVERY frame handed to a consumer and `filed` counts only
+ * the UDP ones, so under a TCP workload a large gap is the normal case. The
+ * question that matters is narrower -- did a UDP datagram ADDRESSED TO US
+ * come off the card and then fail to reach the datagram queue?
+ *
+ * rx_next is the single place any consumer gets a frame, so classifying it
+ * here and comparing with udpq_put's own counter makes the gap mean exactly
+ * one thing: a consumer took somebody else's datagram and destroyed it.
+ * `g_udp_ours_port` keeps the last few destination ports so a missing reply
+ * can be matched against what actually arrived. */
+uint64_t g_udp_ours;
+#define UDP_OURS_RING 12
+static uint16_t g_udp_ours_port[UDP_OURS_RING]; static unsigned g_udp_ours_n;
+/* AND CATCH THE LEAK ON A BOOT THAT SUCCEEDS (M2303).
+ *
+ * Waiting for the failure is the wrong shape: it is roughly one boot in six,
+ * each boot is ten minutes, and four in a row came back clean. But a UDP
+ * datagram addressed to this machine that comes off the card and never
+ * reaches the demux is a bug whether or not anything noticed at the time.
+ *
+ * rx_next is the single place a consumer gets a frame, and a consumer decides
+ * that frame's fate SYNCHRONOUSLY before asking for the next one -- so by the
+ * time the next datagram is classified, the previous one has either been
+ * filed or destroyed. Comparing the filed counter across that boundary names
+ * the loss the instant it happens, with the port, on any boot. */
+static uint64_t g_udp_dropped; static uint16_t g_udp_drop_port;
+static int g_pend; static uint16_t g_pend_port; static uint64_t g_filed_snap;
+static void rx_classify(const uint8_t *f, int len) {
+    if (len < 34 || get16(f + 12) != 0x0800) return;          /* not IPv4 */
+    int ihl = (f[14] & 0x0F) * 4;
+    if (ihl < 20 || len < 14 + ihl + 8) return;
+    if (f[14 + 9] != 17) return;                              /* not UDP */
+    const uint8_t *dst = f + 14 + 16;
+    for (int i = 0; i < 4; i++) if (dst[i] != OUR_IP[i]) return;   /* not unicast to us */
+    if (g_pend && g_rx_filed == g_filed_snap) {
+        g_udp_dropped++; g_udp_drop_port = g_pend_port;
+        if (g_udp_dropped <= 8)
+            kprintf("[udpq] ** a UDP datagram for OUR port %u came off the card and was "
+                    "NEVER FILED -- whichever consumer took it destroyed somebody else's "
+                    "reply (%lu so far) **\n", g_pend_port, (unsigned long)g_udp_dropped);
+    }
+    g_pend = 1; g_pend_port = get16(f + 14 + ihl + 2); g_filed_snap = g_rx_filed;
+    g_udp_ours++;
+    g_udp_ours_port[g_udp_ours_n % UDP_OURS_RING] = get16(f + 14 + ihl + 2);
+    g_udp_ours_n++;
+}
 static int rx_next(uint8_t *buf, int max) {
     for (int guard = 0; guard < 64; guard++) {         /* bounded: never spin on a flood */
         int len = nic_receive(buf, max);
         if (len <= 0) return len;
-        if (!arp_maybe_reply(buf, len)) { g_rx_taken++; return len; }
+        if (!arp_maybe_reply(buf, len)) { g_rx_taken++; rx_classify(buf, len); return len; }
         g_arp_answered++;
     }
     return 0;
+}
+/* The destination ports of the UDP datagrams that were genuinely addressed to
+ * this machine, most recent last -- printed next to the ports the queue filed,
+ * so "the reply never arrived" and "the reply arrived and was destroyed" stop
+ * looking identical. */
+static const char *udp_ours_str(void) {
+    static char b[96]; int p = 0;
+    unsigned n = g_udp_ours_n < UDP_OURS_RING ? g_udp_ours_n : UDP_OURS_RING;
+    for (unsigned i = 0; i < n && p < (int)sizeof b - 8; i++) {
+        unsigned v = g_udp_ours_port[(g_udp_ours_n - n + i) % UDP_OURS_RING];
+        char t[8]; int q = 0;
+        if (!v) t[q++] = '0';
+        while (v) { t[q++] = (char)('0' + v % 10); v /= 10; }
+        while (q) b[p++] = t[--q];
+        b[p++] = ' ';
+    }
+    if (!p) { b[p++] = '('; b[p++] = 'n'; b[p++] = 'o'; b[p++] = 'n'; b[p++] = 'e'; b[p++] = ')'; }
+    b[p] = 0; return b;
 }
 unsigned long long net_arp_answered(void) { return g_arp_answered; }
 
@@ -301,7 +368,7 @@ static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
     if (len < 34) return 1;
     uint8_t proto = f[14 + 9];
     if (proto == 6)  { park_put(f, len); return 1; }           /* TCP: its connection's */
-    if (proto == 17) { g_rx_filed++; udpq_put(f, len); return 1; }   /* UDP: its port's */
+    if (proto == 17) { udpq_put(f, len); return 1; }   /* UDP: its port's (counted inside) */
     if (want_tcp)    { oring_put(f, len); return 1; }          /* ICMP etc: park for ping */
     return 0;                                                  /* ICMP, and the caller wants it */
 }
@@ -1097,6 +1164,14 @@ static void udpq_put(const uint8_t *f, int len) {
      * cannot be represented and is dropped rather than queued as something it
      * is not. Nothing sends them here; saying so beats a silent quirk. */
     if (plen == 0) return;
+    /* COUNT IT WHERE IT IS ACTUALLY QUEUED, NOT WHERE ONE CALLER QUEUES IT
+     * (M2303). This counter lived in net_rx_file_foreign -- the demux -- and
+     * recv_timeout calls udpq_put DIRECTLY, bypassing it. So every datagram
+     * filed on that path looked unfiled, and the leak detector built on top
+     * reported destroyed datagrams on boots where nothing was destroyed. Same
+     * rule as every other instrument in this tree: count the event at the one
+     * place it happens. */
+    g_rx_filed++;
     g_udpq[slot].len = plen;
     g_udpq[slot].dport   = get16(udp + 2);
     g_udpq[slot].srcport = get16(udp + 0);
@@ -1223,13 +1298,16 @@ int net_udp_readable(uint16_t sport) {
                     "%lu went to SOME OTHER consumer; %lu tx failed; %lu ARP request(s) for us "
                     "answered since boot; frames TAKEN %lu, of which %lu were UDP filed for a "
                     "port; UDP queue: %lu datagram(s) EVICTED to make room (last for port %u), "
-                    "recently filed for ports %s\n",
+                    "recently filed for ports %s; UDP addressed to US off the card: "
+                    "%lu, for ports %s; %lu DESTROYED by a consumer (last port %u)\n",
                     sport, (unsigned long)rx, (unsigned long)pf,
                     (unsigned long)(g_udpq_foreign - fo0),
                     (unsigned long)(rx > pf ? rx - pf : 0),
                     (unsigned long)g_udp_tx_fail, (unsigned long)g_arp_answered,
                     (unsigned long)g_rx_taken, (unsigned long)g_rx_filed,
-                    (unsigned long)g_udpq_evicted, g_udpq_evict_port, udpq_recent_str());
+                    (unsigned long)g_udpq_evicted, g_udpq_evict_port, udpq_recent_str(),
+                    (unsigned long)g_udp_ours, udp_ours_str(),
+                    (unsigned long)g_udp_dropped, g_udp_drop_port);
         }
     }
     return 0;

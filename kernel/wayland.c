@@ -426,6 +426,27 @@ struct wl_client {
 static struct wl_client g_cl[WL_MAXCLIENT];
 static int g_listener = -1;
 int g_wl_verbose;                 /* -append wlverbose: log every message both ways */
+
+/* A PER-FRAME LOG LINE IS A PER-FRAME STALL (M2304).
+ *
+ * The commit line printed unconditionally -- 4454 times in one boot -- and
+ * kprintf's serial path is a synchronous busy-wait on the UART. At 115200
+ * baud a 90-byte line is about 8 ms, and this one sits in the commit handler,
+ * which is the render path: every frame Firefox painted, the compositor
+ * blocked for 8 ms before presenting it, and input processing waited behind
+ * it. The user's report was "everything is so slow", and this was a large
+ * part of why.
+ *
+ * Keep the first few (bring-up is where they matter) and then one in every
+ * 512, which still shows the stream is alive and costs nothing. `wlverbose`
+ * restores every line for debugging. */
+static int commit_say(void) {
+    static unsigned long n;
+    n++;
+    if (g_wl_verbose || n <= 8) return 1;
+    if ((n % 512) == 0) { kprintf("[wl] (commit log rate-limited: %lu frames so far)\n", n); return 1; }
+    return 0;
+}
 static unsigned g_nconn, g_nmsg, g_nglobal, g_ncommit;
 /* THREE FRAME COUNTERS, BECAUSE ONE OF THEM WAS A TRAP (M2115).
  *
@@ -841,6 +862,27 @@ uint32_t wl_last_pixel(void) {
     struct wl_object *o = wl_draw_surface(0);
     return o ? ((uint32_t)o->base[0] | ((uint32_t)o->base[1] << 8) |
                 ((uint32_t)o->base[2] << 16) | ((uint32_t)o->base[3] << 24)) : 0;
+}
+
+/* HAS A CLIENT PAINTED SINCE THE LAST TIME ANYONE ASKED? (M2306)
+ *
+ * The window manager had no way to know. Nothing in its loop marked the
+ * scene dirty when a Wayland surface committed, so Firefox's frames reached
+ * the screen only when something ELSE forced a full redraw -- a click, a
+ * window opening, a drag. Between those the browser painted into its buffer
+ * and the screen simply did not change, which is precisely what "everything
+ * is so laggy" looks like from the other side of the glass: the compositor
+ * had the pixels and was not presenting them.
+ *
+ * Edge-triggered on purpose. Returning "there are commits" would be true
+ * forever after the first one and would pin the desktop at a full redraw
+ * every iteration; the caller wants "something new since I last looked". */
+int wl_content_dirty(void) {
+    static unsigned seen;
+    unsigned now = g_ncommit;
+    if (now == seen) return 0;
+    seen = now;
+    return 1;
 }
 uint32_t wl_last_width(void)  { struct wl_object *o = wl_draw_surface(0); return o ? o->width : 0; }
 uint32_t wl_last_height(void) { struct wl_object *o = wl_draw_surface(0); return o ? o->height : 0; }
@@ -2124,12 +2166,12 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                         if (need2 <= o->size && b->height && b->width)
                             mid = rd32(o->base + (unsigned long)(b->height / 2) * b->stride + (unsigned long)(b->width / 2) * 4);
                         if (loud)
-                            kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
+                            if (commit_say()) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
                                     "%u/%u sampled pixels have colour (surface %u, %s)\n",
                                     b->width, b->height, b->stride, b->format, rd32(o->base), mid,
                                     nz, seen, o->id, wl_role_name(o->role));
                         else
-                            kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
+                            if (commit_say()) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
                                     "(surface %u, %s)\n",
                                     b->width, b->height, b->stride, b->format, rd32(o->base),
                                     o->id, wl_role_name(o->role));

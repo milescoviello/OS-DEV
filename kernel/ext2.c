@@ -1802,7 +1802,7 @@ long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
                      const char *path) {
     ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
-    if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
+    if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -10;   /* volume would not open */
     v.write = write;
 
     char parent[256], base[256];
@@ -1811,16 +1811,27 @@ long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
     if (last < 0) parent[0] = 0;
     else { int j = 0; for (; j < last && j < 255; j++) parent[j] = path[j]; parent[j] = 0; }
     { int j = 0, s = last + 1; for (; s < n && j < 255; s++, j++) base[j] = path[s]; base[j] = 0; }
-    if (base[0] == 0) return -1;
+    if (base[0] == 0) return -11;                          /* no basename */
 
     uint8_t pin[256]; int pdir = 0;
     uint32_t parent_ino = walk(&v, parent, pin, &pdir);
-    if (!parent_ino || !pdir) return -1;
-    if (dir_lookup(&v, pin, base, 0)) return -1;           /* name already taken */
+    if (!parent_ino || !pdir) return -12;                  /* parent missing or not a directory */
+    /* NAME ALREADY TAKEN IS -2, NOT -1 (M2304).
+     *
+     * Every failure in this function returned -1, and the Linux ABI layer
+     * worked out "already exists" by doing a SECOND lookup with vfs_stat --
+     * so whenever those two disagreed, an existing directory was reported as
+     * an error. Firefox's SessionStore retries that forever: 6441 failed
+     * mkdirs and 6441 "Failed to copy log stream" errors in ONE boot, each
+     * pair costing two blocking serial writes. That is most of why the
+     * desktop felt unusable to use. The directory lookup that just ran is
+     * the authority on whether the name is there; nothing downstream should
+     * have to ask again. */
+    if (dir_lookup(&v, pin, base, 0)) return -2;           /* name already taken: EEXIST */
 
-    uint32_t ino = alloc_inode(&v); if (!ino) return -1;
+    uint32_t ino = alloc_inode(&v); if (!ino) return -13;  /* no free inode */
     uint32_t blk = alloc_block(&v);
-    if (!blk) { free_inode_num(&v, ino); return -1; }   /* M1616: don't leak the inode we just claimed */
+    if (!blk) { free_inode_num(&v, ino); return -14; }     /* no free block */   /* M1616: don't leak the inode we just claimed */
 
     /* the dir's data block: "." (rec_len 12) then ".." (rec_len = rest of block) */
     uint8_t db[4096];
@@ -1828,7 +1839,7 @@ long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
     e_wr32(db + 0, ino);  e_wr16(db + 4, 12); db[6] = 1; db[7] = 2; db[8] = '.';
     e_wr32(db + 12, parent_ino); e_wr16(db + 16, (uint16_t)(v.block_size - 12));
     db[18] = 2; db[19] = 2; db[20] = '.'; db[21] = '.';
-    if (wrblk(&v, blk, db) < 0) { free_block(&v, blk); free_inode_num(&v, ino); return -1; }
+    if (wrblk(&v, blk, db) < 0) { free_block(&v, blk); free_inode_num(&v, ino); return -15; }
 
     uint8_t inode[256];
     for (uint32_t i = 0; i < v.inode_size; i++) inode[i] = 0;
@@ -1838,14 +1849,14 @@ long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
     e_wr32(inode + 28, v.block_size / 512);                /* i_blocks                     */
     e_wr32(inode + 40, blk);                               /* i_block[0]                   */
     e_stamp(inode);                                        /* i_atime/ctime/mtime = now (M1175) */
-    if (write_inode(&v, ino, inode) < 0) { free_block(&v, blk); free_inode_num(&v, ino); return -1; }
+    if (write_inode(&v, ino, inode) < 0) { free_block(&v, blk); free_inode_num(&v, ino); return -16; }
 
     /* dir_add's own comment: "Returns 0, or -1 if no block has room (growing
      * the directory is unsupported)" -- a real, reachable failure (any
      * directory whose one allocated block fills up), not a hardware-error
      * edge case. Without this cleanup, every failed mkdir into a full
      * directory leaked one inode + one block permanently (M1616). */
-    if (dir_add(&v, parent_ino, base, ino, 2) < 0) { free_block(&v, blk); free_inode_num(&v, ino); return -1; }   /* ftype 2 = directory */
+    if (dir_add(&v, parent_ino, base, ino, 2) < 0) { free_block(&v, blk); free_inode_num(&v, ino); return -17; }   /* the PARENT could not take another entry */   /* ftype 2 = directory */
     if (read_inode(&v, parent_ino, pin) < 0) return -1;         /* parent gains a link (the new dir's "..") */
     e_wr16(pin + 26, (uint16_t)(e_rd16(pin + 26) + 1));
     if (write_inode(&v, parent_ino, pin) < 0) return -1;

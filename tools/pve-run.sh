@@ -44,6 +44,40 @@ if [ "${NOBUILD:-0}" != 1 ]; then
     make build/ext2.img >/dev/null
 fi
 
+# AN EXPIRED CREDENTIAL IS NOT A CLAUDE FAILURE -- AND THE GUARD HAS TO LIVE
+# HERE, NOT IN THE HARNESSES (M2302).
+#
+# M2291 put exactly this check in tools/claudeseries.sh and
+# tools/featurematrix.sh. It works, and it is trivially bypassed: calling
+# pve-run.sh directly with `APPEND="lxedit ..."` skips it. I did that four
+# hours after writing it and spent three boots -- thirty-five minutes --
+# measuring `claude -p -> 1` against a token that had expired ten minutes
+# earlier, while looking for a DNS bug. The second time today.
+#
+# Every path to a Claude boot goes through this script, so this is the only
+# place the check cannot be walked around. It restages the IMAGE only, which
+# leaves build/kernel32.elf untouched -- so a pinned series keeps its digest
+# and this is safe even under NOBUILD=1, which is the case that needs it.
+case "${APPEND:-}" in
+  *lxask*|*lxbash*|*lxedit*|*lxclaude*)
+    CRED=build/lxroot/root/.claude/.credentials.json
+    if [ -f "$CRED" ]; then
+        if ! python3 - "$CRED" <<'PYEOF'
+import json, sys, datetime
+d = json.load(open(sys.argv[1]))['claudeAiOauth']
+left = d['expiresAt']/1000 - datetime.datetime.now(datetime.UTC).timestamp()
+print("==> staged Claude credential: %d min left" % (left/60))
+sys.exit(0 if left > 300 else 1)
+PYEOF
+        then
+            echo "    -> expired (or under 5 min). Restaging and rebuilding the image,"
+            echo "       because measuring a Claude demo against a dead token measures the clock."
+            make build/ext2.img >/dev/null || exit 1
+        fi
+    fi
+    ;;
+esac
+
 # STOP THE VM BEFORE TOUCHING THE IMAGES, and boot it with -snapshot after.
 # Both were wrong on the first run: rsync failed verification on ext2.img
 # because a RUNNING guest was writing into it, and it was writing into it
