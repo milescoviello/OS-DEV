@@ -1572,7 +1572,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
              *
              * Use what the lease says. It is the one address on the network
              * that something has actually promised to answer on. */            if (ns && (ns[0] | ns[1] | ns[2] | ns[3])) {
-                char rc_buf[128]; int n = 0;   /* nameserver line + the options line (M2284) */
+                char rc_buf[256]; int n = 0;   /* two nameserver lines + the options line (M2284/M2318): 128 fit the old content with 46 bytes spare, which is not a margin worth defending */
                 const char *pfx = "nameserver ";
                 for (int i = 0; pfx[i]; i++) rc_buf[n++] = pfx[i];
                 for (int o = 0; o < 4; o++) {
@@ -1600,6 +1600,28 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                  * Shorter timeout, more attempts, and single-request so the A
                  * and AAAA queries go one after the other rather than as a
                  * pair whose loss looks like a server that is down. */
+                /* A SECOND NAMESERVER, BECAUSE ONE LOST DATAGRAM SHOULD NOT
+                 * FAIL A LOOKUP (M2318).
+                 *
+                 * Thirty-six 8-core boots of the Claude file-edit demo: four
+                 * failed, every one of them EAI_AGAIN. The receive path is
+                 * fully accounted for by counters placed where each event
+                 * happens -- the query IS transmitted, the NIC discards
+                 * nothing (its own MPC/RNBC registers read 0), every datagram
+                 * that arrives is filed, none are destroyed or evicted -- and
+                 * the reply for the waiting port simply never reaches the
+                 * machine. That profile is packet loss between here and the
+                 * resolver, not a defect in this stack.
+                 *
+                 * The fix for loss is not to hunt it, it is to survive it.
+                 * `attempts:5` already retries; a SECOND server multiplies
+                 * that by two independent paths, so a lookup now needs ten
+                 * consecutive losses to fail instead of five. The primary
+                 * still comes from the DHCP lease -- this only appends a
+                 * public fallback after it, and only if the lease did not
+                 * already give a second one. */
+                {   const char *fb = "nameserver 8.8.8.8\n";
+                    for (int i = 0; fb[i]; i++) rc_buf[n++] = fb[i]; }
                 const char *opts = "options timeout:2 attempts:5 single-request\n";
                 for (int i = 0; opts[i]; i++) rc_buf[n++] = opts[i];
                 rc_buf[n] = 0;
@@ -1613,7 +1635,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * bridged VM the constant is a machine that does not exist,
                      * and the only symptom was EAI_AGAIN inside a guest program
                      * an hour later. Say which it is. */
-                    kprintf("[lxabi] /etc/resolv.conf -> nameserver %u.%u.%u.%u (%s)\n",
+                    /* Say that the FALLBACK is there too (M2318). The line
+                     * named only the primary, so a second nameserver could be
+                     * added and silently not written and the log would read
+                     * exactly the same -- which is how the whole "from the
+                     * DHCP lease" phrase was wrong for years (M2120). */
+                    kprintf("[lxabi] /etc/resolv.conf -> %d bytes, nameserver %u.%u.%u.%u (%s) "
+                            "+ fallback 8.8.8.8, timeout:2 attempts:5\n", n,
                             ns[0], ns[1], ns[2], ns[3],
                             net_have_lease() ? "from the DHCP lease"
                                              : "the compiled-in SLIRP default -- NO DHCP LEASE, so this "

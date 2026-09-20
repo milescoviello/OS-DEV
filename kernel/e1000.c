@@ -35,6 +35,27 @@
 #define REG_RDBAL  0x2800
 #define REG_RDBAH  0x2804
 #define REG_RDLEN  0x2808
+/* THE CARD COUNTS WHAT IT THREW AWAY, AND NOBODY EVER ASKED (M2317).
+ *
+ * The DNS failure is now pinned to exactly this gap. On a failing boot the
+ * query goes out and no reply ever comes off the card:
+ *
+ *   misses on port 49158
+ *   off the card:            49152 49152 49154 49154 49155 49155 49156 49156
+ *   queries SENT from ports: ... 49158 49158
+ *
+ * Receive path, queue, matching and wakeup are all exonerated by their own
+ * counters. That leaves "the upstream never answered" and "the NIC dropped
+ * it", and the hardware already distinguishes them: MPC counts frames the
+ * card discarded because no descriptor was free, RNBC counts no-buffer
+ * events. RX_COUNT is 64 descriptors and eight cores can outrun that.
+ *
+ * Both are clear-on-read, so they accumulate into totals here rather than
+ * being sampled. A drop the hardware recorded and nothing reported is the
+ * same shape as every other silent failure this campaign has had to add an
+ * instrument for. */
+#define REG_MPC    0x4010    /* Missed Packets Count (clear on read) */
+#define REG_RNBC   0x40A0    /* Receive No Buffers Count (clear on read) */
 #define REG_RDH    0x2810
 #define REG_RDT    0x2818
 #define REG_TDBAL  0x3800
@@ -117,6 +138,18 @@ static uint64_t tx_buf[TX_COUNT];      /* PHYSICAL: handed to the device */
 static uint32_t rx_cur, tx_cur;
 
 static uint32_t reg_read(uint32_t off)            { return *(volatile uint32_t *)(mmio + off); }
+static uint64_t g_e1000_mpc, g_e1000_rnbc;
+/* Accumulate the clear-on-read drop counters. Called from the RX poll, so a
+ * total is never more than one poll stale. */
+static void e1000_drain_stats(void) {
+    if (!mmio) return;
+    g_e1000_mpc  += reg_read(REG_MPC);
+    g_e1000_rnbc += reg_read(REG_RNBC);
+}
+void e1000_drop_counts(uint64_t *mpc, uint64_t *rnbc) {
+    if (mpc)  *mpc  = g_e1000_mpc;
+    if (rnbc) *rnbc = g_e1000_rnbc;
+}
 static void     reg_write(uint32_t off, uint32_t v){ *(volatile uint32_t *)(mmio + off) = v; }
 
 static uint16_t eeprom_read(uint8_t addr) {
@@ -186,6 +219,7 @@ static void e1000_drain_ring(void) {
         }
         rx_ring[i].status = 0;
         reg_write(REG_RDT, i);         /* give the descriptor back immediately */
+        e1000_drain_stats();           /* the card's own drop counters (M2317) */
         rx_cur = (i + 1) % RX_COUNT;
     }
 }

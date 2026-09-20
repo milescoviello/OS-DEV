@@ -318,6 +318,11 @@ static const char *udpq_recent_str(void) {
     b[p] = 0;
     return b;
 }
+/* The NIC's own discard counters (M2317); weak so a build without e1000
+ * still links. */
+void e1000_drop_counts(uint64_t *mpc, uint64_t *rnbc) __attribute__((weak));
+static uint64_t e1k_mpc(void)  { uint64_t a=0,b=0; if (e1000_drop_counts) e1000_drop_counts(&a,&b); return a; }
+static uint64_t e1k_rnbc(void) { uint64_t a=0,b=0; if (e1000_drop_counts) e1000_drop_counts(&a,&b); return b; }
 static uint64_t g_udp_tx_fail;    /* datagrams nic_send refused, which used to be reported as SENT (M2125) */
 #define UDP_TX_RING 16
 static uint16_t g_udp_tx_port[UDP_TX_RING]; static unsigned g_udp_tx_n;   /* source ports put on the wire (M2316) */
@@ -1401,7 +1406,8 @@ int net_udp_readable(uint16_t sport) {
                     "port; UDP queue: %lu datagram(s) EVICTED to make room (last for port %u), "
                     "recently filed for ports %s; UDP addressed to US off the card: "
                     "%lu, for ports %s; %lu DESTROYED by a consumer (last port %u); "
-                    "queries SENT from ports %s\n",
+                    "queries SENT from ports %s; the CARD dropped %lu (no descriptor) "
+                    "+ %lu (no buffer)\n",
                     sport, (unsigned long)rx, (unsigned long)pf,
                     (unsigned long)(g_udpq_foreign - fo0),
                     (unsigned long)(rx > pf ? rx - pf : 0),
@@ -1409,7 +1415,8 @@ int net_udp_readable(uint16_t sport) {
                     (unsigned long)g_rx_taken, (unsigned long)g_rx_filed,
                     (unsigned long)g_udpq_evicted, g_udpq_evict_port, udpq_recent_str(),
                     (unsigned long)g_udp_ours, udp_ours_str(),
-                    (unsigned long)g_udp_dropped, g_udp_drop_port, udp_tx_str());
+                    (unsigned long)g_udp_dropped, g_udp_drop_port, udp_tx_str(),
+                    (unsigned long)e1k_mpc(), (unsigned long)e1k_rnbc());
         }
     }
     return 0;
