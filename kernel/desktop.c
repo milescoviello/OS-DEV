@@ -1541,6 +1541,11 @@ static void restore_scene_rect(int x, int y, int w, int h) {
 
 /* Copy the cached scene to the back buffer, draw the cursor on top, and blit
  * the whole screen. Used whenever the scene itself changed. */
+static uint64_t g_fr_render, g_fr_present; static unsigned g_fr_n;
+static inline uint64_t rdtsc_now(void) {
+    unsigned lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 static void present_frame(void) {
     int nx = mouse_x(), ny = mouse_y();              /* one consistent snapshot */
     memcpy(backbuffer, scenebuf, (size_t)screen_w * screen_h * 4);
@@ -2389,7 +2394,29 @@ void desktop_run(void) {
          * rectangle is actually small, which a maximised browser's never is.
          * Back to one full redraw per commit until there is damage tracking
          * to make the rectangle genuinely small. */
-        if (wl_content_dirty()) dirty = 1;
+        /* A CLIENT PAINTING IS NOT A SCENE CHANGE (M2313).
+         *
+         * M2306 marked the whole scene dirty when a Wayland client committed,
+         * which is what finally put Firefox's frames on screen -- and made
+         * every browser frame repaint the wallpaper, the taskbar and every
+         * other window too. The frame profiler says what that costs:
+         *
+         *     [frame] 300 frames: render 3771 Mcyc, present 1656 Mcyc
+         *             (69% of the frame is the scene draw)
+         *
+         * So redraw only the client's own window into the scene, and let
+         * present_frame() do the rest -- since M2311 it already writes only
+         * the framebuffer rows that actually differ, so the expensive half
+         * is the drawing, not the presenting. M2310 tried to optimise the
+         * presenting and was reverted for being slower; this is the other
+         * half, chosen from the measurement rather than from intuition.
+         *
+         * Windows ABOVE the client have to be redrawn on top of it or they
+         * would be painted over. Anything below is untouched and stays. */
+        int wl_only = 0;
+        if (wl_content_dirty()) {
+            if (win_count > 0) wl_only = 1; else dirty = 1;
+        }
         { int nb = nwlpid_seen; wl_hide_console_for_clients(); if (nwlpid_seen != nb) dirty = 1; }
 
         /* open browser windows requested by the shell (`browse <url>`) */
@@ -3181,7 +3208,46 @@ void desktop_run(void) {
             app_shows_caret((app_t *)windows[win_count - 1].app))
             dirty = 1;
 
-        if (dirty) { render_scene(); present_frame(); }  /* scene changed: full redraw + blit */
+        if (!dirty && wl_only) {
+            /* Only client content moved: redraw those windows and whatever
+             * sits above them, then present. No wallpaper, no taskbar. */
+            fb_set_target(scenebuf);
+            for (int i = 0; i < win_count; i++) {
+                if (windows[i].minimized) continue;
+                int is_wl = (windows[i].kind == KIND_WAYLAND);
+                int above_wl = 0;
+                for (int j = 0; j < i; j++)
+                    if (windows[j].kind == KIND_WAYLAND && !windows[j].minimized &&
+                        rects_overlap(windows[i].x, windows[i].y, windows[i].w, windows[i].h,
+                                      windows[j].x, windows[j].y, windows[j].w, windows[j].h))
+                        above_wl = 1;
+                if (is_wl || above_wl) draw_window(&windows[i], i == win_count - 1);
+            }
+            present_frame();
+        }
+        if (dirty) {
+            /* WHERE A FRAME ACTUALLY GOES (M2312). After M2311 a frame is a
+             * full scene draw, a 4.9 MB copy and a 4.9 MB compare, and which
+             * of those dominates decides what is worth optimising next. The
+             * last guess here -- "a partial present must be cheaper" -- was
+             * wrong and had to be reverted, so this measures instead. TSC
+             * deltas, summed, reported once a second's worth of frames. */
+            uint64_t t0 = rdtsc_now();
+            render_scene();
+            uint64_t t1 = rdtsc_now();
+            present_frame();
+            uint64_t t2 = rdtsc_now();
+            g_fr_render += t1 - t0; g_fr_present += t2 - t1; g_fr_n++;
+            if (g_fr_n == 300) {
+                kprintf("[frame] 300 frames: render %lu Mcyc, present %lu Mcyc "
+                        "(%lu%% of the frame is the scene draw)\n",
+                        (unsigned long)(g_fr_render / 1000000),
+                        (unsigned long)(g_fr_present / 1000000),
+                        (unsigned long)(g_fr_render * 100 /
+                                        (g_fr_render + g_fr_present + 1)));
+                g_fr_n = 0; g_fr_render = 0; g_fr_present = 0;
+            }
+        }
 
         else if (clock_tick) {
             /* Just the clock changed — the common once-a-second case with an
