@@ -319,6 +319,22 @@ static const char *udpq_recent_str(void) {
     return b;
 }
 static uint64_t g_udp_tx_fail;    /* datagrams nic_send refused, which used to be reported as SENT (M2125) */
+#define UDP_TX_RING 16
+static uint16_t g_udp_tx_port[UDP_TX_RING]; static unsigned g_udp_tx_n;   /* source ports put on the wire (M2316) */
+static const char *udp_tx_str(void) {
+    static char b[120]; int p = 0;
+    unsigned n = g_udp_tx_n < UDP_TX_RING ? g_udp_tx_n : UDP_TX_RING;
+    for (unsigned i = 0; i < n && p < (int)sizeof b - 8; i++) {
+        unsigned v = g_udp_tx_port[(g_udp_tx_n - n + i) % UDP_TX_RING];
+        char t[8]; int q = 0;
+        if (!v) t[q++] = '0';
+        while (v) { t[q++] = (char)('0' + v % 10); v /= 10; }
+        while (q) b[p++] = t[--q];
+        b[p++] = ' ';
+    }
+    if (!p) { b[p++] = '-'; }
+    b[p] = 0; return b;
+}
 uint64_t net_udp_foreign(void) { return g_udpq_foreign; }
 /* 16 -> 48 (M2022): same reasoning as PARK_N. This ring holds the protocols
  * that have nowhere else to go, and it is written by every drain site. */
@@ -1041,6 +1057,30 @@ static void udp_send_to(const uint8_t *dstmac, const uint8_t *dstip,
      * happened -- a full TX ring, a firewall drop, a driver error. The caller
      * then waited for a reply to a datagram that was never put on the wire.
      * Report it; the count is what tells a lost reply from a lost query. */
+    /* WHICH SOURCE PORTS ACTUALLY PUT A QUERY ON THE WIRE (M2316).
+     *
+     * The receive side is now fully accounted for: on a failing boot every
+     * UDP datagram that came off the card was filed, none were destroyed,
+     * and the waiter's port simply never appeared --
+     *
+     *   waiter on 49158
+     *   off the card: 8, for ports 49152 49152 49154 49154 49155 49155 49156 49156
+     *   filed:           49152 49152 49154 49154 49155 49155 49156 49156
+     *   0 DESTROYED
+     *
+     * So the reply never arrived. That leaves two causes with opposite
+     * fixes: the query never went out, or it went out and was never
+     * answered. nic_send's return value already distinguishes a refused
+     * transmit (0 of those), but not a query that was never attempted --
+     * and 49153 and 49157 are missing from the reply list too, which looks
+     * more like a pattern than like upstream packet loss.
+     *
+     * So record the source port of every datagram handed to the NIC. If the
+     * waiter's port is in this list and not in the arrived list, the query
+     * went out and the answer never came; if it is in neither, nothing was
+     * ever sent for it and the bug is above this function. */
+    g_udp_tx_port[g_udp_tx_n % UDP_TX_RING] = sport;
+    g_udp_tx_n++;
     int txr = nic_send(pkt, 42 + plen);
     if (txr < 0) {   /* 0 means SENT here -- e1000_send returns 0 on success (M2125) */
         g_udp_tx_fail++;
@@ -1360,7 +1400,8 @@ int net_udp_readable(uint16_t sport) {
                     "answered since boot; frames TAKEN %lu, of which %lu were UDP filed for a "
                     "port; UDP queue: %lu datagram(s) EVICTED to make room (last for port %u), "
                     "recently filed for ports %s; UDP addressed to US off the card: "
-                    "%lu, for ports %s; %lu DESTROYED by a consumer (last port %u)\n",
+                    "%lu, for ports %s; %lu DESTROYED by a consumer (last port %u); "
+                    "queries SENT from ports %s\n",
                     sport, (unsigned long)rx, (unsigned long)pf,
                     (unsigned long)(g_udpq_foreign - fo0),
                     (unsigned long)(rx > pf ? rx - pf : 0),
@@ -1368,7 +1409,7 @@ int net_udp_readable(uint16_t sport) {
                     (unsigned long)g_rx_taken, (unsigned long)g_rx_filed,
                     (unsigned long)g_udpq_evicted, g_udpq_evict_port, udpq_recent_str(),
                     (unsigned long)g_udp_ours, udp_ours_str(),
-                    (unsigned long)g_udp_dropped, g_udp_drop_port);
+                    (unsigned long)g_udp_dropped, g_udp_drop_port, udp_tx_str());
         }
     }
     return 0;
