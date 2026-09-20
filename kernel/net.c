@@ -327,7 +327,42 @@ uint64_t net_udp_foreign(void) { return g_udpq_foreign; }
 static struct { uint8_t buf[ORING_MAX]; int len; uint64_t at; } g_oring[ORING_N];
 #define ORING_TTL 200            /* ticks (~2s): a frame nobody claimed is stale */
 
-static void oring_put(const uint8_t *f, int len) {
+/* ---- THE RECEIVE QUEUES WERE SHARED AND UNSERIALISED (M2315) ------------
+ *
+ * net.c had exactly ONE lock -- ooo_lock, for the TCP out-of-order table --
+ * and the receive queues had none. Each is a shared slot table that a writer
+ * WALKS for a free slot, EVICTS the oldest from when full, then fills field
+ * by field, while a reader walks the same table and clears what it takes.
+ * Two cores in that at once is the read-modify-write hazard that corrupted
+ * inode tables until M2308: both pick the same slot, and one datagram
+ * overwrites the other.
+ *
+ * For a DNS reply that is indistinguishable from the reply never arriving,
+ * which is the failure being chased -- and it is core-count dependent in
+ * exactly the way the measurement says:
+ *
+ *     Claude Code file-edit demo, 8 cores: 4 of 8 boots passed
+ *                                 4 cores: 4 of 4 passed
+ *
+ * One lock PER TABLE rather than one shared lock: the TCP read path files
+ * non-TCP frames into the UDP queue, so a single lock would deadlock the
+ * first time that happened. Same irq_save idiom as ooo_lock, because a frame
+ * can be filed from a NIC interrupt as well as from a task. */
+#define RXQ_LOCK(name) \
+    static volatile int name##_lk; \
+    static inline uint64_t name##_take_lk(void) { \
+        uint64_t fl; __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory"); \
+        while (__atomic_exchange_n(&name##_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause"); \
+        return fl; \
+    } \
+    static inline void name##_give_lk(uint64_t fl) { \
+        __atomic_store_n(&name##_lk, 0, __ATOMIC_RELEASE); \
+        __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc"); \
+    }
+RXQ_LOCK(udpq)
+RXQ_LOCK(oring)
+
+static void oring_put_u(const uint8_t *f, int len) {
     if (len <= 0 || len > ORING_MAX) return;
     uint64_t now = timer_ticks();
     int slot = -1;
@@ -342,7 +377,13 @@ static void oring_put(const uint8_t *f, int len) {
     memcpy(g_oring[slot].buf, f, (size_t)len);
     g_oring[slot].len = len; g_oring[slot].at = now;
 }
-static int oring_take(uint8_t *out, int max) {
+
+static void oring_put(const uint8_t *f, int len) {
+    uint64_t fl = oring_take_lk();
+    oring_put_u(f, len);
+    oring_give_lk(fl);
+}
+static int oring_take_u(uint8_t *out, int max) {
     uint64_t now = timer_ticks();
     for (int i = 0; i < ORING_N; i++) {
         if (!g_oring[i].len) continue;
@@ -353,6 +394,13 @@ static int oring_take(uint8_t *out, int max) {
         return len;
     }
     return 0;
+}
+
+static int oring_take(uint8_t *out, int max) {
+    uint64_t fl = oring_take_lk();
+    int r = oring_take_u(out, max);
+    oring_give_lk(fl);
+    return r;
 }
 
 /* File a frame that is not ours. Returns 1 if it was filed (so the caller
@@ -1080,7 +1128,7 @@ static struct {
 
 static void park_put(const uint8_t *f, int len);   /* defined with the TCP demux below */
 
-static void udpq_put(const uint8_t *f, int len) {
+static void udpq_put_u(const uint8_t *f, int len) {
     int ihl = (f[14] & 0x0F) * 4;
     if (ihl < 20 || len < 14 + ihl + 8) return;
     /* IS THIS DATAGRAM EVEN FOR US? (M2124)
@@ -1193,8 +1241,14 @@ static void udpq_put(const uint8_t *f, int len) {
     }
 }
 
+static void udpq_put(const uint8_t *f, int len) {
+    uint64_t fl = udpq_take_lk();
+    udpq_put_u(f, len);
+    udpq_give_lk(fl);
+}
+
 /* Dequeue a datagram for `sport`. Returns its length, or -1 if none. */
-static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport) {
+static int udpq_take_u(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport) {
     uint64_t now = timer_ticks();
     for (int i = 0; i < UDPQ_N; i++) {
         if (!g_udpq[i].len) continue;
@@ -1208,6 +1262,13 @@ static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint1
         return n;
     }
     return -1;
+}
+
+static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport) {
+    uint64_t fl = udpq_take_lk();
+    int r = udpq_take_u(sport, buf, max, srcip, srcport);
+    udpq_give_lk(fl);
+    return r;
 }
 
 /* Drain the NIC once: UDP datagrams to the queue, TCP frames to the park ring,
