@@ -103,16 +103,57 @@ void fb_set_target(uint32_t *backbuffer) {
     target = backbuffer;
 }
 
+/* WRITE ONLY THE ROWS THAT ACTUALLY CHANGED (M2311).
+ *
+ * This copied the whole 1280x960 surface to the linear framebuffer on every
+ * scene change -- about 4.9 MB, every frame. That is tolerable as memory
+ * traffic and RUINOUS everywhere the framebuffer is watched: QEMU decides
+ * what to send a remote console from the pages the guest DIRTIED, so touching
+ * every page means the entire screen is re-encoded and pushed over the
+ * network for a frame in which three pixels moved. The user's report was
+ * "everything is so slow" on a Proxmox console, and this is the largest
+ * single reason a fast guest looks slow through one.
+ *
+ * So compare the row against what the framebuffer already holds and skip the
+ * write when they match. The comparison reads the LFB, which is slower than
+ * RAM, so it is done in 16-row bands: one memcmp per band, one memcpy per
+ * band that differs. A frame where nothing moved writes nothing at all; a
+ * frame where a caret blinked writes one band.
+ *
+ * `fb_present_force()` stays for the cases that must not be elided -- a mode
+ * set, or a screenshot reading back what it just drew. */
+/* The comparison is against a RAM SHADOW of what was last written, never
+ * against the framebuffer itself: the LFB is uncached MMIO, and reading
+ * 4.9 MB of it per frame would cost far more than the blind write this is
+ * meant to avoid. The shadow costs one screen of RAM. */
+static uint32_t *fb_shadow;
+static int       fb_shadow_ok;
+void fb_present_force(void) {
+    if (!target) return;
+    if (fb_stride == fb_w) { memcpy((void *)lfb, target, (size_t)fb_w * fb_h * 4); return; }
+    for (int y = 0; y < fb_h; y++)
+        memcpy((void *)(lfb + (size_t)y * fb_stride), target + (size_t)y * fb_w, (size_t)fb_w * 4);
+}
 void fb_present(void) {
     if (!target) return;
-    /* memcpy, not a per-element loop: lfb is volatile, so an element loop can't
-     * be vectorised — and this runs on every scene change (drags, typing). */
-    if (fb_stride == fb_w) {                       /* tight LFB (QEMU/bochs): one shot */
-        memcpy((void *)lfb, target, (size_t)fb_w * fb_h * 4);
+    if (!fb_shadow) {
+        fb_shadow = (uint32_t *)kmalloc((size_t)fb_w * fb_h * 4);
+        fb_shadow_ok = 0;
+    }
+    if (!fb_shadow) { fb_present_force(); return; }      /* no memory: behave as before */
+    if (!fb_shadow_ok) {                                  /* first frame: write it all */
+        fb_present_force();
+        memcpy(fb_shadow, target, (size_t)fb_w * fb_h * 4);
+        fb_shadow_ok = 1;
         return;
     }
-    for (int y = 0; y < fb_h; y++)                 /* padded LFB (real GOP): row by row */
-        memcpy((void *)(lfb + (size_t)y * fb_stride), target + (size_t)y * fb_w, (size_t)fb_w * 4);
+    for (int y = 0; y < fb_h; y++) {
+        const uint32_t *src = target    + (size_t)y * fb_w;
+        uint32_t       *shd = fb_shadow + (size_t)y * fb_w;
+        if (memcmp(shd, src, (size_t)fb_w * 4) == 0) continue;   /* row unchanged */
+        memcpy((void *)(lfb + (size_t)y * fb_stride), src, (size_t)fb_w * 4);
+        memcpy(shd, src, (size_t)fb_w * 4);
+    }
 }
 
 /* Save a screenshot of the live screen to `name` as a 24-bit BMP, downscaled to

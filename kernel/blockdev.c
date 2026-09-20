@@ -1079,53 +1079,127 @@ long blockdev_mount_pread(int i, const char *path, void *buf, unsigned long max,
 /* Create a new file at `path` (relative to the volume root) on mount `i`. Only
  * ext2 mounts are writable here (FAT32 boot disk is written directly by fat32.c;
  * ISO 9660 is a read-only medium). Bytes written, or -1. M1132. */
-long blockdev_mount_write(int i, const char *path, const void *buf, unsigned long len) {
+/* ---- ONE WRITER AT A TIME IN THE FILESYSTEM (M2308) ---------------------
+ *
+ * ext2.c, blockdev.c and vfs.c contained NO serialisation of any kind, and
+ * every metadata mutation here is a read-modify-write of a SHARED block:
+ * write_inode reads a 4096-byte inode-table block, changes one 256-byte
+ * inode and writes the whole block back; alloc_block does it to a bitmap;
+ * dir_add to a directory block. Two cores doing that for two different
+ * inodes that happen to share a block each read, each modify, each write --
+ * and the second puts back a copy that never contained the first's change.
+ *
+ * That is the corruption exactly: an inode table whose bytes are wrong,
+ * `0 DIFFERED` on re-read because the bad data really is on the disk, and
+ * only ever above one core --
+ *
+ *     cores    itable errors    SIGSEGVs
+ *       1            0              0
+ *       4            0              0
+ *       8        111-115          8-11
+ *
+ * M2236-M2240 found this same hazard for the GROUP DESCRIPTOR block and
+ * fixed it there alone. M2252 then read "0 / 0 / 0" off a filesystem that
+ * was 100% FULL -- where allocation failed instantly and this path barely
+ * ran -- and called it cured. It was not; it was unexercised.
+ *
+ * The ATA driver already serialises individual TRANSFERS and that cannot
+ * help: the race is between the read and the write, not inside either.
+ *
+ * Writers only -- readers do not modify, and serialising path resolution
+ * across eight cores would cost far more than it buys. Spin-then-yield, the
+ * shape ata.c's lock uses (M1911), because this is held across real disk I/O
+ * and a pure spinner on the holder's own core starves the task it waits for. */
+static volatile int fsw_lock;
+static void fsw_take(void) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&fsw_lock, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void fsw_give(void) { __atomic_store_n(&fsw_lock, 0, __ATOMIC_RELEASE); }
+
+static long blockdev_mount_write_locked(int i, const char *path, const void *buf, unsigned long len) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;          /* read-only filesystem */
     return ext2_write_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                            path ? path : "", buf, len);
 }
+long blockdev_mount_write(int i, const char *path, const void *buf, unsigned long len) {
+    fsw_take();
+    long r = blockdev_mount_write_locked(i, path, buf, len);
+    fsw_give();
+    return r;
+}
+
 
 /* Positional WRITE on mount `i` (ext2 only): place len bytes at byte offset
  * `off`, creating/extending the file, without ever materialising the whole
  * file. The streaming counterpart of blockdev_mount_pread — and unlike that
  * one there is no read-prefix fallback for ISO/FAT, because ISO is read-only
  * and a secondary FAT mount has no write path here at all. M1935. */
-long blockdev_mount_pwrite(int i, const char *path, const void *buf, unsigned long len, uint64_t off) {
+static long blockdev_mount_pwrite_locked(int i, const char *path, const void *buf, unsigned long len, uint64_t off) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;          /* read-only filesystem */
     return ext2_pwrite_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                             path ? path : "", off, buf, len);
 }
+long blockdev_mount_pwrite(int i, const char *path, const void *buf, unsigned long len, uint64_t off) {
+    fsw_take();
+    long r = blockdev_mount_pwrite_locked(i, path, buf, len, off);
+    fsw_give();
+    return r;
+}
+
 
 /* Delete a file on mount `i` (ext2 only). 0 on success, -1 otherwise. M1135. */
-long blockdev_mount_remove(int i, const char *path) {
+static long blockdev_mount_remove_locked(int i, const char *path) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_unlink_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                             path ? path : "");
 }
+long blockdev_mount_remove(int i, const char *path) {
+    fsw_take();
+    long r = blockdev_mount_remove_locked(i, path);
+    fsw_give();
+    return r;
+}
+
 
 /* Create a directory on mount `i` (ext2 only). 0 on success, -1 otherwise. M1137. */
-long blockdev_mount_mkdir(int i, const char *path) {
+static long blockdev_mount_mkdir_locked(int i, const char *path) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_mkdir_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                            path ? path : "");
 }
+long blockdev_mount_mkdir(int i, const char *path) {
+    fsw_take();
+    long r = blockdev_mount_mkdir_locked(i, path);
+    fsw_give();
+    return r;
+}
+
 
 /* Create a symlink on mount `i` (ext2 only). 0 on success, -1 otherwise. M1146. */
-long blockdev_mount_symlink(int i, const char *path, const char *target) {
+static long blockdev_mount_symlink_locked(int i, const char *path, const char *target) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_symlink_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                              path ? path : "", target ? target : "");
 }
+long blockdev_mount_symlink(int i, const char *path, const char *target) {
+    fsw_take();
+    long r = blockdev_mount_symlink_locked(i, path, target);
+    fsw_give();
+    return r;
+}
+
 
 /* Read a symlink's target on mount `i` (ext2 only), not followed. bytes/-1. M1594. */
 long blockdev_mount_readlink(int i, const char *path, void *buf, unsigned long max) {
@@ -1135,20 +1209,34 @@ long blockdev_mount_readlink(int i, const char *path, void *buf, unsigned long m
     return ext2_readlink_path(mount_rfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", buf, max);
 }
 
-long blockdev_mount_link(int i, const char *oldpath, const char *newpath) {   /* hard link (ext2 only); 0/-1 (M1207) */
+static long blockdev_mount_link_locked(int i, const char *oldpath, const char *newpath) {   /* hard link (ext2 only); 0/-1 (M1207) */
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_link_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                           oldpath ? oldpath : "", newpath ? newpath : "");
 }
-long blockdev_mount_rename(int i, const char *oldpath, const char *newpath) {   /* rename/move (ext2 only); 0/-1 (M1213) */
+long blockdev_mount_link(int i, const char *oldpath, const char *newpath) {
+    fsw_take();
+    long r = blockdev_mount_link_locked(i, oldpath, newpath);
+    fsw_give();
+    return r;
+}
+
+static long blockdev_mount_rename_locked(int i, const char *oldpath, const char *newpath) {   /* rename/move (ext2 only); 0/-1 (M1213) */
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_rename_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                             oldpath ? oldpath : "", newpath ? newpath : "");
 }
+long blockdev_mount_rename(int i, const char *oldpath, const char *newpath) {
+    fsw_take();
+    long r = blockdev_mount_rename_locked(i, oldpath, newpath);
+    fsw_give();
+    return r;
+}
+
 long blockdev_mount_rename2(int i, const char *oldpath, const char *newpath, int flags) {  /* renameat2 (ext2 only); 0/-1 (M1232) */
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
@@ -1156,12 +1244,19 @@ long blockdev_mount_rename2(int i, const char *oldpath, const char *newpath, int
     return ext2_rename2_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                              oldpath ? oldpath : "", newpath ? newpath : "", flags);
 }
-long blockdev_mount_truncate(int i, const char *path, uint64_t newlen) {   /* resize (ext2 only); 0/-1 (M1228) */
+static long blockdev_mount_truncate_locked(int i, const char *path, uint64_t newlen) {   /* resize (ext2 only); 0/-1 (M1228) */
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_truncate_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", newlen);
 }
+long blockdev_mount_truncate(int i, const char *path, uint64_t newlen) {
+    fsw_take();
+    long r = blockdev_mount_truncate_locked(i, path, newlen);
+    fsw_give();
+    return r;
+}
+
 
 /* SEEK_HOLE/SEEK_DATA on mount `i`. ext2 walks the block map for real sparse
  * boundaries; -2 means "not an ext2 mount" so vfs falls back to a generic
@@ -1174,26 +1269,47 @@ long blockdev_mount_seek_data_hole(int i, const char *path, long off, int find_h
 }
 
 /* utimensat backend on mount `i` (ext2 only; negative time = leave). 0/-1. M1230. */
-long blockdev_mount_utimes(int i, const char *path, long atime, long mtime) {
+static long blockdev_mount_utimes_locked(int i, const char *path, long atime, long mtime) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_utimes_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", atime, mtime);
 }
+long blockdev_mount_utimes(int i, const char *path, long atime, long mtime) {
+    fsw_take();
+    long r = blockdev_mount_utimes_locked(i, path, atime, mtime);
+    fsw_give();
+    return r;
+}
+
 /* chmod backend on mount `i` (ext2 only). 0/-1. M1241. */
-long blockdev_mount_chmod(int i, const char *path, uint32_t mode) {
+static long blockdev_mount_chmod_locked(int i, const char *path, uint32_t mode) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_chmod_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", mode);
 }
+long blockdev_mount_chmod(int i, const char *path, uint32_t mode) {
+    fsw_take();
+    long r = blockdev_mount_chmod_locked(i, path, mode);
+    fsw_give();
+    return r;
+}
+
 /* chown backend on mount `i` (ext2 only; negative id = leave). 0/-1. M1243. */
-long blockdev_mount_chown(int i, const char *path, long uid, long gid) {
+static long blockdev_mount_chown_locked(int i, const char *path, long uid, long gid) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_chown_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", uid, gid);
 }
+long blockdev_mount_chown(int i, const char *path, long uid, long gid) {
+    fsw_take();
+    long r = blockdev_mount_chown_locked(i, path, uid, gid);
+    fsw_give();
+    return r;
+}
+
 
 int blockdev_mount_fiemap(int i, const char *path, ext2_extent_t *out, int max) {
     blockdev_mount_scan();
@@ -1202,21 +1318,35 @@ int blockdev_mount_fiemap(int i, const char *path, ext2_extent_t *out, int max) 
     return ext2_fiemap(mount_rfn(i), mount_ctx(i), g_mount[i].start, path ? path : "", out, max);
 }
 
-long blockdev_mount_punch(int i, const char *path, uint64_t offset, uint64_t len) {
+static long blockdev_mount_punch_locked(int i, const char *path, uint64_t offset, uint64_t len) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;    /* hole punching: ext2 only (M1153) */
     return ext2_punch_hole(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                            path ? path : "", offset, len);
 }
+long blockdev_mount_punch(int i, const char *path, uint64_t offset, uint64_t len) {
+    fsw_take();
+    long r = blockdev_mount_punch_locked(i, path, offset, len);
+    fsw_give();
+    return r;
+}
+
 
 /* Extended attributes on mount `i` (ext2 only, user.* namespace). M1182. */
-long blockdev_mount_setxattr(int i, const char *path, const char *name, const void *val, unsigned long vlen) {
+static long blockdev_mount_setxattr_locked(int i, const char *path, const char *name, const void *val, unsigned long vlen) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount || g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_setxattr(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                          path ? path : "", name ? name : "", val, vlen);
 }
+long blockdev_mount_setxattr(int i, const char *path, const char *name, const void *val, unsigned long vlen) {
+    fsw_take();
+    long r = blockdev_mount_setxattr_locked(i, path, name, val, vlen);
+    fsw_give();
+    return r;
+}
+
 long blockdev_mount_getxattr(int i, const char *path, const char *name, void *out, unsigned long max) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount || g_mount[i].fstype != FS_EXT2) return -1;
@@ -1229,12 +1359,19 @@ long blockdev_mount_listxattr(int i, const char *path, char *out, unsigned long 
     return ext2_listxattr(mount_rfn(i), mount_ctx(i), g_mount[i].start,
                           path ? path : "", out, max);
 }
-long blockdev_mount_removexattr(int i, const char *path, const char *name) {
+static long blockdev_mount_removexattr_locked(int i, const char *path, const char *name) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount || g_mount[i].fstype != FS_EXT2) return -1;
     return ext2_removexattr(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
                             path ? path : "", name ? name : "");
 }
+long blockdev_mount_removexattr(int i, const char *path, const char *name) {
+    fsw_take();
+    long r = blockdev_mount_removexattr_locked(i, path, name);
+    fsw_give();
+    return r;
+}
+
 
 /* Is `path` (relative to the volume root) a directory on mount `i`? For `cd`. */
 int blockdev_mount_isdir(int i, const char *path) {

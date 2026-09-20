@@ -28,7 +28,7 @@ S=${SCRATCH:-/tmp/claude-1000/-home-miles-OS-DEV/026bcdb5-8d88-4ad7-9f23-58649bf
 mkdir -p "$S"
 H=${PVE_HOST:-192.168.1.5}
 VMID=${VMID:-122}
-D=/root/osdev
+D=${PVE_DIR:-/root/osdev}
 SSH="ssh -o BatchMode=yes root@$H"
 CAP=${CAP:-420}
 

@@ -27,7 +27,7 @@ set -e
 cd "$(dirname "$0")/.."
 H=${PVE_HOST:-192.168.1.5}
 VMID=${VMID:-122}
-D=/root/osdev
+D=${PVE_DIR:-/root/osdev}
 SSH="ssh -o BatchMode=yes root@$H"
 
 # `lxgtk3` SELECTS THE CLIENT, `ffwl` SELECTS THE MODE. On its own lxgtk3

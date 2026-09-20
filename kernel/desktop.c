@@ -1566,6 +1566,42 @@ static void present_cursor(void) {
     cur_px = nx; cur_py = ny;
 }
 
+static int rects_overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh);
+/* ONLY THE CLIENT'S RECTANGLE (M2310).
+ *
+ * M2306 made the desktop redraw when a Wayland client commits, which is what
+ * finally put Firefox's frames on screen -- but it did it through the FULL
+ * path: render_scene() repaints the wallpaper, every window and the taskbar,
+ * and present_frame() memcpy's and blits the whole 1280x960 surface. At a
+ * browser's frame rate that is several megabytes of copying per frame for a
+ * change confined to one window, and it dirties the entire framebuffer, so
+ * the VNC layer above re-encodes the whole screen every time. That is a large
+ * part of why it looks smooth in the counters and feels heavy to a person.
+ *
+ * This is the present_cursor/present_clock treatment (M52/M105) applied to a
+ * client surface: redraw that one window into the scene cache, copy back just
+ * its rectangle, and flush just that rectangle. The cursor is repainted after,
+ * because restoring the rect from the scene erases it wherever it overlapped.
+ */
+static void present_window(int idx) {
+    if (idx < 0 || idx >= win_count) { return; }
+    const window_t *w = &windows[idx];
+    if (w->minimized) return;
+    int x = w->x, y = w->y, ww = w->w, wh = w->h;
+    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (x + ww > screen_w) ww = screen_w - x;
+    if (y + wh > screen_h) wh = screen_h - y;
+    if (ww <= 0 || wh <= 0) return;
+    fb_set_target(scenebuf);
+    draw_window(w, idx == win_count - 1);
+    fb_set_target(backbuffer);
+    restore_scene_rect(x, y, ww, wh);
+    if (cur_px >= 0 && rects_overlap(x, y, ww, wh, cur_px, cur_py,
+                                     mouse_cursor_w(), mouse_cursor_h()))
+        mouse_paint_at(cur_px, cur_py);
+    fb_present_rect(x, y, ww, wh);
+}
+
 static int rects_overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
     return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
 }
@@ -2345,6 +2381,14 @@ void desktop_run(void) {
         /* A CLIENT PAINTED -> THE SCENE CHANGED (M2306). Without this the
          * compositor held Firefox's new frames and never presented them
          * until an unrelated event happened to force a redraw. */
+        /* M2310 REVERTED: the user reported it FELT SLOWER, and they were
+         * right. present_window() ran for EVERY Wayland window on every
+         * commit, and Firefox's window is 1280x960 -- so "only its
+         * rectangle" is the whole screen, plus an extra draw_window() per
+         * client on top of it. A partial present is only a saving when the
+         * rectangle is actually small, which a maximised browser's never is.
+         * Back to one full redraw per commit until there is damage tracking
+         * to make the rectangle genuinely small. */
         if (wl_content_dirty()) dirty = 1;
         { int nb = nwlpid_seen; wl_hide_console_for_clients(); if (nwlpid_seen != nb) dirty = 1; }
 
@@ -3138,6 +3182,7 @@ void desktop_run(void) {
             dirty = 1;
 
         if (dirty) { render_scene(); present_frame(); }  /* scene changed: full redraw + blit */
+
         else if (clock_tick) {
             /* Just the clock changed — the common once-a-second case with an
              * otherwise-idle desktop. Redraw only its pill (present_clock, the

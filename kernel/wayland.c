@@ -3183,22 +3183,27 @@ static void wl_ptr_bcast(struct wl_client *c, uint16_t opcode,
  * gestures) or drop the axis entirely for a version 4 resource. A per
  * resource loop is the only shape that is correct for both. */
 static void wl_ptr_wheel(struct wl_client *c, int ticks_down, uint32_t t) {
-    uint8_t sb[4], db[8], ab[12], tb[8];
+    uint8_t sb[4], db[8], ab[12];
     wr32(sb, WL_AXIS_SOURCE_WHEEL);
     wr32(db, WL_AXIS_VERTICAL);      wr32(db + 4, (uint32_t)(int32_t)ticks_down);
     wr32(ab, t); wr32(ab + 4, WL_AXIS_VERTICAL);
     wr32(ab + 8, (uint32_t)(int32_t)(ticks_down * 2560));   /* 10.0 per notch, 24.8 fixed */
-    wr32(tb, t); wr32(tb + 4, WL_AXIS_VERTICAL);
     for (int i = 0; i < c->nptr; i++) {
         if (c->ptrv[i] >= 5) {
             wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS_SOURCE,   sb, 4);
             wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS_DISCRETE, db, 8);
         }
         wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS, ab, 12);
-        if (c->ptrv[i] >= 5) {
-            wl_send(c, c->ptrs[i], WL_POINTER_EV_AXIS_STOP, tb, 8);
-            wl_send(c, c->ptrs[i], WL_POINTER_EV_FRAME, 0, 0);
-        }
+        /* NO axis_stop HERE (M2309). M2301 sent one in the same frame as
+         * every notch, and axis_stop means "the scroll GESTURE has ended" --
+         * a real compositor emits it once, after the wheel goes quiet, not
+         * between clicks. Ending the gesture in the same frame that starts
+         * it invites the toolkit to discard the delta it just received, so
+         * the fix for "the wheel is not a wheel" may have been cancelling
+         * itself. The user reports the wheel still does nothing, which is
+         * consistent either way; this removes the possibility so the next
+         * reading means something. */
+        if (c->ptrv[i] >= 5) wl_send(c, c->ptrs[i], WL_POINTER_EV_FRAME, 0, 0);
     }
 }
 static void wl_kbd_bcast(struct wl_client *c, uint16_t opcode,
