@@ -262,6 +262,8 @@ static volatile int g_lxfull_test;            /* -append lxfulltest: the whole L
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
+static volatile int g_lxdns_spawned;          /* lxdns already runs alongside the browser -- do not ALSO run the quiet-machine arms (M2321) */
+static volatile int g_lxdns;                  /* -append lxdns: two hundred getaddrinfo calls, so the 1-in-N EAI_AGAIN can be SAMPLED (M2320) */
 static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
 static volatile int g_wlraw;                  /* -append wlraw: also run the raw handshake client (M1978) */
 
@@ -882,6 +884,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxcagetest")) { g_lxabi_test = 1; g_lxcage = 1; }    /* the 8 GiB reservation probes (M2041) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
+        if (cmdline_has(cl, "lxdns"))      { g_lxabi_test = 1; g_lxdns = 1; }    /* hammer getaddrinfo instead of sampling it ten times per Claude boot (M2320) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
         /* BOOTING TO THE DESKTOP IS THE RULE, NOT A MODE (M2214).
@@ -2492,6 +2495,28 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                         spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
                     }
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
+                    if (g_lxdns) {
+                        /* THE DNS PROBE, UNDER REAL LOAD (M2321).
+                         *
+                         * 1160 lookups on a quiet machine came back 1160/1160
+                         * clean -- serial AND twelve-way concurrent -- so the
+                         * EAI_AGAIN that fails one Claude boot in eight is not
+                         * the resolver path being lossy and is not contention
+                         * between resolvers. What is left is the state of the
+                         * machine around it, and Firefox produces that state
+                         * for free: dozens of processes, a saturated eight
+                         * cores, gigabytes of COW churn and a NIC already busy
+                         * with its own connections. Same load, no quota.
+                         *
+                         * Spawned ASYNC and deliberately alongside, not after:
+                         * running it once Firefox has settled would measure the
+                         * quiet machine again with extra steps. */
+                        static const char *av_dl[] = { "6", "400", "60" };
+                        int dpid = app_spawn_linux_from_file_argv("/disk2/lxdns", av_dl, 3);
+                        g_lxdns_spawned = 1;
+                        kprintf("[lxabi] lxdns spawned ALONGSIDE the browser (6 threads x 400 "
+                                "lookups): rc %d pid %d\n", dpid, app_last_spawn_pid());
+                    }
                     /* A HEARTBEAT, because silence is ambiguous (M1996).
                      * Firefox spends minutes relocating an 83-library closure
                      * with no syscalls at all, which is indistinguishable from
@@ -3184,6 +3209,37 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] launching the glibc getaddrinfo probe...\n");
             int gairc = app_run_linux_sync("/disk2/lxgai", 0, 0, 60000);
             kprintf("[lxabi] lxgai exit -> %d\n", gairc);
+        }
+        if (g_lxdns) {
+            /* THE SAME CALL, TWO HUNDRED TIMES (M2320).
+             *
+             * lxgai asks getaddrinfo once and names which step failed. That is
+             * the right shape for a lookup that ALWAYS fails, and the wrong one
+             * for a lookup that fails one time in fifty: a single sample of an
+             * intermittent failure is a coin toss reported as a finding.
+             *
+             * Every sample taken of this bug so far has cost a twelve-minute
+             * `claude -p` boot and a slice of an account quota to produce about
+             * ten lookups -- and the quota is not hypothetical, four boots of
+             * the last batch died on "You've hit your session limit" and were
+             * very nearly read as a kernel failure. This produces two hundred
+             * lookups in fifteen seconds and spends nothing.
+             */
+            /* TWO ARMS, ONE BOOT (M2321). The serial sweep came back 200/200
+             * clean, so the resolver path is not simply lossy and the failure
+             * needs something a Claude boot has that the probe did not. The
+             * first candidate is concurrency: Claude Code resolves from a
+             * dozen threads at once. Running the control and the treatment in
+             * the same boot is what makes that a discriminator rather than two
+             * numbers from two afternoons. */
+            static const char *av_serial[] = { "1", "200", "50" };
+            static const char *av_conc[]   = { "12", "80", "30" };
+            kprintf("[lxabi] getaddrinfo, ARM 1 of 2: 1 thread x 200 lookups (the control)...\n");
+            int dnsrc = app_run_linux_sync("/disk2/lxdns", av_serial, 3, 300000);
+            kprintf("[lxabi] lxdns serial exit -> %d\n", dnsrc);
+            kprintf("[lxabi] getaddrinfo, ARM 2 of 2: 12 threads x 80 lookups (the treatment)...\n");
+            int dnsrc2 = app_run_linux_sync("/disk2/lxdns", av_conc, 3, 300000);
+            kprintf("[lxabi] lxdns concurrent exit -> %d\n", dnsrc2);
         }
         if (g_lxtool_test) {
             /* PHASE 4 (M1955): drive the BORROWED host toolchain inside OS-DEV.

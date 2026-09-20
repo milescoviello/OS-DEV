@@ -219,3 +219,34 @@ $SSH "echo '----- markers -----'; \
       echo '----- budget -----'; \
       grep -a -A 16 '\[budget\]' $PVE_DIR/boot.log | head -18"
 echo "==> done. Full log: $PVE_HOST:$PVE_DIR/boot.log"
+
+# AN ACCOUNT USAGE LIMIT IS NOT A KERNEL FAILURE EITHER (M2319).
+#
+# M2302 put the credential check above, because measuring a Claude demo against
+# an expired token measures the clock. This is the same mistake one layer out,
+# and it cost four boots of an eight-boot batch: the token was valid, the DNS
+# resolved, the TLS connection to the API opened -- `connect -> 160.79.104.10:443
+# = 0` is in the log -- and the API answered "You've hit your session limit".
+# Claude Code exits 1, and `claude -p -> 1` is indistinguishable from every
+# kernel bug this harness exists to find. I read three of those as failures
+# before spotting the sentence in the log.
+#
+# The credential guard cannot catch this: a quota is only knowable AFTER the
+# request. So the verdict has to be classified here, once, where every Claude
+# boot lands -- and it has to be LOUD, because the failing run looks perfect
+# right up to the last line.
+case "${APPEND:-}" in
+  *lxask*|*lxbash*|*lxedit*|*lxclaude*)
+    LIMIT=$($SSH "grep -aoiE \"hit your (session|usage) limit[^\\\"]*|usage limit reached[^\\\"]*\" $PVE_DIR/boot.log 2>/dev/null | head -1")
+    if [ -n "$LIMIT" ]; then
+        echo "----- verdict -----"
+        echo "[harness] NO VERDICT -- THE ACCOUNT'S QUOTA, NOT THIS KERNEL:"
+        echo "[harness]   \"$LIMIT\""
+        echo "[harness] The API was reached and answered. Any 'claude -p -> 1' in this"
+        echo "[harness] log is that answer, and counting it as a failure would be"
+        echo "[harness] counting someone else's rate limiter as our bug."
+        $SSH "printf '[harness] NO VERDICT: account usage limit\n' >> $PVE_DIR/boot.log" >/dev/null 2>&1 || true
+        exit 3
+    fi
+    ;;
+esac

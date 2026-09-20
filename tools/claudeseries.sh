@@ -69,8 +69,14 @@ while [ "$i" -le "$N" ]; do
         tools/pve-run.sh >/dev/null 2>&1
     L=$LOGS/claude-$MODE-c$CORES-r$i.log
     scp -q root@"${PVE_HOST:-192.168.1.5}":/root/osdev/boot.log "$L"
+    # A QUOTA IS NOT AN EXIT CODE (M2319). If the API answered "you've hit your
+    # session limit", `claude -p -> 1` is that answer, and averaging it into a
+    # pass rate turns someone else's rate limiter into this kernel's flakiness.
+    # Four boots of one eight-boot batch were counted that way before the line
+    # was spotted. Print LIMIT, and let the reader subtract the sample.
     printf '%s r%s: exit=%-4s t=%-5s bashok=%s crashed=%s | %s\n' "$MODE" "$i" \
-      "$(grep -ao 'claude -p -> -\?[0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
+      "$(grep -aqiE "hit your (session|usage) limit|usage limit reached" "$L" && echo LIMIT \
+         || grep -ao 'claude -p -> -\?[0-9]*' "$L" | tail -1 | awk '{print $NF}')" \
       "$(tr -d '\0' < "$L" | awk '/claude -p ->/{print (last==""?"<60s":last); exit} /runsync\] t=/{match($0,/t=[0-9]+s/); last=substr($0,RSTART+2,RLENGTH-2)}')" \
       "$(grep -aq 'OSDEV-BASH-OK' "$L" && echo YES || echo no)" \
       "$(grep -aq 'CRASHED with signal' "$L" && echo YES || echo no)" \

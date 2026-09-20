@@ -36,6 +36,19 @@ if printf '%s\n' "$LOG" | grep -q "Failed to authenticate"; then
     echo "SKIP: claude bash-tool demo (the staged OAuth session has expired — re-login in the guest)"
     exit 0
 fi
+# AND THE OTHER WAY A VALID LOGIN STILL CANNOT ANSWER (M2319).
+#
+# The credential is good, the name resolves, the TLS session opens, the API
+# replies -- with "You've hit your session limit". Claude Code then exits 1,
+# which this test would report as "Claude Code did not exit 0" and every later
+# reader would take for a kernel regression. It is not a regression and it is
+# not skippable by re-logging in: it is a quota, and the only honest verdict is
+# that this run measured nothing.
+if printf '%s\n' "$LOG" | grep -qiE "hit your (session|usage) limit|usage limit reached"; then
+    echo "SKIP: claude bash-tool demo (the ACCOUNT hit its usage limit — the API answered, so this run measured the quota, not the kernel)"
+    printf '%s\n' "$LOG" | grep -aoiE "hit your (session|usage) limit.*" | head -1 | sed 's/^/      /'
+    exit 0
+fi
 # The tool CALL: bash was spawned with the command in its argv.
 if printf '%s\n' "$LOG" | grep -q "exec\] pid .* -> /bin/bash"; then
     echo "  ok: Claude Code spawned /bin/bash inside OS-DEV through the Linux ABI"

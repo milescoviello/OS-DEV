@@ -508,6 +508,17 @@ $(LXROOT)/lxgai: tools/lx/lxgai.c
 	 done
 	@echo "  HOSTCC  $@ (glibc getaddrinfo: nsswitch -> libnss_dns -> resolv.conf)"
 
+# DYNAMIC, for the same reason lxgai is: this is the glibc resolver path, and a
+# -static-pie build of it would measure something Claude Code never executes.
+# (M2320)
+$(LXROOT)/lxdns: tools/lx/lxdns.c
+	@mkdir -p $(LXROOT)/lib64 $(LXROOT)/usr/lib64
+	$(CC) -O2 -o $@ $< -lresolv
+	@for so in $$(ldd $@ 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do \
+	   d=$(LXROOT)$$(dirname $$so); mkdir -p $$d; cp -f $$so $$d/ 2>/dev/null || true; \
+	 done
+	@echo "  HOSTCC  $@ (200 getaddrinfo lookups: sample the intermittent EAI_AGAIN)"
+
 $(LXROOT)/lxvmagap: tools/lx/lxvmagap.c
 	@mkdir -p $(LXROOT)
 	$(CC) -static-pie -O2 -o $@ $<
@@ -538,7 +549,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxpollout $(LXROOT)/lxpty $(LXROOT)/lxshcow $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai $(LXROOT)/lxgtk3
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxpollout $(LXROOT)/lxpty $(LXROOT)/lxshcow $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai $(LXROOT)/lxdns $(LXROOT)/lxgtk3
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in
