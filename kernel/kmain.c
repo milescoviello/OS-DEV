@@ -309,6 +309,7 @@ static volatile int g_ffurl;                  /* -append ffurl: the URL comes fr
 static volatile int g_gtksub;                 /* -append gtksub: lxgtk3 + Gecko's empty-input-region subsurface (M2297) */
 static volatile int g_ffimsimple;             /* -append ffimsimple: force GTK's pass-through input method (M2300) */
 static volatile int g_ffimlog;                /* -append ffimlog: MOZ_LOG IMEHandler + KeyboardHandler (M2300) */
+#define FF_MAXTABS 8                          /* URLs from ffurl.txt, one tab each (M2333) */
 static volatile int g_ffnav;                  /* -append ffnav: file:///ffnav.html, one huge link -- does clicking it navigate? (M2331) */
 static volatile int g_ffin;                   /* -append ffin: file:///ffinput.html, the page that makes input visible (M2296) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
@@ -2135,18 +2136,33 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * strings, out of every commit, and out of the build logs.
                      * Trimmed at the first control character so a trailing
                      * newline cannot become part of the address. */
-                    static char urlbuf[512];
-                    const char *av_uf[3];
-                    int have_url = 0;
+                    /* ONE URL PER LINE, AND EACH BECOMES A TAB (M2333).
+                     *
+                     * This read the file and cut it at the first control
+                     * character, so a multi-line ffurl.txt silently became its
+                     * first line -- one address, one tab. Firefox opens every
+                     * URL on its command line as a tab of one window, so the
+                     * whole of multi-tab is: stop truncating, and pass them
+                     * all. The addresses still never reach the kernel image,
+                     * a commit or a build log; only the COUNT is printed. */
+                    static char urlbuf[2048];
+                    const char *av_uf[2 + FF_MAXTABS];
+                    int have_url = 0, nurl = 0;
                     if (g_ffurl) {
                         long un = vfs_pread("/disk2/ffurl.txt", urlbuf, sizeof urlbuf - 1, 0);
                         if (un > 0) {
                             urlbuf[un] = 0;
-                            for (long k = 0; k < un; k++)
-                                if ((unsigned char)urlbuf[k] < 0x20) { urlbuf[k] = 0; break; }
-                            if (urlbuf[0]) {
-                                av_uf[0] = "--no-remote"; av_uf[1] = "--new-instance";
-                                av_uf[2] = urlbuf;
+                            /* Split in place on any control character. Blank
+                             * lines and a trailing newline collapse away,
+                             * which is what a hand-edited file will have. */
+                            av_uf[0] = "--no-remote"; av_uf[1] = "--new-instance";
+                            for (long k = 0; k < un && nurl < FF_MAXTABS; ) {
+                                while (k < un && (unsigned char)urlbuf[k] < 0x20) urlbuf[k++] = 0;
+                                if (k >= un) break;
+                                av_uf[2 + nurl++] = &urlbuf[k];
+                                while (k < un && (unsigned char)urlbuf[k] >= 0x20) k++;
+                            }
+                            if (nurl > 0) {
                                 have_url = 1;
                                 /* Length and scheme only: enough to prove the
                                  * file was read and parsed, without printing
@@ -2160,7 +2176,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                  * implement. */
                                 int is_tls = urlbuf[0]=='h'&&urlbuf[1]=='t'&&urlbuf[2]=='t'&&
                                              urlbuf[3]=='p'&&urlbuf[4]=='s';
-                                kprintf("[ff] URL from /disk2/ffurl.txt: %d chars, %s\n",
+                                kprintf("[ff] %d URL(s) from /disk2/ffurl.txt -> %d tab(s); "
+                                        "first is %d chars, %s\n", nurl, nurl,
                                         (int)__builtin_strlen(urlbuf),
                                         is_tls ? "https" : "not https");
                             }
@@ -2169,6 +2186,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                             kprintf("[ff] -append ffurl given but /disk2/ffurl.txt is missing or empty "
                                     "-- put the address in ./ffurl.txt and rebuild build/ext2.img\n");
                     }
+                    int av_use_n = have_url ? 2 + nurl : 3;
                     const char **av_use = have_url ? av_uf
                                         : (g_ffnav ? av_nv
                                         : (g_ffin ? av_fi
@@ -2521,7 +2539,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                 "seconds instead of minutes\n");
                         spid = app_spawn_linux_from_file_argv("/disk2/usr/bin/zenity", av_z, 2);
                     } else {
-                        spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, 3);
+                        spid = app_spawn_linux_from_file_argv("/disk2/usr/lib64/firefox/firefox", av_use, av_use_n);
                     }
                     kprintf("[ff] firefox rc %d pid %d\n", spid, app_last_spawn_pid());
                     if (g_lxdns) {

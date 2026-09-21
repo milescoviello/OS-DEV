@@ -3,6 +3,7 @@
 #
 #   tools/ff.sh                        the last URL used (./ffurl.txt), or the local test page
 #   tools/ff.sh https://example.com    that URL -- remembered for next time
+#   tools/ff.sh URL URL URL ...        one TAB per URL (up to 8)
 #   tools/ff.sh blank                  about:blank, the fastest thing that proves the stack
 #
 #   NOBUILD=1 tools/ff.sh              skip the build (seconds instead of a minute)
@@ -33,9 +34,16 @@ case "${1:-}" in
   "")            [ -s ffurl.txt ] && APPEND_MODE="ffshow ffurl" ;;
   blank|about:blank) : ;;                       # plain ffshow = the built-in page
   -h|--help)     sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  *)             printf '%s' "$1" > ffurl.txt; APPEND_MODE="ffshow ffurl" ;;
+  *)             # EVERY ARGUMENT IS A TAB (M2333). ffurl.txt is one URL per
+                 # line and the kernel opens each as a tab, so
+                 #   tools/ff.sh https://a https://b https://c
+                 # is a three-tab browser. Still gitignored: the addresses
+                 # being tested are nobody else's business.
+                 : > ffurl.txt
+                 for u in "$@"; do printf '%s\n' "$u" >> ffurl.txt; done
+                 APPEND_MODE="ffshow ffurl" ;;
 esac
-[ -s ffurl.txt ] && echo "==> URL: $(cat ffurl.txt)"
+[ -s ffurl.txt ] && echo "==> $(grep -c . ffurl.txt) tab(s):" && sed 's/^/      /' ffurl.txt
 
 APPEND="$APPEND_MODE nonetdemo" CORES="$CORES" MEM="$MEM" \
   PVE_HOST="$PVE_HOST" VMID="$VMID" NOBUILD="${NOBUILD:-0}" tools/pve-show.sh
