@@ -1,5 +1,63 @@
 # What's next
 
+> **(M2319-M2326) TWO THREADS, ONE DESCRIPTOR. The intermittent
+> `EAI_AGAIN` was never the network, and a packet capture is what proved
+> it.**
+>
+> Four milestones hunted a DNS reply that "never reached the machine".
+> Every counter inside the machine agreed: 0 tx failed, 0 dropped by the
+> card, 0 evicted, 0 destroyed, arrived == filed. M2317 concluded it was
+> upstream loss and M2318 added a second nameserver, which changed
+> nothing -- losing five consecutive packets to each of two independent
+> resolvers is not credible, and that should have been the tell.
+>
+> **The wire settled it.** `tcpdump` on the tap while the failure fired:
+>
+> ```
+> queries 7108   replies 7108   paired 7108   UNANSWERED 0
+> p50 10.6 ms   p90 11.5 ms   p99 15.3 ms   MAX 48.5 ms
+> replies slower than glibc's 2 s deadline: 0
+> ```
+>
+> Every query answered, nothing slower than 48 ms, while `getaddrinfo`
+> in the guest returned EAI_AGAIN after **thirty-eight seconds**.
+>
+> The cause, two layers down: **`socket()` could hand the same descriptor
+> to two threads.** Fourteen call sites did "find a free fd, mark it used
+> later", so two cores allocating at once shared one `struct fdent` --
+> one thread's `connect()` overwriting the other's, one thread's reply
+> delivered to the other's socket. Not socket-specific: every descriptor
+> the kernel hands out.
+>
+> Locking find-and-claim **did not fix it**, and the reason was in the
+> generated code rather than the source: gcc compiles
+> `a->fd[fd] = (struct fdent){ 1, 9, ... }` as `rep stos` -- zero the
+> whole 288-byte entry, then store the fields -- and that bulk zero runs
+> *outside* the lock, transiently clearing `used`. The claim had to move
+> somewhere no initialiser can reach.
+>
+> Three things made this findable, all of them method rather than code.
+> **Sample the cause, not the symptom:** every previous sample cost a
+> twelve-minute `claude -p` boot and a slice of account quota to produce
+> ten lookups; `tools/lx/lxdns.c` does 1160 per boot for free, and
+> `tests/run-udp-port-test.sh` asks the allocator directly and answers in
+> a second. **A test that passes against the bug is worse than no test:**
+> the first version of that test opened 480 sockets as fast as it could
+> and passed against the unfixed allocator, because the window is a few
+> instructions wide; a `pthread_barrier` immediately before the racing
+> call is what made it reproducible. And **an account quota is not a
+> kernel failure** -- four boots of one batch died on "You've hit your
+> session limit" with the API answering perfectly, and were very nearly
+> counted as regressions (M2319 now classifies them as NO VERDICT).
+>
+> Seventh and eighth instances of the one bug class this codebase keeps
+> producing: shared state read-modify-written by several cores with
+> nothing serialising it.
+>
+> Also: **`make ff`** (or `make ff URL=https://...`) now builds, boots the
+> node, waits for Firefox's window rather than for a duration, and opens
+> the console.
+
 > **(M2298-M2301) FIREFOX RESPONDS TO THE MOUSE. The compositor was
 > addressing a `wl_pointer` nobody was listening on.**
 >
