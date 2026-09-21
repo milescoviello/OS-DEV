@@ -212,6 +212,21 @@ static void e1000_drain_ring(void) {
         uint32_t n = (g_swrx_head + 1) % SWRX_N;
         if (n == g_swrx_tail) {
             g_swrx_dropped++;          /* consumer is that far behind: say so */
+            /* SAY SO WHERE SOMEONE WILL SEE IT (M2323). Incrementing a counter
+             * nobody reads is the same as not counting: this one has been
+             * right since M2021 and e1000_rx_dropped() had no callers, while
+             * three milestones went looking for the lost DNS reply in the
+             * card's registers -- which are zero, correctly, because the card
+             * delivered the frame and WE dropped it. Edge-triggered and then
+             * decade-spaced, so a saturated ring cannot flood the log it is
+             * trying to explain. */
+            if (g_swrx_dropped == 1 || g_swrx_dropped == 10 ||
+                g_swrx_dropped == 100 || g_swrx_dropped == 1000 ||
+                g_swrx_dropped == 10000)
+                kprintf("[e1000] ** OUR SOFTWARE RX RING IS FULL: %lu frame(s) taken off the "
+                        "card and then thrown away because no consumer drained the ring "
+                        "(%d slots). The card dropped NOTHING -- this is ours. **\n",
+                        (unsigned long)g_swrx_dropped, SWRX_N);
         } else {
             memcpy(g_swrx[g_swrx_head].buf, hhdm(rx_buf[i]), len);
             g_swrx[g_swrx_head].len = len;

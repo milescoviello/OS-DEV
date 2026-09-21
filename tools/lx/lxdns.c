@@ -75,6 +75,11 @@ static int g_n, g_gap, g_threads;
 static long g_t0;
 static int  g_fails, g_oks;
 static long g_worst, g_total;
+/* A MEAN HIDES THE ONLY THING THAT MATTERS HERE (M2322). Every arm so far has
+ * come back 0 failures with a mean around 45 ms, which reads as "fine" -- and
+ * the worst in the same arm was 2185 ms, past the resolver's two-second
+ * deadline. The failure lives entirely in the tail, so count the tail. */
+static int  g_b[5];   /* <100ms, <500, <1000, <2000, >=2000 */
 static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
 
 static void *sweep(void *arg) {
@@ -100,6 +105,12 @@ static void *sweep(void *arg) {
 
         if (ms > worst) worst = ms;
         total += ms;
+        {   int b = ms < 100 ? 0 : ms < 500 ? 1 : ms < 1000 ? 2 : ms < 2000 ? 3 : 4;
+            pthread_mutex_lock(&g_lk); g_b[b]++; pthread_mutex_unlock(&g_lk); }
+        if (ms >= 500)
+            printf("LXDNS-SLOW: t%ld #%d %s took %ld ms, t=%ld ms%s\n",
+                   id, i, host, ms, a - t0,
+                   ms >= 2000 ? "  <-- PAST THE resolv.conf timeout:2 DEADLINE" : "");
 
         if (rc != 0) {
             fails++;
@@ -164,6 +175,9 @@ int main(int argc, char **argv) {
                tot ? ((g_fails * 1000) / tot) % 10 : 0,
                tot ? g_total / tot : 0, g_worst, now_ms() - g_t0);
     }
+    printf("LXDNS: tail: %d under 100ms, %d 100-500, %d 500-1000, %d 1-2s, %d OVER 2s "
+           "(the resolver gives an attempt 2s and then abandons the socket)\n",
+           g_b[0], g_b[1], g_b[2], g_b[3], g_b[4]);
     /* A failure count is the POINT of this probe, so a non-zero exit would make
      * every harness treat a successful measurement as a broken run. Exit 0 on
      * any completed sweep; the count is in the line above. */

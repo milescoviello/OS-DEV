@@ -341,6 +341,13 @@ static const char *udp_tx_str(void) {
     b[p] = 0; return b;
 }
 uint64_t net_udp_foreign(void) { return g_udpq_foreign; }
+/* DELIVERY LATENCY, NOT DELIVERY (M2322). Exported so the boot budget can
+ * print it on EVERY run: a number only visible inside a failure report is a
+ * number nobody has a baseline for, and this one's whole value is the
+ * comparison between a quiet boot and a loaded one. */
+uint64_t net_udpq_dwell_ms(void);
+uint64_t net_udpq_slow(void);
+uint64_t net_udpq_stale(void);
 /* 16 -> 48 (M2022): same reasoning as PARK_N. This ring holds the protocols
  * that have nowhere else to go, and it is written by every drain site. */
 #define ORING_N   48
@@ -1171,6 +1178,40 @@ static struct {
     uint64_t at;
 } g_udpq[UDPQ_N];
 
+/* HOW LONG A REPLY WAITED, AND WHETHER ANYONE EVER CAME FOR IT (M2322).
+ *
+ * Every counter this queue had answered "did the datagram arrive". None of
+ * them answered "did it arrive IN TIME", and that turns out to be the whole
+ * question: 3560 probe lookups on this kernel never once failed, but the worst
+ * took 2185 ms on a loaded machine against 53 ms on a quiet one, and the
+ * guest's resolv.conf says timeout:2. A reply that lands at 2.1 s is a reply
+ * nobody is waiting for any more -- glibc abandoned that socket at 2.0 s and
+ * retried on a new port -- so it sits here until the TTL reaps it, and the
+ * kernel reports, truthfully and uselessly, that the port it was watching
+ * received nothing.
+ *
+ * Two numbers separate that from real loss. DWELL is how long a datagram sat
+ * here before its owner took it: large dwell means we are slow to hand it
+ * over. STALE is how many aged out with nobody ever coming: non-zero stale on
+ * an ephemeral port means the reply DID arrive and the caller had already
+ * given up, which is the timeout story, and zero stale would refute it. */
+static uint64_t g_udpq_dwell_max; static uint16_t g_udpq_dwell_port;
+static uint64_t g_udpq_slow;      /* taken, but only after more than 200 ms here */
+static uint64_t g_udpq_stale;     /* aged out unclaimed -- an answer to a question withdrawn */
+static uint16_t g_udpq_stale_port;
+
+static void udpq_reap(int i, uint64_t now) {
+    if (g_udpq[i].dport >= 1024) {           /* an ephemeral port: somebody asked and left */
+        g_udpq_stale++; g_udpq_stale_port = g_udpq[i].dport;
+        if (g_udpq_stale <= 8)
+            kprintf("[udpq] STALE: a %d-byte datagram for port %u aged out after %lu ms with "
+                    "nobody left to take it -- the reply arrived, the caller had gone\n",
+                    g_udpq[i].len, g_udpq[i].dport,
+                    (unsigned long)((now - g_udpq[i].at) * 10));
+    }
+    g_udpq[i].len = 0;
+}
+
 static void park_put(const uint8_t *f, int len);   /* defined with the TCP demux below */
 
 static void udpq_put_u(const uint8_t *f, int len) {
@@ -1235,7 +1276,7 @@ static void udpq_put_u(const uint8_t *f, int len) {
     uint64_t now = timer_ticks();
     int slot = -1;
     for (int i = 0; i < UDPQ_N; i++) {
-        if (g_udpq[i].len && now - g_udpq[i].at > UDPQ_TTL) g_udpq[i].len = 0;
+        if (g_udpq[i].len && now - g_udpq[i].at > UDPQ_TTL) udpq_reap(i, now);
         if (!g_udpq[i].len && slot < 0) slot = i;
     }
     if (slot < 0) {                                /* full: evict the oldest */
@@ -1297,8 +1338,18 @@ static int udpq_take_u(uint16_t sport, void *buf, int max, uint8_t srcip[4], uin
     uint64_t now = timer_ticks();
     for (int i = 0; i < UDPQ_N; i++) {
         if (!g_udpq[i].len) continue;
-        if (now - g_udpq[i].at > UDPQ_TTL) { g_udpq[i].len = 0; continue; }
+        if (now - g_udpq[i].at > UDPQ_TTL) { udpq_reap(i, now); continue; }
         if (g_udpq[i].dport != sport) continue;
+        {   uint64_t dwell = now - g_udpq[i].at;
+            if (dwell > g_udpq_dwell_max) { g_udpq_dwell_max = dwell; g_udpq_dwell_port = sport; }
+            if (dwell > 20) {                     /* 20 ticks = 200 ms */
+                g_udpq_slow++;
+                if (g_udpq_slow <= 8)
+                    kprintf("[udpq] SLOW: the datagram for port %u sat in our queue %lu ms before "
+                            "the guest took it -- that time is OURS, not the network's\n",
+                            sport, (unsigned long)(dwell * 10));
+            }
+        }
         int n = g_udpq[i].len; if (n > max) n = max;
         for (int k = 0; k < n; k++) ((uint8_t *)buf)[k] = g_udpq[i].buf[k];
         if (srcip)   for (int k = 0; k < 4; k++) srcip[k] = g_udpq[i].srcip[k];
@@ -1308,6 +1359,30 @@ static int udpq_take_u(uint16_t sport, void *buf, int max, uint8_t srcip[4], uin
     }
     return -1;
 }
+
+/* THE COUNTER THAT WAS ALREADY RIGHT AND NEVER READ (M2323).
+ *
+ * e1000.c has kept a software ring between the card's descriptors and every
+ * consumer since M2021, with `g_swrx_dropped` incremented when that ring is
+ * full -- its own comment calls it "the honest count". Nothing has ever called
+ * e1000_rx_dropped(). Two hundred and fifty-six slots is a lot on an idle
+ * machine and about two seconds of traffic on a busy one, and the card's OWN
+ * drop counters stay at zero the whole time because the hardware ring drained
+ * perfectly -- the frame died one layer above it, in ours.
+ *
+ * That is the difference between "the reply never reached the machine", which
+ * is what M2317 concluded and reported as not our bug, and "the reply reached
+ * the machine and we threw it away", which is what a tcpdump on the tap says
+ * actually happens: 7108 queries, 7108 replies, none slower than 48 ms, while
+ * getaddrinfo inside the guest timed out after thirty-eight seconds.
+ *
+ * Weak so the host test builds, which have no e1000, still link. */
+__attribute__((weak)) uint64_t e1000_rx_dropped(void) { return 0; }
+uint64_t net_rx_ring_dropped(void) { return e1000_rx_dropped(); }
+
+uint64_t net_udpq_dwell_ms(void) { return g_udpq_dwell_max * 10; }
+uint64_t net_udpq_slow(void)     { return g_udpq_slow; }
+uint64_t net_udpq_stale(void)    { return g_udpq_stale; }
 
 static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport) {
     uint64_t fl = udpq_take_lk();
@@ -1407,7 +1482,10 @@ int net_udp_readable(uint16_t sport) {
                     "recently filed for ports %s; UDP addressed to US off the card: "
                     "%lu, for ports %s; %lu DESTROYED by a consumer (last port %u); "
                     "queries SENT from ports %s; the CARD dropped %lu (no descriptor) "
-                    "+ %lu (no buffer)\n",
+                    "+ %lu (no buffer); %lu datagram(s) went STALE unclaimed (last port %u) "
+                    "and %lu were handed over LATE, worst %lu ms (port %u); "
+                    "AND %lu FRAME(S) DIED IN OUR OWN SOFTWARE RX RING BECAUSE NO CONSUMER "
+                    "DRAINED IT\n",
                     sport, (unsigned long)rx, (unsigned long)pf,
                     (unsigned long)(g_udpq_foreign - fo0),
                     (unsigned long)(rx > pf ? rx - pf : 0),
@@ -1416,7 +1494,11 @@ int net_udp_readable(uint16_t sport) {
                     (unsigned long)g_udpq_evicted, g_udpq_evict_port, udpq_recent_str(),
                     (unsigned long)g_udp_ours, udp_ours_str(),
                     (unsigned long)g_udp_dropped, g_udp_drop_port, udp_tx_str(),
-                    (unsigned long)e1k_mpc(), (unsigned long)e1k_rnbc());
+                    (unsigned long)e1k_mpc(), (unsigned long)e1k_rnbc(),
+                    (unsigned long)g_udpq_stale, g_udpq_stale_port,
+                    (unsigned long)g_udpq_slow,
+                    (unsigned long)(g_udpq_dwell_max * 10), g_udpq_dwell_port,
+                    (unsigned long)net_rx_ring_dropped());
         }
     }
     return 0;

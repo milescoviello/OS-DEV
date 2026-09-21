@@ -1417,11 +1417,17 @@ int app_scm_send(int ep, int fd) {
     return 0;
 }
 
+static void fdt_take(void);                   /* the fd-table lock (M2325) */
+static void fdt_give(void);
+static int  app_fd_claim(struct app *a);      /* find AND claim a descriptor as one step (M2325) */
+static void app_fd_unclaim(struct app *a, int fd);
+void app_fd_unclaim_mark(struct app *a, int fd);
+
 int app_scm_recv(int ep) {
     struct app *a = cur(); if (!a) return -1;
     struct scmq *q = scm_in(ep); if (!q) return -1;
     int fd = -1;
-    for (int i = 3 /*APP_FD_FIRST: 0-2 are stdio*/; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }
+    fd = app_fd_claim(a);
     if (fd < 0) return -1;                     /* receiver's fd table is full */
     uint64_t sfl = scm_lock_take();
     scm_pool_init();
@@ -3118,12 +3124,19 @@ void app_arm_next_spawn(app_t *dest, int ppid) {
 int app_open_console_alias(void) {
     struct app *a = cur();
     if (!a) return -1;
+    /* Same find-then-set race as the fourteen sites app_fd_claim replaced
+     * (M2325), but this one starts at fd 0 on purpose -- /dev/tty may legally
+     * land on a free stdio slot -- so it takes the same lock rather than the
+     * same helper. */
+    fdt_take();
     for (int fd = 0; fd < APP_NFD; fd++) {
         if (a->fd[fd].used) continue;
         a->fd[fd].used = 1; a->fd[fd].type = 14; a->fd[fd].obj = 0;
         a->fd[fd].off = 0; a->fd[fd].cloexec = 0; a->fd[fd].nonblock = 0;
+        fdt_give();
         return fd;
     }
+    fdt_give();
     return -1;
 }
 
@@ -11090,6 +11103,137 @@ static int app_fd_over_limit(struct app *a) {
     for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (a->fd[i].used) used++;
     return used >= (int)a->rlim_nofile;
 }
+
+/* TWO THREADS, ONE DESCRIPTOR (M2325) -- and this one is worse than M2324.
+ *
+ * Fourteen places allocated an fd with the same two lines:
+ *
+ *     for (int i = APP_FD_FIRST; i < APP_NFD; i++)
+ *         if (!a->fd[i].used) { fd = i; break; }
+ *     ... a->fd[fd].used = 1;                    <-- much later
+ *
+ * The search and the claim are separate statements, so two threads calling
+ * socket() (or open, pipe, dup, accept, epoll_create, eventfd, timerfd,
+ * memfd_create, inotify_init) at the same moment on different cores BOTH find
+ * the same free slot and BOTH return it. They then share one struct fdent:
+ * one thread's connect() overwrites the other's, one thread's close() closes
+ * the other's socket, and getsockname answers both with the same local port.
+ *
+ * That is how the port-collision test kept failing after M2324 fixed the port
+ * allocator: the ports were not colliding, the DESCRIPTORS were, and the
+ * duplicate port was a symptom of two threads looking at one entry. Which
+ * also means the DNS failure needs no port collision at all -- a resolver
+ * thread whose socket is quietly shared with some other thread's will miss
+ * its reply just as thoroughly, and Claude Code and Firefox open descriptors
+ * from dozens of threads at once.
+ *
+ * Seventh instance of the class, and the one with the widest blast radius: it
+ * is not specific to sockets, it is every descriptor this kernel hands out.
+ *
+ * Claiming has to be part of the search, so the slot is marked used before the
+ * lock is released and no second searcher can see it free. Callers keep their
+ * own initialisation; `used = 1` written twice is harmless. A caller that
+ * FAILS after claiming must app_fd_release() or the slot leaks -- app_socket
+ * is the only one that can, and it does.
+ */
+static volatile int fdt_lock;
+static void fdt_take(void) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&fdt_lock, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void fdt_give(void) { __atomic_store_n(&fdt_lock, 0, __ATOMIC_RELEASE); }
+
+static void *g_fd_owner[APP_NFD];              /* the double-hand-out invariant check (M2325) */
+
+/* THE CLAIM CANNOT LIVE IN THE THING THE CALLER OVERWRITES (M2326).
+ *
+ * M2325 made "find a free slot and mark it used" one locked step, and the
+ * double hand-out survived it. The reason is in the generated code, not the
+ * source: every caller finishes with
+ *
+ *     a->fd[fd] = (struct fdent){ 1, 9, 0, 0, {0}, 0, 0 };
+ *
+ * and gcc compiles a compound literal of a 288-byte struct as `rep stos` --
+ * zero the whole entry, then store the non-zero fields. That bulk zero runs
+ * OUTSIDE the lock and transiently writes `used = 0`. A second thread holding
+ * the fd-table lock scans, sees the slot free, and takes it. Both threads then
+ * own one descriptor, which is how two DNS lookups end up on one socket.
+ *
+ * So the allocator's record of what is taken has to live somewhere a caller's
+ * struct assignment cannot reach. 32 KB of bitmap buys immunity from every
+ * present and future initialiser, which is worth more than auditing fourteen
+ * of them and hoping the fifteenth remembers.
+ *
+ * A slot counts as taken if EITHER bit says so: the bitmap covers the window
+ * above, and fd->used still covers the slots nothing ever claimed -- stdio at
+ * process setup, and dup2's target.
+ */
+static uint8_t g_fd_claimed[MAX_APPS][APP_NFD];
+static int app_slot(struct app *a) {
+    long i = a - apps;
+    return (i >= 0 && i < MAX_APPS) ? (int)i : -1;
+}
+static void app_fd_mark(struct app *a, int fd, int v) {
+    int ai = app_slot(a);
+    if (ai >= 0 && fd >= 0 && fd < APP_NFD) g_fd_claimed[ai][fd] = (uint8_t)v;
+}
+void app_fd_unclaim_mark(struct app *a, int fd) {
+    if (fd >= 0 && fd < APP_NFD && g_fd_owner[fd] == (void *)a) g_fd_owner[fd] = 0;
+}
+static int app_fd_claim(struct app *a) {
+    if (!a) return -1;
+    fdt_take();
+    int fd = -1;
+    {   int ai = app_slot(a);
+        if (!app_fd_over_limit(a))
+            for (int i = APP_FD_FIRST; i < APP_NFD; i++)
+                if (!a->fd[i].used && !(ai >= 0 && g_fd_claimed[ai][i])) { fd = i; break; }
+    }
+    if (fd >= 0) {
+        /* THE INVARIANT, ASSERTED WHERE IT CAN BE BROKEN (M2325).
+         *
+         * A process must never be handed a descriptor it still holds. That is
+         * exactly what the race above did, and for three hours the only
+         * evidence of it was a guest-side probe reporting duplicate ports --
+         * a symptom two layers downstream, which sent me to the port
+         * allocator, then to the receive queue, then to the card's drop
+         * registers, all of which were innocent. This fires on the defect
+         * itself: cheap, silent when correct, and impossible to misread.
+         *
+         * Cleared by app_fd_close AND by process teardown, which clears the fd
+         * table without going through close -- missing that second one made
+         * the check report thirteen false positives per boot, one per process
+         * that recycled an apps[] slot, and a detector that cries wolf is one
+         * more instrument to distrust. */
+        { void **owner = g_fd_owner;
+          if (owner[fd] == (void *)a) {
+              static int shown;
+              if (++shown <= 8)
+                  kprintf("[fdrace] ** fd %d handed to tid %d while pid %d STILL HOLDS IT -- "
+                          "two owners, one descriptor **\n", fd,
+                          task_self() ? (int)task_self()->id : -1, app_current_pid());
+          }
+          owner[fd] = (void *)a; }
+        app_fd_mark(a, fd, 1);            /* the claim the caller cannot erase */
+        /* Zero it as well as claim it: the caller fills in what it needs, and
+         * a stale type or obj from the previous owner read by anything that
+         * walks the table before the caller finishes would be worse than the
+         * race. */
+        a->fd[fd] = (struct fdent){ 0 };
+        a->fd[fd].used = 1;
+    }
+    fdt_give();
+    return fd;
+}
+static void app_fd_unclaim(struct app *a, int fd) {
+    if (!a || fd < 0 || fd >= APP_NFD) return;
+    fdt_take();
+    a->fd[fd] = (struct fdent){ 0 };
+    app_fd_mark(a, fd, 0);
+    fdt_give();
+}
+
 /* pipe(out[2]): out[0]=read end, out[1]=write end. 0/-1. */
 int app_pipe(int *out) {
     struct app *a = cur(); if (!a) return -1;
@@ -11103,10 +11247,13 @@ int app_pipe(int *out) {
     int nofile_used = 0;
     for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (a->fd[i].used) nofile_used++;
     if (!a->rlim_nofile || nofile_used + 2 <= (int)a->rlim_nofile) {
-        for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { rfd = i; break; }
-        for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used && i != rfd) { wfd = i; break; }
+        rfd = app_fd_claim(a);
+        wfd = app_fd_claim(a);
     }
-    if (rfd < 0 || wfd < 0) { pipe_close_end(idx, 0); pipe_close_end(idx, 1); return -1; }   /* table full (or over RLIMIT_NOFILE) */
+    if (rfd < 0 || wfd < 0) {                                     /* table full (or over RLIMIT_NOFILE) */
+        app_fd_unclaim(a, rfd); app_fd_unclaim(a, wfd);           /* M2325: a claim that is not used is a leak */
+        pipe_close_end(idx, 0); pipe_close_end(idx, 1); return -1;
+    }
     a->fd[rfd] = (struct fdent){ 1, 1, 0, idx, {0}, 0 };          /* used, type=pipe, read end */
     a->fd[wfd] = (struct fdent){ 1, 1, 1, idx, {0}, 0 };          /* used, type=pipe, write end */
     out[0] = rfd; out[1] = wfd; return 0;
@@ -11713,7 +11860,15 @@ int app_fd_close(int fd) {
     else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
     else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
     else if (a->fd[fd].type == 16) net_tcp_accept_close();                                  /* accepted AF_INET connection (M2020) */
-    a->fd[fd].used = 0; a->fd[fd].type = 0;
+    /* RELEASE UNDER THE SAME LOCK AS THE CLAIM (M2325). As two bare stores,
+     * a claimer could take the slot the instant `used` went to 0 and then have
+     * its brand-new type overwritten by the `type = 0` that followed -- which
+     * presents as a socket that exists but answers ENOTSOCK to everything. */
+    fdt_take();
+    a->fd[fd] = (struct fdent){ 0 };
+    app_fd_mark(a, fd, 0);
+    fdt_give();
+    app_fd_unclaim_mark(a, fd);
     return 0;
 }
 /* ptsname (M1274): the pts index N for a /dev/ptmx master fd, so userspace can
@@ -11734,6 +11889,7 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].used && a->fd[newfd].type == 10) net_tcp_sock_close(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
     a->fd[newfd] = a->fd[oldfd];                                  /* newfd now references the same end */
+    app_fd_mark(a, newfd, 1);                                     /* claimed without going through app_fd_claim (M2326) */
     /* dup2 NEVER CARRIES FD_CLOEXEC (M2037). POSIX is explicit: the new
      * descriptor does not inherit the close-on-exec flag, whatever oldfd has;
      * only dup3(..., O_CLOEXEC) may ask for it, and this kernel does not even
@@ -11772,7 +11928,7 @@ int app_fifo_open(const char *path, int write) {
     struct app *a = cur(); if (!a) return -1;
     int idx = fifo_pipe(path); if (idx < 0) return -1;
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
     pipe_open_end(idx, write ? 1 : 0);
     a->fd[fd] = (struct fdent){ 1, 1, (uint8_t)(write ? 1 : 0), idx, {0}, 0 };
@@ -11802,7 +11958,7 @@ int app_open(const char *path, int flags) {
             id = (n << 1) | 1;                                   /* slave id */
         }
         int fd = -1;
-        if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+        fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
         if (fd < 0) { if (!(id & 1)) pty_close(id); return -1; } /* no fd slot: undo the master open */
         a->fd[fd] = (struct fdent){ 1, 11, 1, id, {0}, 0 };      /* used, type=11 pty, write_end=1 (bidirectional) */
         int j = 0; while (path[j] && j < (int)sizeof a->fd[fd].path - 1) { a->fd[fd].path[j] = path[j]; j++; }
@@ -11821,7 +11977,7 @@ int app_open(const char *path, int flags) {
         st.stx_size = 0;
     }
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
     uint8_t wr = (flags & O_WRONLY) ? 1 : 0;                  /* write_end=1 => writable file fd (M1195) */
     a->fd[fd] = (struct fdent){ 1, 2, wr, 0, {0}, 0 };        /* used, type=file */
@@ -11883,7 +12039,7 @@ int app_memfd_create(const char *name, int flags) {
     struct app *a = cur(); if (!a) return -1;
     int idx = memfd_alloc(name); if (idx < 0) return -1;
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) { memfd_unref(idx); return -1; }
     a->fd[fd] = (struct fdent){ 1, 3, 1, idx, {0}, 0 };      /* used, type=memfd, writable, obj=idx */
     return fd;
@@ -11930,7 +12086,7 @@ int app_shm_fd(const char *name, int o_creat, int o_excl) {
         memfd_ref(idx);                     /* another descriptor on the same object */
     }
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }
+    fd = app_fd_claim(a);
     if (fd < 0) { memfd_unref(idx); return -24; }   /* EMFILE */
     a->fd[fd] = (struct fdent){ 1, 3, 1, idx, {0}, 0 };   /* used, type=memfd, writable */
     return fd;
@@ -12019,7 +12175,7 @@ void app_sync(void) { }
 int app_timerfd_create(void) {
     struct app *a = cur(); if (!a) return -1;
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
     a->fd[fd] = (struct fdent){ 1, 4, 0, 0, {0}, 0 };       /* used, type=timerfd, off=0 disarmed, obj=0 one-shot */
     return fd;
@@ -12058,7 +12214,7 @@ long app_timerfd_settime(int fd, long delay_ms, long interval_ms) {
 int app_eventfd_create(unsigned int initval, int flags) {
     struct app *a = cur(); if (!a) return -1;
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
     a->fd[fd] = (struct fdent){ 1, 5, (flags & EFD_SEMAPHORE) ? (uint8_t)1 : (uint8_t)0,
                                 (flags & EFD_NONBLOCK) ? 1 : 0, {0}, (long)initval, (flags & EFD_CLOEXEC) ? (uint8_t)1 : (uint8_t)0 };
@@ -12072,7 +12228,7 @@ int app_inotify_init(void) {
     struct app *a = cur(); if (!a) return -1;
     int idx = inotify_new(); if (idx < 0) return -1;
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) { inotify_free(idx); return -1; }
     a->fd[fd] = (struct fdent){ 1, 8, 0, idx, {0}, 0, 0 };   /* used, type=inotify, obj=instance */
     return fd;
@@ -12092,6 +12248,89 @@ int app_inotify_rm(int fd, int wd) {
  * UDP path (M1258) + loopback (M1264). fd type 9; the bound local port lives in
  * fdent.off (0 = unbound -> an ephemeral port is assigned on first sendto). */
 static uint16_t g_ephemeral = 49152;   /* the IANA ephemeral range; must not collide with the kernel resolver's own port (M2125) */
+
+/* TWO SOCKETS, ONE SOURCE PORT (M2324) -- the DNS bug, finally.
+ *
+ * `a->fd[fd].off = g_ephemeral++;` appeared at three call sites and is a
+ * read-modify-write on shared state with no serialisation, executed by every
+ * thread that opens a datagram socket, on eight cores. Two concurrent lookups
+ * are handed the SAME source port, and kernel/net.c's receive queue matches a
+ * reply to a waiter by PORT ALONE -- it has no way to know which of the two
+ * sockets a datagram belongs to. So whichever polls first takes the other's
+ * reply, glibc finds a transaction ID it did not send, discards it as a
+ * spoofed answer, and goes on waiting for a reply that has already been eaten.
+ * Five attempts later: EAI_AGAIN, "Temporary failure in name resolution".
+ *
+ * This is why the hunt took four milestones and went the wrong way. Every
+ * instrument was telling the truth: 0 tx failed, 0 dropped by the card, 0
+ * evicted, 0 stale, 0 late, and -- on a tcpdump of the tap -- 7108 queries,
+ * 7108 replies, none slower than 48 ms. Nothing was lost ANYWHERE. The reply
+ * arrived and was delivered correctly to a socket that had every right to it
+ * under the only rule the queue knows. M2317 read that as "the reply never
+ * reaches the machine, so it is not our bug" and M2318 added a second
+ * nameserver, which of course did nothing: a port collision is local and does
+ * not care how many resolvers you ask.
+ *
+ * It also explains the shape. It needs CONCURRENCY (two sockets in flight) and
+ * LOAD (to widen the window between the read and the write), which is exactly
+ * why 1160 lookups on a quiet machine never failed and why it only ever showed
+ * up under Claude Code or Firefox.
+ *
+ * The sixth instance this session of one bug class: shared state read-modify-
+ * written by several cores with nothing serialising it. Inode tables, block
+ * bitmaps, directory blocks, the datagram queue, the overflow ring -- and now
+ * the port allocator.
+ *
+ * The fix has to make CHOOSING and CLAIMING one indivisible step. Choosing
+ * atomically is not enough: two threads can each pick a distinct number, both
+ * check it is free, and both still be correct in isolation while the check and
+ * the store are apart. So the scan and the store happen under one lock.
+ */
+static volatile int ephem_lock;
+static void ephem_take(void) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&ephem_lock, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void ephem_give(void) { __atomic_store_n(&ephem_lock, 0, __ATOMIC_RELEASE); }
+
+/* Pick a local port nothing else holds and CLAIM it, both inside the lock.
+ * One pass over the fd tables, not one per candidate: it collects which of the
+ * next 64 ports are in use into a bitmask and takes the first gap. Returns 0
+ * if all 64 are somehow taken, which the callers report rather than paper
+ * over -- silently reusing a live port is the bug being fixed. */
+static uint16_t udp_bind_ephemeral(struct app *a, int fd) {
+    ephem_take();
+    uint16_t got = 0;
+    /* Slide the window rather than give up on it: after the cursor wraps back
+     * to 49152 the first 64 ports may still be held by long-lived sockets, and
+     * "all 64 are taken" must not mean "no port available" when 16000 are. */
+    for (int pass = 0; pass < 256 && !got; pass++) {
+        if (g_ephemeral < 49152 || g_ephemeral > 65472) g_ephemeral = 49152;
+        uint16_t base = g_ephemeral;
+        uint64_t used = 0;
+        for (int i = 0; i < MAX_APPS; i++) {
+            if (!apps[i].used) continue;
+            for (int f = 0; f < APP_NFD; f++) {
+                if (!apps[i].fd[f].used) continue;
+                int t = apps[i].fd[f].type;
+                if (t != 9 && t != 15) continue;       /* datagram, and bound servers */
+                uint16_t d = (uint16_t)((uint16_t)apps[i].fd[f].off - base);
+                if (d < 64) used |= 1ull << d;
+            }
+        }
+        for (int d = 0; d < 64; d++)
+            if (!(used & (1ull << d))) { got = (uint16_t)(base + d); break; }
+        if (!got) g_ephemeral = (uint16_t)(base + 64);
+    }
+    if (got) {
+        a->fd[fd].off = got;                       /* the claim, under the lock */
+        g_ephemeral = (uint16_t)(got + 1);
+        if (g_ephemeral < 49152 || g_ephemeral > 65472) g_ephemeral = 49152;
+    }
+    ephem_give();
+    return got;
+}
 /* ---- AF_INET SERVER SOCKETS: bind / listen / accept (M2020) ---------------
  *
  * bind() on an AF_INET socket used to be accepted and ignored, with the
@@ -12139,12 +12378,19 @@ int app_inet_bind(int fd, uint16_t port) {
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
     if (a->fd[fd].type != 10 && a->fd[fd].type != 9) return -1;
     if (port == 0) {
+        /* THE SAME RACE, ONE TABLE OVER (M2324). `!inet_port_taken(p)` then
+         * assign is a check and a store with a preemption point between them,
+         * so two threads can both pass the check on the same port. Same lock,
+         * for the same reason -- and the assignment below is inside it. */
+        ephem_take();
         for (int tries = 0; tries < 1000; tries++) {
             uint16_t p = g_inet_next_ephemeral++;
             if (g_inet_next_ephemeral > 60000) g_inet_next_ephemeral = 45000;
             if (!inet_port_taken(p)) { port = p; break; }
         }
-        if (!port) return -1;
+        if (port) { a->fd[fd].off = port; ephem_give(); return 0; }
+        ephem_give();
+        return -1;
     } else if (inet_port_taken(port)) {
         return -2;                                   /* EADDRINUSE */
     }
@@ -12175,7 +12421,7 @@ int app_inet_accept(int fd) {
     uint16_t port = (uint16_t)a->fd[fd].off;
     if (net_tcp_accept_open(port, 1) != 0) return APP_FD_EAGAIN;   /* ~10ms look, then EAGAIN */
     int nfd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { nfd = i; break; }
+    nfd = app_fd_claim(a);
     if (nfd < 0) { net_tcp_accept_close(); return -1; }
     a->fd[nfd] = (struct fdent){ 1, 16, 0, -1, {0}, (long)port, 0 };
     return nfd;
@@ -12201,7 +12447,7 @@ int app_socket(int domain, int type) {
     if (domain != 2 /*AF_INET*/ && domain != 1 /*AF_UNIX*/) return -1;   /* -> EAFNOSUPPORT */
     if (type != 2 /*SOCK_DGRAM*/ && type != 1 /*SOCK_STREAM*/) return -2;/* -> ESOCKTNOSUPPORT */
     int fd = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -3;                                               /* -> EMFILE */
     if (domain == 1) {
         /* AF_UNIX (M1965). unixsock.c has been a complete implementation since
@@ -12215,7 +12461,8 @@ int app_socket(int domain, int type) {
         return fd;
     }
     if (type == 1) {                                       /* SOCK_STREAM: a TCP client socket (M1268) */
-        int idx = net_tcp_sock_open(); if (idx < 0) return -4;           /* -> ENOBUFS: TCB table full */
+        int idx = net_tcp_sock_open();
+        if (idx < 0) { app_fd_unclaim(a, fd); return -4; }               /* -> ENOBUFS: TCB table full (release the slot claimed above, M2325) */
         a->fd[fd] = (struct fdent){ 1, 10, 0, idx, {0}, 0, 0 };  /* type=AF_INET stream, obj=TCB slot */
     } else {
         a->fd[fd] = (struct fdent){ 1, 9, 0, 0, {0}, 0, 0 };     /* type=AF_INET dgram, off=0 (unbound) */
@@ -12254,7 +12501,7 @@ int app_unix_accept(int fd) {
      * listener down. */
     if (ep < 0) return APP_FD_EAGAIN;
     int nf = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
+    nf = app_fd_claim(a);
     if (nf < 0) { unix_close(ep); return -1; } /* no fd for it: don't leak the endpoint */
     a->fd[nf] = (struct fdent){ 1, 12, 0, ep, {0}, 0, 0 };
     a->fd[nf].nonblock = a->fd[fd].nonblock;   /* accept4 flags override this at the ABI layer */
@@ -12320,11 +12567,11 @@ int app_unix_socketpair(int *out) {
     int x = -1, y = -1;
     if (unix_socketpair(&x, &y) != 0) return -1;
     int f0 = -1, f1 = -1;
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { f0 = i; break; }
+    f0 = app_fd_claim(a);
     if (f0 >= 0) { a->fd[f0] = (struct fdent){ 1, 12, 0, x, {0}, 0, 0 }; }
-    if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { f1 = i; break; }
+    f1 = app_fd_claim(a);
     if (f0 < 0 || f1 < 0) {                    /* unwind: never hand back half a pair */
-        if (f0 >= 0) { a->fd[f0].used = 0; }
+        app_fd_unclaim(a, f0); app_fd_unclaim(a, f1);   /* M2325 */
         unix_close(x); unix_close(y);
         return -1;
     }
@@ -12379,8 +12626,7 @@ int app_connect(int fd, const uint8_t ip[4], int port) {
         for (int i = 0; i < 4; i++) a->fd[fd].peer_ip[i] = ip[i];
         a->fd[fd].peer_port = (uint16_t)port;
         if (a->fd[fd].off == 0) {                 /* bind a source port now, so recv has one to match */
-            a->fd[fd].off = g_ephemeral++;
-            if (g_ephemeral == 0) g_ephemeral = 49152;
+            if (!udp_bind_ephemeral(a, fd)) return -1;   /* M2324: never two sockets on one port */
         }
         return 0;
     }
@@ -12421,7 +12667,7 @@ int app_sock_bind(int fd, int port) {
 long app_sendto(int fd, const uint8_t ip[4], int port, const void *buf, int len) {
     struct app *a = cur(); if (!a) return -1;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 9) return -1;
-    if (a->fd[fd].off == 0) { a->fd[fd].off = g_ephemeral++; if (g_ephemeral == 0) g_ephemeral = 49152; }
+    if (a->fd[fd].off == 0 && !udp_bind_ephemeral(a, fd)) return -1;   /* M2324 */
     return net_udp_send(ip, (uint16_t)port, (uint16_t)a->fd[fd].off, buf, len) == 0 ? len : -1;
 }
 long app_recvfrom(int fd, void *buf, int max, uint8_t srcip[4], uint16_t *srcport) {
@@ -12567,7 +12813,7 @@ int app_epoll_create(void) {
     int idx = -1; for (int i = 0; i < NEPOLL; i++) if (!epolls[i].used) { idx = i; break; }
     if (idx < 0) return -1;
     epolls[idx].used = 1; epolls[idx].refs = 1; epolls[idx].n = 0;
-    int fd = -1; if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    int fd = -1; fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) { epolls[idx].used = 0; return -1; }
     a->fd[fd] = (struct fdent){ 1, 6, 0, idx, {0}, 0, 0 };   /* used, type=epoll, obj=idx */
     return fd;
@@ -13657,7 +13903,7 @@ void app_fd_dump(const char *why) {
 int app_pidfd_open(int pid) {
     struct app *a = cur(); if (!a) return -1;
     if (!app_pid_alive(pid)) return -1;                    /* must name a live process */
-    int fd = -1; if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    int fd = -1; fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
     a->fd[fd] = (struct fdent){ 1, 7, 0, pid, {0}, 0, 0 };  /* used, type=pidfd, obj=pid */
     return fd;
@@ -13680,7 +13926,7 @@ int app_pidfd_getfd(int pidfd, int targetfd) {
     if (!a || pidfd < 0 || pidfd >= APP_NFD || !a->fd[pidfd].used || a->fd[pidfd].type != 7) return -1;
     struct app *t = app_by_pid(a->fd[pidfd].obj);
     if (!t || t->exited || targetfd < 0 || targetfd >= APP_NFD || !t->fd[targetfd].used) return -1;
-    int fd = -1; if (!app_fd_over_limit(a)) for (int i = APP_FD_FIRST; i < APP_NFD; i++) if (!a->fd[i].used) { fd = i; break; }   /* RLIMIT_NOFILE (M1547) */
+    int fd = -1; fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
     if (fd < 0) return -1;
     a->fd[fd] = t->fd[targetfd];                           /* snapshot (shares the underlying object) */
     a->fd[fd].cloexec = 0;                                 /* a freshly-obtained fd is not close-on-exec */
@@ -13816,6 +14062,8 @@ static void app_fd_release(struct app *a) {
         else if (a->fd[i].type == 12) { if (a->fd[i].obj >= 0) unix_close(a->fd[i].obj); }
         else if (a->fd[i].type == 13) unix_unlisten(a->fd[i].obj);
         a->fd[i].used = 0;
+        app_fd_mark(a, i, 0);
+        app_fd_unclaim_mark(a, i);
     }
 }
 

@@ -212,6 +212,13 @@ LXROOT  := $(BUILD)/lxroot
 # ./ffurl.txt is gitignored. If it exists it is staged to /disk2/ffurl.txt and
 # `-append ffurl` points Firefox at it, so a real site can be tested without
 # its address entering the repository, the kernel image's strings or a log.
+# ONE COMMAND TO SEE THE BROWSER: `make ff`, or `make ff URL=https://...`.
+# tools/ff.sh builds, boots the node, waits for the PAGE ON SCREEN marker and
+# opens the Proxmox console. See its header for why it exists.
+.PHONY: ff
+ff:
+	@tools/ff.sh $(URL)
+
 FFURL_SRC := $(wildcard ffurl.txt)
 ifneq ($(FFURL_SRC),)
 FFURL_DST := $(LXROOT)/ffurl.txt
@@ -511,6 +518,11 @@ $(LXROOT)/lxgai: tools/lx/lxgai.c
 # DYNAMIC, for the same reason lxgai is: this is the glibc resolver path, and a
 # -static-pie build of it would measure something Claude Code never executes.
 # (M2320)
+$(LXROOT)/lxport: tools/lx/lxport.c
+	@mkdir -p $(LXROOT)
+	$(CC) -O2 -static-pie -o $@ $<
+	@echo "  HOSTCC  $@ (480 live datagram sockets: are any two on the same local port?)"
+
 $(LXROOT)/lxdns: tools/lx/lxdns.c
 	@mkdir -p $(LXROOT)/lib64 $(LXROOT)/usr/lib64
 	$(CC) -O2 -o $@ $< -lresolv
@@ -549,7 +561,7 @@ $(LXROOT)/lxdyn: tools/lx/lxdyn.c
 	 done
 	@echo "  HOSTCC  $@ (DYNAMICALLY linked, + its ld.so/libc staged)"
 
-LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxpollout $(LXROOT)/lxpty $(LXROOT)/lxshcow $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai $(LXROOT)/lxdns $(LXROOT)/lxgtk3
+LXBINS := $(LXROOT)/lxthread $(LXROOT)/lxdyn $(LXROOT)/hellofree $(LXROOT)/hellolibc $(LXROOT)/lxfileio $(LXROOT)/lxbox $(LXROOT)/lxmmap $(LXROOT)/lxnone $(LXROOT)/lxcowprot $(LXROOT)/lxfmap $(LXROOT)/lxvmagap $(LXROOT)/lxinet $(LXROOT)/lxnopie $(LXROOT)/lxnopiedyn $(LXROOT)/lxscm $(LXROOT)/lxmemfd $(LXROOT)/lxcwd $(LXROOT)/lxcage $(LXROOT)/lxanon $(LXROOT)/lxnbpipe $(LXROOT)/lxpollout $(LXROOT)/lxpty $(LXROOT)/lxshcow $(LXROOT)/lxwait $(LXROOT)/lxepoll $(LXROOT)/lxlongname $(LXROOT)/lxsig $(LXROOT)/lxfutex $(LXROOT)/lxzero $(LXROOT)/lxstack $(LXROOT)/lxtsig $(LXROOT)/lxtls $(LXROOT)/lxlock $(LXROOT)/lxnread $(LXROOT)/lxmadv $(LXROOT)/lxsockopt $(LXROOT)/lxtlsmany $(LXROOT)/lxmsg $(LXROOT)/lxcow $(LXROOT)/lxpriv $(LXROOT)/lxmapcmp $(LXROOT)/lxwrite $(LXROOT)/lxrelo $(LXROOT)/gcstress.js $(LXROOT)/gcstress2.js $(LXROOT)/lxgcage $(LXROOT)/lxcage3 $(LXROOT)/lxtime $(LXROOT)/lxisa $(LXROOT)/lxstress $(LXROOT)/lxwl $(LXROOT)/lxwlraw $(LXROOT)/lxgai $(LXROOT)/lxdns $(LXROOT)/lxport $(LXROOT)/lxgtk3
 
 # --- the borrowed Linux toolchain (M1955) ---------------------------------
 # THE overwhelming majority of what runs on OS-DEV is written from scratch in

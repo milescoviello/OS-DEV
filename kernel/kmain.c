@@ -262,6 +262,7 @@ static volatile int g_lxfull_test;            /* -append lxfulltest: the whole L
 static volatile int g_lxtool_test;            /* -append lxtooltest: drive the BORROWED host toolchain in-guest (M1955) */
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
+static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
 static volatile int g_lxdns_spawned;          /* lxdns already runs alongside the browser -- do not ALSO run the quiet-machine arms (M2321) */
 static volatile int g_lxdns;                  /* -append lxdns: two hundred getaddrinfo calls, so the 1-in-N EAI_AGAIN can be SAMPLED (M2320) */
 static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
@@ -766,6 +767,19 @@ void kmain_budget(const char *when) {
                     "%lu yields, in poll/epoll (concurrent: NOT a share of the wall clock)\n",
                     g_poll_nap_ms, g_poll_naps, g_poll_nap_real_ms, g_poll_yields);
         }
+        {   /* AND HOW LATE THE ANSWERS WERE (M2322). The naps above are what
+             * this costs a waiter; this is what it cost the one waiter whose
+             * deadline is set by somebody else -- glibc's resolver gives an
+             * attempt two seconds and then abandons the socket. */
+            extern uint64_t net_udpq_dwell_ms(void), net_udpq_slow(void), net_udpq_stale(void);
+            extern uint64_t net_rx_ring_dropped(void);
+            kprintf("[budget]   udp rx   worst %lu ms between a datagram landing in our queue and "
+                    "the guest taking it; %lu handed over late (>200 ms); %lu aged out with "
+                    "nobody left to take them; %lu frame(s) DIED in our software RX ring with no "
+                    "consumer draining it (the card dropped none of these -- we did)\n",
+                    (unsigned long)net_udpq_dwell_ms(), (unsigned long)net_udpq_slow(),
+                    (unsigned long)net_udpq_stale(), (unsigned long)net_rx_ring_dropped());
+        }
         {   extern unsigned long g_lx_dispatch_cycles;
             unsigned long n = lx_syscalls_made();
             /* ELAPSED, AND THEREFORE NOT A PER-SYSCALL COST (M2102). I wrapped
@@ -884,6 +898,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxcagetest")) { g_lxabi_test = 1; g_lxcage = 1; }    /* the 8 GiB reservation probes (M2041) */
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
+        if (cmdline_has(cl, "lxport"))     { g_lxabi_test = 1; g_lxport = 1; }   /* the ephemeral port allocator race (M2324) */
         if (cmdline_has(cl, "lxdns"))      { g_lxabi_test = 1; g_lxdns = 1; }    /* hammer getaddrinfo instead of sampling it ten times per Claude boot (M2320) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
@@ -3210,7 +3225,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             int gairc = app_run_linux_sync("/disk2/lxgai", 0, 0, 60000);
             kprintf("[lxabi] lxgai exit -> %d\n", gairc);
         }
-        if (g_lxdns) {
+        if (g_lxport) {
+            /* THE PORT ALLOCATOR, ASKED DIRECTLY (M2324). The DNS symptom needs
+             * load, concurrency and about ten minutes to show itself once. The
+             * cause -- two live sockets on one local port -- is a fact that
+             * getsockname will state in a second, with no network involved. */
+            kprintf("[lxabi] 480 datagram sockets at once: does any local port repeat?...\n");
+            int prc = app_run_linux_sync("/disk2/lxport", 0, 0, 120000);
+            kprintf("[lxabi] lxport exit -> %d\n", prc);
+        }
+        if (g_lxdns && !g_lxdns_spawned) {
             /* THE SAME CALL, TWO HUNDRED TIMES (M2320).
              *
              * lxgai asks getaddrinfo once and names which step failed. That is
