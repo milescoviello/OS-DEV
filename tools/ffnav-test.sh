@@ -18,7 +18,7 @@ click(){ printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","
   printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":true,"button":"left"}}]}}\n' | $SSH "socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp" >/dev/null 2>&1; sleep 1
   printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":false,"button":"left"}}]}}\n' | $SSH "socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp" >/dev/null 2>&1; }
 
-WAIT=full NOBUILD=1 APPEND="ffurl lxout" CORES=${CORES:-8} CAP=${CAP:-420} \
+WAIT=full NOBUILD=1 APPEND="${NAVAPPEND:-ffnav} lxout nonetdemo" CORES=${CORES:-8} CAP=${CAP:-420} \
   VMID=$V PVE_DIR=$D tools/pve-run.sh >"$S/run.txt" 2>&1 &
 RUN=$!
 T0=$(date -u +%s); i=0
@@ -27,8 +27,28 @@ while [ $i -lt 300 ]; do
   sleep 5; i=$((i+5))
 done
 echo "   window at ~${i}s"; sleep 50
+# DID THE PAGE EVEN RENDER? Two earlier runs of this test clicked at a window
+# that was blank -- Firefox had segfaulted -- and the verdict blamed
+# navigation. A test that cannot tell "there was nothing to click" from
+# "clicking did nothing" is not measuring what it claims to.
+if $SSH "grep -aq 'CRASHED with signal' $D/boot.log"; then
+  echo "   => PRECONDITION FAILED: Firefox crashed before the click; nothing was on screen."
+  $SSH "grep -a 'CRASHED with signal' $D/boot.log | tail -1"
+  wait $RUN 2>/dev/null || true
+  exit 1
+fi
 BEFORE=$($SSH "grep -a 'toplevel title:' $D/boot.log | tail -1")
 echo "   title before: $BEFORE"
+# ...and the page has to have LOADED. Firefox's error page is a perfectly good
+# document with its own title, so a failed load looks like a loaded page to a
+# title-diffing oracle -- and clicking empty chrome then "proves" navigation is
+# broken. Name it instead.
+case "$BEFORE" in
+  *"Problem loading page"*|*"Server Not Found"*|*"Unable to connect"*)
+    echo "   => PRECONDITION FAILED: the page never loaded, so there was no link to click."
+    wait $RUN 2>/dev/null || true
+    exit 1 ;;
+esac
 shot before
 # COORDINATES FROM THE RENDERED PAGE, NOT FROM A DESCRIPTION OF IT.
 #
@@ -43,8 +63,17 @@ shot before
 # link is at about (637,632) in 1280x960, which is a large underlined target
 # rather than a 90x18 nav item, so a few pixels of layout drift cannot miss it.
 #   x = 637/1280 * 32768 = 16307     y = 632/960 * 32768 = 21572
-CLICK_X=${CLICK_X:-16307}
-CLICK_Y=${CLICK_Y:-21572}
+# Second correction: (16307,21572) is (637,632), which a screendump showed is
+# the GAP BETWEEN TWO LINES -- the cursor landed two pixels past the end of a
+# link. Aim at the MIDDLE of the longest link on the page instead of near an
+# edge: "a honeypot strangers are attacking" spans x 324..635 at y~645.
+#   x = 480/1280 * 32768 = 12288     y = 645/960 * 32768 = 22016
+# The target is now a block link filling 70% of the viewport (tools/lx/
+# ffnav.html), so the centre of the screen is inside it by a wide margin --
+# which is the only way this stays true when the compositor moves the window.
+#   x = 640/1280 * 32768 = 16384     y = 480/960 * 32768 = 16384
+CLICK_X=${CLICK_X:-16384}
+CLICK_Y=${CLICK_Y:-16384}
 click $CLICK_X $CLICK_Y
 sleep 25
 shot after
@@ -58,6 +87,11 @@ w,h,a=rd(sys.argv[1]); _,_,b=rd(sys.argv[2])
 n=sum(1 for i in range(0,min(len(a),len(b))-2,3) if a[i:i+3]!=b[i:i+3])
 print("   screen changed by %d px %s" % (n, "<-- the page CHANGED" if n>200000 else "(little changed)"))
 PY
-[ "$BEFORE" != "$AFTER" ] && echo "   => NAVIGATION WORKS (the document title changed)" \
-                          || echo "   => title unchanged: either the click missed a link, or navigation did not happen"
+case "$AFTER" in
+  *OSDEV-NAV-ARRIVED*) echo "   => NAVIGATION WORKS: the click followed the link and the DESTINATION document committed" ;;
+  *OSDEV-NAV-START*)   echo "   => the click did not follow the link: still on the start page" ;;
+  *)                   [ "$BEFORE" != "$AFTER" ] \
+                         && echo "   => the title changed, but not to the destination: $AFTER" \
+                         || echo "   => title unchanged: the click did not navigate" ;;
+esac
 wait $RUN 2>/dev/null || true

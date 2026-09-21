@@ -1,0 +1,18 @@
+<!doctype html>
+<!-- The link-navigation test's start page (M2331).
+     Deliberately local and deliberately boring: the first three attempts at
+     this test clicked a LIVE site whose paragraph reflows between runs (the
+     numbers in it are read from a cluster, so "82 milliseconds" becomes "87"
+     and the line wraps differently), and a fixed click coordinate landed on
+     plain text every time. A test of "does clicking a link navigate" must not
+     also be a test of where a remote page happens to lay out today. -->
+<html><head><meta charset="utf-8"><title>OSDEV-NAV-START</title>
+<style>
+  html,body { margin:0; padding:0; background:#101820; }
+  /* One enormous target. The click lands well inside it even if the window
+     moves by a hundred pixels, which is the only robustness that matters
+     here -- the compositor places the window, not this page. */
+  a.big { display:block; width:100%; height:70vh; background:#1e8bc3; color:#fff;
+          font:700 48px/70vh sans-serif; text-align:center; text-decoration:none; }
+</style></head>
+<body><a class="big" href="ffnav2.html">OSDEV-NAV-CLICK-HERE</a></body></html>

@@ -655,6 +655,14 @@ $(LXROOT)/ffinput.html: tools/lx/ffinput.html
 	@cp $< $@
 	@echo "  STAGE   $@ (the CSS-only input probe page)"
 
+$(LXROOT)/ffnav.html: tools/lx/ffnav.html
+	@mkdir -p $(LXROOT)
+	@cp -f $< $@ && echo "  STAGE   $@ (link-navigation start page)"
+
+$(LXROOT)/ffnav2.html: tools/lx/ffnav2.html
+	@mkdir -p $(LXROOT)
+	@cp -f $< $@ && echo "  STAGE   $@ (link-navigation destination)"
+
 $(LXROOT)/big.s: kernel/app.c
 	@mkdir -p $(LXROOT)
 	@$(CC) $(filter-out -MMD -MP -g,$(CFLAGS)) -S $< -o $@ 2>/dev/null || true
@@ -811,7 +819,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/.src-staged
+$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \

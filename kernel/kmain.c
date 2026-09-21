@@ -309,6 +309,7 @@ static volatile int g_ffurl;                  /* -append ffurl: the URL comes fr
 static volatile int g_gtksub;                 /* -append gtksub: lxgtk3 + Gecko's empty-input-region subsurface (M2297) */
 static volatile int g_ffimsimple;             /* -append ffimsimple: force GTK's pass-through input method (M2300) */
 static volatile int g_ffimlog;                /* -append ffimlog: MOZ_LOG IMEHandler + KeyboardHandler (M2300) */
+static volatile int g_ffnav;                  /* -append ffnav: file:///ffnav.html, one huge link -- does clicking it navigate? (M2331) */
 static volatile int g_ffin;                   /* -append ffin: file:///ffinput.html, the page that makes input visible (M2296) */
 static volatile int g_ffnet;                  /* -append ffnet: load a page off the real internet, so the network half of the browser is measured at all (M2210) */
 /* THE ffshow WATCHER (M2200). Everything the ffwl loops printed to the screen
@@ -924,7 +925,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * spawns Firefox is this one, and a URL with no spawn is not a mode. */
         if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") ||
             cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl") ||
-            cmdline_has(cl, "ffin") || cmdline_has(cl, "gtksub")) {
+            cmdline_has(cl, "ffin") || cmdline_has(cl, "ffnav") || cmdline_has(cl, "gtksub")) {
             g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1; g_ffshow = 1; g_noprobes = 1;
         }
         /* -append ffalone: Firefox as the ONLY Wayland client (M2287).
@@ -948,6 +949,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "ffimsimple")) g_ffimsimple = 1;   /* GTK_IM_MODULE=gtk-im-context-simple (M2300) */
         if (cmdline_has(cl, "ffimlog"))    g_ffimlog = 1;      /* Gecko's IME + keyboard log (M2300) */
         if (cmdline_has(cl, "ffin"))       g_ffin = 1;                    /* the CSS-only input probe page (M2296) */
+        if (cmdline_has(cl, "ffnav"))      g_ffnav = 1;                   /* one huge link, and a destination with a distinct title (M2331) */
         if (cmdline_has(cl, "ffhold"))     { g_lxabi_test = 1; g_wltest = 1; g_ffwl = 1;
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
@@ -2078,6 +2080,17 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                      * band, and a scroll repaints nearly everything. */
                     static const char *av_fi[] = { "--no-remote", "--new-instance",
                                                    "file:///ffinput.html" };
+                    /* A LINK BIG ENOUGH THAT A CLICK CANNOT MISS IT (M2331).
+                     * Three attempts to test navigation against a real site
+                     * failed because that page's text is generated from live
+                     * cluster readings -- "82 milliseconds" becomes "87" --
+                     * so the paragraph rewraps between runs and a fixed click
+                     * coordinate landed on plain prose every time. The target
+                     * here is 70% of the viewport and the destination's TITLE
+                     * is the oracle, which only changes when a new document
+                     * commits. */
+                    static const char *av_nv[] = { "--no-remote", "--new-instance",
+                                                   "file:///ffnav.html" };
                     static const char *av_fd[] = { "--no-remote", "--new-instance",
                                                    "data:text/html,<body%20style%3D%22background%3A%23101820%22>"
                                                    "<h1%20style%3D%22color%3A%234fd1c5%22>OS-DEV</h1>" };
@@ -2157,8 +2170,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                     "-- put the address in ./ffurl.txt and rebuild build/ext2.img\n");
                     }
                     const char **av_use = have_url ? av_uf
+                                        : (g_ffnav ? av_nv
                                         : (g_ffin ? av_fi
-                                        : (g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw)));
+                                        : (g_ffnet ? av_fn : (g_ffdata ? av_fd : av_fw))));
                     /* When Firefox parks, the syscall trace shows a futex
                      * address and nothing else -- it cannot name the Gecko
                      * code that is waiting. Firefox can: MOZ_LOG prints the
