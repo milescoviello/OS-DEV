@@ -38,6 +38,20 @@ SSH="ssh -o BatchMode=yes root@$PVE_HOST"
 
 cd "$(dirname "$0")/.."
 
+# WHEN THE RUN DOES NOT HAPPEN, SAY SO (M2330).
+#
+# A worktree built for an A/B comparison had no build/fat.img, so rsync failed
+# and `set -e` aborted this script before the VM was ever restarted. Six
+# "baseline" runs then read the PREVIOUS kernel's leftover boot.log and
+# reported six identical, entirely fictional results -- and because the caller
+# sent stdout to /dev/null, the rsync error was never seen. A harness that
+# cannot distinguish "measured nothing" from "measured zero" is worse than no
+# harness, and this is the second instrument this session with that defect.
+#
+# Stamp the start; the freshness check at the end refuses to return quietly if
+# boot.log was not written after it.
+OSDEV_RUN_T0=$(date -u +%s)
+
 if [ "${NOBUILD:-0}" != 1 ]; then
     echo "==> building kernel + ext2 image..."
     make build/kernel32.elf >/dev/null
@@ -250,3 +264,14 @@ case "${APPEND:-}" in
     fi
     ;;
 esac
+
+# AND THE RUN REALLY DID PRODUCE THIS LOG (M2330). Anything that stopped the
+# boot -- a failed rsync, a VM that would not start, a capture that never
+# attached -- leaves the previous run's boot.log in place, which reads exactly
+# like a successful run of whatever was measured last.
+REMOTE_T=$($SSH "stat -c %Y $PVE_DIR/boot.log 2>/dev/null || echo 0")
+if [ "${REMOTE_T:-0}" -lt "$OSDEV_RUN_T0" ]; then
+    echo "FATAL: $PVE_DIR/boot.log was NOT written by this run (mtime $REMOTE_T < start $OSDEV_RUN_T0)." >&2
+    echo "       Whatever is in it belongs to an earlier boot. Refusing to let it be read as a result." >&2
+    exit 4
+fi

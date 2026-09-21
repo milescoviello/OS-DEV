@@ -1432,7 +1432,23 @@ int app_scm_recv(int ep) {
     if (fd < 0) return -1;                     /* receiver's fd table is full */
     uint64_t sfl = scm_lock_take();
     scm_pool_init();
-    if (scmq_empty(q)) { scm_lock_give(sfl); return -1; }   /* nothing pending */
+    if (scmq_empty(q)) {
+        /* GIVE THE CLAIM BACK (M2330). Claiming the descriptor before knowing
+         * there is one to receive leaks a slot on EVERY empty recvmsg -- and
+         * an empty one is the common case: libwayland asks for ancillary data
+         * on every read and usually there is none. Firefox reached 1021 of
+         * 1024 descriptors with 908 of them claimed-but-never-typed, and then
+         * spent the rest of the run being refused sockets.
+         *
+         * M2325 turned "find a slot, fill it in later" into a real claim,
+         * which is what makes an abandoned claim permanent rather than merely
+         * racy. Every early return after a claim now has to release it; this
+         * was the one the audit missed, because the failure is not an error
+         * path -- it is the ordinary case. */
+        scm_lock_give(sfl);
+        app_fd_unclaim(a, fd);
+        return -1;                                          /* nothing pending */
+    }
     short e = q->head;
     q->head = g_scmpool[e].next;
     if (q->head < 0) q->tail = -1;
@@ -11282,6 +11298,44 @@ static int app_fd_claim(struct app *a) {
         if (!app_fd_over_limit(a))
             for (int i = APP_FD_FIRST; i < APP_NFD; i++)
                 if (!a->fd[i].used && !(ai >= 0 && g_fd_claimed[ai][i])) { fd = i; break; }
+        if (fd < 0) {
+            /* WHICH KIND OF FULL? (M2330) "out of file descriptors" is two
+             * very different faults: a process genuinely holding 1024 of
+             * them, or a claim bitmap that has leaked bits for descriptors
+             * nobody holds -- the exact hazard the bitmap introduced. Count
+             * both at the moment of failure instead of inferring afterwards. */
+            static int shown;
+            if (++shown <= 4) {
+                int nused = 0, nclaim = 0, nboth = 0;
+                for (int i = APP_FD_FIRST; i < APP_NFD; i++) {
+                    int u = a->fd[i].used ? 1 : 0;
+                    int c = (ai >= 0 && g_fd_claimed[ai][i]) ? 1 : 0;
+                    nused += u; nclaim += c; nboth += (u && c);
+                }
+                kprintf("[fd] pid %d OUT OF DESCRIPTORS: %d held, %d claimed, %d both -- "
+                        "%d slot(s) blocked by a CLAIM WITH NO OWNER%s\n",
+                        app_current_pid(), nused, nclaim, nboth, nclaim - nboth,
+                        app_fd_over_limit(a) ? " (RLIMIT_NOFILE reached)" : "");
+                /* AND WHAT ARE THEY? 1021 descriptors is far more than this
+                 * program holds on Linux, so "the table is too small" and
+                 * "something is not being closed" look identical from the
+                 * count alone. The type histogram tells them apart: a leak
+                 * piles up in ONE type. */
+                {   int byt[20]; for (int k = 0; k < 20; k++) byt[k] = 0;
+                    for (int i = APP_FD_FIRST; i < APP_NFD; i++)
+                        if (a->fd[i].used) {
+                            int t = a->fd[i].type; if (t < 0 || t > 19) t = 19;
+                            byt[t]++;
+                        }
+                    static const char *tn[20] = { "free","pipe","file","memfd","timerfd",
+                        "eventfd","epoll","pidfd","inotify","udp","tcp","pty","unix",
+                        "unix-listen","console","inet-listen","inet-accepted","?17","?18","other" };
+                    kprintf("[fd]   by type:");
+                    for (int k = 0; k < 20; k++) if (byt[k]) kprintf(" %s=%d", tn[k], byt[k]);
+                    kprintf("\n");
+                }
+            }
+        }
     }
     if (fd >= 0) {
         /* THE INVARIANT, ASSERTED WHERE IT CAN BE BROKEN (M2325).
