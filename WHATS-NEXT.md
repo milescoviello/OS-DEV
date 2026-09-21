@@ -1,5 +1,48 @@
 # What's next
 
+> **(M2332) THE LAST RED SUITE WAS A DANGLING `else`.**
+>
+> `waylandtest` had been failing on "the committed pixels did not arrive"
+> about a compositor that was receiving and blitting them correctly. Two
+> causes, neither of them a compositor defect:
+>
+> ```c
+> if (loud)
+>     if (commit_say(...)) kprintf(A);   /* with the pixel scan */
+> else
+>     if (commit_say(...)) kprintf(B);   /* without it */
+> ```
+>
+> C binds an `else` to the NEAREST `if`, so the real shape was
+> `if (loud) { if (say) A; else B; }` -- and when `loud` was false, which is
+> **63 commits out of 64**, nothing printed at all. M2094 split that line in
+> two precisely so it would print always and only the megabyte pixel scan
+> would be occasional; its own comment says *"Print always, scan
+> occasionally"*. The missing braces silently reinstated the bug it was
+> written to fix. The suite greps for the client's single commit, and one
+> commit is almost never the 1-in-64.
+>
+> The second: `tests/wl/drive_input.py` aimed at parent-relative (20,12),
+> chosen when the test client had ONE surface. M2094 later gave it a 16x8
+> subsurface at +8,+4 -- covering x 8..23, y 4..11 -- so the aim landed on the
+> child. Wayland delivers motion to the topmost surface under the cursor,
+> relative to THAT surface, so the client correctly reported child-relative
+> numbers and the assertion called the compositor wrong. Re-aimed at (40,20).
+>
+>     PASS: PHASE 8 -- a real libwayland client's surface is DRAWN IN AN
+>     OS-DEV WINDOW, and it takes INPUT
+>
+> **`linuxabitest` is ~1-in-3 flaky, and it is NOT from this work.** Measured
+> three runs at `ead92303` and three at M2332: 2 pass / 1 fail on each, with
+> the symptom varying between a 120-thread futex stall and a boot that triples
+> its log volume and blows the suite's budget. The suspected cause is the same
+> find-then-fill race, in the six `vma_find_gap` sites that never adopted the
+> `vma_reserve` helper M1988 added for exactly this. A naive conversion is
+> NOT the fix: `vma_reserve` holds a spinlock with interrupts off across an
+> O(n)-per-candidate search, and at 120 threads that is its own stall. The fix
+> needs a *bounded* search -- start from the `mmap_next` high-water cursor,
+> fall back to the full scan only on failure.
+
 > **(M2327-M2331) SIX RACES, FOUR BLIND INSTRUMENTS, AND FIREFOX AT 8/8
 > ON A REAL PAGE.**
 >

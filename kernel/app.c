@@ -528,6 +528,41 @@ void app_cow_quarantine_flush(struct app *a);   /* drain the batched COW frees (
  * inferring it from fault addresses is guesswork. O(n^2) in the table size, so
  * it is opt-in -- a browser with a thousand mappings would feel it. */
 int g_vma_audit;
+
+/* DOES THIS MAPPING OVERLAP ONE THAT ALREADY EXISTS? (M2333)
+ *
+ * vma_audit answers the same question for the WHOLE table and is O(n^2), so it
+ * is opt-in and effectively never on. This asks it for ONE slot -- the one just
+ * published -- which is O(n) and cheap enough to leave on always. It exists
+ * because an overlap is the signature of the find-then-fill race that M2329
+ * fixed in the MAP_FIXED path and that six `vma_find_gap` sites still have:
+ * two threads are handed the same address, the later carve removes one of the
+ * twins, and the survivor can be a PROT_NONE reservation that the victim then
+ * faults on -- which is precisely how Firefox died on its own thread stack.
+ *
+ * Silent when correct. Fires only on the defect, and names both slots and the
+ * line that created each, so the report identifies the racing pair rather than
+ * the thread that happened to notice. */
+void vma_published(struct app *a, int slot) {
+    if (!a || slot < 0 || slot >= APP_MAXVMA) return;
+    uint64_t s0 = a->vma[slot].start, e0 = s0 + a->vma[slot].len;
+    if (!a->vma[slot].len) return;
+    for (int i = 0; i < a->nvma; i++) {
+        if (i == slot || !a->vma[i].len) continue;
+        uint64_t s1 = a->vma[i].start, e1 = s1 + a->vma[i].len;
+        if (s0 < e1 && s1 < e0) {
+            static int shown;
+            if (++shown <= 8)
+                kprintf("[vmarace] ** OVERLAP: vma[%d] %lx+%lx (app.c:%u) and vma[%d] %lx+%lx "
+                        "(app.c:%u) -- two allocations share an address **\n",
+                        slot, (unsigned long)s0, (unsigned long)a->vma[slot].len,
+                        (unsigned)a->vma[slot].oline,
+                        i, (unsigned long)s1, (unsigned long)a->vma[i].len,
+                        (unsigned)a->vma[i].oline);
+            return;
+        }
+    }
+}
 static void vma_audit(struct app *a, const char *why) {
     if (!g_vma_audit || !a) return;
     for (int i = 0; i < a->nvma; i++) {
@@ -5027,6 +5062,7 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
         }
     }
     vma_alloc_unlock(a, f);
+    if (slot >= 0) vma_published(a, slot);   /* M2333 */
     if (slot >= 0 && out) *out = addr;
     return slot;
 }
@@ -5385,6 +5421,7 @@ static uint64_t app_mmap_huge_nl(uint64_t len) {
     int vs2; VMA_NEW(a, vs2);
     a->vma[vs2].start = addr;
     a->vma[vs2].len   = len;
+    vma_published(a, vs2);   /* M2333 */
     a->vma[vs2].sealed = 0;
     a->vma[vs2].uffd  = 0;
     a->vma[vs2].file_backed = 0;
@@ -5483,6 +5520,7 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     int vs4; VMA_NEW(a, vs4);
     a->vma[vs4].start = addr;
     a->vma[vs4].len   = len;
+    vma_published(a, vs4);   /* M2333 */
     a->vma[vs4].sealed = 0;
     a->vma[vs4].uffd  = 0;
     a->vma[vs4].file_backed = 1;
@@ -6073,6 +6111,7 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
     }
     int vs5; VMA_NEW(a, vs5);
     a->vma[vs5].start = nbase; a->vma[vs5].len = new_len;
+    vma_published(a, vs5);   /* M2333 */
     a->vma[vs5].sealed = a->vma[vs5].uffd = a->vma[vs5].file_backed = a->vma[vs5].locked = a->vma[vs5].huge = 0;
     
     a->mmap_next = nbase + new_len + PAGE_SIZE;
@@ -6927,6 +6966,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
     int vs6; VMA_NEW(a, vs6);
     a->vma[vs6].start = base;
     a->vma[vs6].len   = total;
+    vma_published(a, vs6);   /* M2333 */
     a->vma[vs6].sealed = 0;
     a->vma[vs6].uffd  = 0;
     a->vma[vs6].file_backed = 0;
@@ -6971,7 +7011,7 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
         __asm__ volatile("invlpg (%0)" : : "r"(base + (uint64_t)p * PAGE_SIZE) : "memory");
     }
     int vs7; VMA_NEW(a, vs7);
-    a->vma[vs7].start = base; a->vma[vs7].len = total; a->vma[vs7].sealed = 0; a->vma[vs7].uffd = 0; a->vma[vs7].file_backed = 0; a->vma[vs7].locked = 0; a->vma[vs7].huge = 0; 
+    a->vma[vs7].start = base; a->vma[vs7].len = total; vma_published(a, vs7); a->vma[vs7].sealed = 0; a->vma[vs7].uffd = 0; a->vma[vs7].file_backed = 0; a->vma[vs7].locked = 0; a->vma[vs7].huge = 0; 
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -9820,6 +9860,7 @@ static int app_vma_add_mapped(struct app *a, const char *path, uint64_t addr, ui
     int vs8; VMA_NEW(a, vs8);
     a->vma[vs8].start = addr;
     a->vma[vs8].len   = len;
+    vma_published(a, vs8);   /* M2333 */
     a->vma[vs8].prot  = (uint8_t)(prot & 0x7);
     if (path) {
         a->vma[vs8].file_backed = 1;
