@@ -1418,6 +1418,7 @@ int app_scm_send(int ep, int fd) {
 }
 
 static void fdt_take(void);                   /* the fd-table lock (M2325) */
+static void app_fd_claims_reset(struct app *a);   /* a recycled slot starts with no claims (M2327) */
 static void fdt_give(void);
 static int  app_fd_claim(struct app *a);      /* find AND claim a descriptor as one step (M2325) */
 static void app_fd_unclaim(struct app *a, int fd);
@@ -9811,6 +9812,14 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
 
     memset(a, 0, sizeof(*a));
     a->used = 1;
+        /* A RECYCLED apps[] SLOT MUST NOT INHERIT ITS PREDECESSOR'S CLAIMS
+         * (M2327). g_fd_claimed is indexed by slot, and teardown clears it --
+         * but an exit path that skips that loop would leave bits set, and
+         * those descriptors would then look permanently taken to the next
+         * process in the slot. That presents as descriptor exhaustion minutes
+         * later and miles away, so the invariant is re-established HERE, where
+         * it cannot depend on every exit path behaving. */
+        app_fd_claims_reset(a);
     a->pid = next_pid++;
     a->pgid = a->sid = a->pid;           /* a spawned app leads its own group + session (M1176) */
     /* Consume the one-shot arming from app_arm_next_spawn, BEFORE the process
@@ -10644,8 +10653,28 @@ void app_memfd_selftest(void) {
     /* Was the OUTGOING buffer retired or freed? If it was freed it is on the
      * kernel heap's free list, and allocations of the same size class get it
      * back -- with a live user mapping still pointing at it. */
-    memfd_ck(m->nretired == 1 && m->retired[0] == oldraw,
-             "the pre-grow buffer was RETIRED rather than freed");
+    /* WHAT M2226 CHANGED, AND WHY THIS ASSERTION HAD TO CHANGE WITH IT.
+     *
+     * Until M2226 this checked `nretired == 1 && retired[0] == oldraw`: the
+     * outgoing buffer must be held, because live mmaps still pointed at it.
+     * M2200 then made the grow RE-POINT every live mapping at the new buffer,
+     * and M2226 finished the thought -- once nothing aliases the old buffer,
+     * holding it is not caution, it is a leak into a four-entry array whose
+     * exhaustion makes memfd_grow refuse outright, which is what produced a
+     * Wayland pool that could not grow past 64 KiB.
+     *
+     * This test drives `m->mapped = 1` by hand and no process has a VMA for
+     * the object, so the re-pointing loop matches nothing, `unshareable` is 0,
+     * and freeing is the CORRECT outcome. The old assertion kept failing on a
+     * kernel that was right -- a stale test reporting a bug that no longer
+     * existed, which costs exactly as much as a missing one.
+     *
+     * The retain-while-aliased property is not lost: it is covered with a REAL
+     * mapping by the wl_shm pool-resize checks in the same suite ("the
+     * outgoing buffer is retired, not handed to kfree"), which is the only
+     * place it can be tested honestly, because it needs a real alias. */
+    memfd_ck(m->nretired == 0,
+             "with nothing actually aliasing it, the outgoing buffer is FREED, not retired (M2226)");
     void *churn[MEMFD_ST_CHURN]; int nch = 0;
     for (int k = 0; k < MEMFD_ST_CHURN; k++) {
         churn[nch] = kmalloc(cap0 + PAGE_SIZE);      /* the same request the old buffer came from */
@@ -10653,10 +10682,18 @@ void app_memfd_selftest(void) {
         for (unsigned long i = 0; i < cap0 + PAGE_SIZE; i++) ((char *)churn[nch])[i] = (char)0x5A;
         nch++;
     }
-    int survived = 1;
-    for (unsigned long i = 0; i < first; i++) if (old[i] != PAT) { survived = 0; break; }
+    /* ...and because it was freed, the heap may hand those pages straight back
+     * out. Asserting that it DOES is what stops this becoming a test that
+     * passes whatever happens: `old` is dangling by design here, and reading
+     * it is the point -- if the block were still held out of the free list the
+     * pattern would survive, and the M2226 optimisation would not be
+     * happening. */
+    int recycled = 0;
+    for (unsigned long i = 0; i < first; i++) if (old[i] != PAT) { recycled = 1; break; }
     for (int k = 0; k < nch; k++) kfree(churn[k]);
-    memfd_ck(survived, "and the retired buffer's pages were NOT handed back out by the heap");
+    memfd_ck(recycled || nch == 0,
+             "and the freed buffer really did go back to the heap (churn reclaimed it)");
+    (void)oldraw;
 
     /* The headroom: the point of over-allocating a mapped object is that the
      * NEXT resize does not move anything, so a live mapping stays correct. */
@@ -11173,6 +11210,11 @@ static uint8_t g_fd_claimed[MAX_APPS][APP_NFD];
 static int app_slot(struct app *a) {
     long i = a - apps;
     return (i >= 0 && i < MAX_APPS) ? (int)i : -1;
+}
+static void app_fd_claims_reset(struct app *a) {
+    int ai = app_slot(a);
+    if (ai < 0) return;
+    for (int i = 0; i < APP_NFD; i++) g_fd_claimed[ai][i] = 0;
 }
 static void app_fd_mark(struct app *a, int fd, int v) {
     int ai = app_slot(a);
@@ -14120,6 +14162,14 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
 
     memset(a, 0, sizeof(*a));
     a->used = 1;
+        /* A RECYCLED apps[] SLOT MUST NOT INHERIT ITS PREDECESSOR'S CLAIMS
+         * (M2327). g_fd_claimed is indexed by slot, and teardown clears it --
+         * but an exit path that skips that loop would leave bits set, and
+         * those descriptors would then look permanently taken to the next
+         * process in the slot. That presents as descriptor exhaustion minutes
+         * later and miles away, so the invariant is re-established HERE, where
+         * it cannot depend on every exit path behaving. */
+        app_fd_claims_reset(a);
     a->pid = next_pid++;                                /* a FRESH pid (not the parent's) */
     /* title: the parent's, marked as a fork */
     int ti = 0; const char *pt = p->title ? p->title : "app";

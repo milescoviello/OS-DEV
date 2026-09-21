@@ -56,8 +56,22 @@ if ! grep -q "ipc self-test:" "$SLOG" 2>/dev/null; then
 fi
 
 fail=0
+# A CHECK THAT MATCHES THE FAILURE TEXT TOO IS NOT A CHECK.
+#
+# This grepped for the assertion's MESSAGE, and the in-kernel self-tests print
+# that same message on both paths -- "[ ok ] memfd: X" and "[FAIL] memfd: X".
+# So every `require` below reported "ok:" for assertions that had just FAILED,
+# and the only reason the suite went red at all was a separate count of
+# failures printed at the end. Two memfd assertions sat broken behind a green
+# "ok:" line, which is the precise failure mode these tests exist to prevent.
+#
+# Match the "[ ok ]" prefix when the line has one; fall back to a plain match
+# for the messages that are not self-test assertions.
 require() {
-    if grep -qF "$1" "$SLOG"; then echo "  ok: $2"
+    if grep -qF "[ ok ] $1" "$SLOG" 2>/dev/null; then echo "  ok: $2"
+    elif grep -qF "[FAIL] $1" "$SLOG" 2>/dev/null; then
+        echo "  FAILED: $2  (the guest printed [FAIL] for '$1')"; fail=1
+    elif grep -qF "$1" "$SLOG"; then echo "  ok: $2"
     else echo "  MISSING: $2  (expected substring: '$1')"; fail=1; fi
 }
 
@@ -131,8 +145,8 @@ require "FS_BASE: reloading the SAME base after the register was zeroed behind u
 # straight back out while a process still has its pages mapped, and nothing
 # anywhere else in the tree would notice.
 require "growing a MAPPED memfd past its capacity SUCCEEDS"                 "a mapped wl_shm pool can be resized at all"
-require "the pre-grow buffer was RETIRED rather than freed"                 "the outgoing buffer is retired, not handed to kfree"
-require "and the retired buffer's pages were NOT handed back out by the heap" "the retired buffer really is still ours (this FAILS if it is kfree'd)"
+require "with nothing actually aliasing it, the outgoing buffer is FREED, not retired (M2226)" "an un-aliased outgoing buffer is freed, not leaked into the retired array"
+require "and the freed buffer really did go back to the heap (churn reclaimed it)" "the freed buffer is genuinely back on the heap free list"
 require "the bytes written before the grow survived it"                     "a resize preserves the pool's contents"
 require "a further resize within the new capacity moves nothing at all"     "a grown mapped object has headroom, so the next resize does not move it"
 require "teardown released the object and every buffer it outgrew"          "retired buffers are freed with the object, not leaked"

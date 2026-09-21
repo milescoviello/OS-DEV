@@ -440,10 +440,36 @@ int g_wl_verbose;                 /* -append wlverbose: log every message both w
  * Keep the first few (bring-up is where they matter) and then one in every
  * 512, which still shows the stream is alive and costs nothing. `wlverbose`
  * restores every line for debugging. */
-static int commit_say(void) {
+/* THE FIRST COMMIT OF EACH SURFACE IS NOT SPAM (M2328).
+ *
+ * The first cut of this rate limiter printed the first EIGHT commits and then
+ * throttled, which broke tests/run-wayland-tests.sh: the in-kernel
+ * surface-selection self-test commits several times during boot and spends
+ * that budget, so the REAL libwayland client's first commit -- the one
+ * carrying 0xff3366cc, which is the pixel the test greps for -- was never
+ * logged. The compositor was working perfectly and the suite said "the
+ * committed pixels did not arrive".
+ *
+ * That file warns about exactly this three lines above the assertion:
+ * "Changing a log line that a test greps for is a test-breaking change, and it
+ * belongs in the same commit as the line." I changed the line's frequency
+ * rather than its text, which is the same thing and harder to notice.
+ *
+ * A global count was the wrong unit anyway. What repeats is FRAMES of a
+ * surface already being logged; what matters is a surface committing for the
+ * first time, which is a structural event exactly like its creation. So key
+ * the budget on the surface and let every surface announce itself once. */
+#define WL_COMMIT_SEEN 64
+static int commit_say(unsigned sid) {
     static unsigned long n;
+    static unsigned seen[WL_COMMIT_SEEN]; static unsigned nseen;
     n++;
-    if (g_wl_verbose || n <= 8) return 1;
+    if (g_wl_verbose) return 1;
+    for (unsigned i = 0; i < nseen; i++) if (seen[i] == sid) goto repeat;
+    if (nseen < WL_COMMIT_SEEN) seen[nseen++] = sid;
+    return 1;                       /* this surface's first commit: always say so */
+repeat:
+    if (n <= 8) return 1;
     if ((n % 512) == 0) { kprintf("[wl] (commit log rate-limited: %lu frames so far)\n", n); return 1; }
     return 0;
 }
@@ -2002,6 +2028,20 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
             wl_surface_unmap(o);
             o->attach_set = 0;
             kprintf("[wl] commit: surface %u attached NULL -- unmapped\n", o->id);
+        } else if (o->attach_set && o->attached && !b) {
+            /* AN ATTACH THAT RESOLVES TO NOTHING WAS SILENT (M2328). A commit
+             * whose attached id is not a live wl_buffer took none of the
+             * branches below and logged nothing at all, so a client that
+             * committed a frame the compositor then dropped looked exactly
+             * like a client that never committed. */
+            kprintf("[wl] commit: surface %u attached object %u, which is NOT a live "
+                    "wl_buffer -- the frame is being DROPPED\n", o->id, o->attached);
+            o->attach_set = 0;
+        } else if (b && !(b->base && b->height && b->stride)) {
+            kprintf("[wl] commit: surface %u buffer %u is unusable (base %lx %ux%u stride %u) "
+                    "-- the frame is being DROPPED\n", o->id, b->id,
+                    (unsigned long)b->base, b->width, b->height, b->stride);
+            o->attach_set = 0;
         } else if (b && b->base && b->height && b->stride) {
             unsigned long need = (unsigned long)b->off + (unsigned long)b->stride * b->height;
             if (need <= b->size) {
@@ -2166,12 +2206,12 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                         if (need2 <= o->size && b->height && b->width)
                             mid = rd32(o->base + (unsigned long)(b->height / 2) * b->stride + (unsigned long)(b->width / 2) * 4);
                         if (loud)
-                            if (commit_say()) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
+                            if (commit_say(o->id)) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
                                     "%u/%u sampled pixels have colour (surface %u, %s)\n",
                                     b->width, b->height, b->stride, b->format, rd32(o->base), mid,
                                     nz, seen, o->id, wl_role_name(o->role));
                         else
-                            if (commit_say()) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
+                            if (commit_say(o->id)) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
                                     "(surface %u, %s)\n",
                                     b->width, b->height, b->stride, b->format, rd32(o->base),
                                     o->id, wl_role_name(o->role));

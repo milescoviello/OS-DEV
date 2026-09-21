@@ -376,16 +376,37 @@ static struct { uint8_t buf[ORING_MAX]; int len; uint64_t at; } g_oring[ORING_N]
  * non-TCP frames into the UDP queue, so a single lock would deadlock the
  * first time that happened. Same irq_save idiom as ooo_lock, because a frame
  * can be filed from a NIC interrupt as well as from a task. */
+/* `cli` IS PRIVILEGED, AND tests/net/net_test.c IS A USERSPACE PROGRAM (M2327).
+ *
+ * M2315 gave these queues an interrupt-safe spinlock and broke `make nettest`
+ * in the same stroke: the host fuzz harness #includes this file and runs it in
+ * ring 3, where `cli` faults. It has been red for four milestones because I
+ * did not run the suite after touching a .c that a host test includes -- which
+ * is a rule already written down in this project, and the second time today
+ * that skipping a cheap check cost more than running it would have.
+ *
+ * -ffreestanding makes __STDC_HOSTED__ 0 for the kernel and 1 for the harness,
+ * so the discriminator needs no new flag and cannot be forgotten at a call
+ * site. The host build keeps the atomic -- which is what the fuzzer exercises
+ * -- and drops only the interrupt masking, which is meaningless there. */
+#if __STDC_HOSTED__
+#  define RXQ_IRQ_SAVE(fl)     do { (fl) = 0; } while (0)
+#  define RXQ_IRQ_RESTORE(fl)  do { (void)(fl); } while (0)
+#else
+#  define RXQ_IRQ_SAVE(fl)     __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory")
+#  define RXQ_IRQ_RESTORE(fl)  __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc")
+#endif
+
 #define RXQ_LOCK(name) \
     static volatile int name##_lk; \
     static inline uint64_t name##_take_lk(void) { \
-        uint64_t fl; __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory"); \
+        uint64_t fl; RXQ_IRQ_SAVE(fl); \
         while (__atomic_exchange_n(&name##_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause"); \
         return fl; \
     } \
     static inline void name##_give_lk(uint64_t fl) { \
         __atomic_store_n(&name##_lk, 0, __ATOMIC_RELEASE); \
-        __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc"); \
+        RXQ_IRQ_RESTORE(fl); \
     }
 RXQ_LOCK(udpq)
 RXQ_LOCK(oring)
