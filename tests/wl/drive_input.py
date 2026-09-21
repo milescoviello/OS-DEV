@@ -25,7 +25,20 @@ import json, os, re, socket, sys, time
 SCREEN_W, SCREEN_H = 1280, 960
 WANT = (0x33, 0x66, 0xCC)          # the client's fill colour
 EXP_W, EXP_H = 64, 32
-OFF_X, OFF_Y = 20, 12              # where inside the surface we aim
+# AIM WHERE ONLY THE PARENT IS (M2332).
+#
+# This was (20,12), chosen when the client had ONE surface. M2094 then gave it
+# a 16x8 SUBSURFACE at +8,+4 -- which covers parent-relative x 8..23, y 4..11 --
+# so (20,12) sits on the child, and Wayland delivers motion to the topmost
+# surface under the cursor with coordinates relative to THAT surface. The
+# client dutifully reported child-relative numbers and the assertion called it
+# a compositor bug. The compositor was right; the aim point had quietly become
+# ambiguous when the test client grew a second surface.
+#
+# The parent is 64x32, so (40,20) is inside it and clear of the child by a wide
+# margin -- and still tests exactly what it meant to: that a screen coordinate
+# arrives at the client as the correct SURFACE-relative one.
+OFF_X, OFF_Y = 40, 20              # where inside the surface we aim (parent only)
 TOL = 3                            # abs-axis quantisation is lossy at 1/32767
 
 class Qmp:

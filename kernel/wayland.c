@@ -2205,16 +2205,38 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                         uint32_t mid = 0;
                         if (need2 <= o->size && b->height && b->width)
                             mid = rd32(o->base + (unsigned long)(b->height / 2) * b->stride + (unsigned long)(b->width / 2) * 4);
-                        if (loud)
-                            if (commit_say(o->id)) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
-                                    "%u/%u sampled pixels have colour (surface %u, %s)\n",
-                                    b->width, b->height, b->stride, b->format, rd32(o->base), mid,
-                                    nz, seen, o->id, wl_role_name(o->role));
-                        else
-                            if (commit_say(o->id)) kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
-                                    "(surface %u, %s)\n",
-                                    b->width, b->height, b->stride, b->format, rd32(o->base),
-                                    o->id, wl_role_name(o->role));
+                        /* BRACES, BECAUSE THE `else` BOUND TO THE WRONG `if` (M2332).
+                         *
+                         * This read `if (loud) if (say) A; else if (say) B;` --
+                         * and C attaches an `else` to the NEAREST `if`, which is
+                         * the inner one. So the real shape was
+                         *
+                         *     if (loud) { if (say) A; else B; }
+                         *
+                         * and when `loud` was false -- 63 commits out of 64 --
+                         * NOTHING was printed. M2094 split this in two precisely
+                         * so the line would print always and only the pixel scan
+                         * would be occasional; its own comment says "Print
+                         * always, scan occasionally". The missing braces quietly
+                         * reinstated the bug it was written to fix.
+                         *
+                         * That is why tests/run-wayland-tests.sh has been red:
+                         * it greps for the client's commit carrying 0xff3366cc,
+                         * the client commits once, and one commit is almost
+                         * never the 1-in-64. The compositor was working the
+                         * whole time and the log simply never said so. */
+                        if (commit_say(o->id)) {
+                            if (loud)
+                                kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
+                                        "%u/%u sampled pixels have colour (surface %u, %s)\n",
+                                        b->width, b->height, b->stride, b->format, rd32(o->base), mid,
+                                        nz, seen, o->id, wl_role_name(o->role));
+                            else
+                                kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x "
+                                        "(surface %u, %s)\n",
+                                        b->width, b->height, b->stride, b->format, rd32(o->base),
+                                        o->id, wl_role_name(o->role));
+                        }
                     }
                 }
             } else {
