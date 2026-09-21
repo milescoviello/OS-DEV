@@ -4887,6 +4887,7 @@ uint64_t app_sbrk(long inc) {
 /* Forward: defined next to app_munmap, which is its other caller. MAP_FIXED
  * and munmap are the same operation on the VMA list. */
 static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len);
+static int app_vma_carve_ex(struct app *a, uint64_t addr, uint64_t len, int except);
 
 /* The mmap window moved ABOVE 4 GiB and grew to 252 GiB (M1964).
  *
@@ -5190,11 +5191,54 @@ static uint64_t app_mmap_fixed_nl(uint64_t addr, uint64_t len) {
     /* MAP_FIXED REPLACES whatever is there -- that is its defining behaviour,
      * not a detail. Refusing on overlap (which is what this did) is what broke
      * ld.so: it reserves a span and then MAP_FIXEDs its segments into it. */
-    if (app_vma_carve(a, addr, len) != 0) return 0;
-    if (vma_full(a)) return 0;                        /* re-check: the carve may have split */
-    int vs0; VMA_NEW(a, vs0);
-    a->vma[vs0].start = addr;
-    a->vma[vs0].len   = len;
+    /* RESERVE THE RANGE BEFORE CARVING IT (M2329).
+     *
+     * This used to carve, then VMA_NEW, then write start/len -- three separate
+     * critical sections. VMA_NEW claims a SLOT, not a RANGE: it leaves
+     * start = 0, len = 1 until the caller fills it in. So a claimed-but-unfilled
+     * slot overlaps nothing, and two threads doing MAP_FIXED at the same
+     * address both carved (each blind to the other's claim) and both inserted.
+     * The fault report says it plainly:
+     *
+     *   ** 2 VMAs COVER THIS ADDRESS (vma[1415] 1c0800000+100000 and
+     *      vma[1416] 1c0800000+100000). Two allocations share it **
+     *
+     * That is how Firefox dies: glibc reserves a thread stack PROT_NONE and
+     * then maps the usable part read-write over it; the RW carve removes ONE
+     * of the twins, the surviving PROT_NONE VMA still covers the page, and the
+     * first write from the new thread faults on its own stack. It killed a DOM
+     * Worker in 3 of 12 real-page boots.
+     *
+     * The lock cannot simply be held across all three, because carve calls
+     * app_msync and can block on disk -- with interrupts off, that is a worse
+     * bug than the one being fixed. So publish the RANGE first, under the
+     * short lock, and carve afterwards: from the instant the slot is visible
+     * it overlaps, so a racing thread's find-gap and carve both see it.
+     * Ninth instance of this session's one bug class -- find, then fill, with
+     * the table unlocked in between.
+     */
+    int vs0 = -1;
+    {   uint64_t rf = vma_alloc_lock(a);
+        vs0 = vma_pick_slot(a);
+        if (vs0 >= 0) {
+            for (unsigned _b = 0; _b < sizeof a->vma[0]; _b++) ((char *)&a->vma[vs0])[_b] = 0;
+            a->vma[vs0].oline = (unsigned short)__LINE__;
+            a->vma[vs0].fidx = -1; a->vma[vs0].mfd = -1;
+            a->vma[vs0].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+            a->vma[vs0].start = addr;
+            a->vma[vs0].len   = len;          /* THE RESERVATION: a range, not a slot */
+            if (vs0 >= a->nvma) a->nvma = vs0 + 1;
+        }
+        vma_alloc_unlock(a, rf);
+    }
+    if (vs0 < 0) return 0;
+    if (app_vma_carve_ex(a, addr, len, vs0) != 0) {
+        uint64_t rf = vma_alloc_lock(a);      /* give the reservation back */
+        a->vma[vs0].start = 0; a->vma[vs0].len = 0;
+        a->vma[vs0].fidx = -1; a->vma[vs0].mfd = -1; a->vma[vs0].prot = 0;
+        vma_alloc_unlock(a, rf);
+        return 0;
+    }
     a->vma[vs0].sealed = 0;
     a->vma[vs0].uffd  = 0;
     a->vma[vs0].file_backed = 0;
@@ -5769,6 +5813,11 @@ static int app_tlb_sync(struct app *a) {
  * slots half way through would leave the address space describing memory that
  * is no longer mapped. Returns 0, or -1 with nothing changed. */
 static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
+    return app_vma_carve_ex(a, addr, len, -1);
+}
+/* `except` is a slot the caller has ALREADY reserved for this very range and
+ * must not carve out from under itself -- see app_mmap_fixed_nl (M2329). */
+static int app_vma_carve_ex(struct app *a, uint64_t addr, uint64_t len, int except) {
     if (!a || !len) return -1;
     uint64_t end = addr + len;
     if (end < addr) return -1;
@@ -5776,6 +5825,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
     /* --- pre-flight: refuse for the whole range or not at all --- */
     int extra = 0;                      /* VMA slots the splits will need */
     for (int i = 0; i < a->nvma; i++) {
+        if (i == except) continue;                              /* our own reservation (M2329) */
         uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
         if (end <= s0 || e0 <= addr) continue;                  /* no overlap */
         /* WHO TOOK A BITE OUT OF THE CAGE? A JS engine's pointer region is
@@ -5805,6 +5855,7 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
 
     /* --- mutate --- */
     for (int i = 0; i < a->nvma; ) {
+        if (i == except) { i++; continue; }                     /* our own reservation (M2329) */
         uint64_t s0 = a->vma[i].start, e0 = s0 + a->vma[i].len;
         if (end <= s0 || e0 <= addr) { i++; continue; }
         uint64_t cs = addr > s0 ? addr : s0, ce = end < e0 ? end : e0;
@@ -11930,8 +11981,17 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].used && a->fd[newfd].type == 8) inotify_free(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 10) net_tcp_sock_close(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
+    /* CLAIM newfd BEFORE WRITING IT, NOT AFTER (M2329). dup2 installs a
+     * descriptor without ever going through app_fd_claim, so between the
+     * struct copy starting and the claim bit being set, an allocator on
+     * another core can hand newfd out to somebody else -- and the copy itself
+     * is a memcpy, so `used` is not reliably 1 for its whole duration either.
+     * Both windows close by doing the claim and the copy under one lock. */
+    fdt_take();
+    app_fd_mark(a, newfd, 1);
     a->fd[newfd] = a->fd[oldfd];                                  /* newfd now references the same end */
-    app_fd_mark(a, newfd, 1);                                     /* claimed without going through app_fd_claim (M2326) */
+    a->fd[newfd].used = 1;
+    fdt_give();
     /* dup2 NEVER CARRIES FD_CLOEXEC (M2037). POSIX is explicit: the new
      * descriptor does not inherit the close-on-exec flag, whatever oldfd has;
      * only dup3(..., O_CLOEXEC) may ask for it, and this kernel does not even

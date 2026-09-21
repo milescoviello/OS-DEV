@@ -30,10 +30,22 @@ echo "   window at ~${i}s"; sleep 50
 BEFORE=$($SSH "grep -a 'toplevel title:' $D/boot.log | tail -1")
 echo "   title before: $BEFORE"
 shot before
-# The nav bar of that page sits near the top of the content area; click the
-# first nav link. Coordinates come from the rendered layout, not a guess:
-# the bar is the full-width strip under the notification bars.
-click 16000 4900
+# COORDINATES FROM THE RENDERED PAGE, NOT FROM A DESCRIPTION OF IT.
+#
+# The first version clicked (16000,4900), which on QEMU's 0..32767 absolute
+# axes is (625,143) of a 1280x960 screen -- the "security sandbox is disabled"
+# notification bar. There is no link there, so the test could not have passed,
+# and it reported the ambiguous "either the click missed a link, or navigation
+# did not happen" -- which is the correct thing for it to say and the reason
+# that wording is there.
+#
+# These come off a screendump of the page actually loaded: the in-paragraph
+# link is at about (637,632) in 1280x960, which is a large underlined target
+# rather than a 90x18 nav item, so a few pixels of layout drift cannot miss it.
+#   x = 637/1280 * 32768 = 16307     y = 632/960 * 32768 = 21572
+CLICK_X=${CLICK_X:-16307}
+CLICK_Y=${CLICK_Y:-21572}
+click $CLICK_X $CLICK_Y
 sleep 25
 shot after
 AFTER=$($SSH "grep -a 'toplevel title:' $D/boot.log | tail -1")
