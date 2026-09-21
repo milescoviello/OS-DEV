@@ -1,5 +1,58 @@
 # What's next
 
+> **(M2327-M2331) SIX RACES, FOUR BLIND INSTRUMENTS, AND FIREFOX AT 8/8
+> ON A REAL PAGE.**
+>
+> | | before | after |
+> |---|---|---|
+> | Firefox, real site, 8 cores | 3 crashes / 12 | **8 / 8 clean** |
+> | descriptors refused per boot | **78** | 0 |
+> | `claude -p`, 8 cores | 50% -> 86% | **6 / 6**, all < 60 s |
+> | link navigation | never tested | **works** |
+>
+> **Firefox was dying on its own thread stack.** The fault report named it:
+> *2 VMAs COVER THIS ADDRESS*. `VMA_NEW` claims a **slot**, not a **range** --
+> it leaves `start = 0, len = 1` until the caller fills it in, and an entry at
+> address 0 overlaps nothing. Two threads doing `MAP_FIXED` at one address
+> both carved, blind to each other, and both inserted. glibc allocates a
+> thread stack by reserving it `PROT_NONE` and mapping the usable part
+> read-write over the reservation; the read-write carve removed one twin, the
+> surviving `PROT_NONE` VMA still covered the page, and the worker faulted the
+> first time it touched its own stack. The lock could not simply be widened --
+> `app_vma_carve` calls `app_msync` and blocks on disk -- so the range is
+> published under the short lock first and everything *except* that slot is
+> carved afterwards.
+>
+> That is the **ninth** instance of one bug class: *find a free thing, fill it
+> in later, table unlocked in between.* Inode tables, block bitmaps, directory
+> blocks, the datagram queue, the overflow ring, the port allocator, the
+> descriptor allocator, `dup2`'s target, the address space.
+>
+> **Fixing one of them created the next.** M2325 turned the descriptor scan
+> into a real claim -- and `app_scm_recv` claims a descriptor *before*
+> checking whether one is waiting, then returns early when the queue is empty,
+> which is the ordinary case because libwayland asks for ancillary data on
+> every read. 908 of Firefox's 1021 descriptors were abandoned claims. The
+> audit missed it because it looked for error paths and this is the happy one.
+>
+> **Four instruments reported success for a failure.** `require` in the IPC
+> harness grepped for an assertion's message, which the guest prints for both
+> `[ ok ]` and `[FAIL]` -- so every check in that file said "ok:" for
+> assertions that had just failed. A commit-log rate limiter silenced the
+> exact line the Wayland suite greps for. `pve-run.sh` returned the previous
+> boot's `boot.log` when a run never started, which produced six fictional
+> "baseline" rows and one retracted regression claim. And the navigation test
+> blamed navigation for a window Firefox had crashed out of.
+>
+> **`make check` had been red since M2315** and nobody noticed -- including a
+> suite *I* broke by putting `cli` into a file a host test runs in ring 3.
+>
+> Still open: `waylandtest`. The lxwl client blocks in `ppoll` after creating
+> its subsurface and no `wl_surface.attach` is ever recorded, so its commit
+> takes no branch. Not the rate limiter and not a dropped frame -- both were
+> instrumented and ruled out. Red at `ead92303` too. Firefox, which uses the
+> same commit path including subsurfaces, is unaffected.
+
 > **(M2319-M2326) TWO THREADS, ONE DESCRIPTOR. The intermittent
 > `EAI_AGAIN` was never the network, and a packet capture is what proved
 > it.**
