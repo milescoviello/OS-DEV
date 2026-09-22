@@ -80,7 +80,7 @@ MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
 CLAUDE_BIN ?= $(shell readlink -f "$$(command -v claude 2>/dev/null)" 2>/dev/null)
 # Firefox's install directory. Staged whole -- see the rule below for why.
 FIREFOX_DIR ?= $(firstword $(wildcard /usr/lib64/firefox /usr/lib/firefox))
-EXT2SIZE := 3900M   # 512M -> 1500M -> 2200M -> 3200M -> 3900M (M2305/M2307).
+EXT2SIZE := 4600M   # 512M -> 1500M -> 2200M -> 3200M -> 3900M -> 4600M (M2305/M2307/M2371: gp108 firmware + headroom; the 500 MB-free guard fired at 443 MB).
 # AND NOT ONE BYTE OVER 4 GiB UNTIL THE 32-BIT OFFSET BUG IS FIXED (M2307).
 # 5200M was tried and it CORRUPTED THE FILESYSTEM: inode-table errors went
 # from 0 to 115 in one boot and Firefox died with SIGSEGV. 5200 MiB is
@@ -853,7 +853,36 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged
+
+# ---- NVIDIA GP108 signed firmware, for the from-scratch driver (M2371) ------
+# Pascal will not bring its graphics engine up without NVIDIA-signed falcon
+# microcode, so ACR/secboot needs these on the guest filesystem. They are
+# copied DEREFERENCED (-L): on this machine gp108's acr/, sec2/ and nvdec/
+# entries are symlinks into gp102/, and staging the links would put dangling
+# relative paths into an image that has no gp102 directory.
+#
+# The count is asserted. A partially-staged firmware set fails at falcon
+# upload time as an opaque hang; failing here names it instead.
+GP108_FW_SRC := /lib/firmware/nvidia/gp108
+GP108_FW_DST := $(LXROOT)/lib/firmware/nvidia/gp108
+$(LXROOT)/.fw-staged: $(LXROOT)/.tools-staged
+	@if [ -d $(GP108_FW_SRC) ]; then \
+	  rm -rf $(GP108_FW_DST); mkdir -p $(GP108_FW_DST); \
+	  cp -rL $(GP108_FW_SRC)/. $(GP108_FW_DST)/; \
+	  n=$$(find $(GP108_FW_DST) -type f | wc -l); \
+	  b=$$(du -sk $(GP108_FW_DST) | cut -f1); \
+	  if [ "$$n" -lt 20 ]; then \
+	    echo "  FATAL   only $$n gp108 firmware files staged, expected 20."; \
+	    echo "          ACR cannot authenticate a partial set; fix the source tree."; \
+	    exit 1; fi; \
+	  echo "  FW      gp108: $$n files, $$b KB (acr, gr, sec2, nvdec)"; \
+	else \
+	  echo "  FW      WARNING: $(GP108_FW_SRC) is absent -- the NVIDIA driver will"; \
+	  echo "          have no signed microcode and secboot cannot run."; \
+	fi
+	@touch $@
+
+$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged $(LXROOT)/.fw-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \

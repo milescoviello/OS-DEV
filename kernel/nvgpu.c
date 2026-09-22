@@ -26,9 +26,20 @@
 #define NV_VENDOR       0x10DE
 #define NV_PMC_BOOT_0   0x000000      /* chip id; readable before any init */
 
+/* Forward declarations, kept together. Adding a function that uses a helper
+ * defined further down has now broken this build three times; one block at
+ * the top is cheaper than rediscovering the order each time. */
+static uint32_t nv_reg_rd(uint32_t reg);
+static void     nv_reg_wr(uint32_t reg, uint32_t val);
+static unsigned nv_rd16(unsigned off);
+static uint32_t nv_rom32(unsigned o);
+static int      nvgpu_vbios_pramin(uint8_t *dst, unsigned len);
+int             g_nv_exec;
+
 static pci_device_t  nv;
 static volatile uint8_t *nv_bar0;
 static uint32_t      nv_boot0;
+static unsigned      g_nv_bit_i;     /* BIT 'I' offset, for the PMU args */
 static uint8_t      *nv_rom;
 static unsigned      nv_romlen;
 
@@ -152,19 +163,157 @@ static int nvgpu_vbios(void) {
     kprintf("[nv] VBIOS: matches the card -- the ROM is ours, and BAR0 is coherent "
             "3 MiB deep, not just at offset 0.\n");
 
-    /* Copy it into RAM once. Everything after this parses structures with
-     * back-references and bounds checks, and doing that against MMIO means
-     * every field read is a device access with the ROM shadow state having to
-     * be right at that instant. One copy, then plain memory. */
-    if (romlen == 0 || romlen > NV_PROM_SIZE) romlen = NV_PROM_SIZE;
+    /* COPY THE WHOLE APERTURE, NOT THE FIRST IMAGE (M2371).
+     *
+     * rom[2]*512 is the length of the FIRST PCIR image only, and an NVIDIA
+     * ROM is a chain of them -- image 0 here reports `last=false`. Sizing the
+     * copy that way gave 60416 bytes, and the PMU table pointer is 0xece4,
+     * 228 bytes past the end: "table pointer ece4 is outside the 60416-byte
+     * ROM". The bounds check caught it, which is the only reason this was a
+     * one-line diagnosis instead of a parser walking uninitialised heap.
+     *
+     * So take the whole 128 KiB PROM window. Reads past the real ROM return
+     * 0xff or 0, and every parser here bounds-checks against nv_romlen, so a
+     * larger window costs a bigger buffer and nothing else. */
+    romlen = NV_PROM_SIZE;
     nv_rom = (uint8_t *)kmalloc(romlen);
     if (!nv_rom) { kprintf("[nv] VBIOS: no memory for a %u-byte copy\n", romlen); return -1; }
     cfg50 = pci_read32(nv.bus, nv.slot, nv.func, 0x50);
     pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50 & ~1u);
-    for (unsigned k = 0; k < romlen; k++) nv_rom[k] = rom[k];
+    /* 32-BIT READS, NOT BYTE READS (M2371). nouveau's nvbios_prom copies the
+     * PROM aperture with nvkm_rd32; a byte-wise copy of an MMIO window is not
+     * guaranteed to return the same data, and this one already disagreed with
+     * an independent copy about byte 2 of the ROM header. Read dwords and
+     * split them, which is what every other consumer of this aperture does. */
+    {   volatile const uint32_t *r32 = (volatile const uint32_t *)rom;
+        for (unsigned k = 0; k + 3 < romlen; k += 4) {
+            uint32_t w = r32[k >> 2];
+            nv_rom[k+0] = (uint8_t)w; nv_rom[k+1] = (uint8_t)(w >> 8);
+            nv_rom[k+2] = (uint8_t)(w >> 16); nv_rom[k+3] = (uint8_t)(w >> 24);
+        }
+    }
     pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50);
     nv_romlen = romlen;
+
+    /* PREFER PRAMIN, AS NOUVEAU DOES. The PROM copy's BIT 'p' pointer lands
+     * in the EFI image on this card; the VRAM image is the self-consistent
+     * one. Only replace the PROM copy if PRAMIN actually returns a signed
+     * image -- a half-read window would be worse than the PROM copy. */
+    {   uint8_t *alt = (uint8_t *)kmalloc(NV_PROM_SIZE);
+        if (alt) {
+            if (nvgpu_vbios_pramin(alt, NV_PROM_SIZE) == 0) {
+                nv_rom = alt; nv_romlen = NV_PROM_SIZE;
+                kprintf("[nv] VBIOS: using the PRAMIN (VRAM) image\n");
+            } else {
+                kfree(alt);
+                kprintf("[nv] VBIOS: falling back to the PROM image\n");
+            }
+        }
+    }
+
+    /* DOES THE APERTURE MIRROR? (M2371) image 0 is 60416 bytes and a second
+     * "image" appears at exactly 0xec00 = 60416. That is suspicious: a PROM
+     * window that wraps at the ROM size would manufacture a fake image there,
+     * and would explain a BIT pointer of 0xece4 that lands on rubbish --
+     * 0xece4 would really be offset 0xe4. Compare the two regions instead of
+     * theorising: if they are byte-identical, the ROM is 60416 bytes and
+     * everything above it is an illusion. */
+    {   unsigned rl = (unsigned)nv_rom[2] * 512, same = 0, n = 0;
+        if (rl && rl + 256 <= nv_romlen) {
+            for (unsigned k = 0; k < 256; k++, n++) if (nv_rom[k] == nv_rom[rl + k]) same++;
+            kprintf("[nv] VBIOS: first 256 bytes vs the same at %x: %u/%u identical -- %s\n",
+                    rl, same, n, same == n
+                    ? "THE APERTURE MIRRORS. The ROM is one image; anything above it is a wrap."
+                    : "not a mirror, the region above image 0 is real data.");
+        }
+    }
+
+    /* Report the real extent by walking the PCIR image chain, so "the ROM is
+     * bigger than its first image" is visible rather than inferred. */
+    {   unsigned img = 0, total = 0;
+        for (int n = 0; n < 8 && img + 0x1a < nv_romlen; n++) {
+            if (nv_rom[img] != 0x55 || nv_rom[img+1] != 0xAA) break;
+            unsigned pc = img + ((unsigned)nv_rom[img+0x18] | ((unsigned)nv_rom[img+0x19] << 8));
+            if (pc + 0x16 >= nv_romlen || nv_rom[pc] != 'P' || nv_rom[pc+1] != 'C' ||
+                nv_rom[pc+2] != 'I' || nv_rom[pc+3] != 'R') break;
+            unsigned ilen = ((unsigned)nv_rom[pc+0x10] | ((unsigned)nv_rom[pc+0x11] << 8)) * 512;
+            unsigned ctype = nv_rom[pc+0x14], last = nv_rom[pc+0x15] & 0x80;
+            /* NPDE OVERRIDES PCIR (nouveau's nvbios_imagen). For any image
+             * that is not code type 0x70, NVIDIA puts the authoritative size
+             * and last-image flag in an NPDE structure sitting just past the
+             * PCIR header, 16-byte aligned. Trusting PCIR alone gets image
+             * boundaries wrong, and image boundaries are how a pointer that
+             * lands "past the end" is judged. */
+            if (ctype != 0x70) {
+                unsigned phdr = (unsigned)nv_rom[pc+0x0a] | ((unsigned)nv_rom[pc+0x0b] << 8);
+                unsigned np = (pc + phdr + 0x0f) & ~0x0fu;
+                if (np + 0x0b < nv_romlen && nv_rom[np] == 'N' && nv_rom[np+1] == 'P' &&
+                    nv_rom[np+2] == 'D' && nv_rom[np+3] == 'E') {
+                    ilen = ((unsigned)nv_rom[np+8] | ((unsigned)nv_rom[np+9] << 8)) * 512;
+                    last = nv_rom[np+0x0a] & 0x80;
+                }
+            }
+            kprintf("[nv] VBIOS: image %d @ %x, %u bytes, code type %02x%s\n",
+                    n, img, ilen, ctype, last ? " (last)" : "");
+            total = img + ilen;
+            if (last || !ilen) break;
+            img += ilen;
+        }
+        kprintf("[nv] VBIOS: %u bytes of images in a %u-byte window\n", total, nv_romlen);
+    }
     return 0;
+}
+
+
+/* ------------------------------------------------------ VBIOS: PRAMIN ---
+ *
+ * nouveau tries VBIOS sources in order and PRAMIN comes BEFORE PROM:
+ *   { nvbios_of }, { nvbios_ramin }, { nvbios_prom }, { acpi }, ...
+ * PRAMIN is the image the card itself placed in VRAM when it POSTed, and its
+ * internal pointers are the self-consistent ones. The PROM copy on this card
+ * is NOT: its BIT 'p' entry points at 0xece4, which is 228 bytes inside the
+ * ROM's second (EFI) image, and the bytes there are high-entropy rubbish
+ * rather than a PMU table. The pointer read is right -- proved by dumping
+ * the bytes it came from, e4 ec 00 00 -- so the image is the thing that is
+ * wrong, and reading the source nouveau actually prefers is the fix.
+ *
+ * Sequence, from shadowramin.c, for GM100+ (Pascal is GM100+):
+ *   addr = rd32(0x021c04);            bit 0 set  -> display disabled, no PRAMIN
+ *   addr = rd32(0x619f04);            !(bit 3)   -> window not enabled
+ *                                     (addr & 3) != 1 -> not in VRAM
+ *   addr = (addr & 0xffffff00) << 8;  if 0: addr = (rd32(0x001700) << 16) + 0xf0000
+ *   save 0x001700, set it to addr >> 16, read dwords from 0x700000 + i, restore.
+ *
+ * It writes one register (the PRAMIN window) and puts it back unconditionally,
+ * including on every early return -- leaving that window moved would silently
+ * change what every later PRAMIN access sees. */
+static int nvgpu_vbios_pramin(uint8_t *dst, unsigned len) {
+    if (!nv_bar0) return -1;
+    uint32_t a = nv_reg_rd(0x021c04);
+    if (a & 1) { kprintf("[nv] PRAMIN: display disabled (0x021c04=%x)\n", a); return -1; }
+    a = nv_reg_rd(0x619f04);
+    if (!(a & 8))       { kprintf("[nv] PRAMIN: window not enabled (0x619f04=%x)\n", a); return -1; }
+    if ((a & 3) != 1)   { kprintf("[nv] PRAMIN: image not in VRAM (0x619f04=%x)\n", a); return -1; }
+    uint64_t addr = (uint64_t)(a & 0xffffff00u) << 8;
+    if (!addr) addr = ((uint64_t)nv_reg_rd(0x001700) << 16) + 0xf0000;
+
+    /* NOT GATED BEHIND nvexec, deliberately. This moves the PRAMIN window and
+     * puts it straight back; nouveau does exactly this on every boot. The
+     * nvexec gate exists to stop UPLOADING AND EXECUTING MICROCODE on a
+     * misunderstanding -- applying it to a restored read window would leave
+     * the driver unable to read the only self-consistent VBIOS it has, which
+     * blocks every later step for no safety gained. */
+    uint32_t saved = nv_reg_rd(0x001700);
+    *(volatile uint32_t *)(nv_bar0 + 0x001700) = (uint32_t)(addr >> 16);
+    for (unsigned i = 0; i + 3 < len && i < 0x100000; i += 4) {
+        uint32_t w = *(volatile uint32_t *)(nv_bar0 + 0x700000 + i);
+        dst[i+0] = (uint8_t)w;       dst[i+1] = (uint8_t)(w >> 8);
+        dst[i+2] = (uint8_t)(w >> 16); dst[i+3] = (uint8_t)(w >> 24);
+    }
+    *(volatile uint32_t *)(nv_bar0 + 0x001700) = saved;   /* always restored */
+    kprintf("[nv] PRAMIN: read %u bytes from VRAM image at %lx (window restored)\n",
+            len, (unsigned long)addr);
+    return (dst[0] == 0x55 && dst[1] == 0xAA) ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ BIT --
@@ -180,6 +329,7 @@ static int nvgpu_vbios(void) {
  * 'I' entry at off 0x02b3 len 34. 16 of 17 ids are ASCII letters -- that
  * ratio is the check, because a misparse destroys it immediately. */
 static int nvgpu_devinit_tables(unsigned bit_i_off, unsigned bit_i_len);
+static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p_ver);
 
 static int nvgpu_bit(void) {
     if (!nv_rom) return -1;
@@ -197,12 +347,16 @@ static int nvgpu_bit(void) {
     }
 
     unsigned letters = 0, init_off = 0, init_len = 0;
+    unsigned pmu_off = 0, pmu_len = 0, pmu_ver = 0;
     for (unsigned e = 0; e < nent; e++) {
         const uint8_t *q = nv_rom + bit + hlen + e * esz;
         uint8_t id = q[0];
         if ((id >= 'A' && id <= 'Z') || (id >= 'a' && id <= 'z')) letters++;
         if (id == 'I') { init_len = (unsigned)q[2] | ((unsigned)q[3] << 8);
                          init_off = (unsigned)q[4] | ((unsigned)q[5] << 8); }
+        if (id == 'p') { pmu_ver = q[1];
+                         pmu_len = (unsigned)q[2] | ((unsigned)q[3] << 8);
+                         pmu_off = (unsigned)q[4] | ((unsigned)q[5] << 8); }
     }
     kprintf("[nv] BIT at %x: %u entries of %u bytes (header %u), %u/%u ids are letters\n",
             bit, nent, esz, hlen, letters, nent);
@@ -213,7 +367,10 @@ static int nvgpu_bit(void) {
     if (!init_off) { kprintf("[nv] BIT: no 'I' entry -- no devinit scripts to run.\n"); return -1; }
     kprintf("[nv] BIT: 'I' (devinit) at %x, %u bytes -- devinit has something to execute.\n",
             init_off, init_len);
+    g_nv_bit_i = init_off;
     nvgpu_devinit_tables(init_off, init_len);
+    if (pmu_off) nvgpu_pmu_find(pmu_off, pmu_len, pmu_ver);
+    else kprintf("[nv] pmu: no BIT 'p' entry -- no PMU applications in this ROM.\n");
     return 0;
 }
 
@@ -331,7 +488,6 @@ static int nv_walk(unsigned at, int depth, uint8_t *seen, unsigned *subs, int *n
  * and PRINTS them without touching the hardware unless -append nvexec says
  * otherwise. A trace that looks right is the prerequisite for letting it
  * write, not a substitute for it. */
-int g_nv_exec;                       /* -append nvexec: actually write */
 
 static uint32_t nv_rom32(unsigned o) {
     if (!nv_rom || o + 3 >= nv_romlen) return 0;
@@ -443,6 +599,205 @@ static void nvgpu_devinit_scope(unsigned script0) {
     kprintf("[nv] devinit: opcodes used:");
     for (int i = 0; i < 256; i++) if (seen[i]) kprintf(" %02x%s", i, nv_oplen[i] ? "" : "*");
     kprintf("   (* = variable-length)\n");
+}
+
+
+/* ------------------------------------------------------------- PMU ------
+ *
+ * GP108's devinit is a PMU application stored in the VBIOS, so finding it is
+ * the prerequisite for falcon bring-up. The chain, from nouveau's pmu.c:
+ *
+ *   BIT 'p' (version 2, length >= 4)  ->  u32 at +0x00 = PMU table
+ *   table: +0 ver, +1 header_len, +2 entry_len, +3 entry_count
+ *   entry: +0x00 type (u8), +0x02 data (u32)
+ *   type 0x04 = DEVINIT, 0x01 = PRE_OS
+ *   descriptor at `data`:
+ *     +0x08 init_addr_pmu   +0x0c args_addr_pmu
+ *     boot: rom data+0x30, pmu u32(+0x10)+u32(+0x18), size u32(+0x1c)-u32(+0x18)
+ *     code: follows boot in both spaces, size u32(+0x20)
+ *     data: rom data+0x30+u32(+0x24), pmu u32(+0x28), size u32(+0x2c)
+ *
+ * Every field is bounds-checked against the ROM and the sizes sanity-checked:
+ * microcode is kilobytes, so a "size" of 0 or several megabytes means the
+ * descriptor was misread, and saying so beats uploading rubbish to a falcon. */
+
+/* ------------------------------------------------- PMU falcon upload ---
+ *
+ * gm200_devinit_post's sequence, which is what GP108 actually uses. Register
+ * offsets are the PMU falcon at 0x10a000 plus nouveau's falcon offsets:
+ *
+ *   reset:  mask(0x10a048, 3, 0); wr(0x10a014, ~0); <PMC toggle>;
+ *           mask(0x10a040, 0, 0); wait !(rd(0x10a10c) & 6); wr(0x10a084, PMC_BOOT_0)
+ *   code:   wr(0x10a180, 0x01000000 | (sec ? 0x10000000 : 0) | dst)
+ *           per 0x100: wr(0x10a188, (dst + i) >> 8);  each word: wr(0x10a184, w)
+ *           pad with zeros to the next 0x100 boundary
+ *   data:   wr(0x10a1c0, 0x01000000 | dst);  each word: wr(0x10a1c4, w)
+ *   args:   wr(0x10a1c0, argp); wr(0x10a1c0, rd(0x10a1c4) + argi); rd(0x10a1c4)
+ *   exec:   wr(0x10a104, init_addr); wr(0x10a10c, 0); wr(0x10a100, 2)
+ *           then wait for 0x10a040 & 0x2000, having set 0x10a040 = 0x5000
+ *
+ * DRY RUN unless -append nvexec. In dry run this counts and describes every
+ * transfer without issuing one: uploading microcode to a falcon on a live
+ * GPU, from a driver whose first attempt at this file got two format strings
+ * and a table layout wrong, is not something to do on a hunch. */
+#define PMU_BASE 0x10a000
+
+static void pmu_wr(uint32_t reg, uint32_t val) { nv_reg_wr(reg, val); }
+static uint32_t pmu_rd(uint32_t reg) { return nv_reg_rd(reg); }
+
+static unsigned nv_pmu_code(uint32_t dst, unsigned img, unsigned len, int sec) {
+    unsigned words = 0;
+    pmu_wr(PMU_BASE + 0x180, 0x01000000u | (sec ? 0x10000000u : 0u) | dst);
+    unsigned i = 0;
+    for (; i < len; i += 4) {
+        if ((i & 0xff) == 0) pmu_wr(PMU_BASE + 0x188, (dst + i) >> 8);
+        pmu_wr(PMU_BASE + 0x184, nv_rom32(img + i));
+        words++;
+    }
+    while (i & 0xff) { pmu_wr(PMU_BASE + 0x184, 0); i += 4; words++; }   /* pad */
+    return words;
+}
+static unsigned nv_pmu_data(uint32_t dst, unsigned img, unsigned len) {
+    unsigned words = 0;
+    pmu_wr(PMU_BASE + 0x1c0, 0x01000000u | dst);
+    for (unsigned i = 0; i < len; i += 4) { pmu_wr(PMU_BASE + 0x1c4, nv_rom32(img + i)); words++; }
+    return words;
+}
+static uint32_t nv_pmu_args(uint32_t argp, uint32_t argi) {
+    pmu_wr(PMU_BASE + 0x1c0, argp);
+    pmu_wr(PMU_BASE + 0x1c0, pmu_rd(PMU_BASE + 0x1c4) + argi);
+    return pmu_rd(PMU_BASE + 0x1c4);
+}
+
+/* Upload and (optionally) run the VBIOS DEVINIT application. */
+static int nvgpu_pmu_devinit(unsigned da, unsigned bit_i_off) {
+    unsigned boot_rom = da + 0x30;
+    uint32_t boot_pmu = nv_rom32(da + 0x10) + nv_rom32(da + 0x18);
+    unsigned boot_sz  = nv_rom32(da + 0x1c) - nv_rom32(da + 0x18);
+    unsigned code_sz  = nv_rom32(da + 0x20);
+    unsigned data_rom = da + 0x30 + nv_rom32(da + 0x24);
+    uint32_t data_pmu = nv_rom32(da + 0x28);
+    unsigned data_sz  = nv_rom32(da + 0x2c);
+    uint32_t init_pmu = nv_rom32(da + 0x08), args_pmu = nv_rom32(da + 0x0c);
+
+    kprintf("[nv] pmu: %s DEVINIT\n", g_nv_exec
+            ? "** UPLOADING AND EXECUTING **" : "dry run (no register is written)");
+
+    if (g_nv_exec) {                      /* falcon reset, per gm200_flcn_* */
+        pmu_wr(PMU_BASE + 0x048, pmu_rd(PMU_BASE + 0x048) & ~3u);
+        pmu_wr(PMU_BASE + 0x014, 0xFFFFFFFFu);
+        pmu_wr(PMU_BASE + 0x040, pmu_rd(PMU_BASE + 0x040));
+        int ok = 0;
+        for (int t = 0; t < 100000; t++)
+            if (!(pmu_rd(PMU_BASE + 0x10c) & 6)) { ok = 1; break; }
+        if (!ok) { kprintf("[nv] pmu: memory scrubbing never finished -- falcon not ready\n"); return -1; }
+        pmu_wr(PMU_BASE + 0x084, nv_boot0);
+    }
+
+    unsigned wb = nv_pmu_code(boot_pmu, boot_rom, boot_sz, 0);
+    unsigned wc = nv_pmu_code(boot_pmu + boot_sz, boot_rom + boot_sz, code_sz, 1);
+    unsigned wd = nv_pmu_data(data_pmu, data_rom, data_sz);
+    kprintf("[nv] pmu:   boot %u word(s) -> %x | code %u -> %x | data %u -> %x\n",
+            wb, boot_pmu, wc, boot_pmu + boot_sz, wd, data_pmu);
+
+    /* Tables and boot scripts the DEVINIT app needs, from BIT 'I'. */
+    if (g_nv_exec) {
+        uint32_t at = nv_pmu_args(args_pmu + 0x08, 0x08);
+        nv_pmu_data(at, nv_rd16(bit_i_off + 0x14), nv_rd16(bit_i_off + 0x16));
+        uint32_t bs = nv_pmu_args(args_pmu + 0x08, 0x10);
+        nv_pmu_data(bs, nv_rd16(bit_i_off + 0x18), nv_rd16(bit_i_off + 0x1a));
+        pmu_wr(0x10a040, 0x00005000);
+        pmu_wr(PMU_BASE + 0x104, init_pmu);
+        pmu_wr(PMU_BASE + 0x10c, 0x00000000);
+        pmu_wr(PMU_BASE + 0x100, 0x00000002);
+        int done = 0;
+        for (int t = 0; t < 2000000; t++)
+            if (pmu_rd(0x10a040) & 0x00002000) { done = 1; break; }
+        kprintf("[nv] pmu: DEVINIT %s (0x10a040 = %x)\n",
+                done ? "SIGNALLED COMPLETE" : "TIMED OUT", pmu_rd(0x10a040));
+        return done ? 0 : -1;
+    }
+    kprintf("[nv] pmu:   would then load tables from BIT 'I' +14/+16 (%x/%u) and boot "
+            "scripts +18/+1a (%x/%u), set 0x10a040=0x5000, exec at %x and wait for "
+            "bit 0x2000\n", nv_rd16(bit_i_off + 0x14), nv_rd16(bit_i_off + 0x16),
+            nv_rd16(bit_i_off + 0x18), nv_rd16(bit_i_off + 0x1a), init_pmu);
+    return 0;
+}
+
+static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p_ver) {
+    if (bit_p_ver != 2 || bit_p_len < 4) {
+        kprintf("[nv] pmu: BIT 'p' is version %u length %u; nouveau requires v2 len>=4\n",
+                bit_p_ver, bit_p_len);
+        return -1;
+    }
+    unsigned tbl = nv_rom32(bit_p_off);
+    /* Show the bytes the pointer came from and the bytes it lands on. The
+     * first attempt read 0xece4, which is 228 bytes into the ROM's SECOND
+     * (EFI) image rather than a PMU table, and produced 219 entries of noise
+     * -- with only the decoded values printed there is no way to tell a
+     * misread pointer from a misread table. */
+    kprintf("[nv] pmu: BIT 'p' @ %x: %02x %02x %02x %02x %02x %02x -> table %x\n",
+            bit_p_off, nv_rom[bit_p_off], nv_rom[bit_p_off+1], nv_rom[bit_p_off+2],
+            nv_rom[bit_p_off+3], nv_rom[bit_p_off+4], nv_rom[bit_p_off+5], tbl);
+    if (tbl && tbl + 16 < nv_romlen)
+        kprintf("[nv] pmu: bytes at %x: %02x %02x %02x %02x %02x %02x %02x %02x "
+                "%02x %02x %02x %02x %02x %02x %02x %02x\n", tbl,
+                nv_rom[tbl+0],nv_rom[tbl+1],nv_rom[tbl+2],nv_rom[tbl+3],
+                nv_rom[tbl+4],nv_rom[tbl+5],nv_rom[tbl+6],nv_rom[tbl+7],
+                nv_rom[tbl+8],nv_rom[tbl+9],nv_rom[tbl+10],nv_rom[tbl+11],
+                nv_rom[tbl+12],nv_rom[tbl+13],nv_rom[tbl+14],nv_rom[tbl+15]);
+    if (!tbl || tbl >= nv_romlen) {
+        kprintf("[nv] pmu: table pointer %x is outside the %u-byte ROM\n", tbl, nv_romlen);
+        return -1;
+    }
+    unsigned ver = nv_rom[tbl], hdr = nv_rom[tbl+1], len = nv_rom[tbl+2], cnt = nv_rom[tbl+3];
+    kprintf("[nv] pmu: table @ %x  ver %02x header %u entry %u count %u\n",
+            tbl, ver, hdr, len, cnt);
+    if (!len || !cnt || tbl + hdr + cnt * len > nv_romlen) {
+        kprintf("[nv] pmu: that header does not fit the ROM -- misparse, not data.\n");
+        return -1;
+    }
+    if (cnt > 32 || hdr > 64 || len > 64) {
+        kprintf("[nv] pmu: header %u entries of %u bytes is not a PMU table -- "
+                "refusing to print %u lines of noise.\n", cnt, len, cnt);
+        return -1;
+    }
+    int found = 0;
+    for (unsigned i = 0; i < cnt; i++) {
+        unsigned e = tbl + hdr + i * len;
+        unsigned type = nv_rom[e], da = nv_rom32(e + 2);
+        const char *what = type == 0x04 ? "  <-- DEVINIT" : type == 0x01 ? "  <-- PRE_OS" : "";
+        kprintf("[nv] pmu:   [%u] type %02x data %x%s\n", i, type, da, what);
+        if (type != 0x04) continue;
+        if (!da || da + 0x30 > nv_romlen) {
+            kprintf("[nv] pmu:   DEVINIT descriptor at %x is out of range\n", da);
+            continue;
+        }
+        unsigned boot_rom = da + 0x30;
+        unsigned boot_pmu = nv_rom32(da + 0x10) + nv_rom32(da + 0x18);
+        unsigned boot_sz  = nv_rom32(da + 0x1c) - nv_rom32(da + 0x18);
+        unsigned code_sz  = nv_rom32(da + 0x20);
+        unsigned data_rom = da + 0x30 + nv_rom32(da + 0x24);
+        unsigned data_pmu = nv_rom32(da + 0x28);
+        unsigned data_sz  = nv_rom32(da + 0x2c);
+        kprintf("[nv] pmu:     init_addr_pmu %x  args_addr_pmu %x\n",
+                nv_rom32(da + 0x08), nv_rom32(da + 0x0c));
+        kprintf("[nv] pmu:     boot: rom %x -> pmu %x, %u bytes\n", boot_rom, boot_pmu, boot_sz);
+        kprintf("[nv] pmu:     code: rom %x -> pmu %x, %u bytes\n",
+                boot_rom + boot_sz, boot_pmu + boot_sz, code_sz);
+        kprintf("[nv] pmu:     data: rom %x -> pmu %x, %u bytes\n", data_rom, data_pmu, data_sz);
+        /* Microcode is kilobytes. Anything else means a misread descriptor. */
+        int sane = boot_sz && boot_sz < 0x10000 && code_sz && code_sz < 0x40000 &&
+                   data_sz < 0x40000 && boot_rom + boot_sz + code_sz <= nv_romlen &&
+                   data_rom + data_sz <= nv_romlen;
+        kprintf("[nv] pmu:     %s\n", sane
+                ? "sizes and ranges are sane -- this is a real PMU image to upload."
+                : "** THESE SIZES ARE NOT PLAUSIBLE. Do not upload this. **");
+        found = sane;
+        if (sane) nvgpu_pmu_devinit(da, g_nv_bit_i);
+    }
+    if (!found) kprintf("[nv] pmu: no usable DEVINIT (type 0x04) application found.\n");
+    return found ? 0 : -1;
 }
 
 static int nvgpu_devinit_tables(unsigned bit_i_off, unsigned bit_i_len) {
