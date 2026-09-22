@@ -3194,32 +3194,6 @@ void app_write_to(app_t *dest, const char *buf, unsigned len) {
                         (unsigned long)timer_ms(),
                         g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
             }
-            /* THE ALT-SCREEN MARKER MUST NOT REQUIRE THE WRITER TO BE CLAUDE
-             * (M2359). First cut keyed both markers on the writing process's
-             * exe, and neither fired on a boot where the TUI demonstrably came
-             * up -- the screendump shows Claude's own trust prompt drawn in the
-             * shell window. The reason: an interactive program writes through a
-             * PTY and the bytes reach this funnel attributed to the SHELL that
-             * owns the window, not to the program that produced them.
-             *
-             * `ESC [ ? 1 0 4 9 h` is specific enough on its own -- nothing else
-             * in this system asks for the alternate screen -- so match it from
-             * any writer and name the exe rather than filtering on it. An
-             * instrument that only fires when it already knows the answer is
-             * not measuring anything. */
-            if (!said_alt) {
-                for (unsigned long i = 0; i + 7 < (unsigned long)len; i++)
-                    if (buf[i] == 0x1b && buf[i+1] == '[' && buf[i+2] == '?' &&
-                        buf[i+3] == '1' && buf[i+4] == '0' && buf[i+5] == '4' &&
-                        buf[i+6] == '9' && buf[i+7] == 'h') {
-                        said_alt = 1;
-                        kprintf("[tui] ALT SCREEN at %lu ms since boot by \"%s\" -- "
-                                "TIME TO PROMPT %lu ms after the last claude launch\n",
-                                (unsigned long)timer_ms(), exe ? exe : "?",
-                                g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
-                        break;
-                    }
-            }
         }
     }
     grid_write(a, buf, len);      /* the SAME terminal a native app writes to (M2004) */
@@ -4387,6 +4361,40 @@ long app_console_nread(void) {
  * dropped rather than resynchronised into text: a terminal that prints the
  * pieces of a broken character is noisier than one that prints nothing. */
 void grid_write(struct app *a, const char *buf, unsigned len) {
+    /* TIME-TO-PROMPT, IN THE ONE FUNNEL EVERY TERMINAL BYTE PASSES (M2359).
+     *
+     * Two earlier attempts put this in `app_write_to` and neither fired on a
+     * boot where Claude Code's TUI provably came up -- the screendump shows
+     * its trust dialog drawn in an OS-DEV shell window. `app_write_to` is the
+     * LINUX-ABI write funnel, and the path here is not that: Claude writes to
+     * a pty, the OS-DEV shell -- a NATIVE ring-3 app -- reads it and paints
+     * it, and a native write never touches the Linux funnel at all.
+     *
+     * `grid_write` is where both routes meet, which is why the mirror for
+     * guest output was moved into this area in the first place. The lesson,
+     * for the third time this session: find the funnel by reading the code
+     * path, not by picking the function whose name matches the concept.
+     *
+     * `ESC [ ? 1 0 4 9 h` is a TUI taking over the terminal -- the moment a
+     * prompt is about to be drawn, and the closest thing to "ready" that does
+     * not require reading pixels. Nothing else in this system asks for the
+     * alternate screen, so it needs no filter on who wrote it. */
+    {   static int said_alt;
+        extern unsigned long g_claude_exec_ms;
+        if (!said_alt && len >= 8) {
+            for (unsigned i = 0; i + 7 < len; i++)
+                if (buf[i] == 0x1b && buf[i+1] == '[' && buf[i+2] == '?' &&
+                    buf[i+3] == '1' && buf[i+4] == '0' && buf[i+5] == '4' &&
+                    buf[i+6] == '9' && buf[i+7] == 'h') {
+                    said_alt = 1;
+                    kprintf("[tui] ALT SCREEN at %lu ms since boot -- TIME TO PROMPT "
+                            "%lu ms after the last claude launch\n",
+                            (unsigned long)timer_ms(),
+                            g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
+                    break;
+                }
+        }
+    }
     if (!a) return;
     for (unsigned i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)buf[i];
