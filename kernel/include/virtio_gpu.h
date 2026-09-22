@@ -65,3 +65,14 @@ int virtio_gpu_present(int x, int y, int w, int h);
  * whole screen, and log each control command's response code, asserting every
  * one is VIRTIO_GPU_RESP_OK_*. No-op (logs "none attached") if no device. */
 void virtio_gpu_selftest(void);
+
+/* ---- 3D / virgl (M2346) ---------------------------------------------------
+ * `virtio_gpu_has_3d()` is TWO facts and-ed together: the device offered and we
+ * accepted VIRTIO_GPU_F_VIRGL, AND it then reported a non-empty capset. They
+ * come apart in practice -- QEMU built with virglrenderer but unable to create
+ * a host GL context offers the bit and reports zero capsets -- so a caller that
+ * checked only the feature would claim 3D and then fail on the first draw. */
+int      virtio_gpu_has_3d(void);
+uint32_t virtio_gpu_capset_id(void);
+uint32_t virtio_gpu_capset_ver(void);
+uint32_t virtio_gpu_capset_size(void);

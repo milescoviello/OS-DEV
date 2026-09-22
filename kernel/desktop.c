@@ -1542,6 +1542,8 @@ static void restore_scene_rect(int x, int y, int w, int h) {
 /* Copy the cached scene to the back buffer, draw the cursor on top, and blit
  * the whole screen. Used whenever the scene itself changed. */
 static uint64_t g_fr_render, g_fr_present; static unsigned g_fr_n;
+static unsigned long g_fr_t0;   /* wall ms at the start of this 300-frame window (M2344) */
+static uint64_t g_pf_draw, g_pf_pres; static unsigned g_pf_n; static unsigned long g_pf_t0;  /* the PARTIAL path, which is the hot one (M2345) */
 static inline uint64_t rdtsc_now(void) {
     unsigned lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
@@ -3230,6 +3232,17 @@ void desktop_run(void) {
         if (!dirty && wl_only) {
             /* Only client content moved: redraw those windows and whatever
              * sits above them, then present. No wallpaper, no taskbar. */
+            /* AND THIS IS THE PATH THAT ACTUALLY RUNS WHEN A BROWSER ANIMATES,
+             * AND IT WAS NEVER MEASURED (M2345).
+             *
+             * The [frame] line below lives inside `if (dirty)`, so the number
+             * everything has been reasoned from all week -- 1.9 ms a frame,
+             * ~500 fps of headroom, "the compositor is not the problem" -- is
+             * the cost of a FULL SCENE REDRAW. A client committing 100 frames a
+             * second takes this branch instead, and the cost of this branch was
+             * not in any budget. Same shape, its own counters, so the two can
+             * be compared rather than conflated. */
+            uint64_t p0 = rdtsc_now();
             fb_set_target(scenebuf);
             for (int i = 0; i < win_count; i++) {
                 if (windows[i].minimized) continue;
@@ -3242,7 +3255,20 @@ void desktop_run(void) {
                         above_wl = 1;
                 if (is_wl || above_wl) draw_window(&windows[i], i == win_count - 1);
             }
+            uint64_t p1 = rdtsc_now();
             present_frame();
+            uint64_t p2 = rdtsc_now();
+            g_pf_draw += p1 - p0; g_pf_pres += p2 - p1; g_pf_n++;
+            if (g_pf_n == 300) {
+                unsigned long now = timer_ms();
+                unsigned long dt = g_pf_t0 && now > g_pf_t0 ? now - g_pf_t0 : 0;
+                kprintf("[frame] PARTIAL (client content only): 300 in %lu ms = %lu fps, "
+                        "draw %lu Mcyc, present %lu Mcyc\n",
+                        dt, dt ? 300000ul / dt : 0,
+                        (unsigned long)(g_pf_draw / 1000000),
+                        (unsigned long)(g_pf_pres / 1000000));
+                g_pf_n = 0; g_pf_draw = 0; g_pf_pres = 0; g_pf_t0 = now;
+            }
         }
         if (dirty) {
             /* WHERE A FRAME ACTUALLY GOES (M2312). After M2311 a frame is a
@@ -3258,13 +3284,21 @@ void desktop_run(void) {
             uint64_t t2 = rdtsc_now();
             g_fr_render += t1 - t0; g_fr_present += t2 - t1; g_fr_n++;
             if (g_fr_n == 300) {
-                kprintf("[frame] 300 frames: render %lu Mcyc, present %lu Mcyc "
-                        "(%lu%% of the frame is the scene draw)\n",
+                /* AND THE RATE, NOT JUST THE COST (M2344). Cost per frame says
+                 * what the compositor COULD sustain; it cannot say what it
+                 * actually did, and those differ by whatever the loop waits
+                 * for between frames. 300 frames over a wall interval is the
+                 * number a human would call the frame rate. */
+                unsigned long now = timer_ms();
+                unsigned long dt = g_fr_t0 && now > g_fr_t0 ? now - g_fr_t0 : 0;
+                kprintf("[frame] 300 frames in %lu ms = %lu fps: render %lu Mcyc, "
+                        "present %lu Mcyc (%lu%% of the frame is the scene draw)\n",
+                        dt, dt ? 300000ul / dt : 0,
                         (unsigned long)(g_fr_render / 1000000),
                         (unsigned long)(g_fr_present / 1000000),
                         (unsigned long)(g_fr_render * 100 /
                                         (g_fr_render + g_fr_present + 1)));
-                g_fr_n = 0; g_fr_render = 0; g_fr_present = 0;
+                g_fr_n = 0; g_fr_render = 0; g_fr_present = 0; g_fr_t0 = now;
             }
         }
 

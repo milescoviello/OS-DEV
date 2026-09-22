@@ -145,8 +145,38 @@ struct vring_used {
 #define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
 #define VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING 0x0107
 
+/* 3D control commands (M2346). The 2D set above is all a framebuffer needs;
+ * these are what a GL driver needs, and nothing in the tree had ever asked the
+ * device whether it offered them. */
+#define VIRTIO_GPU_CMD_GET_CAPSET_INFO      0x0108
+#define VIRTIO_GPU_CMD_GET_CAPSET           0x0109
+#define VIRTIO_GPU_CMD_CTX_CREATE           0x0200
+#define VIRTIO_GPU_CMD_CTX_DESTROY          0x0201
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE  0x0202
+#define VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE  0x0203
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D   0x0204
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D  0x0205
+#define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D 0x0206
+#define VIRTIO_GPU_CMD_SUBMIT_3D            0x0207
+
 #define VIRTIO_GPU_RESP_OK_NODATA           0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO     0x1101
+#define VIRTIO_GPU_RESP_OK_CAPSET_INFO      0x1102
+#define VIRTIO_GPU_RESP_OK_CAPSET           0x1103
+
+/* THE FEATURE BIT THAT WAS BEING REFUSED ON PURPOSE (M2346). The driver's own
+ * comment said "we accept ONLY that (no VIRGL/EDID/etc.)", which was the right
+ * call for a 2D framebuffer and is the wall for anything that wants a GPU. */
+#define VIRTIO_GPU_F_VIRGL                  0   /* device offers 3D / virgl   */
+#define VIRTIO_GPU_F_EDID                   1
+#define VIRTIO_GPU_F_RESOURCE_UUID          2
+#define VIRTIO_GPU_F_RESOURCE_BLOB          3
+#define VIRTIO_GPU_F_CONTEXT_INIT           4
+
+/* Capsets. virglrenderer publishes its capabilities as an opaque blob the
+ * guest's Mesa parses; the kernel only has to fetch it verbatim. */
+#define VIRTIO_GPU_CAPSET_VIRGL             1
+#define VIRTIO_GPU_CAPSET_VIRGL2            2
 
 /* Pixel format. B8G8R8X8 (value 2) is, as a little-endian 32-bit word, exactly
  * 0x00RRGGBB — the SAME layout fb.c draws into — so the desktop's pixels copy
@@ -177,6 +207,35 @@ struct virtio_gpu_display_one {
 struct virtio_gpu_resp_display_info {
     struct virtio_gpu_ctrl_hdr hdr;
     struct virtio_gpu_display_one pmodes[VIRTIO_GPU_MAX_SCANOUTS];
+} __attribute__((packed));
+
+struct virtio_gpu_get_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_index;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resp_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_max_version;
+    uint32_t capset_max_size;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_get_capset {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_version;
+} __attribute__((packed));
+
+/* The device-specific config region (virtio 1.1 §5.7.4). `num_capsets` is the
+ * only field here that has ever mattered to us and it was never read. */
+struct virtio_gpu_config {
+    uint32_t events_read;
+    uint32_t events_clear;
+    uint32_t num_scanouts;
+    uint32_t num_capsets;
 } __attribute__((packed));
 
 struct virtio_gpu_resource_create_2d {
@@ -261,6 +320,14 @@ static struct {
     uint64_t  backing_phys;
     uint32_t  backing_bytes;
     int width, height;
+
+    /* 3D (M2346). `virgl` is what the DEVICE offered and we accepted;
+     * `ncapsets`/`capset_*` are what it then told us about its renderer. A
+     * host with virgl compiled in but no GL context answers the feature bit
+     * and then reports zero capsets, so these are separate facts on purpose. */
+    int virgl;
+    uint32_t ncapsets;
+    uint32_t capset_id, capset_ver, capset_size;
 } vg;
 
 /* ---- MMIO accessors ------------------------------------------------------- */
@@ -564,6 +631,44 @@ static int cmd_resource_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 
 /* ---- bring-up ------------------------------------------------------------- */
+/* ---- 3D: what the host's renderer can do (M2346) --------------------------
+ *
+ * Two questions, and the whole point of asking them separately is that the
+ * answers can disagree. The feature bit says the DEVICE MODEL has virgl
+ * compiled in. `num_capsets` and the capset info say the RENDERER actually
+ * came up -- QEMU built with virglrenderer but started without a GL context
+ * offers the bit and then reports zero capsets, which is exactly the state
+ * this machine was in an hour ago (no libEGL installed, so `-display
+ * egl-headless` failed to create a context while the device was still there).
+ * A driver that only checked the bit would have reported 3D support and then
+ * failed on the first draw with nothing to point at. */
+static struct virtio_gpu_get_capset_info   rq_capsinfo;
+static struct virtio_gpu_resp_capset_info  rp_capsinfo;
+
+static uint32_t cfg_num_capsets(void) {
+    if (!vg.device) return 0;
+    return *(volatile uint32_t *)(vg.device + __builtin_offsetof(struct virtio_gpu_config, num_capsets));
+}
+
+/* GET_CAPSET_INFO for one index -> id / max version / max size. */
+static int cmd_get_capset_info(uint32_t index, uint32_t *id, uint32_t *ver, uint32_t *size) {
+    hdr_init(&rq_capsinfo.hdr, VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+    rq_capsinfo.capset_index = index;
+    rq_capsinfo.padding = 0;
+    memset(&rp_capsinfo, 0, sizeof(rp_capsinfo));
+    uint32_t t = gpu_cmd(&rq_capsinfo, sizeof(rq_capsinfo), &rp_capsinfo, sizeof(rp_capsinfo));
+    if (t != VIRTIO_GPU_RESP_OK_CAPSET_INFO) return -1;
+    *id   = rp_capsinfo.capset_id;
+    *ver  = rp_capsinfo.capset_max_version;
+    *size = rp_capsinfo.capset_max_size;
+    return 0;
+}
+
+int virtio_gpu_has_3d(void)        { return vg.virgl && vg.capset_size > 0; }
+uint32_t virtio_gpu_capset_id(void)   { return vg.capset_id; }
+uint32_t virtio_gpu_capset_ver(void)  { return vg.capset_ver; }
+uint32_t virtio_gpu_capset_size(void) { return vg.capset_size; }
+
 int virtio_gpu_init(void) {
     memset(&vg, 0, sizeof(vg));
 
@@ -594,9 +699,15 @@ int virtio_gpu_init(void) {
     cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
     /* Feature negotiation: a modern device offers VIRTIO_F_VERSION_1 (bit 32),
-     * which the driver MUST accept; we accept ONLY that (no VIRGL/EDID/etc.).
-     * Read device-feature word 1 to confirm bit 32 is offered, then write our
-     * accepted features: word 0 = 0, word 1 = VIRTIO_F_VERSION_1. */
+     * which the driver MUST accept.
+     *
+     * AND NOW VIRGL TOO, IF THE DEVICE OFFERS IT (M2346). This used to accept
+     * only VERSION_1, by a decision its own comment recorded -- "no
+     * VIRGL/EDID/etc." -- which was correct for a driver whose whole job was
+     * one scanout and is the wall for anything that wants to run a shader.
+     * Taking the bit is free when the host is `virtio-vga-gl` and impossible
+     * when it is not, which makes it a clean probe as well as a capability:
+     * `vg.virgl` afterwards is a measured fact about the host, not a guess. */
     cc_w32(VCC_DEVICE_FEATURE_SELECT, VIRTIO_F_VERSION_1_WORD);
     uint32_t devf1 = cc_r32(VCC_DEVICE_FEATURE);
     if (!(devf1 & VIRTIO_F_VERSION_1_BIT)) {
@@ -605,8 +716,12 @@ int virtio_gpu_init(void) {
         cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -1;
     }
+    cc_w32(VCC_DEVICE_FEATURE_SELECT, 0);
+    uint32_t devf0 = cc_r32(VCC_DEVICE_FEATURE);
+    uint32_t want0 = 0;
+    if (devf0 & (1u << VIRTIO_GPU_F_VIRGL)) { want0 |= 1u << VIRTIO_GPU_F_VIRGL; vg.virgl = 1; }
     cc_w32(VCC_DRIVER_FEATURE_SELECT, 0);
-    cc_w32(VCC_DRIVER_FEATURE, 0);
+    cc_w32(VCC_DRIVER_FEATURE, want0);
     cc_w32(VCC_DRIVER_FEATURE_SELECT, VIRTIO_F_VERSION_1_WORD);
     cc_w32(VCC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_BIT);
 
@@ -680,6 +795,39 @@ int virtio_gpu_init(void) {
     kprintf("[ ok ] virtio-gpu up: scanout 0 %dx%d (enabled=%d), resource %d live "
             "(boot display stays on the linear framebuffer).\n",
             w, h, enabled, RESOURCE_ID);
+
+    /* AND NOW ASK ABOUT 3D, reporting each step so a failure names itself. */
+    vg.ncapsets = cfg_num_capsets();
+    if (!vg.virgl) {
+        kprintf("[gpu3d] the device did NOT offer VIRTIO_GPU_F_VIRGL -- this is a 2D-only "
+                "virtio-gpu. On QEMU that means `-device virtio-vga` rather than "
+                "`virtio-vga-gl`.\n");
+    } else if (!vg.ncapsets) {
+        kprintf("[gpu3d] VIRGL was offered and accepted, but the device reports 0 capsets: "
+                "the device model has 3D compiled in and its RENDERER did not come up. "
+                "On QEMU that is a host-side GL failure, not a guest one.\n");
+    } else {
+        for (uint32_t i = 0; i < vg.ncapsets; i++) {
+            uint32_t id = 0, ver = 0, sz = 0;
+            if (cmd_get_capset_info(i, &id, &ver, &sz) != 0) {
+                kprintf("[gpu3d] capset %u: the device refused GET_CAPSET_INFO\n", i);
+                continue;
+            }
+            kprintf("[gpu3d] capset %u: id %u (%s), max version %u, max size %u bytes\n",
+                    i, id, id == VIRTIO_GPU_CAPSET_VIRGL  ? "VIRGL"  :
+                            id == VIRTIO_GPU_CAPSET_VIRGL2 ? "VIRGL2" : "unknown",
+                    ver, sz);
+            /* Prefer VIRGL2 -- it is the one Mesa's virgl driver wants. */
+            if (sz && (id == VIRTIO_GPU_CAPSET_VIRGL2 ||
+                       (id == VIRTIO_GPU_CAPSET_VIRGL && vg.capset_id == 0))) {
+                vg.capset_id = id; vg.capset_ver = ver; vg.capset_size = sz;
+            }
+        }
+        if (virtio_gpu_has_3d())
+            kprintf("[ ok ] virtio-gpu 3D IS AVAILABLE: capset %u version %u, %u bytes of "
+                    "renderer capabilities to hand a GL driver.\n",
+                    vg.capset_id, vg.capset_ver, vg.capset_size);
+    }
     return 0;
 }
 

@@ -67,10 +67,35 @@ echo "==> booting VM $VMID ($CORES core(s), ${MEM}M, -append \"$APPEND\") -- NOT
 # landed somewhere other than where the user pointed: "the mouse isnt in the
 # same place its offset weird". Absolute input is the fix, not the problem.
 $SSH "qm set $VMID --tablet 1" >/dev/null 2>&1 || true
+# THE DISPLAY DEVICE IS A VARIABLE NOW (M2346). `std` is the Bochs VGA this has
+# always used; `virtio-gl` is `-device virtio-vga-gl -display egl-headless,gl=core`,
+# which is the only way a guest can reach a real GPU here. Set explicitly on
+# every run rather than left sticky in the VM config, because a display type
+# left over from a previous experiment is a confound nobody would look for.
+$SSH "qm set $VMID --vga ${VGA:-std}" >/dev/null 2>&1 || true
+
+# A 3D DEVICE THAT IS NOT THE DISPLAY (M2346).
+#
+# The obvious way to reach a GPU is `--vga virtio-gl`, which makes
+# `virtio-vga-gl` the primary adapter. Tried, and it HANGS THIS KERNEL AT BOOT
+# -- thirty-six lines in, at the memory-isolation demo, with no "Multiboot
+# framebuffer" line, so `fb_init_mb` found no framebuffer tag and fbcon fell
+# back to a Bochs VBE mode-set against a device whose framebuffer is not where
+# stdvga's is. Replacing a display path that works with one that does not, in
+# order to get at a feature that has nothing to do with display, is a bad
+# trade.
+#
+# So: leave the display on stdvga, exactly as it has always been, and attach
+# `virtio-gpu-gl` as a SECOND, headless device whose only job is 3D. QEMU wants
+# `-display egl-headless,gl=core` for the host GL context either way, and
+# Proxmox only passes that itself for `--vga virtio-gl`, so for `std` we add it
+# and there is no duplicate.
+GPU3D_ARGS=""
+[ "${GPU3D:-0}" = 1 ] && GPU3D_ARGS="-display egl-headless,gl=core -device virtio-gpu-gl,id=gpu3d,bus=pci.0,addr=0x1c"
 $SSH "qm set $VMID --memory $MEM --cores $CORES --args \
   '-snapshot -kernel $PVE_DIR/kernel32.elf -append \"$APPEND\" \
    -drive file=$PVE_DIR/fat.img,format=raw,if=ide,index=0 \
-   -drive file=$PVE_DIR/ext2.img,format=raw,if=ide,index=1' >/dev/null"
+   -drive file=$PVE_DIR/ext2.img,format=raw,if=ide,index=1 $GPU3D_ARGS' >/dev/null"
 $SSH "qm start $VMID"
 
 # DRAIN THE SERIAL PORT, OR THE BOOT STALLS (M2163).

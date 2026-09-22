@@ -1388,6 +1388,59 @@ static uint32_t g_wl_watch_colour;
 static unsigned g_wl_page_best, g_wl_page_commits, g_wl_commits_seen;
 void wl_page_watch(uint32_t argb) { g_wl_watch_colour = argb; }
 
+/* THE FRAME RATE OF THE PAGE, WHICH NOTHING IN THE TREE MEASURED (M2344).
+ *
+ * The compositor's own [frame] line reports what a frame COSTS -- 1.9 ms, ~500
+ * fps of headroom -- and that number has been used all week to argue the paint
+ * path is not the problem. It is the right answer to the wrong question. What a
+ * human watching an animation sees is how often the CLIENT hands over a new
+ * frame, and a client that renders at 3 fps looks exactly as bad on a
+ * compositor with 500 fps of headroom as on one without.
+ *
+ * So count commits per surface per second. The busiest surface in the window is
+ * the animating one -- a browser puts page content in its own subsurface and
+ * commits it once per painted frame -- and its commit rate IS the page's frame
+ * rate. Costs nothing: one timer_ms() and an increment per commit, one serial
+ * line per second, and only when something actually committed.
+ *
+ * This instrument can report failure, which is the whole point: a page that
+ * renders nothing commits nothing and prints no line at all, and a page that
+ * renders slowly prints the small number rather than the headroom. */
+#define WL_FPS_TRACK 8
+static struct { unsigned id, w, h, n; } g_fps[WL_FPS_TRACK];
+static unsigned      g_fps_nt;
+static unsigned long g_fps_t0;
+static unsigned      g_fps_last;        /* last reported rate, for the summary */
+unsigned wl_fps_last(void) { return g_fps_last; }
+
+static void wl_fps_note(unsigned id, unsigned w, unsigned h) {
+    unsigned long now = timer_ms();
+    if (!g_fps_t0) { g_fps_t0 = now; return; }
+    int f = -1;
+    for (unsigned i = 0; i < g_fps_nt; i++) if (g_fps[i].id == id) { f = (int)i; break; }
+    if (f < 0 && g_fps_nt < WL_FPS_TRACK) { f = (int)g_fps_nt++; g_fps[f].id = id; g_fps[f].n = 0; }
+    if (f >= 0) { g_fps[f].w = w; g_fps[f].h = h; g_fps[f].n++; }
+
+    if (now - g_fps_t0 < 1000) return;
+    {   unsigned long dt = now - g_fps_t0;
+        int best = -1; unsigned tot = 0;
+        for (unsigned i = 0; i < g_fps_nt; i++) {
+            tot += g_fps[i].n;
+            if (g_fps[i].n && (best < 0 || g_fps[i].n > g_fps[best].n)) best = (int)i;
+        }
+        if (best >= 0) {
+            unsigned rate = (unsigned)((unsigned long)g_fps[best].n * 1000ul / dt);
+            g_fps_last = rate;
+            kprintf("[fps] %lu ms: surface %u %ux%u committed %u frame(s) = %u fps "
+                    "(busiest of %u tracked, %u commit(s) in total)\n",
+                    dt, g_fps[best].id, g_fps[best].w, g_fps[best].h,
+                    g_fps[best].n, rate, g_fps_nt, tot);
+        }
+        for (unsigned i = 0; i < g_fps_nt; i++) g_fps[i].n = 0;
+        g_fps_t0 = now;
+    }
+}
+
 static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     wl_inlat_woke((int)(c - g_cl));      /* M2337: the client is awake and talking */
     uint32_t obj = rd32(m + 0);
@@ -2073,6 +2126,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                 o->width  = b->width; o->height = b->height;
                 o->stride = b->stride; o->format = b->format;
                 g_ncommit++;
+                wl_fps_note(o->id, o->width, o->height);
                 /* THE FIRST PIXEL IS THE WRONG PIXEL TO REPORT (M2089).
                  *
                  * It was the only one printed, and for 762 consecutive Firefox
