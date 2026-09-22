@@ -211,6 +211,26 @@ static int nvgpu_vbios(void) {
         }
     }
 
+    /* IS THE REGION ABOVE IMAGE 0 EVEN BACKED? (M2372)
+     *
+     * The bytes at 0xece4 are high-entropy, which reads as "encrypted
+     * firmware" but reads equally well as "an unbacked MMIO window returning
+     * bus noise". Those are opposite conclusions and the difference is one
+     * experiment: read the same address twice. Real ROM is stable; a
+     * floating bus is not. Do it at an offset inside image 0 as the control,
+     * so a stable result above the image cannot be explained by the test
+     * itself being broken. */
+    {   volatile const uint32_t *r32 = (volatile const uint32_t *)rom;
+        unsigned ctl = 0x100 >> 2, hi = 0xece4 >> 2;
+        uint32_t c1 = r32[ctl], h1 = r32[hi];
+        for (volatile int d = 0; d < 100000; d++) { }
+        uint32_t c2 = r32[ctl], h2 = r32[hi];
+        kprintf("[nv] VBIOS: reread test -- inside image 0 @100: %08x then %08x (%s); "
+                "above it @ece4: %08x then %08x (%s)\n",
+                c1, c2, c1 == c2 ? "stable" : "UNSTABLE",
+                h1, h2, h1 == h2 ? "stable" : "UNSTABLE -- unbacked window, not data");
+    }
+
     /* DOES THE APERTURE MIRROR? (M2371) image 0 is 60416 bytes and a second
      * "image" appears at exactly 0xec00 = 60416. That is suspicious: a PROM
      * window that wraps at the ROM size would manufacture a fake image there,
@@ -758,6 +778,35 @@ static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p
         return -1;
     }
     if (cnt > 32 || hdr > 64 || len > 64) {
+        /* SEARCH INSTEAD OF GUESSING A BASE. The pointer is read correctly
+         * (its source bytes are printed above) and the data it lands on is
+         * not a table. Rather than invent an offset adjustment, scan the ROM
+         * for a structurally valid PMU table -- sane header, at least one
+         * entry, and a type 0x04 (DEVINIT) among them. If exactly one turns
+         * up, the delta from the stated pointer names the correction; if
+         * none does, this ROM does not carry one and that is the answer. */
+        unsigned hits = 0, where = 0;
+        for (unsigned o = 0x100; o + 0x40 < nv_romlen; o += 4) {
+            unsigned h = nv_rom[o+1], l = nv_rom[o+2], c = nv_rom[o+3];
+            if (h < 4 || h > 32 || l < 4 || l > 32 || c < 1 || c > 24) continue;
+            if (o + h + c * l > nv_romlen) continue;
+            unsigned devinit = 0, plausible = 1;
+            for (unsigned i = 0; i < c && plausible; i++) {
+                unsigned e = o + h + i * l, ty = nv_rom[e], dp = nv_rom32(e + 2);
+                if (ty == 0x04) devinit = dp;
+                if (dp && (dp >= nv_romlen)) plausible = 0;      /* entry points off the end */
+            }
+            if (plausible && devinit && devinit + 0x30 < nv_romlen) {
+                if (hits < 4) kprintf("[nv] pmu: candidate table @ %x (hdr %u entry %u count %u), "
+                                      "DEVINIT data @ %x\n", o, h, l, c, devinit);
+                hits++; where = o;
+            }
+        }
+        kprintf("[nv] pmu: scan found %u candidate table(s)%s\n", hits,
+                hits == 1 ? " -- one is a usable answer" : hits ? " -- ambiguous" : "");
+        if (hits == 1) kprintf("[nv] pmu: stated pointer %x, found %x, delta %d\n",
+                               nv_rom32(bit_p_off), where, (int)where - (int)nv_rom32(bit_p_off));
+
         kprintf("[nv] pmu: header %u entries of %u bytes is not a PMU table -- "
                 "refusing to print %u lines of noise.\n", cnt, len, cnt);
         return -1;
