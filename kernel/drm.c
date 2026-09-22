@@ -298,9 +298,31 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_version v;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof v)) return E_FAULT;
         memcpy(&v, uarg, sizeof v);
-        /* The version a real virtio_gpu kernel driver reports. Mesa checks it:
-         * virgl wants >= 0.1 and refuses to load below that. */
-        v.version_major = 0; v.version_minor = 1; v.version_patchlevel = 0;
+        /* 0.0, NOT 0.1, AND THE DIFFERENCE IS A DEADLOCK (M2356).
+         *
+         * I first wrote 0.1 because that is what a real virtio_gpu kernel
+         * reports. In this uAPI the minor version IS a capability bit:
+         *
+         *     qdws->base.supports_fences = drm_version >= VIRGL_DRM_VERSION(0, 1);
+         *
+         * At 0.1 Mesa sets VIRTGPU_EXECBUF_FENCE_FD_OUT on every submit and
+         * expects an out-fence descriptor back. We do not implement fence
+         * descriptors, so `eb.fence_fd` came back as the -1 Mesa had put
+         * there, Mesa built a fence around fd -1, and waiting on it became
+         * `poll()` on a negative fd -- which poll IGNORES, so the wait became
+         * an infinite sleep on nothing. The symptom was a process that ran the
+         * whole GL chain correctly, submitted one command buffer, and then sat
+         * in `lx_poll_nap_sleep` making no syscall for 45 seconds.
+         *
+         * At 0.0 Mesa uses `virgl_drm_fence_create_legacy`, which bases fence
+         * status on VIRTGPU_WAIT -- which we DO implement, and answer honestly,
+         * because submission here is synchronous and an object is therefore
+         * never busy. The two halves agree.
+         *
+         * So this is not a version number, it is a statement about what we
+         * support, and it must stay 0 until real fence descriptors exist.
+         * `drm_version` gates nothing else: virgl only checks major == 0. */
+        v.version_major = 0; v.version_minor = 0; v.version_patchlevel = 0;
         /* Each of the three strings is copied only as far as the caller said
          * it could hold, and the LENGTH IS WRITTEN BACK as the amount copied.
          * libdrm calls this twice -- once with zero lengths to learn the
