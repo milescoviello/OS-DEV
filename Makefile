@@ -484,7 +484,7 @@ $(LXROOT)/lxcwd: tools/lx/lxcwd.c
 # to the staged Mesa in-guest, not to this host's glvnd. (M2349)
 $(LXROOT)/lxgl: tools/lx/lxgl.c
 	@mkdir -p $(LXROOT)
-	$(CC) -O2 -I/usr/include/libdrm -o $@ $< -lEGL -lGLESv2 -ldrm
+	$(CC) -O2 -I/usr/include/libdrm -o $@ $< -lEGL -lGLESv2 -ldrm -lwayland-client
 	@echo "  HOSTCC  $@ (eight links from a GL call to the host iGPU)"
 
 $(LXROOT)/lxdrm: tools/lx/lxdrm.c

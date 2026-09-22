@@ -33,6 +33,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <xf86drm.h>
+#include <wayland-client.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -155,10 +156,33 @@ int main(void) {
     }
     fflush(stdout);
 
+    /* THE WAYLAND PLATFORM, WHICH IS THE ONE FIREFOX USES (M2363).
+     *
+     * This probe passes surfaceless -- GL ES 3.2 on the host iGPU, a clear
+     * read back byte-exact -- on the same kernel and the same Mesa where
+     * Firefox's WebGL dies with "egl: failed to create dri2 screen". The only
+     * structural difference is the EGL PLATFORM: a browser is a Wayland
+     * client and gets its display from the compositor connection, which pulls
+     * in the wl_drm/dmabuf machinery that surfaceless never touches.
+     *
+     * So reproduce Firefox's path in 30 KB instead of paying ten minutes a
+     * run to ask a 200 MB browser. WL=1 selects it. If Wayland fails here and
+     * surfaceless passes, the fault is in the compositor integration and not
+     * in the GPU, the render node, or the driver -- which is exactly the
+     * split that four Firefox runs could not make. */
     EGLDisplay dpy = EGL_NO_DISPLAY;
     PFNEGLGETPLATFORMDISPLAYEXTPROC getpd =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (getpd) dpy = getpd(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+    const char *wlmode = getenv("LXGL_WAYLAND");
+    if (wlmode && *wlmode == '1') {
+        struct wl_display *wd = wl_display_connect(NULL);
+        printf("LXGL: wl_display_connect -> %p\n", (void *)wd);
+        if (!wd) { printf("LXGL: RESULT FAIL (no compositor connection)\n"); return 1; }
+        if (getpd) dpy = getpd(EGL_PLATFORM_WAYLAND_EXT, wd, NULL);
+        printf("LXGL: eglGetPlatformDisplay(WAYLAND) -> %p\n", (void *)dpy);
+    }
+    if (dpy == EGL_NO_DISPLAY && getpd)
+        dpy = getpd(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
     if (dpy == EGL_NO_DISPLAY) dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     CHK(dpy != EGL_NO_DISPLAY, "eglGetDisplay -> %p", (void *)dpy);
     if (dpy == EGL_NO_DISPLAY) { printf("LXGL: RESULT FAIL (no EGL display)\n"); return 1; }
