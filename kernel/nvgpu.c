@@ -39,6 +39,7 @@ int             g_nv_exec;
 static pci_device_t  nv;
 static volatile uint8_t *nv_bar0;
 static uint32_t      nv_boot0;
+static unsigned      g_nv_bitM_off, g_nv_bitM_len, g_nv_bitM_ver;
 static unsigned      g_nv_bit_i;     /* BIT 'I' offset, for the PMU args */
 static uint8_t      *nv_rom;
 static unsigned      nv_romlen;
@@ -374,6 +375,9 @@ static int nvgpu_bit(void) {
         if ((id >= 'A' && id <= 'Z') || (id >= 'a' && id <= 'z')) letters++;
         if (id == 'I') { init_len = (unsigned)q[2] | ((unsigned)q[3] << 8);
                          init_off = (unsigned)q[4] | ((unsigned)q[5] << 8); }
+        if (id == 'M') { g_nv_bitM_ver = q[1];
+                         g_nv_bitM_len = (unsigned)q[2] | ((unsigned)q[3] << 8);
+                         g_nv_bitM_off = (unsigned)q[4] | ((unsigned)q[5] << 8); }
         if (id == 'p') { pmu_ver = q[1];
                          pmu_len = (unsigned)q[2] | ((unsigned)q[3] << 8);
                          pmu_off = (unsigned)q[4] | ((unsigned)q[5] << 8); }
@@ -448,7 +452,44 @@ static int nv_walk(unsigned at, int depth, uint8_t *seen, unsigned *subs, int *n
          * are not hard, they just are not constants, and leaving them out of
          * the walk stops it dead on a script that is otherwise fine.
          *   0x58 ZM_REG_SEQUENCE: 6 header bytes then count u32s. */
-        if (op == 0x58) len = 6 + (unsigned)nv_rom[at + 5] * 4;
+        /* The variable-length opcodes this ROM actually uses, each computed
+         * the way nouveau's handler advances its offset:
+         *   0x58 ZM_REG_SEQUENCE            6 + count*4        count = rd08(+5)
+         *   0x91 ZM_REG_GROUP               6 + count*4        count = rd08(+5)
+         *   0x8f RAM_RESTRICT_ZM_REG_GROUP  7 + num*gcount*4   num = rd08(+6),
+         *        gcount = nvbios_ramcfg_count() out of BIT 'M'
+         *   0xac is in NO nouveau version (their table stops at 0xaa), but the
+         *        bytes say what it is: `ac f4 13 02 00 | 01 00 00 00 |
+         *        01 00 00 00 | 5b ...` is opcode + three u32s = 13 bytes, and
+         *        13 lands exactly on a 0x5b SUB_DIRECT. Same shape as
+         *        INIT_RESET. Treated as 13 and the walk is the test: if every
+         *        script now reaches DONE, the stride was right; if it derails,
+         *        it was not. */
+        if (op == 0x58 || op == 0x91) len = 6 + (unsigned)nv_rom[at + 5] * 4;
+        if (op == 0x8f) {
+            unsigned gcount = 0;
+            if (g_nv_bitM_ver == 1 && g_nv_bitM_len >= 5) gcount = nv_rom[g_nv_bitM_off + 2];
+            else if (g_nv_bitM_ver == 2 && g_nv_bitM_len >= 3) gcount = nv_rom[g_nv_bitM_off + 0];
+            len = gcount ? 7 + (unsigned)nv_rom[at + 6] * gcount * 4 : 0;
+        }
+        if (op == 0xac) len = 13;
+        /* Round two, after 0xac=13 let the walk reach 60+ more instructions
+         * and surface these. All four are in nouveau's table; all four just
+         * compute their own length:
+         *   0x4d ZM_I2C_BYTE    4 + count*2      count = rd08(+3)
+         *   0x56 CONDITION_TIME 3
+         *   0xa9 GPIO_NE        2 + count        count = rd08(+1)
+         * 0x9e, like 0xac, is in NO nouveau version -- left unknown so the
+         * walk stops on it and prints its bytes rather than inventing a
+         * second stride on the strength of the first one working. */
+        if (op == 0x4d) len = 4 + (unsigned)nv_rom[at + 3] * 2;
+        if (op == 0x56) len = 3;
+        /* 0x33 REPEAT is a loop header: 2 bytes, then the following opcodes
+         * run count times. For a LINEAR walk the stride is just the header --
+         * the body is walked once, which is what we want when the question is
+         * "which opcodes does this script contain". */
+        if (op == 0x33) len = 2;
+        if (op == 0xa9) len = 2 + (unsigned)nv_rom[at + 1];
         if (!len) {
             /* Be precise about WHICH kind of unknown this is: 0x8f and 0x91
              * ARE in nouveau's table and merely compute their own length,
@@ -458,8 +499,12 @@ static int nv_walk(unsigned at, int depth, uint8_t *seen, unsigned *subs, int *n
             kprintf("[nv] devinit:   stopped at %x: opcode %02x has no fixed stride "
                     "(either variable-length in nouveau, or unknown to it). "
                     "Bytes around it:\n", at, op);
+            /* SIX LINES, NOT THREE. Inferring a stride needs to see where
+             * the NEXT plausible opcode begins: 0xac was only inferable
+             * because 13 bytes landed exactly on a 0x5b SUB_DIRECT. Three
+             * lines was not enough context for 0xaf. */
             unsigned from = at > 16 ? at - 16 : 0;
-            for (int r = 0; r < 3; r++) {
+            for (int r = 0; r < 6; r++) {
                 unsigned b = from + r * 16;
                 if (b + 16 > nv_romlen) break;
                 kprintf("[nv] devinit:     %05x: %02x %02x %02x %02x %02x %02x %02x %02x "
