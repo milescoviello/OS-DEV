@@ -1,5 +1,51 @@
 # What's next
 
+> **(M2341-M2343) THE OVERSHOOT WAS REAL, THE PAYOFF WAS 6%, AND THE BUDGET
+> HAD BEEN LYING ABOUT WHY.**
+>
+> `[budget]` said 6,608 ms of sleep were asked for and 29,050 ms were actually
+> slept -- a 4.4x overshoot, because `wake_at` was in 100 Hz ticks so a 1 ms
+> nap slept until the next one. Everything here is poll-driven, so this was
+> the most promising lead in the tree. Fixed: nanosecond deadlines via
+> `timer_ns()`, LAPIC at 1000 Hz, the 10 ms-quantum accounting kept at its old
+> rate by running only every 10th tick.
+>
+> ```
+> overshoot      22,520 ms -> 3,691 ms                     6.1x
+> time-to-page   29.23/29.96/29.81 -> 27.77/27.61/27.91    6.4%
+> ```
+>
+> Two lessons, and the second is the expensive one.
+>
+> **The fix at 1000 Hz was catastrophic on its own.** `task_wake_sleepers()`
+> walks the whole task ring under the global runqueue lock; doing that a
+> thousand times a second left the boot still probing ATA *thirty-four minutes
+> in*. The design was fine and the sequencing was not -- it went to the VM
+> before it was measured. M2342 gives the scan an O(1) `g_next_wake_ns` hint
+> so it takes no lock at all when nothing is due.
+>
+> **The instrument had already said the fix would not pay.** Of 14,160 naps,
+> **626 ended because somebody woke them and 13,534 ran their deadline out.**
+> Only the woken ones had work waiting: the 22.5 s of oversleep was concurrent
+> idle polling, not critical path. That split was printed *before* the fix was
+> written. A 9x number is not a 9x opportunity unless something is waiting on
+> it, and this one was not.
+>
+> So the boot is **latency-bound, not throughput-bound** -- 89% of core-time
+> is idle. Which is exactly what `[budget]` had been denying in a hardcoded
+> string: *"MOST OF THE BOOT IS GUEST CODE UNDER TCG, and no amount of work on
+> the disk, the faults or the console will change how long it takes."* It
+> printed whenever the largest named cost fell under half of busy -- a
+> conclusion drawn *from* the part the instrument could not account for, which
+> is backwards -- and it was flatly false, because this project develops on a
+> KVM host and nothing in the tree had ever asked. M2343 asks: CPUID leaf
+> 0x40000000 answers `TCGTCGTCGTCG` for the emulator and `KVMKVMKVM` for the
+> accelerator. The residual is now named (`UNATTRIBUTED N% of busy`, and past
+> 25% it tells you to go instrument it rather than conclude from it), and the
+> shape line reports latency- vs throughput-bound from the measurement instead
+> of from a `#define`. That string had been discouraging exactly the work that
+> took click-to-pixel from 224 ms to 34 ms this week.
+
 > **(M2332) THE LAST RED SUITE WAS A DANGLING `else`.**
 >
 > `waylandtest` had been failing on "the committed pixels did not arrive"
