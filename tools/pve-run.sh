@@ -197,7 +197,7 @@ $SSH "qm set $VMID --vga ${VGA:-std}" >/dev/null 2>&1 || true
 # for the host GL context either way, and Proxmox passes that itself ONLY for
 # `--vga virtio-gl`, so for `std` we add it and there is no duplicate.
 GPU3D_ARGS=""
-[ "${GPU3D:-0}" = 1 ] && GPU3D_ARGS="-display egl-headless,gl=core -device virtio-gpu,id=gpu3d,bus=pci.0,addr=0x1c"
+[ "${GPU3D:-0}" = 1 ] && GPU3D_ARGS="-display egl-headless,gl=core -device virtio-gpu-gl,id=gpu3d,bus=pci.0,addr=0x1c"
 $SSH "qm set $VMID --memory $MEM --cores $CORES --args \
   \"-snapshot -kernel $PVE_DIR/kernel32.elf -append \\\"$APPEND\\\" \
     -drive file=$PVE_DIR/fat.img,format=raw,if=ide,index=0 \

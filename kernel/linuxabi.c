@@ -38,6 +38,7 @@
 #include "wayland.h"   /* g_wl_verbose (M1978) */
 #include "vmm.h"
 #include "app.h"
+#include "drm.h"   /* DRM render-node ioctls (M2347) */
 #include "flock.h"      /* rlock_get/rlock_set/flock_op -- record locks the NATIVE fcntl has had since M1597 (M2085) */
 #include "rtc.h"
 #include "random.h"
@@ -3718,6 +3719,17 @@ static void lx_dispatch_body(struct registers *r) {
                     kprintf("[linuxabi] ioctl(fd %ld, 0x%lx) type=%d\n", a1, req, app_fd_type((int)a1));
             }
         }
+        /* THE DRM RENDER NODE COMES FIRST OF ALL (M2347), because a DRM
+         * ioctl is neither a terminal ioctl nor a generic descriptor one and
+         * would otherwise fall through the whole chain to ENOTTY -- which is
+         * indistinguishable from "this kernel does not implement it", and is
+         * the answer that would have been returned no matter how much of the
+         * render node existed. */
+        if (app_fd_type((int)a1) == 17) {
+            r->rax = (uint64_t)drm_ioctl((int)a1, (unsigned long)req, (void *)(uintptr_t)r->rdx);
+            break;
+        }
+
         /* THE GENERIC DESCRIPTOR IOCTLS COME FIRST, BECAUSE THEY ARE NOT
          * TERMINAL IOCTLS (M2086).
          *

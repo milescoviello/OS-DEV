@@ -11,6 +11,7 @@
  */
 #include "app.h"
 #include "flock.h"   /* flock_release_pid on process exit (M1177) */
+#include "drm.h"     /* the DRM render node, fd type 17 (M2347) */
 #include "inotify.h" /* inotify fd type 8 (M1266) */
 #include "net.h"     /* net_udp_send/recv for AF_INET datagram sockets, fd type 9 (M1267) */
 #include "pty.h"     /* pty_release_pid on process exit (M1185) */
@@ -12048,6 +12049,7 @@ int app_fd_close(int fd) {
     else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
     else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
     else if (a->fd[fd].type == 16) net_tcp_accept_close();                                  /* accepted AF_INET connection (M2020) */
+    else if (a->fd[fd].type == 17) drm_close_node(a->fd[fd].obj);                            /* DRM render node (M2347) */
     /* RELEASE UNDER THE SAME LOCK AS THE CLAIM (M2325). As two bare stores,
      * a claimer could take the slot the instant `used` went to 0 and then have
      * its brand-new type overwritten by the `type = 0` that followed -- which
@@ -12141,6 +12143,22 @@ int app_open(const char *path, int flags) {
      * type-11 fds over pty.c (obj = the pty endpoint id; master ids are even,
      * slave = master|1). This is the Unix98 PTY naming over the existing M1185
      * line-discipline engine — programs find their tty by path, not a magic id. */
+    /* /dev/dri/renderD128 (M2347): the DRM render node. Type 17 over drm.c.
+     * Only opens when there is really a 3D device behind it -- a node that
+     * exists and then refuses everything is worse than no node at all,
+     * because Mesa reads the first as a broken driver and the second as a
+     * machine without a GPU, and only the second is true. */
+    if (drm_is_node_path(path)) {
+        int id = drm_open_node();
+        if (id < 0) return -1;
+        int fd = app_fd_claim(a);
+        if (fd < 0) { drm_close_node(id); return -1; }
+        a->fd[fd] = (struct fdent){ 1, 17, 1, id, {0}, 0 };
+        int j = 0; while (path[j] && j < (int)sizeof a->fd[fd].path - 1) { a->fd[fd].path[j] = path[j]; j++; }
+        a->fd[fd].path[j] = 0;
+        a->fd[fd].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
+        return fd;
+    }
     int is_pts = 1; { const char *pfx = "/dev/pts/"; for (int k = 0; pfx[k]; k++) if (path[k] != pfx[k]) { is_pts = 0; break; } }
     if (strcmp(path, "/dev/ptmx") == 0 || is_pts) {
         int id;

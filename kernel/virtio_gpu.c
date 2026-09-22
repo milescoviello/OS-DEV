@@ -49,6 +49,7 @@
 #include "vmm.h"
 #include "string.h"
 #include "console.h"
+#include "task.h"   /* task_yield/task_current_id for the queue lock (M2348) */
 
 /* ---- modern virtio PCI capability structure (virtio 1.0 spec §4.1.4) ------
  * Each virtio vendor capability in PCI config space is this 16-byte struct
@@ -229,6 +230,77 @@ struct virtio_gpu_get_capset {
     uint32_t capset_version;
 } __attribute__((packed));
 
+/* ---- the 3D structs (M2348) -----------------------------------------------
+ *
+ * A `box` is a 3D region; 2D transfers use d=1. Note the ORDER of the trailing
+ * fields in a 3D transfer -- offset, resource_id, level, stride, layer_stride
+ * -- because getting resource_id and level the wrong way round produces a
+ * command the host accepts and then applies to mip level N of resource 0,
+ * which draws nothing and reports success. */
+struct virtio_gpu_box {
+    uint32_t x, y, z, w, h, d;
+} __attribute__((packed));
+
+struct virtio_gpu_ctx_create {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t nlen;
+    uint32_t context_init;
+    char debug_name[64];
+} __attribute__((packed));
+
+struct virtio_gpu_ctx_resource {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resource_create_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t target;
+    uint32_t format;
+    uint32_t bind;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t array_size;
+    uint32_t last_level;
+    uint32_t nr_samples;
+    uint32_t flags;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_transfer_host_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_box box;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t level;
+    uint32_t stride;
+    uint32_t layer_stride;
+} __attribute__((packed));
+
+/* SUBMIT_3D is the header, a size, then `size` bytes of virgl command stream
+ * IMMEDIATELY FOLLOWING. The command data is Mesa's on one end and
+ * virglrenderer's on the other and is opaque here by design -- a kernel that
+ * parsed it would be inventing a third opinion about GL. */
+#define GPU_CMDBUF_MAX (1024u * 1024u)
+struct virtio_gpu_cmd_submit {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t size;
+    uint32_t padding;
+} __attribute__((packed));
+
+/* GET_CAPSET's reply is the header followed by `capset_max_size` opaque bytes.
+ * The device decides how many; the guest must provide room for the number it
+ * was told at GET_CAPSET_INFO time. virgl2 reports 1384 here, so 4 KiB of
+ * slack is a whole capset's worth of headroom and still one page. */
+#define GPU_CAPSET_MAX 4096
+struct virtio_gpu_resp_capset {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint8_t capset_data[GPU_CAPSET_MAX];
+} __attribute__((packed));
+
 /* The device-specific config region (virtio 1.1 §5.7.4). `num_capsets` is the
  * only field here that has ever mattered to us and it was never read. */
 struct virtio_gpu_config {
@@ -297,6 +369,12 @@ struct virtio_gpu_resource_flush {
 #define VIRTIO_QUEUE_ALIGN 4096
 
 /* Driver state. */
+/* Why init failed, for the caller to print. A pointer to a literal, so there
+ * is nothing to allocate on a path that may be failing because allocation
+ * failed. (M2348) */
+static const char *g_vg_why;
+const char *virtio_gpu_why(void) { return g_vg_why ? g_vg_why : "no reason was recorded"; }
+
 static struct {
     int present;
 
@@ -325,6 +403,7 @@ static struct {
      * `ncapsets`/`capset_*` are what it then told us about its renderer. A
      * host with virgl compiled in but no GL context answers the feature bit
      * and then reports zero capsets, so these are separate facts on purpose. */
+    int scanout;                /* is the 2D scanout resource live? (M2348) */
     int virgl;
     uint32_t ncapsets;
     uint32_t capset_id, capset_ver, capset_size;
@@ -369,14 +448,41 @@ static uint64_t bar_base(const pci_device_t *d, int bar) {
 /* Map `len` bytes of MMIO starting at the page containing `phys`, cache-disabled
  * (identity map), and return a pointer to `phys`. Maps whole pages, like
  * ahci.c/e1000.c/hda.c. Returns NULL on a zero address. */
+/* MAP DEVICE MMIO IN THE SHARED HIGHER HALF, NOT IDENTITY (M2349).
+ *
+ * This used to identity-map the BAR -- `vmm_map(off, off, ...)` -- exactly like
+ * ahci.c, e1000.c, ehci.c, svga.c and hpet.c still do. That is fine for every
+ * one of those, because they are only ever touched from kernel threads. It is
+ * NOT fine here, and the difference is that this driver is now reachable from
+ * a SYSCALL: a GL driver in ring 3 calls an ioctl, and the ioctl rings the
+ * device's notify doorbell while running on that PROCESS's CR3.
+ *
+ * On this host QEMU puts the device's 64-bit BAR at physical ~0xe06_00000000
+ * -- about 14.4 TB, in the high PCI hole -- so the identity mapping landed in
+ * PML4[28]. Read vmm_create_address_space: a new address space shares
+ * PML4[256..511] BY POINTER and copies PML4[0]'s PDPT entries by value.
+ * PML4[28] is in neither set. So the doorbell existed only in the kernel's
+ * address space, and the first ioctl that rang it took:
+ *
+ *     Page Fault err=0x2  CR2=0x00000e0600007000
+ *     rip=...  mov %dx,(%rax)          <- *vg.notify_q0 = 0
+ *     [0] gpu_cmd_locked  [1] virtio_gpu_get_capset  [2] drm_ioctl
+ *
+ * Every 2D command at boot worked, because boot runs on the kernel CR3. That
+ * is why this looked like a capset bug for two boots: the failing thing was
+ * neither the capset nor the buffer, it was WHOSE PAGE TABLES WERE LOADED.
+ *
+ * The HHDM only huge-maps [0, RAM), so HHDM_BASE + a 14 TB BAR is untouched
+ * address space in the higher half -- shared by pointer, therefore visible in
+ * every process from the moment it is mapped. */
 static volatile uint8_t *map_mmio(uint64_t phys, uint32_t len) {
     if (!phys)
         return NULL;
     uint64_t start = phys & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t end   = phys + len;
     for (uint64_t off = start; off < end; off += PAGE_SIZE)
-        vmm_map(off, off, PTE_WRITABLE | PTE_PCD);
-    return (volatile uint8_t *)(uintptr_t)phys;
+        vmm_map((uint64_t)(uintptr_t)hhdm(off), off, PTE_WRITABLE | PTE_PCD);
+    return (volatile uint8_t *)hhdm(phys);
 }
 
 /* Walk the PCI capability list and locate + map the four virtio config regions.
@@ -494,7 +600,50 @@ static int setup_queue(void) {
  * so we always use descriptors 0,1 and avail/used slot 0 — exactly like
  * virtio_blk.c. The buffers must stay put for the device, so the callers use
  * static storage. */
+/* THE CONTROL QUEUE IS NOW A SHARED RESOURCE, AND IT WAS NOT LOCKED (M2348).
+ *
+ * Everything above this point runs ONCE, from one thread, during boot -- which
+ * is why `gpu_cmd` gets to use descriptors 0 and 1 unconditionally, and why
+ * the request bodies are file-scope statics. Perfectly sound for a
+ * configure-once path.
+ *
+ * It stops being sound the moment a GL driver is submitting command buffers:
+ * Mesa submits from whatever thread the application drew on, and this OS has
+ * eight cores. Two threads in `gpu_cmd` at once would write the same
+ * descriptor pair, publish the same avail slot twice, and then each consume
+ * one used entry for a response that belongs to the other -- the exact shape
+ * of the find-then-fill class this codebase has now found eleven times. Worse,
+ * the failure is silent: both callers get A response, so both succeed and one
+ * of them reads the other's answer.
+ *
+ * So the queue gets a real lock, with the yielding-spin shape from ata.c
+ * (M1911): spin briefly because most commands are quick, then yield rather
+ * than burn the timeslice the holder needs to finish. */
+static volatile int gq_lock;
+static volatile int gq_owner = -1;
+static void gq_take(void) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&gq_lock, 1, __ATOMIC_ACQUIRE)) {
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+        else __asm__ volatile("pause");
+    }
+    gq_owner = task_current_id();
+}
+static void gq_give(void) {
+    gq_owner = -1;
+    __atomic_store_n(&gq_lock, 0, __ATOMIC_RELEASE);
+}
+
+static uint32_t gpu_cmd_locked(const void *req, uint32_t req_len, void *resp, uint32_t resp_len);
+
 static uint32_t gpu_cmd(const void *req, uint32_t req_len, void *resp, uint32_t resp_len) {
+    gq_take();
+    uint32_t t = gpu_cmd_locked(req, req_len, resp, resp_len);
+    gq_give();
+    return t;
+}
+
+static uint32_t gpu_cmd_locked(const void *req, uint32_t req_len, void *resp, uint32_t resp_len) {
     /* The queue must be set up (common cfg mapped, notify resolved, >=2 descs).
      * Note: vg.present is intentionally NOT required here — init issues commands
      * (GET_DISPLAY_INFO, CREATE_2D, ...) after the rings are live but before it
@@ -536,6 +685,49 @@ static uint32_t gpu_cmd(const void *req, uint32_t req_len, void *resp, uint32_t 
         (void)*vg.isr;                     /* ack any pending interrupt */
 
     return ((const struct virtio_gpu_ctrl_hdr *)resp)->type;
+}
+
+/* EVERY BUFFER THE DEVICE TOUCHES COMES FROM THE PMM, NOT FROM BSS (M2349).
+ *
+ * This driver's request/response buffers have always been file-scope statics,
+ * with a comment explaining it: "Identity-mapped BSS, so phys_of resolves them
+ * like the backing buffer." True for the small ones that were there. It stopped
+ * being true the moment M2346 added a 4 KiB capset response, which landed at
+ * 0xffffffff86c3ebe0 -- past the end of the kernel image -- and the first
+ * GET_CAPSET took a KERNEL PAGE FAULT inside phys_of's page walk:
+ *
+ *     Page Fault err=0x2  CR2=0x00000e0600007000
+ *     rsi=000ffffffffff000              <- a PTE address mask
+ *     [0] gpu_cmd_locked  [1] gpu_cmd  [2] virtio_gpu_get_capset  [3] drm_ioctl
+ *
+ * A device-visible buffer needs a physical address we KNOW, not one recovered
+ * by translating a kernel virtual address that may not be mapped the way the
+ * translation assumes. So: one contiguous arena from the PMM, carved up for
+ * the large request and response bodies. The small statics stay -- they work,
+ * they are proven, and moving them would be churn -- but nothing new joins
+ * them.
+ *
+ * `pmm_alloc_contiguous` is the right allocator and this driver was not using
+ * it anywhere: the 2D backing hoped that a thousand consecutive
+ * `pmm_alloc_frame()` calls would come back adjacent, which is not what that
+ * function promises and is why the scanout failed with "a run of 67". */
+#define GPU_DMA_FRAMES 32                 /* 128 KiB: capset response + a 4096-entry sg list */
+static uint8_t  *g_dma;
+static uint64_t  g_dma_phys;
+
+static int gpu_dma_init(void) {
+    if (g_dma) return 0;
+    uint64_t base = pmm_alloc_contiguous(GPU_DMA_FRAMES, 1);
+    if (!base) {
+        kprintf("[virtio-gpu] could not reserve %d contiguous frames for a DMA arena; "
+                "commands with large bodies (capset, scatter-gather attach) cannot run\n",
+                GPU_DMA_FRAMES);
+        return -1;
+    }
+    g_dma = (uint8_t *)hhdm(base);
+    g_dma_phys = base;
+    memset(g_dma, 0, GPU_DMA_FRAMES * PAGE_SIZE);
+    return 0;
 }
 
 /* Fill a request header. */
@@ -664,6 +856,177 @@ static int cmd_get_capset_info(uint32_t index, uint32_t *id, uint32_t *ver, uint
     return 0;
 }
 
+/* GET_CAPSET -> copy the renderer's capability blob into the caller's buffer.
+ * Returns the number of bytes written, or -1.
+ *
+ * The blob is OPAQUE TO US ON PURPOSE. It is virglrenderer's description of
+ * itself -- GL version, limits, format support -- and the only thing that
+ * parses it is the guest's Mesa. A kernel that tried to interpret it would be
+ * inventing a second opinion about the host's GPU; its job is to hand the
+ * bytes across unmodified and to be honest about how many there were. */
+/* The request head lives at arena offset 0, the response at 4 KiB. Both are
+ * inside one contiguous PMM run, so their physical addresses are g_dma_phys +
+ * the offset and no page walk is involved. */
+#define GPU_DMA_REQ_OFF   0u
+#define GPU_DMA_RESP_OFF  4096u
+
+int virtio_gpu_get_capset(uint32_t id, uint32_t ver, void *out, uint32_t out_len) {
+    if (!vg.present || !out || !out_len) return -1;
+    if (gpu_dma_init() != 0) return -1;
+    if (out_len > GPU_CAPSET_MAX) out_len = GPU_CAPSET_MAX;
+    gq_take();
+    struct virtio_gpu_get_capset  *rq = (struct virtio_gpu_get_capset *)(g_dma + GPU_DMA_REQ_OFF);
+    struct virtio_gpu_resp_capset *rp = (struct virtio_gpu_resp_capset *)(g_dma + GPU_DMA_RESP_OFF);
+    hdr_init(&rq->hdr, VIRTIO_GPU_CMD_GET_CAPSET);
+    rq->capset_id = id;
+    rq->capset_version = ver;
+    memset(rp, 0, sizeof(struct virtio_gpu_ctrl_hdr) + out_len);
+    /* Ask for exactly the header plus what the caller can hold: a device that
+     * would write more than that must be told so by the descriptor length,
+     * not discovered afterwards by a smashed buffer. */
+    uint32_t t = gpu_cmd_locked(rq, (uint32_t)sizeof *rq,
+                                rp, (uint32_t)sizeof(struct virtio_gpu_ctrl_hdr) + out_len);
+    int rc = -1;
+    if (t == VIRTIO_GPU_RESP_OK_CAPSET) { memcpy(out, rp->capset_data, out_len); rc = (int)out_len; }
+    gq_give();
+    return rc;
+}
+
+/* ---- the 3D commands (M2348) ----------------------------------------------
+ *
+ * Each is a thin, honest wrapper: fill the request, send it, return 0 only if
+ * the device said OK_NODATA. No retries and no "probably fine" -- a 3D command
+ * that half-worked leaves host GL state the guest thinks it set and does not
+ * have, and that is not debuggable from the guest side at all.
+ *
+ * `hdr.ctx_id` is what makes these 3D: the same RESOURCE_UNREF is a 2D command
+ * with ctx 0 and a context resource release with a real one. */
+static struct virtio_gpu_ctx_create          rq_ctxc;
+static struct virtio_gpu_ctx_resource        rq_ctxr;
+static struct virtio_gpu_resource_create_3d  rq_c3d;
+static struct virtio_gpu_transfer_host_3d    rq_x3d;
+static struct virtio_gpu_ctrl_hdr            rp_3d;
+
+static void hdr_init_ctx(struct virtio_gpu_ctrl_hdr *h, uint32_t type, uint32_t ctx) {
+    hdr_init(h, type);
+    h->ctx_id = ctx;
+}
+
+int virtio_gpu_ctx_create(uint32_t ctx_id, const char *name) {
+    if (!virtio_gpu_has_3d()) return -1;
+    hdr_init_ctx(&rq_ctxc.hdr, VIRTIO_GPU_CMD_CTX_CREATE, ctx_id);
+    memset(rq_ctxc.debug_name, 0, sizeof rq_ctxc.debug_name);
+    uint32_t n = 0;
+    if (name) { while (name[n] && n < sizeof rq_ctxc.debug_name - 1) { rq_ctxc.debug_name[n] = name[n]; n++; } }
+    rq_ctxc.nlen = n;
+    rq_ctxc.context_init = 0;
+    return gpu_cmd(&rq_ctxc, sizeof rq_ctxc, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+int virtio_gpu_ctx_destroy(uint32_t ctx_id) {
+    if (!virtio_gpu_has_3d()) return -1;
+    hdr_init_ctx(&rq_hdr, VIRTIO_GPU_CMD_CTX_DESTROY, ctx_id);
+    return gpu_cmd(&rq_hdr, sizeof rq_hdr, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+int virtio_gpu_ctx_attach(uint32_t ctx_id, uint32_t res_id, int attach) {
+    if (!virtio_gpu_has_3d()) return -1;
+    hdr_init_ctx(&rq_ctxr.hdr, attach ? VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE
+                                      : VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, ctx_id);
+    rq_ctxr.resource_id = res_id;
+    rq_ctxr.padding = 0;
+    return gpu_cmd(&rq_ctxr, sizeof rq_ctxr, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+int virtio_gpu_res_create_3d(uint32_t ctx_id, uint32_t res_id, uint32_t target, uint32_t format,
+                             uint32_t bind, uint32_t w, uint32_t h, uint32_t depth,
+                             uint32_t array_size, uint32_t last_level, uint32_t nr_samples,
+                             uint32_t flags) {
+    if (!virtio_gpu_has_3d()) return -1;
+    hdr_init_ctx(&rq_c3d.hdr, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, ctx_id);
+    rq_c3d.resource_id = res_id; rq_c3d.target = target; rq_c3d.format = format;
+    rq_c3d.bind = bind; rq_c3d.width = w; rq_c3d.height = h; rq_c3d.depth = depth;
+    rq_c3d.array_size = array_size; rq_c3d.last_level = last_level;
+    rq_c3d.nr_samples = nr_samples; rq_c3d.flags = flags; rq_c3d.padding = 0;
+    return gpu_cmd(&rq_c3d, sizeof rq_c3d, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+int virtio_gpu_res_unref(uint32_t res_id) {
+    if (!vg.present) return -1;
+    static struct virtio_gpu_resource_unref { struct virtio_gpu_ctrl_hdr hdr;
+                                              uint32_t resource_id; uint32_t padding; } ru;
+    hdr_init(&ru.hdr, VIRTIO_GPU_CMD_RESOURCE_UNREF);
+    ru.resource_id = res_id; ru.padding = 0;
+    return gpu_cmd(&ru, sizeof ru, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+int virtio_gpu_attach_backing_phys(uint32_t res_id, uint64_t phys, uint32_t len) {
+    if (!vg.present) return -1;
+    hdr_init(&rq_attach.hdr, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+    rq_attach.resource_id = res_id;
+    rq_attach.nr_entries = 1;
+    rq_attach.entry.addr = phys;
+    rq_attach.entry.length = len;
+    rq_attach.entry.padding = 0;
+    return gpu_cmd(&rq_attach, sizeof rq_attach, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+int virtio_gpu_transfer_3d(uint32_t ctx_id, uint32_t res_id, int to_host,
+                           uint32_t x, uint32_t y, uint32_t z,
+                           uint32_t w, uint32_t h, uint32_t d,
+                           uint64_t offset, uint32_t level, uint32_t stride, uint32_t layer_stride) {
+    if (!virtio_gpu_has_3d()) return -1;
+    hdr_init_ctx(&rq_x3d.hdr, to_host ? VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
+                                      : VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, ctx_id);
+    rq_x3d.box.x = x; rq_x3d.box.y = y; rq_x3d.box.z = z;
+    rq_x3d.box.w = w; rq_x3d.box.h = h; rq_x3d.box.d = d;
+    rq_x3d.offset = offset; rq_x3d.resource_id = res_id; rq_x3d.level = level;
+    rq_x3d.stride = stride; rq_x3d.layer_stride = layer_stride;
+    return gpu_cmd(&rq_x3d, sizeof rq_x3d, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+/* SUBMIT_3D. The command stream has to be PHYSICALLY CONTIGUOUS with the
+ * header for the two-descriptor chain this driver uses, so it is staged into a
+ * single contiguous kernel buffer. Copying is the point, not a cost to
+ * apologise for: the alternative is handing the device a pointer into a user
+ * page, and a user page can be a COW alias that the device then writes through
+ * or reads stale -- the bug class that cost four milestones in the socket
+ * path. */
+static uint8_t *g_cmdbuf;              /* header + up to GPU_CMDBUF_MAX bytes */
+static uint64_t g_cmdbuf_phys;
+
+int virtio_gpu_submit_3d(uint32_t ctx_id, const void *data, uint32_t size) {
+    if (!virtio_gpu_has_3d() || !data || !size) return -1;
+    if (size > GPU_CMDBUF_MAX) return -1;
+    if (!g_cmdbuf) {
+        uint32_t need = (uint32_t)sizeof(struct virtio_gpu_cmd_submit) + GPU_CMDBUF_MAX;
+        uint32_t frames = (need + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint64_t base = pmm_alloc_frame(), prev = base;
+        if (!base) return -1;
+        for (uint32_t i = 1; i < frames; i++) {
+            uint64_t f = pmm_alloc_frame();
+            if (!f || f != prev + PAGE_SIZE) {
+                kprintf("[gpu3d] the %u-frame command buffer could not be allocated "
+                        "CONTIGUOUSLY -- physical memory is too fragmented for a "
+                        "single-entry descriptor\n", frames);
+                return -1;
+            }
+            prev = f;
+        }
+        g_cmdbuf = (uint8_t *)hhdm(base);
+        g_cmdbuf_phys = base;
+    }
+    gq_take();
+    struct virtio_gpu_cmd_submit *sb = (struct virtio_gpu_cmd_submit *)g_cmdbuf;
+    hdr_init_ctx(&sb->hdr, VIRTIO_GPU_CMD_SUBMIT_3D, ctx_id);
+    sb->size = size;
+    sb->padding = 0;
+    memcpy(g_cmdbuf + sizeof *sb, data, size);
+    uint32_t t = gpu_cmd_locked(g_cmdbuf, (uint32_t)sizeof *sb + size, &rp_3d, sizeof rp_3d);
+    gq_give();
+    return t == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
 int virtio_gpu_has_3d(void)        { return vg.virgl && vg.capset_size > 0; }
 uint32_t virtio_gpu_capset_id(void)   { return vg.capset_id; }
 uint32_t virtio_gpu_capset_ver(void)  { return vg.capset_ver; }
@@ -675,19 +1038,30 @@ int virtio_gpu_init(void) {
     /* QEMU's virtio-gpu-pci is the MODERN virtio-gpu device: vendor 0x1AF4,
      * device 0x1050. (The transitional id 0x1010 would be a legacy/transitional
      * GPU; QEMU only ships 0x1050, so we match it primarily and fall back.) */
+    /* WHICH STEP FAILED (M2348). Every `return -1` below used to surface as
+     * the caller's one message, "no virtio-gpu device found (none attached)" --
+     * which names the FIRST of five unrelated causes and is a lie for the
+     * other four. It cost a debugging session: the PCI enumeration printed
+     * `00:1c.0 1af4:1050` in the same boot that claimed no device was
+     * attached, and the two statements cannot both be true. Say which. */
     pci_device_t dev = pci_find(0x1AF4, 0x1050);
     if (!dev.valid)
         dev = pci_find(0x1AF4, 0x1010);
-    if (!dev.valid)
-        return -1;                          /* no virtio-gpu — clean no-op */
+    if (!dev.valid) {
+        g_vg_why = "no 1af4:1050 or 1af4:1010 on the PCI bus -- none attached";
+        return -1;
+    }
 
     /* Enable PCI memory-space decode + bus mastering (the device DMAs our
      * rings + backing). Modern transport is MMIO only — no I/O-space needed. */
     pci_enable_bus_master(&dev);
 
     /* Locate + map the modern virtio config regions from the PCI caps. */
-    if (map_virtio_caps(&dev) != 0)
+    if (map_virtio_caps(&dev) != 0) {
+        g_vg_why = "the device is on the bus but its modern virtio config caps "
+                   "could not be mapped";
         return -1;
+    }
 
     /* --- modern init handshake (virtio 1.0 §3.1.1) --------------------------
      * Reset, then ACK + DRIVER. */
@@ -713,6 +1087,7 @@ int virtio_gpu_init(void) {
     if (!(devf1 & VIRTIO_F_VERSION_1_BIT)) {
         /* A device that doesn't offer VERSION_1 isn't a modern device we can
          * drive this way — bail cleanly. */
+        g_vg_why = "the device does not offer VIRTIO_F_VERSION_1 (legacy transport)";
         cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -1;
     }
@@ -729,13 +1104,42 @@ int virtio_gpu_init(void) {
      * accept our feature set, in which case we must not proceed. */
     cc_w8(VCC_DEVICE_STATUS,
           VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+    if (!(cc_r8(VCC_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK) && want0) {
+        /* A REFUSED OPTIONAL FEATURE MUST NOT COST US THE DEVICE (M2348).
+         *
+         * Before M2346 this driver asked for exactly one feature, which every
+         * modern device must offer, so FEATURES_OK could only fail if
+         * something was badly wrong. Now that it asks for VIRGL as well, a
+         * device that offers the bit and then declines the combination takes
+         * the whole GPU down with it -- and the caller reports "none
+         * attached", about a device the PCI enumeration printed two lines
+         * earlier. 3D is a bonus; the 2D scanout is not. So: renegotiate
+         * without it, from a full reset, because the spec does not allow
+         * rewriting the driver features once FEATURES_OK has been set. */
+        kprintf("[gpu3d] the device declined VERSION_1+VIRGL together; "
+                "retrying 2D-only so the display is not lost\n");
+        vg.virgl = 0; want0 = 0;
+        cc_w8(VCC_DEVICE_STATUS, 0);
+        for (int i = 0; i < 1000000 && cc_r8(VCC_DEVICE_STATUS) != 0; i++)
+            __asm__ volatile("pause");
+        cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        cc_w32(VCC_DRIVER_FEATURE_SELECT, 0);
+        cc_w32(VCC_DRIVER_FEATURE, 0);
+        cc_w32(VCC_DRIVER_FEATURE_SELECT, VIRTIO_F_VERSION_1_WORD);
+        cc_w32(VCC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_BIT);
+        cc_w8(VCC_DEVICE_STATUS,
+              VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+    }
     if (!(cc_r8(VCC_DEVICE_STATUS) & VIRTIO_STATUS_FEATURES_OK)) {
+        g_vg_why = "the device cleared FEATURES_OK even for VIRTIO_F_VERSION_1 alone";
         cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -1;
     }
 
     /* Set up the control virtqueue (queue 0). */
     if (setup_queue() != 0) {
+        g_vg_why = "the control virtqueue could not be set up";
         cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -1;
     }
@@ -752,6 +1156,7 @@ int virtio_gpu_init(void) {
     /* --- query the display, then bind a backing buffer to scanout 0 --------- */
     int w = 0, h = 0, enabled = 0;
     if (cmd_get_display_info(&w, &h, &enabled) != 0) {
+        g_vg_why = "GET_DISPLAY_INFO got no answer: the queue is live but the device is not replying";
         vg.present = 0;
         cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -1;
@@ -768,33 +1173,54 @@ int virtio_gpu_init(void) {
     /* Allocate the backing buffer = exactly width*height*4 bytes, as a run of
      * contiguous identity-mapped frames (so we can attach it as ONE mem entry
      * with a physical base + length, and index it as a normal pixel array). */
+    /* A FAILED 2D SCANOUT MUST NOT COST US THE 3D DEVICE (M2348).
+     *
+     * This is the bug that produced "NOT AVAILABLE: no reason was recorded" --
+     * `vg.present = 0; return -1;` on three paths none of which had been
+     * instrumented, in a block that sets up a DISPLAY BUFFER THE CALLER DOES
+     * NOT WANT. The device is attached headless specifically for 3D; the
+     * desktop draws through the linear framebuffer and always has.
+     *
+     * And the failure is a real fragility, not bad luck: the backing is handed
+     * to the device as a SINGLE mem entry, so it needs one physically
+     * contiguous run of `w*h*4` bytes -- a thousand frames at 1280x800. That
+     * allocation succeeded one boot and failed the next, with nothing between
+     * them but a few kilobytes of new BSS shifting where the PMM had got to.
+     * A capability that depends on allocator luck is not a capability.
+     *
+     * So: try it, report exactly what happened, and keep going either way.
+     * `vg.scanout` records whether 2D is usable so `virtio_gpu_present` can
+     * refuse honestly instead of drawing into a buffer the host never saw. */
+    /* USE THE CONTIGUOUS ALLOCATOR THAT EXISTS (M2349). This loop used to call
+     * `pmm_alloc_frame()` a thousand times and give up the moment two results
+     * were not adjacent -- which is not a property that function promises. It
+     * reported "a run of 67" against 1000 needed, and the 2D scanout was lost
+     * on a machine with gigabytes free. `pmm_alloc_contiguous` searches. */
     vg.backing_bytes = (uint32_t)w * (uint32_t)h * 4u;
     uint32_t bframes = (vg.backing_bytes + (PAGE_SIZE - 1)) / PAGE_SIZE;
-    uint64_t bbase = pmm_alloc_frame();
-    if (!bbase) { vg.present = 0; return -1; }
-    uint64_t bprev = bbase;
-    for (uint32_t i = 1; i < bframes; i++) {
-        uint64_t f = pmm_alloc_frame();
-        if (!f || f != bprev + PAGE_SIZE) { vg.present = 0; return -1; }  /* need contiguous */
-        bprev = f;
+    uint64_t bbase = pmm_alloc_contiguous(bframes, 1);
+    uint64_t got = bbase ? bframes : 0;
+    if (got == bframes) {
+        vg.backing_phys  = bbase;
+        vg.backing       = (uint32_t *)hhdm(bbase);
+        vg.backing_bytes = bframes * PAGE_SIZE;        /* rounded-up mapped size */
+        memset(vg.backing, 0, vg.backing_bytes);
+        if (cmd_create_2d((uint32_t)w, (uint32_t)h) == 0 &&
+            cmd_attach_backing(vg.backing_phys, (uint32_t)w * (uint32_t)h * 4u) == 0 &&
+            cmd_set_scanout((uint32_t)w, (uint32_t)h) == 0) {
+            vg.scanout = 1;
+            kprintf("[ ok ] virtio-gpu up: scanout 0 %dx%d (enabled=%d), resource %d live "
+                    "(boot display stays on the linear framebuffer).\n",
+                    w, h, enabled, RESOURCE_ID);
+        } else {
+            kprintf("[virtio-gpu] 2D scanout setup was REFUSED by the device "
+                    "(CREATE_2D/ATTACH_BACKING/SET_SCANOUT); 3D is unaffected.\n");
+        }
+    } else {
+        kprintf("[virtio-gpu] no 2D scanout: pmm_alloc_contiguous could not find %u "
+                "contiguous frames for a %dx%d backing. 3D does not use this buffer "
+                "at all, so continuing.\n", bframes, w, h);
     }
-    vg.backing_phys  = bbase;
-    vg.backing       = (uint32_t *)hhdm(bbase);
-    vg.backing_bytes = bframes * PAGE_SIZE;            /* rounded-up mapped size */
-    memset(vg.backing, 0, vg.backing_bytes);
-
-    /* CREATE_2D + ATTACH_BACKING + SET_SCANOUT so the resource is live. */
-    if (cmd_create_2d((uint32_t)w, (uint32_t)h) != 0 ||
-        cmd_attach_backing(vg.backing_phys, (uint32_t)w * (uint32_t)h * 4u) != 0 ||
-        cmd_set_scanout((uint32_t)w, (uint32_t)h) != 0) {
-        vg.present = 0;
-        cc_w8(VCC_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
-        return -1;
-    }
-
-    kprintf("[ ok ] virtio-gpu up: scanout 0 %dx%d (enabled=%d), resource %d live "
-            "(boot display stays on the linear framebuffer).\n",
-            w, h, enabled, RESOURCE_ID);
 
     /* AND NOW ASK ABOUT 3D, reporting each step so a failure names itself. */
     vg.ncapsets = cfg_num_capsets();
@@ -840,6 +1266,10 @@ uint32_t *virtio_gpu_backing(void) { return vg.present ? vg.backing : 0; }
  * that rect to the host resource, then RESOURCE_FLUSH it (the "flush" the
  * desktop compositor would call). The rect is clamped within the display. */
 int virtio_gpu_present(int x, int y, int w, int h) {
+    /* NO SCANOUT MEANS NO PRESENT (M2348). Returning success here would have
+     * this function copy pixels into a buffer the host was never told about,
+     * which is a display that silently shows nothing. */
+    if (!vg.scanout) return -1;
     if (!vg.present)
         return -1;
     /* Clamp the rect within [0,width]x[0,height]; never transfer/flush OOB. */
@@ -860,11 +1290,16 @@ int virtio_gpu_present(int x, int y, int w, int h) {
 /* ---- boot-time verification (the headless proof, like hda_selftest) -------- */
 void virtio_gpu_selftest(void) {
     if (!vg.present) {
-        kprintf("[virtio-gpu] no virtio-gpu device found "
-                "(none attached; linear-framebuffer display intact).\n\n");
+        kprintf("[virtio-gpu] NOT AVAILABLE: %s (linear-framebuffer display "
+                "intact).\n\n", virtio_gpu_why());
         return;
     }
 
+    if (!vg.scanout) {
+        kprintf("[virtio-gpu] selftest: SKIPPED the 2D present cycle -- this device has no "
+                "scanout resource (see above). 3D availability is reported separately.\n\n");
+        return;
+    }
     kprintf("[virtio-gpu] selftest: display info %dx%d; resource %d created+attached+scanned-out.\n",
             vg.width, vg.height, RESOURCE_ID);
 

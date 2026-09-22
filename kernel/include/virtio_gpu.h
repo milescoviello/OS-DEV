@@ -76,3 +76,32 @@ int      virtio_gpu_has_3d(void);
 uint32_t virtio_gpu_capset_id(void);
 uint32_t virtio_gpu_capset_ver(void);
 uint32_t virtio_gpu_capset_size(void);
+
+/* Copy the host renderer's capability blob (`virtio_gpu_capset_size()` bytes
+ * for `virtio_gpu_capset_id()`) into `out`. Opaque to the kernel by design --
+ * only the guest's GL driver parses it. Returns bytes written, or -1. */
+int virtio_gpu_get_capset(uint32_t id, uint32_t ver, void *out, uint32_t out_len);
+
+/* ---- 3D submission (M2348) -------------------------------------------------
+ * The device-side half of a GL driver's needs. Each returns 0 only when the
+ * device answered OK -- no retries and no optimism, because a 3D command that
+ * half-worked leaves host GL state the guest believes it set and does not
+ * have, which is not diagnosable from the guest at all. */
+int virtio_gpu_ctx_create(uint32_t ctx_id, const char *name);
+int virtio_gpu_ctx_destroy(uint32_t ctx_id);
+int virtio_gpu_ctx_attach(uint32_t ctx_id, uint32_t res_id, int attach);
+int virtio_gpu_res_create_3d(uint32_t ctx_id, uint32_t res_id, uint32_t target, uint32_t format,
+                             uint32_t bind, uint32_t w, uint32_t h, uint32_t depth,
+                             uint32_t array_size, uint32_t last_level, uint32_t nr_samples,
+                             uint32_t flags);
+int virtio_gpu_res_unref(uint32_t res_id);
+int virtio_gpu_attach_backing_phys(uint32_t res_id, uint64_t phys, uint32_t len);
+int virtio_gpu_transfer_3d(uint32_t ctx_id, uint32_t res_id, int to_host,
+                           uint32_t x, uint32_t y, uint32_t z,
+                           uint32_t w, uint32_t h, uint32_t d,
+                           uint64_t offset, uint32_t level, uint32_t stride, uint32_t layer_stride);
+int virtio_gpu_submit_3d(uint32_t ctx_id, const void *data, uint32_t size);
+
+/* Why virtio_gpu_init() returned -1. Five unrelated causes used to share one
+ * message that named only the first of them. (M2348) */
+const char *virtio_gpu_why(void);

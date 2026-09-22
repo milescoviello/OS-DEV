@@ -263,6 +263,7 @@ static volatile int g_lxtool_test;            /* -append lxtooltest: drive the B
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
+static volatile int g_lxdrm;                  /* -append lxdrm: does the DRM render node answer the four questions Mesa asks? (M2347) */
 static volatile int g_lxdns_spawned;          /* lxdns already runs alongside the browser -- do not ALSO run the quiet-machine arms (M2321) */
 static volatile int g_lxdns;                  /* -append lxdns: two hundred getaddrinfo calls, so the 1-in-N EAI_AGAIN can be SAMPLED (M2320) */
 static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
@@ -966,6 +967,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "lxport"))     { g_lxabi_test = 1; g_lxport = 1; }   /* the ephemeral port allocator race (M2324) */
+        if (cmdline_has(cl, "lxdrm"))      { g_lxabi_test = 1; g_lxdrm = 1; }    /* the DRM render node, asked directly (M2347) */
         if (cmdline_has(cl, "lxdns"))      { g_lxabi_test = 1; g_lxdns = 1; }    /* hammer getaddrinfo instead of sampling it ten times per Claude boot (M2320) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
@@ -3751,6 +3753,33 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * asserts every command returned OK — the headless proof, like hda_selftest. */
     virtio_gpu_init();
     virtio_gpu_selftest();
+
+    /* THE RENDER-NODE PROBE RUNS HERE, NOT WITH THE OTHER lxabi PROBES (M2347).
+     *
+     * It was in the lxabi block four hundred lines above this, and it reported
+     * `open(/dev/dri/renderD128) FAILED: No such file or directory`. Both ends
+     * were behaving exactly as designed: `drm_open_node()` refuses to hand out
+     * a node when there is no 3D device behind it, and at that point in the
+     * boot there wasn't one, because `virtio_gpu_init()` is RIGHT HERE. The
+     * probe asked a true question at a moment when the answer had to be no.
+     *
+     * Another instrument measuring the wrong moment -- the same shape as the
+     * fps meter counting an unstarted benchmark. Worth the comment because the
+     * failure was perfectly legible and still pointed at the wrong component:
+     * every line of it was about the kernel, and the defect was in when it
+     * was called. */
+    if (g_lxdrm) {
+        /* THE RENDER NODE, ASKED DIRECTLY (M2347). The program that will
+         * really ask these questions is Mesa, which answers a wrong answer
+         * by silently falling back to software -- so a kernel bug here
+         * presents as "WebGL is slow", three layers away from its cause.
+         * A 30 KB probe that prints every answer is the difference between
+         * a bug with an address and a bug with a symptom. */
+        kprintf("[lxabi] the DRM render node: VERSION, GETPARAM, GET_CAPS...\n");
+        int drc = app_run_linux_sync("/disk2/lxdrm", 0, 0, 30000);
+        kprintf("[lxabi] lxdrm exit -> %d\n", drc);
+    }
+
 
     /* Bring up VMware SVGA-II (PCI 0x15AD:0x0405) as YET ANOTHER additional
      * display device — the boot display stays on the linear framebuffer
