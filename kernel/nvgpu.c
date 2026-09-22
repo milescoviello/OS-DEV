@@ -179,6 +179,8 @@ static int nvgpu_vbios(void) {
  * written: token at 0x1e0, header_len 12, entry_size 6, 17 entries, and the
  * 'I' entry at off 0x02b3 len 34. 16 of 17 ids are ASCII letters -- that
  * ratio is the check, because a misparse destroys it immediately. */
+static int nvgpu_devinit_tables(unsigned bit_i_off, unsigned bit_i_len);
+
 static int nvgpu_bit(void) {
     if (!nv_rom) return -1;
     unsigned bit = 0;
@@ -211,7 +213,274 @@ static int nvgpu_bit(void) {
     if (!init_off) { kprintf("[nv] BIT: no 'I' entry -- no devinit scripts to run.\n"); return -1; }
     kprintf("[nv] BIT: 'I' (devinit) at %x, %u bytes -- devinit has something to execute.\n",
             init_off, init_len);
+    nvgpu_devinit_tables(init_off, init_len);
     return 0;
+}
+
+/* --------------------------------------------------------- devinit ------
+ *
+ * The 'I' entry is a block of u16 sub-table pointers, at offsets fixed by
+ * nouveau's init_table_(): +0x00 script table, +0x02 macro index, +0x04
+ * macro, +0x06 condition, +0x08 io condition, +0x0a io flag condition,
+ * +0x0c function, +0x10 xlat. init_script(i) is u16(script_table + i*2), and
+ * the list ends at the first zero.
+ *
+ * These offsets are from the nouveau source on this machine, not memory --
+ * the BIT header layout was already guessed wrong once today and produced
+ * "70 entries of 50 bytes" of pure garbage. */
+static unsigned nv_rd16(unsigned off) {
+    if (!nv_rom || off + 1 >= nv_romlen) return 0;
+    return (unsigned)nv_rom[off] | ((unsigned)nv_rom[off + 1] << 8);
+}
+
+
+/* --------------------------------------------------- devinit opcodes ----
+ *
+ * Lengths EXTRACTED MECHANICALLY from nouveau's init.c, not transcribed:
+ * each handler advances init->offset by a constant, so a script scraped
+ * those constants out of the 69-entry dispatch table. 47 are a fixed size;
+ * the other 22 compute their length from their own operands and need real
+ * interpretation. 0 here means "not fixed-length" -- and the walker STOPS
+ * and names it rather than guessing a stride, because a wrong stride
+ * desynchronises the stream and every opcode after it is fiction.
+ *
+ * kprintf has no '-' flag. This file already shipped a "%-18s" that printed
+ * literally and shifted every argument after it, which is the second time
+ * today -- the first was a "%-4s" in the SYN-ACK tracer. Plain %s only. */
+static const uint8_t nv_oplen[256] = {
+    [0x36]=1,[0x37]=11,[0x38]=1,[0x39]=2,[0x3a]=3,[0x3b]=2,[0x3c]=2,
+    [0x47]=9,[0x48]=9,[0x4b]=9,[0x4f]=5,[0x52]=4,[0x53]=3,[0x57]=3,
+    [0x59]=7,[0x5a]=7,[0x5b]=3,[0x5c]=3,[0x5e]=6,[0x5f]=22,[0x62]=5,
+    [0x63]=1,[0x65]=13,[0x67]=1,[0x68]=1,[0x69]=5,[0x6b]=2,[0x6d]=3,
+    [0x6e]=13,[0x6f]=2,[0x71]=1,[0x72]=1,[0x73]=9,[0x74]=3,[0x75]=2,
+    [0x76]=2,[0x77]=7,[0x78]=6,[0x79]=7,[0x7a]=9,[0x8c]=1,[0x8d]=1,
+    [0x8e]=1,[0x90]=9,[0x96]=17,[0x97]=13,[0x9a]=7,
+};
+
+/* Walk a script without executing it: how long is it, which opcodes does it
+ * actually use, and does it terminate? That is the scope of the interpreter
+ * measured instead of guessed. Returns the number of opcodes walked. */
+static int nv_walk(unsigned at, int depth, uint8_t *seen, unsigned *subs, int *nsub) {
+    int n = 0;
+    while (at && at < nv_romlen && n < 4096) {
+        uint8_t op = nv_rom[at];
+        seen[op] = 1;
+        if (op == 0x71) { n++; return n; }            /* INIT_DONE */
+        unsigned len = nv_oplen[op];
+        /* Opcodes whose length is computable from their own operands. These
+         * are not hard, they just are not constants, and leaving them out of
+         * the walk stops it dead on a script that is otherwise fine.
+         *   0x58 ZM_REG_SEQUENCE: 6 header bytes then count u32s. */
+        if (op == 0x58) len = 6 + (unsigned)nv_rom[at + 5] * 4;
+        if (!len) {
+            /* Be precise about WHICH kind of unknown this is: 0x8f and 0x91
+             * ARE in nouveau's table and merely compute their own length,
+             * whereas 0xac is in no nouveau version on this machine (6.14,
+             * 7.1, 7.1-gentoo all stop at 0xaa). Conflating those two was a
+             * misleading message in the first version of this walker. */
+            kprintf("[nv] devinit:   stopped at %x: opcode %02x has no fixed stride "
+                    "(either variable-length in nouveau, or unknown to it). "
+                    "Bytes around it:\n", at, op);
+            unsigned from = at > 16 ? at - 16 : 0;
+            for (int r = 0; r < 3; r++) {
+                unsigned b = from + r * 16;
+                if (b + 16 > nv_romlen) break;
+                kprintf("[nv] devinit:     %05x: %02x %02x %02x %02x %02x %02x %02x %02x "
+                        "%02x %02x %02x %02x %02x %02x %02x %02x%s\n", b,
+                        nv_rom[b+0],nv_rom[b+1],nv_rom[b+2],nv_rom[b+3],
+                        nv_rom[b+4],nv_rom[b+5],nv_rom[b+6],nv_rom[b+7],
+                        nv_rom[b+8],nv_rom[b+9],nv_rom[b+10],nv_rom[b+11],
+                        nv_rom[b+12],nv_rom[b+13],nv_rom[b+14],nv_rom[b+15],
+                        (at >= b && at < b + 16) ? "   <-- stop is on this line" : "");
+            }
+            return -n;
+        }
+        if (op == 0x5b && depth == 0 && *nsub < 32) {  /* SUB_DIRECT: record the target */
+            unsigned t = nv_rd16(at + 1);
+            int dup = 0;
+            for (int k = 0; k < *nsub; k++) if (subs[k] == t) dup = 1;
+            if (!dup) subs[(*nsub)++] = t;
+        }
+        at += len; n++;
+    }
+    return n;
+}
+
+
+/* ------------------------------------------------- devinit interpreter --
+ *
+ * This ROM's scripts use NINE opcodes, not nouveau's sixty-nine -- measured
+ * by walking the real scripts rather than assumed. Eight are register
+ * read/modify/write plus flow control, and they are implemented here exactly
+ * as nouveau's handlers do it (semantics read from the source on this
+ * machine, not from memory -- the BIT layout and two kprintf format strings
+ * were already got wrong from memory today):
+ *
+ *   0x7a ZM_REG           R[reg] = data        (+ the addr==0x200 |= 1 quirk)
+ *   0x6e NV_REG           R[reg] = (R[reg] & mask) | data
+ *   0x5f COPY_NV_REG      R[d] = (R[d] & dmask) | ((shift(R[s]) & smask) ^ sxor)
+ *   0x58 ZM_REG_SEQUENCE  count u32s into consecutive registers
+ *   0x5b SUB_DIRECT       call a sub-script
+ *   0x75 CONDITION        suspend unless (R[reg] & msk) == val
+ *   0x72 RESUME           resume
+ *   0x71 DONE             stop
+ *
+ * DRY RUN BY DEFAULT. Executing devinit means writing to a real GPU's
+ * registers from a from-scratch driver, and getting it wrong can wedge the
+ * card or the host. So the interpreter computes every read, write and branch
+ * and PRINTS them without touching the hardware unless -append nvexec says
+ * otherwise. A trace that looks right is the prerequisite for letting it
+ * write, not a substitute for it. */
+int g_nv_exec;                       /* -append nvexec: actually write */
+
+static uint32_t nv_rom32(unsigned o) {
+    if (!nv_rom || o + 3 >= nv_romlen) return 0;
+    return (uint32_t)nv_rom[o] | ((uint32_t)nv_rom[o+1] << 8) |
+           ((uint32_t)nv_rom[o+2] << 16) | ((uint32_t)nv_rom[o+3] << 24);
+}
+static uint32_t nv_reg_rd(uint32_t reg) {
+    if (!nv_bar0 || reg + 3 >= (16u << 20)) return 0;
+    return *(volatile uint32_t *)(nv_bar0 + reg);
+}
+static void nv_reg_wr(uint32_t reg, uint32_t val) {
+    if (!g_nv_exec) return;                      /* dry run */
+    if (!nv_bar0 || reg + 3 >= (16u << 20)) return;
+    *(volatile uint32_t *)(nv_bar0 + reg) = val;
+}
+static uint32_t nv_shift(uint32_t d, uint8_t sh) {
+    return sh < 0x80 ? (d >> sh) : (d << (0x100 - sh));
+}
+
+static unsigned nv_cond_table;       /* set from the 'I' entry */
+static int nv_cond_met(uint8_t cond) {
+    if (!nv_cond_table) return 0;
+    unsigned e = nv_cond_table + cond * 12;
+    uint32_t reg = nv_rom32(e), msk = nv_rom32(e + 4), val = nv_rom32(e + 8);
+    return (nv_reg_rd(reg) & msk) == val;
+}
+
+static int nv_run(unsigned at, int depth, int *exec, int *ops) {
+    while (at && at < nv_romlen && *ops < 4096) {
+        uint8_t op = nv_rom[at];
+        (*ops)++;
+        switch (op) {
+        case 0x71:                                             /* DONE */
+            return 0;
+        case 0x72:                                             /* RESUME */
+            *exec = 1; at += 1; break;
+        case 0x75: {                                           /* CONDITION */
+            uint8_t c = nv_rom[at + 1];
+            int met = nv_cond_met(c);
+            if (!met) *exec = 0;
+            at += 2; break; }
+        case 0x5b: {                                           /* SUB_DIRECT */
+            unsigned t = nv_rd16(at + 1);
+            if (depth < 4) nv_run(t, depth + 1, exec, ops);
+            at += 3; break; }
+        case 0x7a: {                                           /* ZM_REG */
+            uint32_t reg = nv_rom32(at + 1), data = nv_rom32(at + 5);
+            if (reg == 0x000200) data |= 1;                    /* nouveau's quirk */
+            if (*exec) nv_reg_wr(reg, data);
+            at += 9; break; }
+        case 0x6e: {                                           /* NV_REG */
+            uint32_t reg = nv_rom32(at + 1), mask = nv_rom32(at + 5), data = nv_rom32(at + 9);
+            if (*exec) nv_reg_wr(reg, (nv_reg_rd(reg) & mask) | data);
+            at += 13; break; }
+        case 0x5f: {                                           /* COPY_NV_REG */
+            uint32_t sreg = nv_rom32(at + 1); uint8_t sh = nv_rom[at + 5];
+            uint32_t smask = nv_rom32(at + 6), sxor = nv_rom32(at + 10);
+            uint32_t dreg = nv_rom32(at + 14), dmask = nv_rom32(at + 18);
+            if (*exec) {
+                uint32_t d = (nv_shift(nv_reg_rd(sreg), sh) & smask) ^ sxor;
+                nv_reg_wr(dreg, (nv_reg_rd(dreg) & dmask) | d);
+            }
+            at += 22; break; }
+        case 0x58: {                                           /* ZM_REG_SEQUENCE */
+            uint32_t base = nv_rom32(at + 1); unsigned cnt = nv_rom[at + 5];
+            unsigned o = at + 6;
+            for (unsigned k = 0; k < cnt; k++, o += 4, base += 4)
+                if (*exec) nv_reg_wr(base, nv_rom32(o));
+            at = o; break; }
+        default:
+            kprintf("[nv] devinit: UNIMPLEMENTED opcode %02x at %x after %d op(s) -- "
+                    "stopping rather than guessing a stride\n", op, at, *ops);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
+    nv_cond_table = cond_table;
+    int exec = 1, ops = 0;
+    kprintf("[nv] devinit: %s the script\n",
+            g_nv_exec ? "** EXECUTING ** (nvexec given: this WRITES to the GPU)"
+                      : "dry run (computing every read/write, touching nothing; "
+                        "-append nvexec to arm it)");
+    int r = nv_run(script0, 0, &exec, &ops);
+    kprintf("[nv] devinit: %s after %d opcode(s), exec flag %d\n",
+            r == 0 ? "COMPLETED" : "ABORTED", ops, exec);
+}
+
+static void nvgpu_devinit_scope(unsigned script0) {
+    static uint8_t seen[256];
+    static unsigned subs[32];
+    int nsub = 0;
+    int n = nv_walk(script0, 0, seen, subs, &nsub);
+    kprintf("[nv] devinit: main script %s after %d opcode(s), %d sub-script(s) called\n",
+            n < 0 ? "STOPPED" : "walked cleanly", n < 0 ? -n : n, nsub);
+    for (int i = 0; i < nsub; i++) {
+        int m = nv_walk(subs[i], 1, seen, subs, &nsub);
+        kprintf("[nv] devinit:   sub %x: %s after %d opcode(s)\n", subs[i],
+                m < 0 ? "STOPPED" : "ok", m < 0 ? -m : m);
+    }
+    int distinct = 0, needlogic = 0;
+    for (int i = 0; i < 256; i++)
+        if (seen[i]) { distinct++; if (!nv_oplen[i] && i != 0x71) needlogic++; }
+    kprintf("[nv] devinit: THIS ROM's scripts use %d distinct opcode(s); %d of them are "
+            "variable-length and need real interpretation (nouveau defines 69 total).\n",
+            distinct, needlogic);
+    kprintf("[nv] devinit: opcodes used:");
+    for (int i = 0; i < 256; i++) if (seen[i]) kprintf(" %02x%s", i, nv_oplen[i] ? "" : "*");
+    kprintf("   (* = variable-length)\n");
+}
+
+static int nvgpu_devinit_tables(unsigned bit_i_off, unsigned bit_i_len) {
+    static const struct { unsigned off; const char *name; } tbl[] = {
+        { 0x00, "script" }, { 0x02, "macro index" }, { 0x04, "macro" },
+        { 0x06, "condition" }, { 0x08, "io condition" },
+        { 0x0a, "io flag condition" }, { 0x0c, "function" }, { 0x10, "xlat" },
+    };
+    for (unsigned k = 0; k < sizeof tbl / sizeof tbl[0]; k++) {
+        if (bit_i_len < tbl[k].off + 2) continue;
+        unsigned v = nv_rd16(bit_i_off + tbl[k].off);
+        if (v) kprintf("[nv] devinit:   %s table @ %x\n", tbl[k].name, v);
+    }
+    unsigned st = nv_rd16(bit_i_off + 0x00);
+    if (!st) { kprintf("[nv] devinit: no script table -- nothing to execute.\n"); return -1; }
+
+    int n = 0;
+    for (int i = 0; i < 16; i++) {
+        unsigned p = nv_rd16(st + i * 2);
+        if (!p) break;
+        n++;
+        /* The first byte must be an opcode. nouveau's dispatch table ends at
+         * 0xaa, so anything above that means this is not a script and the
+         * pointer chain is wrong -- say so instead of "executing" it. */
+        unsigned op = (p < nv_romlen) ? nv_rom[p] : 0xFFFF;
+        kprintf("[nv] devinit:   script[%d] @ %x, first byte %02x%s\n", i, p, op,
+                op > 0xAA ? "  <-- NOT A VALID OPCODE (max is 0xaa)" : "");
+        if (p + 8 < nv_romlen)
+            kprintf("[nv] devinit:     %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    nv_rom[p], nv_rom[p+1], nv_rom[p+2], nv_rom[p+3],
+                    nv_rom[p+4], nv_rom[p+5], nv_rom[p+6], nv_rom[p+7]);
+    }
+    kprintf("[nv] devinit: %d script(s) in the table at %x\n", n, st);
+    if (n) {
+        nvgpu_devinit_scope(nv_rd16(st));
+        nvgpu_devinit_run(nv_rd16(st), nv_rd16(bit_i_off + 0x06));
+    }
+    return n ? 0 : -1;
 }
 
 int nvgpu_bit_probe(void) { return nvgpu_bit(); }
