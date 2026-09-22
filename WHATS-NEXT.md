@@ -1,5 +1,71 @@
 # What's next
 
+> **(M2368-M2373) A REAL NVIDIA GT 1030 IS PASSED THROUGH AND TALKING TO
+> OS-DEV -- AND ITS VBIOS CANNOT POST IT. A proven negative.**
+>
+> ```
+> [nv] found NVIDIA 10de:1d01 at 00:10.0
+> [nv]   BAR0 32-bit base fd000000 size 16 MiB
+> [nv]   BAR1 64-bit base 7040000000 size 256 MiB
+> [nv] PMC_BOOT_0 = 138000a1 -> chipset 0x138, revision a1
+> [nv] VBIOS: PCIR says vendor 10de device 1d01 -- matches the card
+> [nv] BIT at 1e0: 17 entries, 'I' (devinit) at 2b3, 'p' (PMU) at 3b9
+> ```
+>
+> The card is enumerated, its BARs are mapped higher-half, and it answers
+> register reads. `PMC_BOOT_0 = 138000a1` is cross-checked three ways: our
+> PCI walk, the BAR layout, and -- later, independently -- nouveau itself
+> reporting `NVIDIA GP108 (138000a1)` and `fb: 2048 MiB GDDR5`.
+>
+> **Then it stops, for a reason that is not ours.** GP108's devinit
+> (`gm200_devinit_post`) uploads a DEVINIT application from the VBIOS to the
+> PMU falcon -- the host does not interpret init scripts on this generation,
+> which is why opcode 0xac in those scripts appears in no nouveau version.
+> That application is reached through BIT 'p', and on this card the chain
+> ends nowhere: the table at 0xece4 holds exactly one type-0x04 entry whose
+> data pointer, 0x300b0ecc, is outside **every** image available -- the
+> 60416-byte PROM aperture, the 57856-byte sysfs ROM, and nouveau's own
+> 235008-byte debugfs copy.
+>
+> nouveau never notices because it never runs that path. The card is
+> `boot_vga=1`, so the host firmware POSTed it at boot and
+> `gm200_devinit_post` takes the `post == false` branch. OS-DEV is the first
+> thing that has ever needed this table on this card.
+>
+> **Every way of POSTing it in a VM, tested and eliminated:** `romfile=` so
+> SeaBIOS runs the option ROM (no effect); `x-vga=1` (refused until
+> vfio-pci was reloaded with `disable_vga=0`, then accepted -- and the card
+> is still not POSTed); POSTing it on the host with nouveau and handing it
+> back (nouveau initialises it cleanly, the state does not survive VM
+> start). Neither GPU advertises FLR, so vfio falls back to a bus reset and
+> there is no knob to suppress it. The GT 710 fallback is worse:
+> `boot_vga=0`, never POSTed at all.
+>
+> **Method, which is the durable part.** Seven hypotheses were raised for
+> the unresolvable pointer and seven were settled against the hardware:
+> dword-vs-byte PROM reads (RETRACTED -- identical data), PRAMIN
+> (unavailable on a cold card), aperture mirroring (15/256 bytes match), a
+> table elsewhere in the ROM (three loose candidates, inconclusive), two
+> POST mechanisms, and "the high-entropy bytes are bus noise" -- killed by
+> reading the same address twice and getting `dbaf297f` both times, with a
+> stable control inside image 0. That last test cost one boot and separated
+> two opposite conclusions that look identical in a hex dump.
+>
+> Two course corrections came out of it. The devinit interpreter was written
+> and then shown to be the wrong mechanism *before* it ever executed -- it
+> defaults to a dry run, so a misunderstood init sequence was never issued
+> to a real GPU. And a VRAM-size reader was written, produced
+> "3135188992 MiB", and **refused its own answer** against nouveau's
+> known-good 2048 MiB.
+>
+> Also here: the gp108 signed firmware (20 files, dereferenced from gp102)
+> is staged into the guest image with a count assertion, and EXT2SIZE went
+> 3900M -> 4600M after the M2305 free-space guard correctly fired at 443 MB.
+>
+> Host left exactly as found: both GPU functions on vfio-pci, GT 710
+> unbound, `disable_vga` back to Y, nouveau unloaded, VM 125 stopped with
+> its `clean-baseline` snapshot intact.
+
 > **(M2364-M2366) THE PAGE LOAD WAS LOSING 9.4% OF ITS INBOUND FRAMES, AND THE
 > GUEST COULD NOT SEE ANY OF IT.**
 >
