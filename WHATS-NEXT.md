@@ -1,5 +1,32 @@
 # What's next
 
+> **(M2375) THE RESET MECHANISM, NAMED AND ELIMINATED.** M2373 said "QEMU
+> resets the card at VM start" without saying how. There was a specific
+> mechanism: vfio-pci drops an idle passthrough device into D3hot, and
+> D3->D0 resets GPU state. `disable_idle_d3` was `N` on this host.
+>
+> Tested properly, after two false starts of my own making: the runtime
+> write does not hold (the parameter is consumed at device-open time, so
+> the module must be *loaded* with it); nouveau silently refuses to bind
+> because vfio-pci's `ids=` reclaims the device, so `driver_override` is
+> required; and **twice I read an old dmesg timestamp as proof of a
+> successful POST**, fixed by counting matching lines before and after
+> instead of eyeballing the tail.
+>
+> With all three corrected -- module loaded with `disable_idle_d3=1`, card
+> verifiably holding **D0** instead of dropping to D3hot, nouveau genuinely
+> re-POSTing it (15 fresh dmesg lines at a new timestamp), handed back to
+> vfio still in D0 -- the guest **still** reads `0x619f04 = 1`. Not POSTed.
+>
+> So vfio resets the device on open by some path independent of power
+> state. The negative stands, with the one suppressible mechanism named and
+> struck off rather than assumed.
+>
+> Every POST route tried: `romfile=` for SeaBIOS; `x-vga=1` (which needed
+> vfio-pci reloaded with `disable_vga=0` before it was even accepted);
+> host-POST-and-handoff; and host-POST-and-handoff with idle-D3 suppressed.
+> None survives VM start.
+
 > **(M2368-M2373) A REAL NVIDIA GT 1030 IS PASSED THROUGH AND TALKING TO
 > OS-DEV -- AND ITS VBIOS CANNOT POST IT. A proven negative.**
 >
