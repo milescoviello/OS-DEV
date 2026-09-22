@@ -4360,41 +4360,47 @@ long app_console_nread(void) {
  * readable ASCII stand-in, or nothing (zero-width). A malformed sequence is
  * dropped rather than resynchronised into text: a terminal that prints the
  * pieces of a broken character is noisier than one that prints nothing. */
-void grid_write(struct app *a, const char *buf, unsigned len) {
-    /* TIME-TO-PROMPT, IN THE ONE FUNNEL EVERY TERMINAL BYTE PASSES (M2359).
-     *
-     * Two earlier attempts put this in `app_write_to` and neither fired on a
-     * boot where Claude Code's TUI provably came up -- the screendump shows
-     * its trust dialog drawn in an OS-DEV shell window. `app_write_to` is the
-     * LINUX-ABI write funnel, and the path here is not that: Claude writes to
-     * a pty, the OS-DEV shell -- a NATIVE ring-3 app -- reads it and paints
-     * it, and a native write never touches the Linux funnel at all.
-     *
-     * `grid_write` is where both routes meet, which is why the mirror for
-     * guest output was moved into this area in the first place. The lesson,
-     * for the third time this session: find the funnel by reading the code
-     * path, not by picking the function whose name matches the concept.
-     *
-     * `ESC [ ? 1 0 4 9 h` is a TUI taking over the terminal -- the moment a
-     * prompt is about to be drawn, and the closest thing to "ready" that does
-     * not require reading pixels. Nothing else in this system asks for the
-     * alternate screen, so it needs no filter on who wrote it. */
-    {   static int said_alt;
-        extern unsigned long g_claude_exec_ms;
-        if (!said_alt && len >= 8) {
-            for (unsigned i = 0; i + 7 < len; i++)
-                if (buf[i] == 0x1b && buf[i+1] == '[' && buf[i+2] == '?' &&
-                    buf[i+3] == '1' && buf[i+4] == '0' && buf[i+5] == '4' &&
-                    buf[i+6] == '9' && buf[i+7] == 'h') {
-                    said_alt = 1;
-                    kprintf("[tui] ALT SCREEN at %lu ms since boot -- TIME TO PROMPT "
-                            "%lu ms after the last claude launch\n",
-                            (unsigned long)timer_ms(),
-                            g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
-                    break;
-                }
+/* TIME-TO-PROMPT: A ROLLING MATCH, BECAUSE THE BYTES ARRIVE IN PIECES (M2359).
+ *
+ * Fourth attempt at this marker, and the first three each failed for a
+ * different reason worth writing down, because they are all the same mistake
+ * in different clothes -- assuming where the data is instead of following it.
+ *
+ *  1. Keyed on the writing process's exe. An interactive program writes to a
+ *     PTY and the bytes reach a window attributed to the SHELL that owns it,
+ *     not to the program that produced them.
+ *  2. Hooked in `app_write_to` -- the LINUX-ABI write funnel. The OS-DEV shell
+ *     is a NATIVE ring-3 app, and a native write never passes through it.
+ *  3. Hooked in `grid_write`, which IS reached -- but the detector required all
+ *     eight bytes of `ESC [ ? 1 0 4 9 h` inside ONE call. A terminal relay
+ *     writes in small chunks, so the sequence spans calls and a per-buffer
+ *     scan can never see it. That is an assumption about buffering I never
+ *     checked, and it is why the marker stayed silent on four separate boots
+ *     where the TUI provably came up.
+ *
+ * A rolling state machine has none of those assumptions: it does not care who
+ * wrote the bytes, how they were split, or which funnel they came through.
+ * Called from both `grid_write` and `pty_write` so whichever carries them
+ * first wins, and one-shot so the second call costs a branch. */
+void tui_watch(const char *buf, unsigned len) {
+    static const char pat[8] = { 0x1b, '[', '?', '1', '0', '4', '9', 'h' };
+    static int st, said;
+    extern unsigned long g_claude_exec_ms;
+    if (said || !buf) return;
+    for (unsigned i = 0; i < len; i++) {
+        st = (buf[i] == pat[st]) ? st + 1 : (buf[i] == pat[0] ? 1 : 0);
+        if (st == 8) {
+            said = 1;
+            kprintf("[tui] ALT SCREEN at %lu ms since boot -- TIME TO PROMPT %lu ms "
+                    "after the last claude launch\n", (unsigned long)timer_ms(),
+                    g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
+            return;
         }
     }
+}
+
+void grid_write(struct app *a, const char *buf, unsigned len) {
+    tui_watch(buf, len);
     if (!a) return;
     for (unsigned i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)buf[i];

@@ -17,6 +17,7 @@
 #include "app.h"        /* app_killpg, app_sys_getpid */
 #include "syscall.h"    /* ICANON, ECHO, ISIG, VINTR/VEOF/VERASE/VKILL */
 #include "console.h"   /* kprintf: a lost line has to be able to say so (M2206) */
+#include "timer.h"     /* timer_ms: the time-to-prompt floor (M2361) */
 
 #define SIGINT 2        /* matches app.c's local define (not in a shared header) */
 #define NPTY   8
@@ -182,6 +183,33 @@ static struct pty *resolve(int id, int *is_slave) {
 }
 
 long pty_write(int id, const void *buf, unsigned long len) {
+    /* CLAUDE'S FIRST OUTPUT, WHICH IS A THING IT DEFINITELY PRODUCES (M2361).
+     *
+     * The four previous attempts at a time-to-prompt marker all hunted for
+     * `ESC [ ? 1 0 4 9 h`, the alternate-screen sequence -- and CLAUDE CODE
+     * NEVER SENDS IT. Its TUI is Ink, which renders INLINE: the screendump
+     * shows its output below the `osdev:/$ claude` line with the shell banner
+     * still visible above. I picked a proxy for "the prompt is up" and never
+     * checked that the program emits it, which is worse than the three
+     * plumbing mistakes before it -- those were wrong about where the bytes
+     * go, this was wrong about whether the bytes exist.
+     *
+     * A pty write after a claude exec is not ambiguous and cannot be absent:
+     * it is the moment the process stops loading and starts talking. That is
+     * a floor for time-to-prompt, not the prompt itself, and it is labelled as
+     * such. The prompt proper is a pixel question and the harness answers it
+     * with screendumps. */
+    { extern unsigned long g_claude_exec_ms;
+      static int said;
+      if (!said && g_claude_exec_ms && len > 0) {
+          said = 1;
+          kprintf("[claude] FIRST OUTPUT at %lu ms since boot -- %lu ms after launch "
+                  "(a floor for time-to-prompt; the prompt itself is a pixel question)\n",
+                  (unsigned long)timer_ms(),
+                  (unsigned long)timer_ms() - g_claude_exec_ms);
+      } }
+    { extern void tui_watch(const char *b, unsigned n);
+      tui_watch((const char *)buf, (unsigned)len); }
     int slave; struct pty *p = resolve(id, &slave); if (!p) return -1;
     const unsigned char *d = (const unsigned char *)buf;
     if (!slave) {                                            /* MASTER write -> line discipline */

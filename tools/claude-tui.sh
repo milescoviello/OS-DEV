@@ -87,9 +87,14 @@ sleep 3
 echo "==> typing: claude"
 typestr "claude"; key ret
 echo "    waiting for the TUI to come up (this is a 214 MB binary starting)"
+# THREE SECONDS, NOT TWENTY (M2361). The goal's threshold for this number is
+# 20 s, and a poll that samples every 20 s cannot distinguish 5 s from 19 s --
+# it can only say "somewhere under twenty", which is the answer and the
+# threshold being the same number by coincidence. A screendump round trip is
+# ~2 s, so 3 s is about as fine as this oracle goes.
 w=0; PREV=desktop
 while [ $w -lt 420 ]; do
-    sleep 20; w=$((w+20))
+    sleep 3; w=$((w+3))
     shot "tui-$w"
     D1=$(changed "$PREV" "tui-$w")
     echo "    ...${w}s: $D1 px changed since the last look"
