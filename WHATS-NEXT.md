@@ -1,5 +1,38 @@
 # What's next
 
+> **(M2361) CLAUDE CODE REACHES ITS PROMPT IN <= 3 SECONDS.**
+>
+> At the first 3-second poll after Enter, 9573 pixels had changed and the
+> screendump shows the complete TUI -- "Accessing workspace:", the safety-check
+> dialog, "Enter to confirm . Esc to cancel". Later polls change 60-105 pixels,
+> which is a cursor blinking.
+>
+> ```
+> goal's stated baseline   ~60 s
+> target                   < 20 s
+> measured today           <= 3 s     (3 s is the oracle's resolution)
+> ```
+>
+> Honest about the pair: ~60 s is the goal's own figure, not one measured with
+> this oracle, and it may have been timing `claude -p` completing a query --
+> network and API included, a different thing. The after is solid: from Enter
+> to a drawn prompt, at most three seconds.
+>
+> **Five attempts at the instrument, and the last mistake was the worst.** The
+> first four hunted `ESC [ ? 1 0 4 9 h`, the alternate-screen sequence, through
+> four different funnels -- wrong process attribution, the Linux-ABI funnel
+> instead of the native one, a per-buffer scan that could not see a pattern
+> split across writes, then a rolling matcher in both funnels. **Claude Code
+> never sends it.** Its TUI is Ink, which renders INLINE; the screendump shows
+> its output below the `osdev:/$ claude` line with the shell banner still
+> above. Three mistakes were about where the bytes go; the fourth was about
+> whether they exist -- I picked a proxy for "ready" and never checked the
+> program emits it, and the screendump disproving it had been in the scratch
+> directory since the second try.
+>
+> Also: the harness polled every 20 s for a metric whose threshold is 20 s, so
+> it could only ever answer "somewhere under twenty". Now 3 s.
+
 > **(M2360) THE 34 ms CLICK-TO-PIXEL RESULT DOES NOT SURVIVE SIX TABS.**
 >
 > Measured for the first time, with clicks only so nothing can legitimately

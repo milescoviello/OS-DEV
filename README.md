@@ -8,7 +8,7 @@ little assembly. It **compiles its own kernel inside itself**, and its Linux
 ABI layer runs unmodified Linux binaries: GCC, Node.js, Claude Code, Firefox.
 Developed under QEMU; boots on real hardware through GRUB.
 
-[![Milestones](https://img.shields.io/badge/milestones-2360-blue)](WHATS-NEXT.md)
+[![Milestones](https://img.shields.io/badge/milestones-2361-blue)](WHATS-NEXT.md)
 [![Tests](https://img.shields.io/badge/tests-111%20suites-brightgreen)](tests/README.md)
 [![host tests](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml/badge.svg)](https://github.com/kitslayer/OS-DEV/actions/workflows/ci.yml)
 [![From scratch](https://img.shields.io/badge/from--scratch-~135k%20lines-orange)](#status)
