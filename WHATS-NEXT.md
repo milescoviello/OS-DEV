@@ -1,5 +1,59 @@
 # What's next
 
+> **(M2364-M2366) THE PAGE LOAD WAS LOSING 9.4% OF ITS INBOUND FRAMES, AND THE
+> GUEST COULD NOT SEE ANY OF IT.**
+>
+> A time-to-page profile put the cost in the network: 14 of 37 HTTPS connects
+> failing, each burning 4 SYNs x 1.2 s. Every in-guest counter said the network
+> was healthy, and every one of them was telling the truth.
+>
+> ```
+> tap tx_dropped (host->guest)   1229 (9.4%)  ->  0
+> SYN / SYN-ACK on the wire      26 out, 14 back  ->  26 out, 26 back
+> 443 connect failures                     17  ->  0
+>   of which silent (no SYN sent)          12  ->  0
+> page title on screen                  ~29.7 s  ->  ~23.7 s
+> ```
+>
+> **Two causes, and the second was only visible once the first was fixed.**
+>
+> QEMU's e1000 refuses a frame via `can_receive()` when no RX descriptor is
+> free, and the net layer then drops it AT THE TAP without the card counting a
+> miss. So MPC and RNBC read a truthful zero, the software RX ring never
+> overflowed, the park ring evicted nothing -- the frames were never offered to
+> the card at all. 64 descriptors is under a millisecond of line rate against a
+> kernel that sleeps in 10 ms quanta. Now 256, the most that fits the single
+> 4 KiB frame the ring lives in.
+>
+> With that fixed, the remaining failures turned out never to have sent a
+> packet. `tcp_connect` has one exit before the first SYN -- `arp_resolve`
+> timing out -- and it printed nothing, so the instrumented path carried a full
+> diagnostic while the silent path carried every failure. The ARP cache was
+> filled only by `arp_resolve`'s own wait loop, so on expiry a dozen concurrent
+> connects stampeded and destroyed each other's replies. Fixed by learning
+> sender IP->MAC from any ARP seen in `rx_next`, and by using a stale gateway
+> MAC rather than failing a connection (RFC 1122 allows it; a gateway's MAC
+> does not change).
+>
+> **The method mattered more than either fix.** Three theories died on
+> evidence before the right one: the park ring (0 evictions, and the hop trace
+> showed `park=0 take=0` -- the frames were never parked because they never
+> arrived), `srv_rx` destroying foreign TCP (a real bug, but netcon was not
+> running), and the e1000 RX race (`nic_receive` is locked). A wire capture
+> settled it, as one did for DNS in M2290.
+>
+> Two of my own instruments lied on the way and were caught by arithmetic, not
+> by the tools: a tcpdump armed on a tap that `qm stop` was about to destroy,
+> and one armed with a 300 s window before a 25-minute build. Both now report
+> their own failure. A third printed `%-4s` to a kprintf that has no `-` flag,
+> shifting every argument and silently dropping the two fields the trace
+> existed to report.
+>
+> Still open: `connect()` ignores `O_NONBLOCK` (`EINPROGRESS` exists nowhere in
+> the kernel), so every connect is synchronous on Firefox's shared socket
+> thread; the display is 1280x960 against a >=1440p requirement; and
+> volumeshaderbm's WebGL still fails at `egl: failed to create dri2 screen`.
+
 > **(M2361) CLAUDE CODE REACHES ITS PROMPT IN <= 3 SECONDS.**
 >
 > At the first 3-second poll after Enter, 9573 pixels had changed and the
