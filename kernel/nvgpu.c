@@ -35,6 +35,7 @@ static unsigned nv_rd16(unsigned off);
 static uint32_t nv_rom32(unsigned o);
 static int      nvgpu_vbios_pramin(uint8_t *dst, unsigned len);
 int             g_nv_exec;
+static unsigned g_nv_skipped_vga, g_nv_skipped_i2c, g_nv_skipped_gpio;
 
 static pci_device_t  nv;
 static volatile uint8_t *nv_bar0;
@@ -489,6 +490,11 @@ static int nv_walk(unsigned at, int depth, uint8_t *seen, unsigned *subs, int *n
          * the body is walked once, which is what we want when the question is
          * "which opcodes does this script contain". */
         if (op == 0x33) len = 2;
+        /* GT 710 (Kepler) set. Its scripts contain NO 0xac and NO 0xaf --
+         * every opcode is one nouveau implements, which is what "these are
+         * meant to be host-executed" looks like in the data.
+         *   0x4c I2C_BYTE  4 + count*3   count = rd08(+3) */
+        if (op == 0x4c) len = 4 + (unsigned)nv_rom[at + 3] * 3;
         if (op == 0xa9) len = 2 + (unsigned)nv_rom[at + 1];
         if (!len) {
             /* Be precise about WHICH kind of unknown this is: 0x8f and 0x91
@@ -616,6 +622,49 @@ static int nv_run(unsigned at, int depth, int *exec, int *ops) {
                 nv_reg_wr(dreg, (nv_reg_rd(dreg) & dmask) | d);
             }
             at += 22; break; }
+        case 0x38:                                             /* NOT: invert exec */
+            *exec = !*exec; at += 1; break;
+        case 0x56: {                                           /* CONDITION_TIME */
+            uint8_t c = nv_rom[at + 1];
+            if (!nv_cond_met(c)) *exec = 0;                    /* retry loop is a wait */
+            at += 3; break; }
+        case 0x90: {                                           /* COPY_ZM_REG */
+            uint32_t sreg = nv_rom32(at + 1), dreg = nv_rom32(at + 5);
+            if (*exec) nv_reg_wr(dreg, nv_reg_rd(sreg));
+            at += 9; break; }
+        case 0x8e:                                             /* GPIO */
+            g_nv_skipped_gpio++; at += 1; break;
+        case 0xa9:                                             /* GPIO_NE */
+            g_nv_skipped_gpio++; at += 2 + (unsigned)nv_rom[at + 1]; break;
+        case 0x36:                                             /* END_REPEAT */
+        case 0x8c:                                             /* RESET_BEGUN */
+        case 0x8d:                                             /* RESET_END   */
+            at += 1; break;                                    /* no register effect */
+        case 0x33:                                             /* REPEAT (loop hdr) */
+            at += 2; break;
+        case 0x74: {                                           /* TIME: delay usec */
+            unsigned us = nv_rd16(at + 1);
+            if (*exec) for (volatile unsigned d = 0; d < us * 40u; d++) { }
+            at += 3; break; }
+        case 0x97: {                                           /* ZM_MASK_ADD */
+            uint32_t reg = nv_rom32(at + 1), mask = nv_rom32(at + 5), add = nv_rom32(at + 9);
+            if (*exec) {
+                uint32_t v = nv_reg_rd(reg);
+                nv_reg_wr(reg, (v & mask) | ((v + add) & ~mask));
+            }
+            at += 13; break; }
+        case 0x53:                                             /* ZM_CR: VGA CRTC */
+        case 0x69:                                             /* IO: VGA port     */
+            /* Both are legacy VGA PORT I/O, not MMIO. vfio-pci is loaded
+             * with disable_vga=1 on this host, so the guest has no VGA port
+             * access to the card at all -- these cannot be executed here and
+             * are stepped over rather than faked. Counted, so the report can
+             * say how much of devinit was skipped. */
+            g_nv_skipped_vga++;
+            at += (op == 0x53) ? 3 : 5; break;
+        case 0x4c: {                                           /* I2C_BYTE */
+            g_nv_skipped_i2c++;                                /* needs an I2C engine */
+            at += 4 + (unsigned)nv_rom[at + 3] * 3; break; }
         case 0x58: {                                           /* ZM_REG_SEQUENCE */
             uint32_t base = nv_rom32(at + 1); unsigned cnt = nv_rom[at + 5];
             unsigned o = at + 6;
@@ -641,6 +690,11 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     int r = nv_run(script0, 0, &exec, &ops);
     kprintf("[nv] devinit: %s after %d opcode(s), exec flag %d\n",
             r == 0 ? "COMPLETED" : "ABORTED", ops, exec);
+    if (g_nv_skipped_vga || g_nv_skipped_i2c || g_nv_skipped_gpio)
+        kprintf("[nv] devinit: SKIPPED %u VGA port, %u I2C, %u GPIO op(s) -- those need "
+                "engines this driver does not have yet, so this is NOT a complete POST "
+                "and saying so is the point\n",
+                g_nv_skipped_vga, g_nv_skipped_i2c, g_nv_skipped_gpio);
 }
 
 static void nvgpu_devinit_scope(unsigned script0) {
@@ -1043,11 +1097,24 @@ int nvgpu_init(void) {
     unsigned chipset = (nv_boot0 >> 20) & 0x1FF;
     kprintf("[nv] PMC_BOOT_0 = %08x -> chipset 0x%x, revision %02x\n",
             nv_boot0, chipset, nv_boot0 & 0xFF);
+    /* Name the chip. GK208B (0x106) matters as much as GP108 (0x138) now:
+     * Kepler's devinit is gf100_devinit -> nv04_devinit_post -> nvbios_post,
+     * which interprets init scripts ON THE HOST CPU, and its chipset entry
+     * has no .acr at all. Both blockers that closed the GT 1030 -- a
+     * PMU-only devinit whose descriptor is invalid, and signed firmware --
+     * simply do not exist on this part. */
     kprintf("[nv] %s\n",
-            chipset == 0x138 ? "THAT IS GP108 -- the GT 1030 is alive and answering "
-                               "register reads over a higher-half BAR mapping."
-                             : "An NVIDIA chip is answering, but it is not the GP108 "
-                               "this campaign expects -- check which card got passed.");
+            chipset == 0x138 ? "GP108 (GT 1030): devinit is PMU-only and its VBIOS "
+                               "descriptor is invalid -- see M2373/M2374."
+          : chipset == 0x106 ? "GK208B (GT 710): KEPLER. devinit runs init scripts on "
+                               "the CPU and needs no signed firmware."
+                             : "An NVIDIA chip is answering, but not one this campaign "
+                               "has a plan for -- check which card got passed.");
+    /* nouveau decides whether a card needs POSTing from this bit. */
+    {   uint32_t p = nv_reg_rd(0x02240c);
+        kprintf("[nv] 0x2240c = %08x -> the card %s POSTing\n", p,
+                (p & 2) ? "does NOT need" : "NEEDS");
+    }
     nvgpu_vram();                          /* all reads; works on a cold card (M2373) */
     if (nvgpu_vbios() == 0) nvgpu_bit();   /* devinit's scripts live in there (M2369) */
     return 0;
