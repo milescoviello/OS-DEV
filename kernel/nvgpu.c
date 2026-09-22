@@ -690,6 +690,24 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     int r = nv_run(script0, 0, &exec, &ops);
     kprintf("[nv] devinit: %s after %d opcode(s), exec flag %d\n",
             r == 0 ? "COMPLETED" : "ABORTED", ops, exec);
+    /* RE-READ THE STATE AFTER, NOT BEFORE (M2377).
+     *
+     * Every POST indicator -- 0x2240c, 0x619f04, the FB registers -- was
+     * being read in nvgpu_init(), which runs BEFORE this. So the armed run
+     * reported "the card NEEDS POSTing" and "PRAMIN not enabled" from a
+     * snapshot taken before devinit had executed a single opcode, which
+     * says nothing about whether it worked. Same shape as the two earlier
+     * ordering faults in this project: a capability tested before the
+     * capability was created. The only honest comparison is before/after. */
+    {   uint32_t post = nv_reg_rd(0x02240c), pram = nv_reg_rd(0x619f04);
+        kprintf("[nv] AFTER devinit: 0x2240c = %08x -> the card %s POSTing\n",
+                post, (post & 2) ? "does NOT need" : "STILL NEEDS");
+        kprintf("[nv] AFTER devinit: 0x619f04 = %08x -> PRAMIN %s\n",
+                pram, (pram & 8) ? "IS NOW ENABLED" : "still not enabled");
+        uint32_t fbps = nv_reg_rd(0x022438), fbpas = nv_reg_rd(0x022548);
+        kprintf("[nv] AFTER devinit: FBP layout fbps=%u fbpas=%u%s\n",
+                fbps, fbpas, (fbps && fbpas) ? "  <-- now plausible" : "  (still not answering)");
+    }
     if (g_nv_skipped_vga || g_nv_skipped_i2c || g_nv_skipped_gpio)
         kprintf("[nv] devinit: SKIPPED %u VGA port, %u I2C, %u GPIO op(s) -- those need "
                 "engines this driver does not have yet, so this is NOT a complete POST "
@@ -1085,6 +1103,46 @@ int nvgpu_init(void) {
     uint64_t maplen = b0sz > (16u << 20) ? (16u << 20) : b0sz;
     nv_bar0 = map_mmio(b0, maplen);
     if (!nv_bar0) { kprintf("[nv] could not map BAR0\n"); return -1; }
+
+    /* DO OUR WRITES EVEN LAND? (M2377)
+     *
+     * 231 register writes from devinit changed nothing observable, and there
+     * are two completely different explanations: devinit is incomplete, or
+     * this driver cannot write to the card at all. Reads demonstrably work
+     * (PMC_BOOT_0), but a read-only BAR mapping, a missing PCI memory-space
+     * enable, or a stray const would all look exactly like "devinit did not
+     * help". Test it on a scratch register before blaming the interpreter.
+     *
+     * NV_PBUS_SCRATCH at 0x1400 is a plain scratch register: it exists to be
+     * written and read back, and nothing depends on its value. Restore it
+     * anyway. */
+    {   /* PICK A REGISTER THAT IS ACTUALLY THERE. The first attempt used
+         * 0x1400 and read back 0xbad0011f -- NVIDIA's PRI-error magic, not
+         * data. That proved only that 0x1400 is unreachable on this card,
+         * NOT that writes fail, and reporting it as "writes do not reach the
+         * card" would have been a false finding about the whole driver.
+         *
+         * 0x1700 is the PRAMIN window register: this driver already reads it
+         * successfully, nouveau writes it on every VBIOS shadow, and a
+         * 0xbad0 pattern there would be unambiguous. Values are restored. */
+        static const uint32_t probe[] = { 0x001700, 0x000200, 0x022400 };
+        for (unsigned i = 0; i < sizeof probe / sizeof probe[0]; i++) {
+            volatile uint32_t *r = (volatile uint32_t *)(nv_bar0 + probe[i]);
+            uint32_t save = *r;
+            if ((save & 0xFFFF0000u) == 0xBAD00000u) {
+                kprintf("[nv] MMIO probe %06x: reads %08x -- PRI error, register not "
+                        "reachable (not a write-path failure)\n", probe[i], save);
+                continue;
+            }
+            *r = save ^ 0x00000001u;              /* flip one harmless bit */
+            uint32_t rb = *r;
+            *r = save;                            /* restore immediately */
+            kprintf("[nv] MMIO probe %06x: was %08x, wrote %08x, read %08x -- writes %s\n",
+                    probe[i], save, save ^ 1u, rb,
+                    rb == (save ^ 1u) ? "LAND HERE" :
+                    rb == save ? "are IGNORED here (read-only or gated)" : "read back differently");
+        }
+    }
 
     nv_boot0 = nv_rd32(NV_PMC_BOOT_0);
     if (nv_boot0 == 0xFFFFFFFFu || nv_boot0 == 0) {

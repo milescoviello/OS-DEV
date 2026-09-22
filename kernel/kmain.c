@@ -1011,6 +1011,10 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * The first cut set g_ffurl and nothing else, so `-append ffurl`
          * booted to a desktop with no browser in it at all -- the flag that
          * spawns Firefox is this one, and a URL with no spawn is not a mode. */
+        /* -append nvexec: let the NVIDIA devinit interpreter actually WRITE
+         * to the GPU. Off by default -- everything up to here has been a dry
+         * run precisely so that arming it is a deliberate act (M2376). */
+        if (cmdline_has(cl, "nvexec")) { extern int g_nv_exec; g_nv_exec = 1; }
         {   const char *q = cl;                     /* fbres=WxH (M2367) */
             while (*q) {
                 if (q[0]=='f'&&q[1]=='b'&&q[2]=='r'&&q[3]=='e'&&q[4]=='s'&&q[5]=='=') {
