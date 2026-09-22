@@ -1,5 +1,42 @@
 # What's next
 
+> **(M2360) THE 34 ms CLICK-TO-PIXEL RESULT DOES NOT SURVIVE SIX TABS.**
+>
+> Measured for the first time, with clicks only so nothing can legitimately
+> fail to repaint, six live tabs on eight cores:
+>
+> ```
+> 6 clicks delivered (ptr fwd: 12 BUTTON = 6 x 2 events)
+> 4 samples from 6 clicks       <- two switches produced NO repaint
+> 2.9 ms | one 10-50 ms | TWO OVER 200 ms, one of them 1.89 s
+> ```
+>
+> M2337-M2340 took click-to-pixel from 224 ms to 34 ms mean and 134 ms worst,
+> and that is real -- but it was measured with ONE tab. Under the load the goal
+> actually names, two of four measured switches exceed 200 ms and one takes
+> nearly two seconds. **The criterion "no visible stall at 8 cores with 6+ live
+> tabs" is not met**, and the earlier win has to be read as a single-tab
+> number.
+>
+> **Three instruments returned plausible wrong answers before this one did.**
+>
+> 1. `[inputlat]` with scroll events mixed in. It pairs an input with the NEXT
+>    commit from the focused client; twenty scrolls on pages with nothing to
+>    scroll correctly caused no repaint, so each paired with whatever committed
+>    next. Output: 21.9 s and 3.0 s, describing nothing.
+> 2. Screendump polling -- the method this goal prescribes, and useless here.
+>    One round trip costs ~5.27 s, so six switches "measured"
+>    `5269 5246 5307 5246 5285 5302 ms`. **A 61 ms spread on a 5.3 s mean is a
+>    fixed cost wearing a latency's clothes.** The variance is the tell.
+> 3. A shell bug: `grep -c ... || echo 0` emits two lines when nothing matches,
+>    so `$((MARK+1))` was a syntax error and the extraction fell back to the
+>    first samples OF THE BOOT -- page-load latencies, the exact confusion the
+>    mark exists to prevent.
+>
+> Each printed something that looked like an answer. Two were caught only by
+> asking whether the number *could* be true. An instrument that prints a number
+> has not thereby measured anything.
+
 > **(M2351-M2356) OS-DEV RUNS OpenGL ES 3.2 ON THE HOST'S GPU, AND A DRAW
 > COMES BACK CORRECT.**
 >
