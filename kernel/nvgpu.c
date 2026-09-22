@@ -889,6 +889,54 @@ static int nvgpu_devinit_tables(unsigned bit_i_off, unsigned bit_i_len) {
 
 int nvgpu_bit_probe(void) { return nvgpu_bit(); }
 
+
+/* ---------------------------------------------------------------- VRAM --
+ *
+ * How much memory does the card have, asked of the card rather than assumed?
+ * This is the fb subdev's first job and it is all READS, so it works on a
+ * card that has not been POSTed -- unlike everything hanging off devinit.
+ *
+ * The walk is nouveau's gf100_ram_ctor + gm107/gm200/gp100 probes for GP108:
+ *   fbps  = rd32(0x022438)   how many FBPs
+ *   fbpao = rd32(0x021c14)   per-FBPA disable mask
+ *   fbpas = rd32(0x022458)   FBPAs per FBP
+ *   an FBP is disabled if rd32(0x021d38) has its bit
+ *   each live FBPA contributes rd32(0x90020c + fbpa*0x4000) MiB
+ *
+ * CHECKABLE: the host's nouveau reports "fb: 2048 MiB GDDR5" for this exact
+ * card, so this has a right answer that was known before the code was
+ * written. A number that merely looks plausible is not evidence -- four
+ * instruments in this campaign produced plausible numbers for things they
+ * never measured. */
+static void nvgpu_vram(void) {
+    if (!nv_bar0) return;
+    uint32_t fbps  = nv_reg_rd(0x022438);
+    uint32_t fbpao = nv_reg_rd(0x021c14);
+    uint32_t fbpas = nv_reg_rd(0x022458);
+    uint32_t dis   = nv_reg_rd(0x021d38);
+    if (!fbps || fbps > 32 || !fbpas || fbpas > 32) {
+        kprintf("[nv] fb: FBP layout reads fbps=%x fbpas=%x -- not plausible, so the "
+                "card is not answering these registers; no VRAM size claimed.\n",
+                fbps, fbpas);
+        return;
+    }
+    uint32_t total = 0; unsigned live = 0;
+    for (uint32_t fbp = 0; fbp < fbps; fbp++) {
+        if (dis & (1u << fbp)) continue;
+        uint32_t fbpa = fbp * fbpas, sub = 0;
+        for (uint32_t k = 0; k < fbpas; k++, fbpa++) {
+            if (fbpao & (1u << fbpa)) continue;
+            sub += nv_reg_rd(0x90020c + fbpa * 0x4000);
+        }
+        if (sub) { live++; total += sub; }
+    }
+    kprintf("[nv] fb: %u FBP(s), %u per-FBP FBPA(s), %u live -> %u MiB of VRAM\n",
+            fbps, fbpas, live, total);
+    kprintf("[nv] fb: %s\n", total == 2048
+            ? "2048 MiB -- matches what nouveau reports for this card on the host."
+            : "that is NOT the 2048 MiB nouveau reports for this card; the walk is wrong.");
+}
+
 int nvgpu_present(void)   { return nv.valid; }
 uint32_t nvgpu_boot0(void){ return nv_boot0; }
 
@@ -955,6 +1003,7 @@ int nvgpu_init(void) {
                                "register reads over a higher-half BAR mapping."
                              : "An NVIDIA chip is answering, but it is not the GP108 "
                                "this campaign expects -- check which card got passed.");
+    nvgpu_vram();                          /* all reads; works on a cold card (M2373) */
     if (nvgpu_vbios() == 0) nvgpu_bit();   /* devinit's scripts live in there (M2369) */
     return 0;
 }
