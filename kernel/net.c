@@ -207,10 +207,34 @@ static void rx_classify(const uint8_t *f, int len) {
     g_udp_ours_port[g_udp_ours_n % UDP_OURS_RING] = get16(f + 14 + ihl + 2);
     g_udp_ours_n++;
 }
+/* WHERE DID THIS CONNECTION'S SYN-ACK DIE? (M2364)
+ *
+ * A wire capture proved the server answers every SYN -- 26 SYNs out, 14
+ * SYN-ACKs back -- while tcp_connect reported "0 segment(s) matched this
+ * 4-tuple" for six of eight connects. So the reply reaches the host bridge
+ * and the connect loop never sees it. The three places it can die (never
+ * delivered to the card, taken off the card and destroyed by a consumer,
+ * parked and then lost in the ring) are indistinguishable from either end.
+ *
+ * SILENTLY, and that is the whole design. The first version of this traced
+ * with a kprintf per hop and the connect failures VANISHED: 15 of 15
+ * succeeded against 2 of 8 on the same binary minutes earlier. Serial output
+ * on the receive path perturbs precisely the timing under test -- so the
+ * instrument has to be counters and a small ring, read only when a connect
+ * has already failed and the cost no longer matters. */
+#define SA_CARD 0
+#define SA_PARK 1
+#define SA_TAKE 2
+static void synack_trace(int hop, const uint8_t *f, int len);
+/* Cache sender IP->MAC from any ARP we see (M2366); defined with arp_cache. */
+static void arp_learn(const uint8_t *f, int len);
+
 static int rx_next(uint8_t *buf, int max) {
     for (int guard = 0; guard < 64; guard++) {         /* bounded: never spin on a flood */
         int len = nic_receive(buf, max);
         if (len <= 0) return len;
+        synack_trace(SA_CARD, buf, len);
+        arp_learn(buf, len);           /* learn before any consumer can destroy it */
         if (!arp_maybe_reply(buf, len)) { g_rx_taken++; rx_classify(buf, len); return len; }
         g_arp_answered++;
     }
@@ -618,12 +642,50 @@ static const uint8_t *next_hop(const uint8_t *dst) {
     return dst;                                    /* on our own segment */
 }
 
+/* PASSIVE ARP LEARNING (M2366).
+ *
+ * The cache was populated ONLY by arp_resolve's own wait loop, so when the
+ * 60 s entry for the gateway expired every concurrent connect missed at once,
+ * each broadcast its own request, and each then destroyed the others' replies:
+ * recv_timeout hands a frame to arp_resolve, arp_resolve compares it against
+ * the one address it wants and drops it on the floor if it does not match.
+ * A page opening a dozen sockets at once therefore had most of them wait the
+ * full 2 s and give up -- ENETUNREACH, no SYN ever sent.
+ *
+ * rx_next is the one place a frame comes off the card, and every ARP packet
+ * (request or reply) carries its sender's IP and MAC. Learning there keeps the
+ * gateway mapping fresh from the router's own periodic traffic, so the expiry
+ * stampede stops happening in the first place. */
+static void arp_learn(const uint8_t *f, int len) {
+    if (len < 42 || get16(f + 12) != 0x0806) return;
+    uint16_t op = get16(f + 20);
+    if (op != 1 && op != 2) return;                 /* request or reply both carry it */
+    const uint8_t *sip = f + 28, *smac = f + 22;
+    if (!sip[0] && !sip[1] && !sip[2] && !sip[3]) return;   /* ARP probe: no sender IP */
+    for (int i = 0; i < ARP_CACHE_N; i++)
+        if (arp_cache[i].used && memcmp(arp_cache[i].ip, sip, 4) == 0) {
+            memcpy(arp_cache[i].mac, smac, 6);
+            arp_cache[i].exp = timer_ticks() + ARP_TTL;
+            return;
+        }
+    /* Only ADD the gateway: the table is four entries and a chatty LAN would
+     * otherwise evict the one mapping every outbound connection needs. */
+    if (memcmp(sip, GW_IP, 4) != 0) return;
+    static int rr;
+    int slot = rr; rr = (rr + 1) % ARP_CACHE_N;
+    memcpy(arp_cache[slot].ip, sip, 4); memcpy(arp_cache[slot].mac, smac, 6);
+    arp_cache[slot].exp = timer_ticks() + ARP_TTL; arp_cache[slot].used = 1;
+}
+
 static int arp_resolve(const uint8_t *ip, uint8_t *out_mac) {
+    uint8_t stale[6]; int have_stale = 0, stale_slot = -1;
     for (int i = 0; i < ARP_CACHE_N; i++)          /* serve a fresh cached mapping */
-        if (arp_cache[i].used && timer_ticks() < arp_cache[i].exp
-            && memcmp(arp_cache[i].ip, ip, 4) == 0) {
-            memcpy(out_mac, arp_cache[i].mac, 6);
-            return 1;
+        if (arp_cache[i].used && memcmp(arp_cache[i].ip, ip, 4) == 0) {
+            if (timer_ticks() < arp_cache[i].exp) {
+                memcpy(out_mac, arp_cache[i].mac, 6);
+                return 1;
+            }
+            memcpy(stale, arp_cache[i].mac, 6); have_stale = 1; stale_slot = i;
         }
     const uint8_t *mac = nic_mac();
     uint8_t pkt[42];
@@ -663,6 +725,23 @@ static int arp_resolve(const uint8_t *ip, uint8_t *out_mac) {
             arp_cache[slot].exp = timer_ticks() + ARP_TTL; arp_cache[slot].used = 1;
             return 1;
         }
+    }
+    /* A TIMEOUT IS NOT A REASON TO FAIL A CONNECTION (M2366). If we have ever
+     * known this address's MAC, use it: a default gateway's hardware address
+     * effectively never changes, and RFC 1122 explicitly allows using a stale
+     * entry while revalidation is in flight. Failing instead turned a lost ARP
+     * reply into ENETUNREACH on a connect that had not sent a single packet. */
+    if (have_stale) {
+        memcpy(out_mac, stale, 6);
+        if (stale_slot >= 0)                    /* don't re-stampede on every call */
+            arp_cache[stale_slot].exp = timer_ticks() + ARP_TTL / 4;
+        static unsigned long nstale;
+        if (++nstale <= 4 || (nstale % 100) == 0)
+            kprintf("[arp] %u.%u.%u.%u did not answer in 2 s -- using the last known MAC "
+                    "%02x:%02x:%02x:%02x:%02x:%02x instead of failing the connection "
+                    "(%lu-th time)\n", ip[0], ip[1], ip[2], ip[3],
+                    stale[0], stale[1], stale[2], stale[3], stale[4], stale[5], nstale);
+        return 1;
     }
     return 0;
 }
@@ -1750,7 +1829,11 @@ int net_tcp_sock_getpeer(int idx, uint8_t out[6]) {
     return 0;
 }
 int net_tcp_sock_connect(int idx, const uint8_t ip[4], uint16_t port) {
-    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) return -1;
+    if (idx < 0 || idx >= TCPSOCK_N || !g_tcpsock[idx].used) {
+        kprintf("[tcp] connect REFUSED before any SYN: socket slot %d is not open "
+                "(TCPSOCK_N=%d)\n", idx, TCPSOCK_N);
+        return -1;
+    }
     return tcp_connect(&g_tcpsock[idx].c, ip, port);
 }
 long net_tcp_sock_send(int idx, const void *buf, int len) {
@@ -1970,6 +2053,32 @@ int net_sntp(void) {
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
+/* See the forward declaration above rx_next (M2364). */
+#define SA_RING 96
+static struct { uint16_t port; uint8_t hop; } g_sa[SA_RING];
+static unsigned g_sa_n;
+static uint64_t g_sa_hits[3];
+static void synack_trace(int hop, const uint8_t *f, int len) {
+    if (len < 34 || get16(f + 12) != 0x0800 || f[14 + 9] != 6) return;
+    int ihl = (f[14] & 0x0F) * 4;
+    if (ihl < 20 || 14 + ihl + 20 > len) return;
+    const uint8_t *t = f + 14 + ihl;
+    if (!((t[13] & TCP_SYN) && (t[13] & TCP_ACK))) return;
+    g_sa_hits[hop]++;
+    g_sa[g_sa_n % SA_RING].port = get16(t + 2);     /* OUR ephemeral port */
+    g_sa[g_sa_n % SA_RING].hop  = (uint8_t)hop;
+    g_sa_n++;
+}
+/* Did `hop` ever see a SYN-ACK addressed to our port `port`? */
+static int sa_saw(int hop, uint16_t port) {
+    unsigned n = g_sa_n < SA_RING ? g_sa_n : SA_RING;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned k = (g_sa_n - 1 - i) % SA_RING;
+        if (g_sa[k].hop == (uint8_t)hop && g_sa[k].port == port) return 1;
+    }
+    return 0;
+}
+
 static void put32(uint8_t *p, uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
 static uint32_t get32(const uint8_t *p) { return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3]; }
 
@@ -2001,13 +2110,32 @@ static void tcp_send_seg(const uint8_t *dmac, const uint8_t *dip,
 
     put16(tcp + 0, sport); put16(tcp + 2, dport);
     put32(tcp + 4, seq);   put32(tcp + 8, ack);
-    tcp[12] = 5 << 4;                      /* data offset = 5 words, no options */
+    /* ADVERTISE AN MSS ON THE SYN (M2366).
+     *
+     * We sent no TCP options at all, and RFC 1122 says a peer that receives no
+     * MSS option MUST assume 536. A capture of a real page load shows exactly
+     * that: the server answers our optionless SYN with `options [mss 1460]`
+     * and then sends us 536-byte segments -- `seq 1:537`, and one ACK from us
+     * per 536 bytes. So every byte of every page arrived in chunks under 37%
+     * of what the link could carry, at ~2.7x the segment count, ~2.7x the
+     * ACKs, and ~2.7x the trips through a receive path whose cost is per-frame
+     * rather than per-byte.
+     *
+     * 1460 = 1500 MTU - 20 IP - 20 TCP. Only on a SYN, which is the only
+     * segment where options are negotiated, and only when it carries no data
+     * (our SYNs never do), so the data path below is untouched. */
+    int optlen = 0;
+    if ((flags & TCP_SYN) && dlen == 0) {
+        tcp[20] = 2; tcp[21] = 4; put16(tcp + 22, 1460);   /* kind 2, len 4, MSS */
+        optlen = 4;
+    }
+    tcp[12] = (uint8_t)(((20 + optlen) / 4) << 4);   /* data offset, in 32-bit words */
     tcp[13] = flags;
     put16(tcp + 14, 32768);                /* window */
     put16(tcp + 16, 0);                    /* checksum (fill below) */
     put16(tcp + 18, 0);                    /* urgent ptr */
-    if (dlen > 0) memcpy(tcp + 20, data, dlen);
-    int tcplen = 20 + dlen;
+    if (dlen > 0) memcpy(tcp + 20 + optlen, data, dlen);
+    int tcplen = 20 + optlen + dlen;
     put16(tcp + 16, l4_checksum(OUR_IP, dip, 6, tcp, tcplen));
 
     ip[0] = 0x45; ip[1] = 0; put16(ip + 2, 20 + tcplen);
@@ -2140,6 +2268,7 @@ static void park_put(const uint8_t *f, int len) {
                 if (g_park[i].at < oldest) { oldest = g_park[i].at; slot = i; }
         }
     }
+    synack_trace(SA_PARK, f, len);
     memcpy(g_park[slot].buf, f, (size_t)len);
     g_park[slot].len = len;
     g_park[slot].at  = now;
@@ -2157,6 +2286,7 @@ static int park_take(uint8_t *buf, int max, const uint8_t *dip,
         int n = g_park[i].len; if (n > max) n = max;
         memcpy(buf, g_park[i].buf, (size_t)n);
         g_park[i].len = 0;
+        synack_trace(SA_TAKE, buf, n);
         return n;
     }
     return 0;
@@ -2230,12 +2360,39 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
                                      * on a socket that failed to connect, so a claim here would leak a slot on
                                      * every failed connection attempt (bad host, refused, timed out) */
     memcpy(c->ip, ip, 4);
-    if (!arp_resolve(GW_IP, c->gw)) { c->errno_hint = ENETUNREACH; return -1; }   /* can't even reach the gateway (M1564) */
+    if (!arp_resolve(GW_IP, c->gw)) {
+        /* SAY SO (M2366). This is the ONLY way tcp_connect fails without
+         * sending a SYN, and it printed nothing -- so twelve of sixteen
+         * failed connects in a page load produced no [tcp] line at all and
+         * were invisible, while the four that DID reach the retry loop got a
+         * full diagnostic. The counts proved it rather than any log: 27
+         * successes + 4 reported timeouts x 4 SYNs = 43, exactly the 43 SYNs
+         * on the wire, so the other twelve never transmitted anything. */
+        static unsigned long nfail;
+        nfail++;
+        if (nfail <= 8 || (nfail % 50) == 0)
+            kprintf("[tcp] connect %u.%u.%u.%u:%u ABANDONED BEFORE THE FIRST SYN: could not "
+                    "ARP the gateway %u.%u.%u.%u in 2 s (%lu-th time). No SYN was ever sent, "
+                    "so this failure is invisible on the wire.\n",
+                    ip[0], ip[1], ip[2], ip[3], port,
+                    GW_IP[0], GW_IP[1], GW_IP[2], GW_IP[3], nfail);
+        c->errno_hint = ENETUNREACH; return -1;   /* can't even reach the gateway (M1564) */
+    }
     c->dport = port;
     static uint32_t conn_ctr = 0; conn_ctr++;   /* a monotonic per-connection nonce: the 100 Hz clock alone repeats across rapid reconnects (a browser's back-to-back sub-resource fetches), reusing port+ISN and risking a stale SYN-ACK/segment from the prior connection being accepted on the reused 4-tuple */
     c->sport = (uint16_t)(40000 + ((timer_ticks() + conn_ctr * 2179u) & 0x3FFF));
     c->myseq = ((uint32_t)(timer_ticks() * 2654435761u) ^ (conn_ctr * 0x9E3779B9u)) | 1;
     uint8_t buf[1600];
+    /* WHY DID THE HANDSHAKE FAIL? (M2364)
+     *
+     * A profile of time-to-page found 14 of 37 HTTPS connects failing, each
+     * costing 4 attempts x 1.2 s = the 4.8 s gaps that dominate the wall
+     * clock. `ETIMEDOUT` says only "nothing answered", which is consistent
+     * with three completely different faults: the SYN never left, a SYN-ACK
+     * came back and was dropped before this loop saw it, or one arrived and
+     * was rejected because its ACK number did not match. Those need opposite
+     * fixes, and the errno cannot tell them apart -- so count them. */
+    int saw_any = 0, saw_synack = 0, saw_badack = 0, saw_rst = 0;
     for (int attempt = 0; attempt < 4; attempt++) {
         tcp_send_seg(c->gw, c->ip, c->sport, port, c->myseq, 0, TCP_SYN, 0, 0);
         uint8_t *tcp; int dlen;
@@ -2243,6 +2400,12 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
         while (timer_ticks() < deadline) {
             if (!tcp_recv_seg(buf, sizeof(buf), c->ip, c->sport, port, 30, &tcp, &dlen)) continue;
             uint8_t fl = tcp[13];
+            saw_any++;
+            if (fl & TCP_RST) saw_rst++;
+            if ((fl & TCP_SYN) && (fl & TCP_ACK)) {
+                saw_synack++;
+                if (get32(tcp + 8) != c->myseq + 1) saw_badack++;
+            }
             if (fl & TCP_RST) { c->errno_hint = ECONNREFUSED; return -1; }   /* actively refused (M1564) */
             if ((fl & TCP_SYN) && (fl & TCP_ACK) && get32(tcp + 8) == c->myseq + 1) {
                 c->theirseq = get32(tcp + 4) + 1;
@@ -2254,6 +2417,28 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
                 return 0;
             }
         }
+    }
+    /* Name which of the three it was. Rate-limited: a failing page can do this
+     * fourteen times and the first few are the informative ones. */
+    {   static int told;
+        if (told < 12) { told++;
+            kprintf("[tcp] connect %u.%u.%u.%u:%u FAILED after 4 SYNs (sport %u): "
+                    "%d segment(s) matched this 4-tuple, %d were SYN|ACK, %d of those had "
+                    "the WRONG ack number, %d RST -- %s\n",
+                    c->ip[0], c->ip[1], c->ip[2], c->ip[3], port, c->sport,
+                    saw_any, saw_synack, saw_badack, saw_rst,
+                    saw_any == 0 ? "NOTHING came back: the SYN or the reply is being lost"
+                    : saw_synack == 0 ? "traffic arrived but no SYN|ACK among it"
+                    : "a SYN|ACK arrived and was REJECTED -- look at the ack number");
+            /* ...and say HOW FAR the reply got, which is the part the 4-tuple
+             * counters above cannot see (M2364). */
+            kprintf("[tcp]   a SYN|ACK for port %u reached: card=%s park=%s take=%s"
+                    "  (totals card=%lu park=%lu take=%lu)\n", c->sport,
+                    sa_saw(SA_CARD, c->sport) ? "YES" : "no",
+                    sa_saw(SA_PARK, c->sport) ? "YES" : "no",
+                    sa_saw(SA_TAKE, c->sport) ? "YES" : "no",
+                    (unsigned long)g_sa_hits[SA_CARD], (unsigned long)g_sa_hits[SA_PARK],
+                    (unsigned long)g_sa_hits[SA_TAKE]); }
     }
     c->errno_hint = ETIMEDOUT;   /* nothing ever answered the SYN (M1564) */
     return -1;

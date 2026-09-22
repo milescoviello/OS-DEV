@@ -13084,7 +13084,11 @@ int app_connect(int fd, const uint8_t ip[4], int port) {
         }
         return 0;
     }
-    if (a->fd[fd].type != 10) return -1;
+    if (a->fd[fd].type != 10) {
+        kprintf("[tcp] connect REFUSED before any SYN: fd %d is type %d, not an "
+                "AF_INET stream socket\n", fd, a->fd[fd].type);
+        return -1;
+    }
     return net_tcp_sock_connect(a->fd[fd].obj, ip, (uint16_t)port);
 }
 /* setsockopt/getsockopt (M1554): TCP client sockets (type 10) only -- these
