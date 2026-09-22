@@ -12,6 +12,7 @@
 #include "app.h"
 #include "flock.h"   /* flock_release_pid on process exit (M1177) */
 #include "drm.h"     /* the DRM render node, fd type 17 (M2347) */
+#include "virtio_gpu.h" /* is there really a GPU to point Firefox at? (M2352) */
 #include "inotify.h" /* inotify fd type 8 (M1266) */
 #include "net.h"     /* net_udp_send/recv for AF_INET datagram sockets, fd type 9 (M1267) */
 #include "pty.h"     /* pty_release_pid on process exit (M1185) */
@@ -10147,11 +10148,38 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * rendering is not a degraded mode we are settling for: it is the mode
          * whose output is a shared-memory buffer, which is exactly what wl_shm
          * and this compositor are built to carry. */
-        envp0[18] = "LIBGL_ALWAYS_SOFTWARE=1";
-        envp0[19] = "MOZ_ACCELERATED=0";
-        envp0[20] = "MOZ_X11_EGL=0";
-        envp0[21] = "MOZ_DISABLE_GPU_PROCESS=1";
-        envp0[22] = "MOZ_WEBRENDER_SOFTWARE=1";
+        /* ...AND THE PREMISE OF THAT PARAGRAPH IS NOW HALF FALSE (M2352).
+         *
+         * It says "there is no DRM device here and no Mesa vendor library".
+         * There is now: /dev/dri/renderD128 answers the four questions a GL
+         * driver asks, and a virgl-only Mesa is staged. So forcing software
+         * unconditionally would be choosing the slow path on a machine that
+         * has a fast one -- and the fast one is the entire point of the GPU
+         * work, because a volumetric fragment shader is not something a CPU
+         * rasteriser finishes in 16 ms.
+         *
+         * Conditional, not flipped. A boot with no `virtio-gpu-gl` attached --
+         * which is most boots, and every bare-metal one -- must still get the
+         * software path, because the paragraph above is entirely correct about
+         * what happens when glvnd resolves no vendor: null function tables and
+         * a browser that draws nothing. `virtio_gpu_has_3d()` is the same
+         * two-facts-and-ed test the driver reports at boot, so this cannot
+         * disagree with what the log says. */
+        if (virtio_gpu_has_3d()) {
+            envp0[18] = "LIBGL_ALWAYS_SOFTWARE=0";
+            envp0[19] = "MOZ_ACCELERATED=1";
+            envp0[20] = "MOZ_X11_EGL=0";        /* there is no X11 here either way */
+            envp0[21] = "MOZ_DISABLE_GPU_PROCESS=1";   /* one process is enough to debug */
+            envp0[22] = "MOZ_WEBRENDER_SOFTWARE=1";    /* compositing stays on the CPU: our
+                                                        * compositor takes wl_shm, not dmabuf.
+                                                        * WebGL is what we want on the GPU. */
+        } else {
+            envp0[18] = "LIBGL_ALWAYS_SOFTWARE=1";
+            envp0[19] = "MOZ_ACCELERATED=0";
+            envp0[20] = "MOZ_X11_EGL=0";
+            envp0[21] = "MOZ_DISABLE_GPU_PROCESS=1";
+            envp0[22] = "MOZ_WEBRENDER_SOFTWARE=1";
+        }
         /* Claude Code runs a connectivity preflight against platform.claude.com
          * and exits if it does not like the answer. Our stack completes that
          * exchange -- the capture shows the TLS handshake finishing in 0.3s and

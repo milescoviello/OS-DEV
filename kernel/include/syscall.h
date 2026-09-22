@@ -615,6 +615,16 @@ struct statx {                /* unsigned/unsigned long to match the other share
     unsigned long  stx_atime;    /* last access (epoch s) */
     unsigned       stx_ino;      /* inode number (0 if n/a) */
     unsigned       stx_blksize;  /* preferred I/O block size */
+    /* WHICH DEVICE, for a character device (M2353). Added because libdrm will
+     * not look at a DRM node without it: drmGetDevices2 opendir()s /dev/dri,
+     * stat()s each entry, and requires S_ISCHR **and** major 226 with minor
+     * >= 128 before it will consider the node at all. This struct had no rdev
+     * field, so path-based stat reported the render node as a character device
+     * belonging to device 0:0 -- which libdrm skips silently, so Mesa found no
+     * devices and eglInitialize failed with EGL_NOT_INITIALIZED and no reason.
+     * Appended at the END: the host test suites #include kernel .c files, and
+     * a field inserted in the middle would silently shift every offset. */
+    unsigned long  stx_rdev;     /* (major << 8) | minor, 0 for a non-device */
 };
 #define S_IFMT   0xF000
 #define S_IFREG  0x8000

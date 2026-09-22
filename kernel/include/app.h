@@ -26,7 +26,7 @@ void        app_dump_threads(int pid);                                /* where e
 void        app_count_lx_syscall(unsigned long nr);                    /* one more Linux syscall by the caller, counted BY NUMBER (M2004/M2066) */
 int         app_reap_selftest(void);
 int         app_pendq_selftest(void);                                  /* -append selftest: a live app must not lose its window to a dead one (M2076) */                                   /* -append selftest: only ONE reaper may tear a process down (M2072) */
-#define LX_ENV_CMDLINE 4
+#define LX_ENV_CMDLINE 8   /* 4 -> 8: the GL probes need EGL_LOG_LEVEL + MESA_DEBUG alongside the JSC switches (M2351) */
 extern const char *g_lx_env_cmdline[LX_ENV_CMDLINE];   /* extra environment for every Linux program, from -append (M2073) */
 void        app_set_fault_siginfo(uint64_t addr, int code);       /* si_addr/si_code for the NEXT fault signal delivered (M2073) */
 void        app_lx_syshist_dump(app_t *a, int want);                   /* the top `want` syscall numbers since the last sample -- what a stuck program is actually doing (M2066) */

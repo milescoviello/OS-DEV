@@ -20,3 +20,8 @@ long procfs_read(const char *abs, void *buf, unsigned long max);
 long procfs_write(const char *abs, const void *buf, unsigned long len);
 /* List the entries of "/proc" or "/dev" into out[]; returns the count. */
 int  procfs_list(const char *dir, vfs_dirent *out, int max);
+
+/* The one synthetic symlink: /sys/dev/char/226:128/device/subsystem, which
+ * libdrm resolves with realpath(3) before Mesa will load a driver. (M2353) */
+int         procfs_is_drm_symlink(const char *abs);
+const char *procfs_drm_symlink_target(const char *abs);

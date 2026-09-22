@@ -25,6 +25,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <dirent.h>
+#include <limits.h>
+#include <xf86drm.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -36,6 +44,115 @@ int main(void) {
     /* Say what we are asking for, so a log with no GL in it at all is still
      * distinguishable from one where this never ran. */
     printf("LXGL: start -- asking EGL for a surfaceless display\n");
+    /* MESA LOGS TO STDERR, AND IT PRINTED NOTHING ON THE FIRST RUN (M2351).
+     * Unbuffered, and echoed through stdout as well, so "Mesa said nothing"
+     * means Mesa said nothing rather than "Mesa's buffer was never flushed
+     * because the process exited through a path that does not flush". */
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("LXGL: env EGL_LOG_LEVEL=%s MESA_DEBUG=%s LD_LIBRARY_PATH=%.80s\n",
+           getenv("EGL_LOG_LEVEL") ? getenv("EGL_LOG_LEVEL") : "(unset)",
+           getenv("MESA_DEBUG") ? getenv("MESA_DEBUG") : "(unset)",
+           getenv("LD_LIBRARY_PATH") ? getenv("LD_LIBRARY_PATH") : "(unset)");
+
+    /* WHAT MESA WILL SEE WHEN IT OPENS THE NODE ITSELF.
+     *
+     * Mesa's surfaceless platform loops renderD128..renderD191, opens each,
+     * and hands the fd to libdrm. libdrm's drmGetDevice2 begins with
+     * fstat(fd) and REQUIRES S_ISCHR and a DRM major/minor -- 226 and >=128
+     * for a render node -- before it will look at anything else. If our fstat
+     * reports a regular file, every later step is unreachable and the only
+     * symptom is EGL_NOT_INITIALIZED, which is what the first run got. Print
+     * it, because it is a one-line answer to a question that would otherwise
+     * cost a boot each to guess at. */
+    {
+        int t = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        printf("LXGL: open(/dev/dri/renderD128) = %d%s\n", t, t < 0 ? strerror(errno) : "");
+        if (t >= 0) {
+            struct stat st;
+            if (fstat(t, &st) == 0)
+                printf("LXGL: fstat -> mode 0%o (S_ISCHR=%d), rdev major %u minor %u, size %lld\n",
+                       (unsigned)st.st_mode, S_ISCHR(st.st_mode) ? 1 : 0,
+                       (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev),
+                       (long long)st.st_size);
+            else
+                printf("LXGL: fstat FAILED: %s\n", strerror(errno));
+            close(t);
+        }
+        /* AND CAN IT BE READ AS A DIRECTORY? libdrm's drmGetDevices2 -- which
+         * is what builds EGL's device list, and therefore the thing that
+         * decides whether a hardware driver is even attempted -- enumerates by
+         * opendir("/dev/dri") and readdir, not by opening a known name. A
+         * directory that stats correctly and lists nothing yields an empty
+         * device list, which surfaces three layers up as "DRI2: failed to load
+         * driver". (M2353) */
+        {   DIR *d = opendir("/dev/dri");
+            if (!d) printf("LXGL: opendir(/dev/dri) FAILED: %s\n", strerror(errno));
+            else {
+                struct dirent *e; int n = 0;
+                printf("LXGL: readdir(/dev/dri):");
+                while ((e = readdir(d))) { printf(" %s", e->d_name); n++; }
+                printf("  (%d entr%s)\n", n, n == 1 ? "y" : "ies");
+                closedir(d);
+            }
+        }
+        /* And the two sysfs steps libdrm takes next, in its order, because a
+         * failure in either is silent in every log above this one. */
+        {   struct stat s1;
+            printf("LXGL: stat(/sys/dev/char/226:128/device/drm) -> %s\n",
+                   stat("/sys/dev/char/226:128/device/drm", &s1) == 0 ? "ok" : strerror(errno));
+            char rp[4096];
+            const char *r2 = realpath("/sys/dev/char/226:128/device/subsystem", rp);
+            printf("LXGL: realpath(.../device/subsystem) -> %s\n", r2 ? r2 : strerror(errno));
+        }
+        /* ASK libdrm DIRECTLY (M2353). Every prerequisite this probe checks now
+         * holds -- the node opens, fstats as a character device with the right
+         * rdev, appears in readdir, and its sysfs subsystem link resolves to
+         * /sys/bus/virtio -- and Mesa still says "DRI2: failed to load driver"
+         * with no reason. Mesa's device list comes from drmGetDevices2, and
+         * its driver name from drmGetVersion; asking both here separates "the
+         * kernel is missing something libdrm needs" from "libdrm is fine and
+         * Mesa's lookup is the problem", which need completely different
+         * fixes. One level down is cheaper than one more guess. */
+        {   drmVersionPtr v = 0;
+            int t2 = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+            if (t2 >= 0) {
+                v = drmGetVersion(t2);
+                if (v) {
+                    printf("LXGL: drmGetVersion -> \"%s\" %d.%d.%d (name_len %d)\n",
+                           v->name ? v->name : "(null)", v->version_major,
+                           v->version_minor, v->version_patchlevel, v->name_len);
+                    drmFreeVersion(v);
+                } else printf("LXGL: drmGetVersion FAILED\n");
+                printf("LXGL: drmGetNodeTypeFromFd -> %d (2 = DRM_NODE_RENDER)\n",
+                       drmGetNodeTypeFromFd(t2));
+                drmDevicePtr one = 0;
+                int r1 = drmGetDevice2(t2, 0, &one);
+                printf("LXGL: drmGetDevice2(fd) -> %d%s", r1, r1 ? " " : "");
+                if (r1) printf("(%s)\n", strerror(-r1));
+                else {
+                    printf(", bustype %d, available_nodes 0x%x\n",
+                           one->bustype, one->available_nodes);
+                    drmFreeDevice(&one);
+                }
+                close(t2);
+            }
+            drmDevicePtr devs[8];
+            int nd = drmGetDevices2(0, devs, 8);
+            printf("LXGL: drmGetDevices2 -> %d device(s)%s\n", nd,
+                   nd < 0 ? strerror(-nd) : "");
+            for (int i = 0; i < nd; i++) {
+                printf("LXGL:   device %d: bustype %d, available_nodes 0x%x\n",
+                       i, devs[i]->bustype, devs[i]->available_nodes);
+            }
+            if (nd > 0) drmFreeDevices(devs, nd);
+        }
+        struct stat sd;
+        printf("LXGL: stat(/dev/dri) -> %s%s\n",
+               stat("/dev/dri", &sd) == 0 ? "ok" : "FAILED: ",
+               stat("/dev/dri", &sd) == 0 ? (S_ISDIR(sd.st_mode) ? " (a directory)" : " (NOT a directory)")
+                                          : strerror(errno));
+    }
     fflush(stdout);
 
     EGLDisplay dpy = EGL_NO_DISPLAY;

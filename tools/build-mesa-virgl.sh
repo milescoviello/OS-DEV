@@ -99,7 +99,42 @@ find "$OUT/stage" -name "*_dri.so" -o -name "libEGL*" -o -name "libGL*" -o -name
 # which is why --libdir above matches where these land.
 echo "==> staging into $LXROOT"
 mkdir -p "$LXROOT"
+# Headers and pkgconfig are build-time artefacts; the guest runs binaries, and
+# every megabyte staged is a megabyte of ext2 the boot reads through a disk
+# path measured at 4.3x read amplification.
+rm -rf "$OUT/stage/usr/include" "$OUT/stage/usr/lib64/pkgconfig"
 ( cd "$OUT/stage" && tar cf - . ) | ( cd "$LXROOT" && tar xf - )
+
+# THE ONE DEPENDENCY THAT IS NOT ALREADY THERE. libgallium DT_NEEDEDs
+# libSPIRV-Tools; libdrm, libexpat, libz, libzstd, libstdc++, libgcc_s and
+# libwayland-client are all staged already for Firefox. Checked, not assumed --
+# a missing DT_NEEDED presents as "libEGL.so.1 not found", which reads as a
+# Mesa problem rather than a staging one.
+for dep in libSPIRV-Tools.so; do
+    if [ ! -e "$LXROOT/usr/lib64/$dep" ]; then
+        src=$(ls /usr/lib64/$dep 2>/dev/null | head -1)
+        [ -n "$src" ] || { echo "build-mesa-virgl: $dep not found on this host" >&2; exit 1; }
+        cp -L "$src" "$LXROOT/usr/lib64/$dep"
+        echo "    staged dep $dep ($(du -h "$LXROOT/usr/lib64/$dep" | cut -f1))"
+    fi
+done
+
+# AND PROVE EVERY DT_NEEDED RESOLVES, before a boot has to discover it.
+echo "==> checking the closure resolves inside the guest root:"
+miss=0
+for lib in "$LXROOT"/usr/lib64/libEGL.so.1.0.0 "$LXROOT"/usr/lib64/libgallium-*.so \
+           "$LXROOT"/usr/lib64/libGLESv2.so.2.0.0 "$LXROOT"/usr/lib64/libgbm.so.1.0.0; do
+    [ -e "$lib" ] || continue
+    for n in $(objdump -p "$lib" 2>/dev/null | awk '/NEEDED/{print $2}'); do
+        case "$n" in ld-linux*|linux-vdso*) continue ;; esac
+        if [ ! -e "$LXROOT/usr/lib64/$n" ] && [ ! -e "$LXROOT/lib64/$n" ] && \
+           [ ! -e "$LXROOT/usr/lib/$n" ]; then
+            echo "    MISSING  $n (needed by $(basename "$lib"))"; miss=$((miss+1))
+        fi
+    done
+done
+[ "$miss" = 0 ] && echo "    all DT_NEEDED entries present" || \
+    { echo "build-mesa-virgl: $miss unresolved dependency(ies)" >&2; exit 1; }
 echo "==> staged. DRI modules now in the guest:"
 ls -la "$LXROOT/usr/lib64/" 2>/dev/null | head -20
 # Mesa 26 has NO separate *_dri.so: the gallium driver is inside

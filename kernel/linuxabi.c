@@ -38,6 +38,7 @@
 #include "wayland.h"   /* g_wl_verbose (M1978) */
 #include "vmm.h"
 #include "app.h"
+#include "procfs.h"   /* the synthetic DRM sysfs symlink (M2353) */
 #include "drm.h"   /* DRM render-node ioctls (M2347) */
 #include "flock.h"      /* rlock_get/rlock_set/flock_op -- record locks the NATIVE fcntl has had since M1597 (M2085) */
 #include "rtc.h"
@@ -2252,6 +2253,10 @@ static void lx_dispatch_body(struct registers *r) {
         *(uint64_t *)(o + 32) = sx.stx_ino;                /* stx_ino */
         *(uint64_t *)(o + 40) = sx.stx_size;               /* stx_size */
         *(uint64_t *)(o + 48) = (sx.stx_size + 511) / 512; /* stx_blocks */
+        if (sx.stx_rdev) {                                 /* stx_rdev_major/minor (M2353) */
+            *(uint32_t *)(o + 128) = (uint32_t)(sx.stx_rdev >> 8);
+            *(uint32_t *)(o + 132) = (uint32_t)(sx.stx_rdev & 0xff);
+        }
         for (int t = 64; t <= 112; t += 16)                /* atime/btime/ctime/mtime */
             *(uint64_t *)(o + t) = sx.stx_mtime;
         /* THE DEVICE, which this call never reported (M2107). Offsets 136/140,
@@ -4429,6 +4434,35 @@ static void lx_dispatch_body(struct registers *r) {
                  * ttyname() and a few TUI programs read it to find their own
                  * terminal: major 5 minor 2 is /dev/ptmx, major 136 is a pts
                  * slave, which is what Linux reports. */
+                /* AND A DRM RENDER NODE IS A CHARACTER DEVICE TOO (M2351),
+                 * for exactly the same kind of reason as the pty above, in a
+                 * library that is even stricter about it. libdrm's
+                 * drmGetDevice2 -- which Mesa calls before it will load any
+                 * driver -- starts with
+                 *
+                 *     if (fstat(fd, &sbuf)) return -errno;
+                 *     maj = major(sbuf.st_rdev); min = minor(sbuf.st_rdev);
+                 *     if (!drmNodeIsDRM(maj, min) || !S_ISCHR(sbuf.st_mode))
+                 *             return -EINVAL;
+                 *
+                 * so a render node reported as a regular file is rejected
+                 * before anything else is looked at, and the only symptom
+                 * upstream is eglInitialize returning EGL_NOT_INITIALIZED with
+                 * no explanation -- which is exactly what the first lxgl run
+                 * got. Linux numbers DRM major 226, with render nodes from
+                 * minor 128; this is renderD128. */
+                if (app_fd_type((int)a1) == 17) {
+                    *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFCHR | 0666u;
+                    *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                    *(uint64_t *)(st + LXST_O_RDEV)    = (226ull << 8) | 128ull;
+                    *(int64_t  *)(st + LXST_O_SIZE)    = 0;
+                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                    *(int64_t  *)(st + LXST_O_BLOCKS)  = 0;
+                    *(uint64_t *)(st + LXST_O_INO)     = 0x3000ull;
+                    *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+                    r->rax = 0;
+                    break;
+                }
                 {   long ptsn = app_pts_number((int)a1);
                     int is_pty = app_fd_type((int)a1) == 11;
                     if (is_pty) {
@@ -4524,6 +4558,20 @@ static void lx_dispatch_body(struct registers *r) {
 
         const char *vis = 0;                 /* the answer, in the process's own view */
         char lbuf[VFS_PATH_MAX];             /* ...when it has to be read off disk */
+
+        /* 4. A SYNTHETIC SYMLINK IN OUR OWN sysfs (M2353). /sys is not on any
+         * filesystem, so the vfs_readlink route below cannot serve it, and
+         * libdrm resolves this exact path with realpath(3) before Mesa will
+         * load a driver. */
+        if (procfs_is_drm_symlink(upath)) {
+            const char *tgt = procfs_drm_symlink_target(upath);
+            uint64_t n = 0; while (tgt[n]) n++;
+            if (n > usz) n = usz;
+            if (!vmm_user_ok(ub, n)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            for (uint64_t i = 0; i < n; i++) ((char *)(uintptr_t)ub)[i] = tgt[i];
+            r->rax = n;
+            break;
+        }
 
         /* /proc/<self|pid>/... -- only "self" and the caller's own pid are
          * interesting here, and both name the calling process. */
@@ -4787,6 +4835,12 @@ static void lx_dispatch_body(struct registers *r) {
         *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);  /* 512-byte units, as Linux defines it */
         *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;   /* a real inode -- see LXS_fstat (M1955) */
         *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+        /* AND st_rdev, WHICH THIS CALL NEVER REPORTED (M2353). fstat has
+         * carried it for a pty since M2211 and for the render node since
+         * M2351; the PATH spelling reported 0 for both. libdrm enumerates
+         * devices by stat-ing directory entries, not by fstat-ing an open
+         * descriptor, so a correct fstat was not enough to be seen. */
+        *(uint64_t *)(st + LXST_O_RDEV)    = sx.stx_rdev;
         r->rax = 0;
         break;
     }

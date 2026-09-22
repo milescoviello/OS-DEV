@@ -10,6 +10,7 @@
  * for /proc, and /dev writes either discard (null) or fail (full).
  */
 #include "procfs.h"
+#include "virtio_gpu.h"   /* is there a GPU behind /dev/dri/renderD128? (M2351) */
 #include "pmm.h"
 #include "vmm.h"
 #include "timer.h"
@@ -489,7 +490,9 @@ static const struct pf proc_files[] = {
     { "bcache", gen_bcache }, { "measure", gen_measure }, { "cas", gen_cas }, { "fw", gen_fw },
     { "notify", gen_notify }, { "swaps", gen_swaps }, { "shm", gen_shm }, { "events", gen_events }, { "bpf", gen_bpf }, { "syscalls", gen_syscalls },
 };
-static const char *dev_files[] = { "null", "zero", "random", "urandom", "full", "clipboard", "kmsg", "tty" };   /* tty: the controlling terminal, opened specially by the Linux ABI (M2004) */
+static const char *dev_files[] = { "null", "zero", "random", "urandom", "full", "clipboard", "kmsg", "tty" };
+/* Listed in /dev separately from dev_files because it is a DIRECTORY, not a
+ * character device, and procfs_exists keys chardev off that table. (M2351) */   /* tty: the controlling terminal, opened specially by the Linux ABI (M2004) */
 
 /* --- NESTED /proc/sys and /sys nodes (M1970) --------------------------------
  *
@@ -518,6 +521,84 @@ static const struct sf sys_files[] = {
 };
 #define NSYSF (int)(sizeof(sys_files)/sizeof(sys_files[0]))
 
+/* WHAT libdrm READS BEFORE MESA WILL LOAD ANY DRIVER (M2353).
+ *
+ * Mesa's EGL calls `_eglAddDevice(fd)` -> `_eglAddDRMDevice` ->
+ * `drmGetDevice2(fd, 0, &dev)`, and returns NULL -- no device, therefore
+ * EGL_NOT_INITIALIZED -- if that fails. drmGetDevice2 is a sysfs reader:
+ *
+ *   1. fstat(fd): S_ISCHR and a DRM major/minor. (done in M2351)
+ *   2. drmNodeIsDRM: stat("/sys/dev/char/226:128/device/drm")
+ *   3. drmParseSubsystemType: realpath("/sys/dev/char/226:128/device/subsystem")
+ *      and compare the BASENAME against pci/usb/platform/virtio. realpath, not
+ *      readlink -- so `subsystem` has to be a real symlink and its target has
+ *      to exist, or glibc's realpath fails on the component.
+ *   4. drmParsePciBusInfo: "PCI_SLOT_NAME=" out of .../device/uevent
+ *   5. drmParsePciDeviceInfo: the five hex files below, falling back to
+ *      .../device/config if they are absent.
+ *
+ * None of this is invented: the device really is PCI 0000:00:1c.0, really is
+ * 1af4:1050, and the kernel already printed exactly that from its own PCI
+ * enumeration. This is the same information, in the place a library looks.
+ *
+ * Gated on virtio_gpu_has_3d() throughout, so a boot with no GPU has no
+ * /sys/dev/char entries to mislead anything. */
+#define DRM_SYS "/sys/dev/char/226:128/device"
+/* AND THE SUBSYSTEM IS virtio, NOT pci -- WHICH IS NOT A COSMETIC CHOICE.
+ *
+ * The first cut of this table said `pci` and gave the real 1af4:1050 ids,
+ * reasoning that the device genuinely is a PCI device. Both true, and it would
+ * have made things WORSE, because of what Mesa does with the answer:
+ *
+ *     if (!loader_get_pci_id_for_fd(fd, &vendor_id, &chip_id)) {
+ *         driver = loader_get_kernel_driver_name(fd);   <- "virtio_gpu" -> virgl
+ *         return driver;
+ *     }
+ *     driver = loader_get_driver_for_fd_pci(vendor_id, chip_id);  <- a fixed table
+ *
+ * Mesa's PCI-id table maps Intel, AMD and NVIDIA ids to drivers. 1af4:1050 is
+ * in no such table, so succeeding at the PCI probe returns NULL and the driver
+ * never loads -- while FAILING it falls through to the kernel driver name,
+ * which is exactly the answer we want. Supplying more accurate information
+ * would have taken the path that cannot work.
+ *
+ * Linux does not report it as PCI either, and for a real reason: the DRM
+ * device's parent is the VIRTIO device, whose parent is the PCI device. The
+ * subsystem of the immediate parent is virtio. So this is both what Linux says
+ * and what makes Mesa take the path that resolves.
+ *
+ * libdrm's virtio branch then wants MODALIAS to start with "virtio:", which is
+ * where the device and vendor ids belong in this spelling -- d=0x10 is
+ * virtio-gpu's device type, v=0x1af4 the vendor. */
+static const struct sf drm_sys_files[] = {
+    { DRM_SYS "/uevent",
+      "DRIVER=virtio_gpu\n"
+      "MODALIAS=virtio:d00000010v00001AF4\n" },
+};
+#define NDRMSYSF (int)(sizeof(drm_sys_files)/sizeof(drm_sys_files[0]))
+
+/* The directories those files live in, plus the symlink target. `drm` is a
+ * directory purely so step 2's stat() succeeds -- that is all libdrm does with
+ * it. */
+static const char *drm_sys_dirs[] = {
+    "/sys/dev", "/sys/dev/char", "/sys/dev/char/226:128",
+    DRM_SYS, DRM_SYS "/drm", "/sys/bus", "/sys/bus/virtio",
+};
+#define NDRMSYSD (int)(sizeof(drm_sys_dirs)/sizeof(drm_sys_dirs[0]))
+
+/* THE ONE SYMLINK. Its target must exist, because realpath resolves every
+ * component -- pointing it at a path we do not serve would fail in exactly the
+ * same silent way as not having it at all. */
+#define DRM_SYS_SUBSYSTEM DRM_SYS "/subsystem"
+#define DRM_SYS_SUBSYS_TARGET "/sys/bus/virtio"
+
+int procfs_is_drm_symlink(const char *abs) {
+    return virtio_gpu_has_3d() && peq(abs, DRM_SYS_SUBSYSTEM);
+}
+const char *procfs_drm_symlink_target(const char *abs) {
+    return procfs_is_drm_symlink(abs) ? DRM_SYS_SUBSYS_TARGET : 0;
+}
+
 /* /sys/devices/system/cpu/online is generated, not constant: it reports the
  * cores that are actually up, which is what a runtime sizes its thread pool
  * from. Format is a range list, "0" for one core and "0-3" for four. */
@@ -542,6 +623,13 @@ static long sysfs_read(const char *abs, char *b, int max) {
             p = sapp(b, p, max, sys_files[i].text);
             b[p] = 0; return p;
         }
+    if (virtio_gpu_has_3d())
+        for (int i = 0; i < NDRMSYSF; i++)
+            if (peq(abs, drm_sys_files[i].path)) {
+                int p = 0;
+                p = sapp(b, p, max, drm_sys_files[i].text);
+                b[p] = 0; return p;
+            }
     return -1;
 }
 static int sysfs_has(const char *abs) {
@@ -549,20 +637,56 @@ static int sysfs_has(const char *abs) {
         peq(abs, "/sys/devices/system/cpu/possible") ||
         peq(abs, "/sys/devices/system/cpu/present")) return 1;
     for (int i = 0; i < NSYSF; i++) if (peq(abs, sys_files[i].path)) return 1;
+    if (virtio_gpu_has_3d()) {
+        for (int i = 0; i < NDRMSYSF; i++) if (peq(abs, drm_sys_files[i].path)) return 1;
+        if (peq(abs, DRM_SYS_SUBSYSTEM)) return 1;
+    }
     return 0;
 }
 #define NPROC (int)(sizeof(proc_files)/sizeof(proc_files[0]))
 #define NDEV  (int)(sizeof(dev_files)/sizeof(dev_files[0]))
 
 static int proc_pid_path(const char *abs, int *pid, const char **file);   /* defined below (M1965) */
+
+/* The synthetic sysfs directories the DRM device needs (M2353). A trailing
+ * slash is accepted on each, because callers spell directories both ways and a
+ * path that exists only without its slash is a bug waiting for one caller. */
+static int procfs_is_drm_sysdir(const char *abs) {
+    if (!virtio_gpu_has_3d()) return 0;
+    for (int i = 0; i < NDRMSYSD; i++) {
+        if (peq(abs, drm_sys_dirs[i])) return 1;
+        {   const char *d = drm_sys_dirs[i]; int k = 0;
+            while (d[k] && abs[k] == d[k]) k++;
+            if (!d[k] && abs[k] == '/' && !abs[k + 1]) return 1;
+        }
+    }
+    return 0;
+}
 int procfs_is_dir(const char *abs) {
     /* /dev/shm is a DIRECTORY -- POSIX shared memory lives in it as named
      * objects, and a program that means to use shm checks for the directory
      * before trying. The objects themselves are not files on any filesystem;
      * openat() intercepts /dev/shm/NAME into a named memfd (M2008), so this
      * only has to make the directory itself real. */
+    /* AND /dev/dri IS A DIRECTORY (M2351), for the same reason: Mesa's
+     * surfaceless platform and libdrm both stat it, and a render node in a
+     * directory that does not exist is a node nobody looks for. The node
+     * itself is intercepted in app_open (fd type 17 over drm.c), so this only
+     * has to make the directory and the name real. */
+    /* AND /sys ITSELF (M2353). procfs.c has generated nested /sys nodes since
+     * M1970 and the directory they live in was never a directory -- stat("/sys")
+     * failed. Nothing noticed, because everything reaching /sys until now asked
+     * for a leaf by full path. glibc's realpath(3) does not: it lstats every
+     * component in turn, so a single missing intermediate makes the whole
+     * resolution fail, and libdrm resolves
+     * /sys/dev/char/226:128/device/subsystem before Mesa will load a driver. */
     return peq(abs, "/proc") || peq(abs, "/proc/") || peq(abs, "/dev") || peq(abs, "/dev/") ||
-           peq(abs, "/dev/shm") || peq(abs, "/dev/shm/");
+           peq(abs, "/dev/shm") || peq(abs, "/dev/shm/") ||
+           peq(abs, "/dev/dri") || peq(abs, "/dev/dri/") ||
+           peq(abs, "/sys") || peq(abs, "/sys/") ||
+           peq(abs, "/sys/kernel") || peq(abs, "/sys/kernel/") ||
+           peq(abs, "/sys/devices") || peq(abs, "/sys/devices/") ||
+           procfs_is_drm_sysdir(abs);
 }
 int procfs_owns(const char *abs) {
     return startswith(abs, "/proc/") || startswith(abs, "/dev/") ||
@@ -587,6 +711,11 @@ int procfs_exists(const char *abs, int *chardev) {
     if (sysfs_has(abs)) return 1;                            /* nested /proc/sys and /sys (M1970) */
     if (startswith(abs, "/dev/")) {
         const char *f = abs + 5;
+        /* The render node, only when there is really a GPU behind it -- the
+         * same rule app_open applies. A node that stats as present and then
+         * refuses to open reads as a broken driver; absent reads as a machine
+         * without a GPU, and only the second is true. (M2351) */
+        if (peq(f, "dri/renderD128") && virtio_gpu_has_3d()) { if (chardev) *chardev = 1; return 1; }
         for (int i = 0; i < NDEV; i++) if (peq(f, dev_files[i])) { if (chardev) *chardev = 1; return 1; }
         return 0;
     }
@@ -1061,7 +1190,21 @@ int procfs_list(const char *dir, vfs_dirent *out, int max) {
             while (s[k] && k < 62) { out[n].name[k] = s[k]; k++; }
             out[n].name[k] = 0; out[n].size = 0; out[n].date = out[n].time = 0; n++;
         }
+    } else if (peq(dir, "/dev/dri") || peq(dir, "/dev/dri/")) {
+        if (virtio_gpu_has_3d() && n < max) {
+            const char *s2 = "renderD128";
+            int k = 0; while (s2[k] && k < 62) { out[n].name[k] = s2[k]; k++; }
+            out[n].name[k] = 0; out[n].size = 0; out[n].date = out[n].time = 0; n++;
+        }
     } else if (peq(dir, "/dev") || peq(dir, "/dev/")) {
+        /* `dri` is in this listing but not in dev_files, because dev_files is
+         * the character-device table and this is a directory. A program that
+         * scans /dev looking for a GPU needs to SEE it here. (M2351) */
+        if (virtio_gpu_has_3d() && n < max) {
+            const char *d2 = "dri";
+            int k = 0; while (d2[k] && k < 62) { out[n].name[k] = d2[k]; k++; }
+            out[n].name[k] = 0; out[n].size = 0; out[n].date = out[n].time = 0; n++;
+        }
         for (int i = 0; i < NDEV && n < max; i++) {
             int k = 0; const char *s = dev_files[i];
             while (s[k] && k < 62) { out[n].name[k] = s[k]; k++; }

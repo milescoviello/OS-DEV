@@ -264,6 +264,7 @@ static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- 
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
 static volatile int g_lxdrm;                  /* -append lxdrm: does the DRM render node answer the four questions Mesa asks? (M2347) */
+static volatile int g_lxgl;                   /* -append lxgl: eight links from a GL call to the host iGPU (M2351) */
 static volatile int g_lxdns_spawned;          /* lxdns already runs alongside the browser -- do not ALSO run the quiet-machine arms (M2321) */
 static volatile int g_lxdns;                  /* -append lxdns: two hundred getaddrinfo calls, so the 1-in-N EAI_AGAIN can be SAMPLED (M2320) */
 static volatile int g_fftest;                 /* -append fftest: run Firefox against our Wayland compositor (M1982) */
@@ -967,7 +968,13 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "lxport"))     { g_lxabi_test = 1; g_lxport = 1; }   /* the ephemeral port allocator race (M2324) */
-        if (cmdline_has(cl, "lxdrm"))      { g_lxabi_test = 1; g_lxdrm = 1; }    /* the DRM render node, asked directly (M2347) */
+        /* NOT g_lxabi_test. These two run from their own site after
+         * virtio_gpu_init, not from the lxabi block, so setting that flag only
+         * made every boot of a GPU probe run the whole thirty-probe ABI suite
+         * first -- a minute and a half of unrelated work per measurement, on a
+         * loop whose round trip is already several minutes. */
+        if (cmdline_has(cl, "lxdrm"))      g_lxdrm = 1;    /* the DRM render node, asked directly (M2347) */
+        if (cmdline_has(cl, "lxgl"))       g_lxgl = 1;     /* EGL -> Mesa virgl -> the host GPU (M2351) */
         if (cmdline_has(cl, "lxdns"))      { g_lxabi_test = 1; g_lxdns = 1; }    /* hammer getaddrinfo instead of sampling it ten times per Claude boot (M2320) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
@@ -1037,6 +1044,19 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnojit"))  g_lx_env_cmdline[0] = "BUN_JSC_useJIT=0";
         if (cmdline_has(cl, "lxnogc"))   g_lx_env_cmdline[1] = "BUN_JSC_useConcurrentGC=0";
         if (cmdline_has(cl, "lxnogen"))  g_lx_env_cmdline[2] = "BUN_JSC_useGenerationalGC=0";   /* what each Linux process is actually doing (M2066) */
+        /* MAKE MESA EXPLAIN ITSELF (M2351). A GL driver that cannot use the
+         * hardware falls back to software and says so only at debug level --
+         * precisely the failure this campaign must be able to see, because
+         * "it is slow" is the same symptom as "the ioctl is wrong". */
+        if (cmdline_has(cl, "glverbose")) {
+            g_lx_env_cmdline[3] = "EGL_LOG_LEVEL=debug";
+            g_lx_env_cmdline[4] = "MESA_DEBUG=1";
+            /* LIBGL_DEBUG is what turns on the LOADER's own log -- the part
+             * that says which driver name it derived and where it looked --
+             * and that is the layer reporting "DRI2: failed to load driver"
+             * with no reason attached. */
+            g_lx_env_cmdline[5] = "LIBGL_DEBUG=verbose";
+        }
         /* THE PHASE 7 DEMO IS NOT GATED ON A 120-THREAD STRESS PROBE (M2278).
          *
          * lxask/lxbash/lxedit set g_lxabi_test, which runs the whole ABI
@@ -3768,6 +3788,18 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * failure was perfectly legible and still pointed at the wrong component:
      * every line of it was about the kernel, and the defect was in when it
      * was called. */
+    if (g_lxgl) {
+        /* THE WHOLE CHAIN, IN ONE PROGRAM (M2351): EGL -> Mesa virgl ->
+         * /dev/dri/renderD128 -> virtio-gpu -> virglrenderer -> host GL.
+         * Eight links. Firefox exercises the same eight and answers a failure
+         * in any of them by silently falling back to SWGL, so asking through
+         * Firefox cannot say which link broke. The assertion is GL_RENDERER
+         * containing "virgl" and a clear that reads back green --
+         * configured-but-dead contexts pass every other check. */
+        kprintf("[lxabi] the GL chain: EGL -> Mesa virgl -> our render node -> the host GPU...\n");
+        int grc = app_run_linux_sync("/disk2/lxgl", 0, 0, 60000);
+        kprintf("[lxabi] lxgl exit -> %d\n", grc);
+    }
     if (g_lxdrm) {
         /* THE RENDER NODE, ASKED DIRECTLY (M2347). The program that will
          * really ask these questions is Mesa, which answers a wrong answer

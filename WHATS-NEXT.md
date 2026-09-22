@@ -1,5 +1,95 @@
 # What's next
 
+> **(M2344-M2350) OS-DEV CAN SEE A REAL GPU, AND THE DOORBELL ONLY EXISTED IN
+> THE KERNEL.**
+>
+> The goal is 60 fps on a WebGL volumetric-shader benchmark. Firefox's WebGL
+> runs on SWGL, a software rasteriser, and no amount of CPU finishes a
+> raymarching fragment shader in 16 ms -- so this needs a real GPU, which means
+> virgl: Mesa in the guest, a DRM render node in the kernel, virtio-gpu 3D on
+> the wire, virglrenderer on the host.
+>
+> **Measured, end to end:**
+>
+> ```
+> [gpu3d] capset 1: id 2 (VIRGL2), max version 2, max size 1384 bytes
+> LXDRM: VERSION -> driver "virtio_gpu" 0.1.0
+> LXDRM: GETPARAM(3D_FEATURES) -> value 1
+> LXDRM: GET_CAPS(virgl2, 1384 bytes) -> 342 non-zero byte(s)
+> LXDRM: RESOURCE_CREATE 64x64 BGRA -> bo_handle 1, res_handle 64
+> LXDRM: mmap(16384 bytes at that offset) -> 0x10066c000
+> LXDRM: the pattern came back through the HOST: 0 of 16384 bytes differ
+> LXDRM: RESULT PASS
+> ```
+>
+> Sixteen kilobytes written by a ring-3 process, pushed to the host's GL
+> texture, **wiped in the guest**, pulled back, byte-identical. The wipe is the
+> assertion: without it the comparison passes whether or not either transfer
+> did anything.
+>
+> **THE BUG WORTH REMEMBERING.** Every 2D command at boot worked and the first
+> one issued from an ioctl panicked:
+>
+> ```
+> Page Fault err=0x2  CR2=0x00000e0600007000
+> rip=...  mov %dx,(%rax)          <- *vg.notify_q0 = 0
+> [0] gpu_cmd_locked  [1] virtio_gpu_get_capset  [2] drm_ioctl
+> ```
+>
+> `map_mmio` identity-mapped the BAR -- as `ahci.c`, `e1000.c`, `ehci.c`,
+> `svga.c` and `hpet.c` still do, safely, because they are only touched from
+> kernel threads. This driver is now reached from a **syscall**, which runs on
+> the calling process's CR3, and QEMU puts this 64-bit BAR at physical
+> ~0xe06_00000000 -- 14.4 TB, so PML4[28]. `vmm_create_address_space` shares
+> PML4[256..511] by pointer and copies PML4[0]'s PDPT by value; PML4[28] is in
+> neither. **The doorbell existed only in the kernel's address space.** It
+> looked like a capset bug for two boots; the failing thing was neither the
+> command nor the buffer but *whose page tables were loaded*. What settled it
+> was `objdump` of the faulting address: the panic trace names the function,
+> the instruction names the pointer, and two boots went into inferring from
+> register values what one disassembly said outright.
+>
+> Three more of the same shape alongside it. Device-visible buffers were BSS
+> statics resolved with `vmm_translate`, and M2346's 4 KiB capset response
+> landed past the end of the kernel image. The 2D backing called
+> `pmm_alloc_frame()` a thousand times hoping for adjacency -- it reported "a
+> run of 67" against 1000 needed, on a machine with gigabytes free, and
+> `pmm_alloc_contiguous` exists and searches. And "no virtio-gpu device found"
+> was printed for **five** unrelated causes, naming only the first, in the same
+> boot whose PCI enumeration printed `00:1c.0 1af4:1050`.
+>
+> **The instruments came first, and two of them were wrong before they were
+> right.** `[fps]` counts `wl_surface.commit` per surface per second, because
+> `[frame]`'s 1.9 ms/frame has been carrying the claim "the compositor is not
+> the problem" -- the right answer to the wrong question, since what a viewer
+> sees is how often the *client* hands over a frame. The first reading was
+> "mean 27.9 fps, max 103" on volumeshaderbm, and the screendump showed the
+> benchmark **sitting there waiting for a click**. The second, after clicking,
+> was "mean 20.5 fps" of Firefox's own *Server Not Found*. Both numbers were
+> real and neither described anything anybody asked about; `ffbench.sh` now
+> reads the window title back and refuses to report a frame rate for an error
+> page. `[frame]` also turned out to be instrumented only inside `if (dirty)`
+> -- a full scene redraw -- while a client committing 100 frames a second takes
+> the `wl_only` partial path, which had no timing in it at all.
+>
+> **Host prerequisites, both measured rather than assumed.** pve-ultra had
+> virglrenderer and libepoxy but no Mesa, so `-display egl-headless` died with
+> "Couldn't open libEGL.so.1" (ten additive Debian packages; a bogus rendernode
+> still answers "render node init failed", so the probe can fail). And
+> `--vga virtio-gl` **hangs this kernel** 36 lines into boot -- no Multiboot
+> framebuffer tag, so fbcon falls back to a Bochs VBE mode-set against a device
+> whose framebuffer is not where stdvga's is. Replacing a working display path
+> to reach a feature that has nothing to do with display is a bad trade, so the
+> display stays on stdvga and `virtio-gpu-gl` is attached as a second, headless
+> device (`GPU3D=1`).
+>
+> Mesa is built rather than staged: Debian's 42 MB megadriver drags in LLVM 19,
+> z3, libedit, libsensors and nine X11 libraries, **none of which is virgl's**
+> -- virgl compiles no shaders locally, virglrenderer does that on the host. It
+> is llvmpipe in the same binary that needs LLVM, and llvmpipe is the thing we
+> are trying to leave. Configured for virgl alone it is 22 MB, and every
+> remaining dependency but one was already staged.
+
 > **(M2341-M2343) THE OVERSHOOT WAS REAL, THE PAYOFF WAS 6%, AND THE BUDGET
 > HAD BEEN LYING ABOUT WHY.**
 >

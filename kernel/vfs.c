@@ -508,6 +508,23 @@ int vfs_list_path(const char *path, vfs_dirent *out, int max) {
         kfree(fe);
         return n;
     }
+    /* A SYNTHETIC DIRECTORY, WHICH THIS COULD NOT LIST AT ALL (M2353).
+     *
+     * vfs_list() has served /proc and /dev since M1216, but only for the
+     * CURRENT DIRECTORY -- through `synth_cwd`, an integer saying which
+     * synthetic root the shell is sitting in. There was no path-based route,
+     * so `vfs_list_path("/dev")` fell through to the boot filesystem, found
+     * nothing, and returned -1. Nothing noticed for a long time because the
+     * only caller was the in-guest shell's `ls`, which is cwd-based.
+     *
+     * getdents64 is path-based, and libdrm enumerates GPUs by
+     * opendir("/dev/dri") + readdir -- not by opening a known name. So a
+     * render node that opened correctly, stat-ed correctly and answered every
+     * ioctl was still invisible to Mesa, and the symptom three layers up was
+     * eglInitialize returning EGL_NOT_INITIALIZED with no reason given. */
+    {   char ap[VFS_PATH_MAX];
+        if (synth_path(p, ap, sizeof ap)) return procfs_list(ap, out, max);
+    }
     if (!fs || !fs->list_path) return -1;
     return fs->list_path(p, out, max);
 }
@@ -678,6 +695,17 @@ static int vfs_stat_inner(const char *path, struct statx *st) {
         veq(path, "/dev") || veq(path, "/dev/") || veq(path, "/snap") || veq(path, "/snap/")) {
         st->stx_mode = S_IFDIR | 0755u; st->stx_ino = path_ino(path); return 0;
     }
+    /* AND ASK procfs WHICH SYNTHETIC PATHS ARE DIRECTORIES (M2352), instead of
+     * keeping a second list here that has to be remembered separately. This
+     * hardcoded set had drifted: procfs.c has called /dev/shm a directory since
+     * M2008 and /dev/dri one since M2351, and stat reported both as regular
+     * files -- `stat(/dev/dri) -> ok (NOT a directory)`, which is the shape of
+     * answer that makes a library give up without saying why. */
+    {   char ap[VFS_PATH_MAX];
+        if (synth_path(path, ap, sizeof ap) && procfs_is_dir(ap)) {
+            st->stx_mode = S_IFDIR | 0755u; st->stx_ino = path_ino(ap); return 0;
+        }
+    }
     { /* /proc and /dev FILES (M1965). The directories were already handled
        * above; their contents were not, so stat said "no such file" for every
        * one of them and open() therefore refused to open any. Size is reported
@@ -687,8 +715,25 @@ static int vfs_stat_inner(const char *path, struct statx *st) {
         if (synth_path(path, ap, sizeof ap)) {
             int chardev = 0;
             if (!procfs_exists(ap, &chardev)) return -1;
+            /* A SYMLINK MUST STAT AS ONE (M2353). glibc's realpath lstats
+             * each component and only calls readlink when the mode says
+             * S_IFLNK; reported as a regular file, the link is never followed
+             * and libdrm's subsystem probe compares the basename "subsystem"
+             * against "pci" and gives up. */
+            if (procfs_is_drm_symlink(ap)) {
+                const char *tgt = procfs_drm_symlink_target(ap);
+                st->stx_mode = S_IFLNK | 0777u;
+                st->stx_size = 0;
+                for (const char *q = tgt; q && *q; q++) st->stx_size++;
+                st->stx_ino = path_ino(ap);
+                return 0;
+            }
             st->stx_mode = (unsigned)(chardev ? S_IFCHR : S_IFREG) | (chardev ? 0666u : 0444u);
             st->stx_ino = path_ino(ap);
+            /* Linux numbers DRM major 226, render nodes from minor 128. Only
+             * this node has a meaningful rdev; the rest of /dev is synthetic
+             * and nothing asks. (M2353) */
+            if (veq(ap, "/dev/dri/renderD128")) st->stx_rdev = (226ul << 8) | 128ul;
             return 0;
         }
     }
