@@ -1060,7 +1060,44 @@ void task_wake(task_t *t) {
      * that is actually parked, and skipped when an IPI to it is still in
      * flight, because a broadcast on every wake would be thousands of VM exits
      * a second now that pipe and eventfd writes wake pollers (M2208). */
-    smp_send_resched_ipi();
+    /* WAKEUP PREEMPTION (M2340).
+     *
+     * If a core was idle, the poke above is enough. If every core is BUSY --
+     * which is the case that matters, because it is what "under load" means --
+     * the woken task used to wait for somebody's next 100 Hz tick, and then
+     * possibly several more before it was picked. Measured on a click: 4 of 10
+     * landed in 1-10 ms and 3 took over 50 ms, with the spread coming entirely
+     * from this.
+     *
+     * So find the core running the LEAST deserving task -- highest vruntime --
+     * and, if the task we just woke is ahead of it, ask that core to make a
+     * fresh decision. sched_tick() in the 0x43 handler does the rest, and if
+     * the woken task turns out not to deserve the CPU the core simply picks
+     * the same task again: the cost is one IPI, not a wrong decision.
+     *
+     * RATE-LIMITED, because pipe, eventfd and AF_UNIX writes all wake pollers
+     * now and an unconditional IPI per wake would be thousands of VM exits a
+     * second -- the same objection M2216 raised against broadcasting. One
+     * preemption poke per 200 us caps it at 5000/s worst case while leaving
+     * every isolated interactive wake on the fast path. */
+    if (!smp_send_resched_ipi() && t && t->state == TASK_READY) {
+        static volatile uint64_t last_poke_tsc;
+        uint64_t nowt = idle_tsc();
+        uint64_t cpm  = timer_cycles_per_ms();
+        uint64_t gap  = cpm ? (cpm / 5) : 0;            /* 200 us */
+        if (gap && nowt - __atomic_load_n(&last_poke_tsc, __ATOMIC_RELAXED) >= gap) {
+            int worst = -1; uint64_t worst_vr = 0;
+            for (int c = 0; c < MAX_SCHED_CPUS; c++) {
+                task_t *r = cur[c];
+                if (!r || r == t) continue;
+                if (worst < 0 || r->vruntime > worst_vr) { worst = c; worst_vr = r->vruntime; }
+            }
+            if (worst >= 0 && t->vruntime < worst_vr) {
+                __atomic_store_n(&last_poke_tsc, nowt, __ATOMIC_RELAXED);
+                smp_send_resched_cpu(worst);
+            }
+        }
+    }
 }
 
 /* Sleep the current task for `ms`, off-CPU, until the timer wakes it (M1079) —

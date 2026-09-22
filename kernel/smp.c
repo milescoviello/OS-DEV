@@ -265,11 +265,14 @@ static volatile unsigned char smp_resched_sent[SMP_MAXCPU];
 void smp_resched_ack(int apic) {
     smp_resched_sent[apic & (SMP_MAXCPU - 1)] = 0;
 }
-void smp_send_resched_ipi(void) {
-    if (!lapic) return;
+/* Returns 1 if an idle core was poked, 0 if every core is busy -- the caller
+ * needs to know, because "all busy" is exactly when a woken interactive task
+ * would otherwise wait for somebody's next timer tick (M2340). */
+int smp_send_resched_ipi(void) {
+    if (!lapic) return 0;
     int me = smp_current_cpu() & (SMP_MAXCPU - 1);
     int n = __atomic_load_n(&smp_cpu_count, __ATOMIC_RELAXED);
-    if (n <= 1) return;
+    if (n <= 1) return 0;
     for (int i = 0; i < SMP_MAXCPU; i++) {
         if (i == me || !smp_core_idle[i]) continue;
         if (__atomic_exchange_n(&smp_resched_sent[i], 1, __ATOMIC_ACQ_REL)) continue;  /* one in flight already */
@@ -277,8 +280,30 @@ void smp_send_resched_ipi(void) {
         lapic_wr(LAPIC_ICRLO, 0x43 | (1u << 14));            /* fixed, assert, that core */
         for (uint32_t g = 0; g < 1000000u && (lapic_rd(LAPIC_ICRLO) & ICR_PENDING); g++)
             __asm__ volatile("pause");
-        return;                                              /* one idle core is enough for one task */
+        return 1;                                            /* one idle core is enough for one task */
     }
+    return 0;                                                /* every core is busy */
+}
+
+/* POKE A SPECIFIC, BUSY CORE (M2340).
+ *
+ * smp_send_resched_ipi above only ever targets an IDLE core, so under load --
+ * which is precisely when latency is felt -- a woken task was left to wait for
+ * some core's next 100 Hz tick. The 0x43 handler already calls sched_tick(),
+ * so a busy core that receives this WILL make a fresh scheduling decision;
+ * nothing new is needed on the receiving side. */
+int smp_send_resched_cpu(int cpu) {
+    if (!lapic) return 0;
+    int me = smp_current_cpu() & (SMP_MAXCPU - 1);
+    cpu &= (SMP_MAXCPU - 1);
+    if (cpu == me) return 0;
+    if (__atomic_load_n(&smp_cpu_count, __ATOMIC_RELAXED) <= 1) return 0;
+    if (__atomic_exchange_n(&smp_resched_sent[cpu], 1, __ATOMIC_ACQ_REL)) return 0;
+    lapic_wr(LAPIC_ICRHI, (uint32_t)cpu << 24);
+    lapic_wr(LAPIC_ICRLO, 0x43 | (1u << 14));
+    for (uint32_t g = 0; g < 1000000u && (lapic_rd(LAPIC_ICRLO) & ICR_PENDING); g++)
+        __asm__ volatile("pause");
+    return 1;
 }
 
 void smp_wake_aps(void) {

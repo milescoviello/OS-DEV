@@ -32,7 +32,8 @@ void lapic_eoi(void);              /* end-of-interrupt to this core's local APIC
 void smp_parallel_for(int n, smp_fn fn, void *ctx);   /* run fn over [0,n) across all cores */
 void smp_wake_aps(void);           /* IPI every AP awake (M1198's wake vector 0x40) */
 void smp_send_tlb_shootdown_ipi(void);  /* all-but-self IPI at vector 0x41 (M1963) */
-void smp_send_resched_ipi(void);   /* wake ONE idle core to pick up a newly-runnable task, vector 0x42 (M2216) */
+int  smp_send_resched_ipi(void);   /* wake ONE idle core; 0 if all are busy (M2216/M2340) */
+int  smp_send_resched_cpu(int cpu); /* poke a SPECIFIC core, busy or not (M2340) */
 void smp_resched_ack(int apic);    /* the 0x42 handler, clearing the in-flight flag (M2216) */
 extern volatile unsigned char smp_core_idle[16];   /* set while that core is halted in the idle task (M2216) */
 void smp_send_panic_nmi(void);           /* all-but-self NMI: stop every other core so a panic can print (M2080) */
