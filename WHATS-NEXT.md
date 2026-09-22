@@ -1,5 +1,62 @@
 # What's next
 
+> **(M2351-M2355) OS-DEV RUNS OpenGL ES 3.2 ON THE HOST'S GPU.**
+>
+> ```
+> LXGL: drmGetDevices2 -> 1 device(s)
+> libEGL debug: using driver virtio_gpu for 3
+> libEGL debug: pci id for fd 3: 1af4:1050, driver virtio_gpu
+> LXGL: eglInitialize -> 1, EGL 1.5, vendor "Mesa Project"
+> LXGL: GL_RENDERER = virgl (Mesa Intel(R) Graphics (ARL))
+> LXGL: GL_VERSION  = OpenGL ES 3.2 Mesa 26.1.6
+> LXGL: is this the HOST GPU? YES -- virgl
+> [drm] EXECBUFFER (0xc0406442) -> 0
+> ```
+>
+> Eight links: a ring-3 program calls EGL, Mesa's virgl driver turns GL into a
+> command stream, our DRM render node forwards it to virtio-gpu, QEMU hands it
+> to virglrenderer, and that runs it on an Arrow Lake iGPU. **"Mesa Intel(R)
+> Graphics (ARL)" is the HOST's device name arriving back through the whole
+> chain** — the one thing a software fallback cannot fake, which is exactly why
+> `tools/lx/lxgl.c` exists: Firefox answers a failure anywhere in here by
+> silently rasterising on the CPU, so asking through Firefox tells you nothing
+> about which link broke.
+>
+> **Getting there was eight kernel requirements, and four had nothing to do
+> with GPUs.** `struct statx` had no `rdev` field, so path-based `stat`
+> reported the render node as belonging to device 0:0 and libdrm skipped it —
+> and libdrm enumerates by stat-ing directory entries, never by `fstat`, so a
+> correct `fstat` was not enough to be *seen*. `vfs_stat` kept its own list of
+> synthetic directories which had drifted from procfs.c's, so `/dev/shm` had
+> been a directory to one and a regular file to the other since M2008. `/sys`
+> itself had never stat-ed as a directory, unnoticed because every caller until
+> now asked for a leaf by full path and `realpath(3)` lstats every component.
+> And `vfs_list_path` could not list a synthetic directory **at all** — /proc
+> and /dev have been listable since M1216, but only through `synth_cwd`, so
+> `readdir("/dev/dri")` returned nothing.
+>
+> **TWO OF THE BUGS WERE MINE, MADE WHILE DEBUGGING, AND BOTH PRODUCED THE
+> SYMPTOM I WAS CHASING.** I "corrected" the sysfs subsystem from `pci` to
+> `virtio` — Linux does report virtio, so it felt like an accuracy fix — and
+> libdrm's `drmGetDeviceFromDevId` contains `if (subsystem_type !=
+> DRM_BUS_PCI) return -ENODEV;`. Measured: `drmGetDevice2(fd) -> -19`,
+> `drmGetDevices2 -> 0 device(s)`. The reasoning behind the change ("an unknown
+> PCI id makes Mesa return NULL") was read off an older Mesa; 26 falls back to
+> the kernel driver name. Then a Makefile edit made tool-staging restage
+> `lxgl`'s host `ldd` closure, silently replacing the 468 KB virgl Mesa libEGL
+> with the host's 88 KB glvnd stub — whose failure message is *word for word*
+> "DRI2: failed to load driver". It also exposed that the Mesa staging had
+> never been in the build at all; I had been running it by hand, and a
+> prerequisite that lives only in a shell history is not a prerequisite.
+>
+> **The method lesson is the expensive one.** Mesa's and libdrm's sources were
+> in `/var/cache/distfiles` the whole time. One `grep -n ENODEV xf86drm.c`
+> stated the requirement that four six-minute VM round trips of inference had
+> failed to find, and `src/egl/main/eglapi.c:680` explained the
+> try-hardware-then-zink-then-software sequence that had made one failure look
+> like three. Every wrong turn in this chain came from reasoning about these
+> libraries instead of reading them.
+
 > **(M2344-M2350) OS-DEV CAN SEE A REAL GPU, AND THE DOORBELL ONLY EXISTED IN
 > THE KERNEL.**
 >
