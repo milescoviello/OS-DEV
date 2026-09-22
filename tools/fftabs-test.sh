@@ -114,59 +114,46 @@ echo "   shots in $S"
 wait $RUN 2>/dev/null || true
 # (the 7th-tab check below runs before the verdict -- M2334)
 
-# ---- a SEVENTH tab, opened from the running browser (M2334) ---------------
+# ---- a SEVENTH tab, opened from the running browser (M2336) ---------------
 #
 # Everything above proves Firefox can be STARTED with tabs. This proves the
-# running browser can make a new one: Ctrl+T, type an address, Enter. It is a
-# different path -- the tab strip grows, a fresh docshell is created, and the
-# address goes through the URL bar's parser rather than the command line.
-# QMP TAKES QCODE NAMES, NOT CHARACTERS. The first version sent each character
-# verbatim, so "example.org" arrived as "exampleorg" -- the '.' is named "dot"
-# and an unknown qcode is simply dropped. Enter then sent that to a search
-# engine and the new tab loaded a results page, which the test would happily
-# have called a success.
-# QMP TAKES QCODE NAMES, NOT CHARACTERS. Sending "." sends nothing -- the
-# qcode is "dot" -- so "example.org" arrived as "exampleorg", Enter treated
-# it as a search term, and the new tab loaded a Google results page. The tab
-# had opened correctly; the ADDRESS was mistyped by the harness. (M2335)
+# running browser can make one: Ctrl+T, type an address, Enter. It is a
+# different path -- the strip grows, a fresh docshell appears, and the address
+# goes through the URL bar rather than the command line -- and it was BROKEN
+# until M2336: every connect() timed out because a SYN-ACK had been evicted
+# from a 64-slot park ring, so a tab opened after startup could never load.
 type_str(){ for c in $(echo "$1" | sed 's/./& /g'); do
-      case "$c" in
-        .) q=dot ;; -) q=minus ;; /) q=slash ;; ,) q=comma ;;
-        *) q="$c" ;;
-      esac
-      printf '{"execute":"qmp_capabilities"}\n{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"%s"}]}}\n' "$q" \
-        | $SSH "socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp" >/dev/null 2>&1; done; }
+      case "$c" in .) q=dot ;; -) q=minus ;; /) q=slash ;; *) q="$c" ;; esac
+      keyc "{\"type\":\"qcode\",\"data\":\"$q\"}"; sleep 0.25; done; }
 keyc(){ printf '{"execute":"qmp_capabilities"}\n{"execute":"send-key","arguments":{"keys":[%s]}}\n' "$1" \
         | $SSH "socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp" >/dev/null 2>&1; }
+waittitle(){ n=0; while [ $n -lt 30 ]; do case "$(title)" in *"$1"*) return 0 ;; esac; sleep 3; n=$((n+1)); done; return 1; }
 
-echo "   --- opening a 7th tab from the running browser ---"
-BEFORE7=$(title)
-keyc '{"type":"qcode","data":"ctrl"},{"type":"qcode","data":"t"}'; sleep 4
-type_str "example.org"
-# Enter, then Enter again, then a real load window. The first attempt sent one
-# `ret` and waited 20 s; the screendump showed the address typed correctly and
-# the bar still in edit mode, so the submit -- not the typing -- is what had
-# not happened. A second press costs nothing if the first worked.
-keyc '{"type":"qcode","data":"ret"}'; sleep 4
-keyc '{"type":"qcode","data":"kp_enter"}'
-# POLL FOR THE DOCUMENT, DO NOT SLEEP AT IT. A 40 s sleep caught the tab mid
-# fetch -- title "example.org/", stop button showing, content still blank --
-# and the assertion read that as a failure to navigate. The load had started
-# correctly; the harness looked too early.
-n=0
-while [ $n -lt 40 ]; do
-  case "$(title)" in *"Example Domain"*) break ;; esac
-  sleep 3; n=$((n+1))
-done
-shot tab7
-AFTER7=$(title)
-B7=$(urlbar "$S/tab7.ppm" 2>/dev/null || echo "?")
-echo "   after Ctrl+T + typing: title=$AFTER7 urlbar=$B7"
-case "$bars" in
-  *"$B7"*) echo "   => NEW TAB FAILED: the address bar matches a tab that already existed"; fail=1 ;;
-  *)       case "$AFTER7" in
-             *"Example Domain"*) echo "   => NEW TAB WORKS: Ctrl+T, typed an address, and it loaded" ;;
-             *) echo "   => NEW TAB INCONCLUSIVE: address bar is new but the title is $AFTER7"; fail=1 ;;
-           esac ;;
-esac
+echo "   --- a 7th tab from the running browser ---"
+keyc '{"type":"qcode","data":"ctrl"},{"type":"qcode","data":"t"}'; sleep 5
+type_str "example.net"
+# LET THE GUEST CATCH UP BEFORE ENTER. Pressing it early submitted a partial
+# address ("exampl") and the autocomplete turned it into a web search.
+sleep 10
+keyc '{"type":"qcode","data":"ret"}'
+if waittitle "Example Domain"; then echo "   => NEW TAB WORKS: $(title)"; else
+  echo "   => NEW TAB FAILED: $(title)"; fail=1; fi
+shot seventh
+
+# ---- and a LINK inside that tab (M2336) ----------------------------------
+# example.net carries one link, "Learn more" -> iana.org/domains/example, at a
+# fixed place on a page that does not reflow (unlike the live dashboard that
+# defeated three attempts at the single-tab navigation test).
+echo "   --- clicking a link inside the tab ---"
+BEFORE_L=$(title)
+click $(( 334 * 32768 / 1280 )) $(( 385 * 32768 / 960 )); sleep 8
+shot linknav
+AFTER_L=$(title)
+if [ "$BEFORE_L" != "$AFTER_L" ]; then
+  echo "   => LINK NAV WORKS: the tab left $BEFORE_L for $AFTER_L"
+else
+  echo "   => LINK NAV FAILED: still on $BEFORE_L"; fail=1
+fi
+
+[ $fail -eq 0 ] && echo "   RESULT: PASS" || echo "   RESULT: FAIL"
 exit $fail

@@ -168,6 +168,11 @@ unsigned long g_inpreg_calls, g_inpreg_obj;   /* set_input_region: total, and ho
 #define WL_KEYBOARD_EV_LEAVE     2
 #define WL_KEYBOARD_EV_KEY       3
 #define WL_KEYBOARD_EV_MODIFIERS 4
+
+/* Forward-declared: the commit handler stops the clock these start (M2337). */
+static void wl_inlat_start(void);
+static void wl_inlat_stop_for(int slot);
+static void wl_inlat_woke(int slot);
 #define WL_KEYBOARD_EV_REPEAT    5
 #define WL_KEYBOARD_KEYMAP_NONE  0    /* "no keymap": the client uses raw evdev codes */
 
@@ -1384,6 +1389,7 @@ static unsigned g_wl_page_best, g_wl_page_commits, g_wl_commits_seen;
 void wl_page_watch(uint32_t argb) { g_wl_watch_colour = argb; }
 
 static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
+    wl_inlat_woke((int)(c - g_cl));      /* M2337: the client is awake and talking */
     uint32_t obj = rd32(m + 0);
     uint32_t sz_op = rd32(m + 4);
     uint16_t opcode = (uint16_t)(sz_op & 0xFFFF);
@@ -2225,6 +2231,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
                          * the client commits once, and one commit is almost
                          * never the 1-in-64. The compositor was working the
                          * whole time and the log simply never said so. */
+                        wl_inlat_stop_for((int)(c - g_cl));   /* M2337: only the FOCUSED client counts */
                         if (commit_say(o->id)) {
                             if (loud)
                                 kprintf("[wl] commit: %ux%u stride %u format %u -> first 0x%08x mid 0x%08x, "
@@ -3364,6 +3371,96 @@ static void wl_kbd_enter(struct wl_client *c) {
     c->kbd_in = 1;
 }
 
+/* CLICK-TO-PIXEL, IN CYCLES (M2337).
+ *
+ * The question a user actually asks is "how long after I click does the
+ * screen change", and nothing here could answer it. The frame profiler says a
+ * frame costs ~1.9 ms to draw and present, which is a throughput number and
+ * says nothing about latency. Host-side screendump polling cannot answer it
+ * either: a `qm monitor screendump` plus settle plus scp is about a second,
+ * which is ten times coarser than the thing being measured.
+ *
+ * So measure it where both ends are visible: stamp the cycle counter when an
+ * input event is handed to the focused client, and stop the clock when that
+ * client COMMITS its next frame. That is input -> the client's response,
+ * which is everything the user feels except the final blit -- and the blit is
+ * already known to be ~1.9 ms.
+ *
+ * Only ONE measurement is in flight at a time, and motion is deliberately
+ * excluded: a pointer drag posts hundreds of events and would drown the
+ * clicks and keys, which are what a person waits on.
+ */
+static inline uint64_t wl_tsc(void) {
+    unsigned lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint64_t g_inlat_t0, g_inlat_n, g_inlat_sum, g_inlat_min = ~0ull, g_inlat_max;
+static uint64_t g_inlat_b[5];       /* <1ms, <10ms, <50ms, <200ms, >=200ms */
+static int      g_inlat_pending;
+
+static void wl_inlat_start(void) {
+    if (g_inlat_pending) return;          /* one in flight: do not restart the clock */
+    g_inlat_t0 = wl_tsc();
+    g_inlat_pending = 1;
+}
+/* ONLY THE CLIENT THE INPUT WENT TO (M2337). The first cut stopped the clock
+ * on the next commit from ANY client, and this compositor always has the
+ * little Wayland demo client committing alongside the browser -- so an
+ * unrelated repaint could stop the clock early and the number would flatter
+ * itself. The caller passes the client index and it must match the focus. */
+/* SPLIT THE WAIT (M2337). A mean of 505 ms with a 2 ms best case is two
+ * different stories added together, and optimising before separating them is
+ * how this project has picked the wrong hot spot three times. So take an
+ * intermediate stamp: the client's FIRST request after the input. Everything
+ * before it is ours -- delivering the event and getting the thread scheduled.
+ * Everything after it is Gecko thinking and drawing. */
+static uint64_t g_inlat_wake, g_inlat_wsum, g_inlat_wmax;
+static void wl_inlat_woke(int slot) {
+    if (!g_inlat_pending || g_inlat_wake || slot != wl_focus_client()) return;
+    g_inlat_wake = wl_tsc();
+}
+static void wl_inlat_stop_for(int slot) {
+    if (!g_inlat_pending || slot != wl_focus_client()) return;
+    if (g_inlat_wake) {
+        uint64_t w = g_inlat_wake - g_inlat_t0;
+        g_inlat_wsum += w;
+        if (w > g_inlat_wmax) g_inlat_wmax = w;
+    }
+    g_inlat_wake = 0;
+    uint64_t d = wl_tsc() - g_inlat_t0;
+    g_inlat_pending = 0;
+    g_inlat_n++; g_inlat_sum += d;
+    /* A MEAN CANNOT TELL "SLOW" FROM "MOSTLY FAST WITH STALLS" (M2339).
+     * min 1 ms, mean 68 ms, max 448 ms is consistent with two completely
+     * different faults -- every click costing 68 ms, or most costing 1 ms and
+     * one in ten stalling for half a second -- and they need opposite fixes.
+     * Bucket it. Thresholds in cycles at ~5.2 GHz: 5 Mcyc ~ 1 ms,
+     * 52 Mcyc ~ 10 ms, 260 Mcyc ~ 50 ms, 1.04 Gcyc ~ 200 ms. */
+    {   int b = d < 5200000ull ? 0 : d < 52000000ull ? 1
+              : d < 260000000ull ? 2 : d < 1040000000ull ? 3 : 4;
+        g_inlat_b[b]++; }
+    if (d < g_inlat_min) g_inlat_min = d;
+    if (d > g_inlat_max) g_inlat_max = d;
+    /* Report on a cadence a human can read, in cycles -- the caller divides by
+     * the host clock. Kcycles so the numbers stay legible. */
+    if (g_inlat_n <= 4 || (g_inlat_n % 10) == 0)
+        kprintf("[inputlat] input -> commit: %lu samples, last %lu Kcyc, min %lu, "
+                "mean %lu, max %lu Kcyc | OURS (input -> the client's first "
+                "request): mean %lu, max %lu Kcyc\n",
+                (unsigned long)g_inlat_n, (unsigned long)(d / 1000),
+                (unsigned long)(g_inlat_min / 1000),
+                (unsigned long)((g_inlat_sum / g_inlat_n) / 1000),
+                (unsigned long)(g_inlat_max / 1000),
+                (unsigned long)((g_inlat_wsum / g_inlat_n) / 1000),
+                (unsigned long)(g_inlat_wmax / 1000));
+    if (g_inlat_n <= 4 || (g_inlat_n % 10) == 0)
+        kprintf("[inputlat]   spread: %lu under 1ms, %lu 1-10ms, %lu 10-50ms, "
+                "%lu 50-200ms, %lu OVER 200ms\n",
+                (unsigned long)g_inlat_b[0], (unsigned long)g_inlat_b[1],
+                (unsigned long)g_inlat_b[2], (unsigned long)g_inlat_b[3],
+                (unsigned long)g_inlat_b[4]);
+}
+
 /* The cursor left the surface. Without this a client believes the pointer is
  * still inside it forever -- it keeps a hover highlight up, and it never sees
  * the enter() that should follow the cursor coming back. */
@@ -3404,6 +3501,7 @@ void wl_post_motion(int x, int y) {
 }
 
 void wl_post_button(int x, int y, unsigned button, int pressed) {
+    if (pressed) wl_inlat_start();            /* M2337 */
     int focus = wl_focus_client();
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
@@ -3436,6 +3534,7 @@ void wl_post_button(int x, int y, unsigned button, int pressed) {
  * is the kind of inversion that is invisible until someone scrolls the wrong
  * way. */
 void wl_post_axis(int x, int y, int ticks_down) {
+    wl_inlat_start();                         /* M2337 */
     int focus = wl_focus_client();
     if (focus < 0) return;
     if (!ticks_down) return;
@@ -3495,6 +3594,7 @@ static void wl_kbd_send_mods(struct wl_client *c) {
 }
 
 void wl_post_key(unsigned keycode, int pressed) {
+    if (pressed && !wl_mod_bit(keycode)) wl_inlat_start();   /* M2337: not the modifier itself */
     int focus = wl_focus_client();
     unsigned bit = wl_mod_bit(keycode);
     if (bit) {                                  /* track it even with no client */

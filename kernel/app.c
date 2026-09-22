@@ -13318,6 +13318,22 @@ static void epoll_note_peer_ready(int fdtype, int obj) {
     }
 }
 
+/* THE COMPOSITOR'S SENDS NEVER WOKE ANYBODY (M2338).
+ *
+ * M2138 wired the poll-nap wake into app_unix_send -- the SYSCALL path, taken
+ * when one guest process writes to another. kernel/wayland.c is not a guest
+ * process: it calls unix_send() directly from kernel context, so every input
+ * event it delivered landed in the peer's ring and then sat there while the
+ * client slept out its full nap. M2138's own comment says "the latency IS the
+ * nap", and it was right -- it just did not cover the one sender whose
+ * latency a human actually feels.
+ *
+ * Measured: input -> the client's first request averaged 489 Mcycles (94 ms)
+ * with the client itself answering in under a microsecond, and a click takes
+ * several protocol round trips, so ~9 naps at ~10 ms each. Exposed here so
+ * unixsock.c can call it without reaching into the epoll internals. */
+void app_note_unix_peer_ready(int peer_ep) { epoll_note_peer_ready(12, peer_ep); }
+
 static void epoll_note_post(struct app *a, int fd) { epoll_rearm_edge(a, fd); }
 static void epoll_note_drain(struct app *a, int fd) {
     if (!a || fd < 0 || fd >= APP_NFD) return;

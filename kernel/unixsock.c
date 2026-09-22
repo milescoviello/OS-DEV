@@ -342,6 +342,14 @@ long unix_send_ex(int ep, const void *buf, unsigned long len, int nb) {
             task_t **pw = s ? &c->a_waiter : &c->b_waiter;       /* wake the peer's blocked reader */
             if (*pw) { task_wake(*pw); *pw = 0; }
             usock_irq_restore(fl);
+            /* ...AND THE PEER'S POLL NAPPERS (M2338). A blocked read registers
+             * itself above; a thread parked in poll()/epoll_wait() does not --
+             * it is asleep on a timer, so without this it waits out the tick
+             * no matter when the data arrived. Deliberately after the
+             * interrupt restore: the wake walks fd tables and must not run
+             * with interrupts off. */
+            extern void app_note_unix_peer_ready(int peer_ep);
+            app_note_unix_peer_ready(ep ^ 1);
             return n;
         }
         /* The ring is full and not one byte moved. */

@@ -24,7 +24,25 @@
 pref("gfx.webrender.software",       true);   // SWGL: rasterise on the CPU
 pref("gfx.webrender.all",            true);   // ...and use WebRender for everything
 pref("gfx.x11-egl.force-disabled",   true);   // never probe EGL; there is none
-pref("webgl.disabled",               true);   // a page asking for WebGL must fail fast, not hang
+// WEBGL, THROUGH SWGL (M2337). This was `true` with the note "a page asking
+// for WebGL must fail fast, not hang", which was the right call when the only
+// way to get a GL context was an EGL that does not exist in this image. But
+// software WebRender above IS a GL implementation -- SWGL, Firefox's own CPU
+// rasteriser -- and it can back WebGL without Mesa, libEGL or a driver.
+//
+// Worth trying before staging anything: the alternative is Mesa + LLVM, whose
+// closure measured 199 MB against 688 MB free in the image, for llvmpipe
+// output that would be no faster than SWGL.
+//
+// If a page asks for WebGL and gets SWGL, it runs on the CPU -- correct, and
+// slow. `webgl.disable-fail-if-major-performance-caveat` stops a page from
+// refusing to start just because the implementation admits it is software.
+pref("webgl.disabled",                                        false);
+pref("webgl.force-enabled",                                   true);
+pref("webgl.disable-fail-if-major-performance-caveat",        true);
+pref("webgl.disable-angle",                                   true);
+pref("webgl.enable-surface-texture",                          false);
+pref("gfx.canvas.accelerated",                                false);
 // THE GPU PROCESS IS BACK ON (M2115). It was disabled because it died in a
 // respawn loop trying to create an EGL display -- but that was the EGL, and
 // software WebRender above removes EGL from the path entirely. It matters
