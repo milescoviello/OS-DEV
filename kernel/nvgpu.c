@@ -34,6 +34,7 @@ static void     nv_reg_wr(uint32_t reg, uint32_t val);
 static unsigned nv_rd16(unsigned off);
 static uint32_t nv_rom32(unsigned o);
 static int      nvgpu_vbios_pramin(uint8_t *dst, unsigned len);
+static int      nv_gpio_reset(uint8_t match);
 int             g_nv_exec;
 static unsigned g_nv_skipped_vga, g_nv_skipped_i2c, g_nv_skipped_gpio;
 
@@ -574,6 +575,16 @@ static void nv_reg_wr(uint32_t reg, uint32_t val) {
     if (!nv_bar0 || reg + 3 >= (16u << 20)) return;
     *(volatile uint32_t *)(nv_bar0 + reg) = val;
 }
+/* VGA registers on NV_50+ live in MMIO at BAR0+0x601000 (nvkm_wrport). */
+static void nv_vga_wr(unsigned port, uint8_t v) {
+    if (!nv_bar0 || !g_nv_exec) return;
+    *(volatile uint8_t *)(nv_bar0 + 0x601000 + port) = v;
+}
+static uint8_t nv_vga_rd(unsigned port) {
+    if (!nv_bar0) return 0;
+    return *(volatile uint8_t *)(nv_bar0 + 0x601000 + port);
+}
+
 static uint32_t nv_shift(uint32_t d, uint8_t sh) {
     return sh < 0x80 ? (d >> sh) : (d << (0x100 - sh));
 }
@@ -585,6 +596,10 @@ static int nv_cond_met(uint8_t cond) {
     uint32_t reg = nv_rom32(e), msk = nv_rom32(e + 4), val = nv_rom32(e + 8);
     return (nv_reg_rd(reg) & msk) == val;
 }
+
+/* Run a repeat body once; returns the offset just past its END_REPEAT, or 0
+ * if it ran off the end. Separate from nv_run so a loop can re-enter it. */
+static unsigned nv_run_body(unsigned at, int depth, int *exec, int *ops, unsigned *n);
 
 static int nv_run(unsigned at, int depth, int *exec, int *ops) {
     while (at && at < nv_romlen && *ops < 4096) {
@@ -632,16 +647,40 @@ static int nv_run(unsigned at, int depth, int *exec, int *ops) {
             uint32_t sreg = nv_rom32(at + 1), dreg = nv_rom32(at + 5);
             if (*exec) nv_reg_wr(dreg, nv_reg_rd(sreg));
             at += 9; break; }
-        case 0x8e:                                             /* GPIO */
-            g_nv_skipped_gpio++; at += 1; break;
+        case 0x8e:                                             /* GPIO: reset all */
+            if (*exec) { if (nv_gpio_reset(0xff) < 0) g_nv_skipped_gpio++; }
+            at += 1; break;
         case 0xa9:                                             /* GPIO_NE */
-            g_nv_skipped_gpio++; at += 2 + (unsigned)nv_rom[at + 1]; break;
-        case 0x36:                                             /* END_REPEAT */
+            /* nouveau resets every GPIO whose func is NOT in the list that
+             * follows; resetting all is a superset and the list is short.
+             * Recorded as a known deviation rather than hidden. */
+            if (*exec) { if (nv_gpio_reset(0xff) < 0) g_nv_skipped_gpio++; }
+            at += 2 + (unsigned)nv_rom[at + 1]; break;
         case 0x8c:                                             /* RESET_BEGUN */
         case 0x8d:                                             /* RESET_END   */
             at += 1; break;                                    /* no register effect */
-        case 0x33:                                             /* REPEAT (loop hdr) */
-            at += 2; break;
+        case 0x33: {
+            /* REPEAT IS A LOOP, AND TREATING IT AS A 2-BYTE SKIP WAS A REAL
+             * BUG (M2378). nouveau runs the body `count` times: it records
+             * the position after the header, re-executes from there, and
+             * END_REPEAT (0x36) terminates each pass. Skipping it executed
+             * every repeated block exactly ONCE.
+             *
+             * That matters because nouveau POSTs this very card from cold
+             * using these same scripts -- so a devinit that runs them and
+             * does not POST it is running them WRONG, not running the wrong
+             * thing. Loops are the obvious candidate: memory training and
+             * PLL settling are exactly the work a VBIOS repeats. */
+            unsigned cnt = nv_rom[at + 1];
+            unsigned body = at + 2, endp = body;
+            for (unsigned k = 0; k < cnt && k < 256; k++) {
+                unsigned sub_ops = 0;
+                endp = nv_run_body(body, depth, exec, ops, &sub_ops);
+                if (!endp) return -1;
+            }
+            at = endp; break; }
+        case 0x36:                                             /* END_REPEAT */
+            return (int)at + 1;                                /* ends one pass */
         case 0x74: {                                           /* TIME: delay usec */
             unsigned us = nv_rd16(at + 1);
             if (*exec) for (volatile unsigned d = 0; d < us * 40u; d++) { }
@@ -653,15 +692,36 @@ static int nv_run(unsigned at, int depth, int *exec, int *ops) {
                 nv_reg_wr(reg, (v & mask) | ((v + add) & ~mask));
             }
             at += 13; break; }
-        case 0x53:                                             /* ZM_CR: VGA CRTC */
-        case 0x69:                                             /* IO: VGA port     */
-            /* Both are legacy VGA PORT I/O, not MMIO. vfio-pci is loaded
-             * with disable_vga=1 on this host, so the guest has no VGA port
-             * access to the card at all -- these cannot be executed here and
-             * are stepped over rather than faked. Counted, so the report can
-             * say how much of devinit was skipped. */
-            g_nv_skipped_vga++;
-            at += (op == 0x53) ? 3 : 5; break;
+        case 0x53: {                                           /* ZM_CR */
+            /* NOT LEGACY PORT I/O AFTER ALL (M2378). I skipped 0x53 and 0x69
+             * believing they needed VGA ports the guest cannot reach with
+             * vfio's disable_vga=1. nouveau's nvkm_wrport shows otherwise:
+             * on NV_50 and later, VGA registers are MMIO-mapped --
+             *     nvkm_wr08(device, 0x601000 + port, data)
+             * -- so they go through BAR0 like everything else, and the two
+             * most likely load-bearing skips become implementable.
+             * ZM_CR is CRTC index/data at 0x3d4/0x3d5. */
+            uint8_t idx = nv_rom[at + 1], val = nv_rom[at + 2];
+            if (*exec) { nv_vga_wr(0x03d4, idx); nv_vga_wr(0x03d5, val); }
+            at += 3; break; }
+        case 0x69: {                                           /* IO */
+            unsigned port = nv_rd16(at + 1);
+            uint8_t mask = nv_rom[at + 3], data = nv_rom[at + 4];
+            if (*exec) {
+                /* nouveau special-cases exactly this on NV_50+: port 0x03c3
+                 * with data 1 is not a port write at all, it is four MMIO
+                 * masks and a delay. Reproduced rather than approximated. */
+                if (port == 0x03c3 && data == 0x01) {
+                    nv_reg_wr(0x614100, (nv_reg_rd(0x614100) & ~0xf0800000u) | 0x00800000u);
+                    nv_reg_wr(0x00e18c, (nv_reg_rd(0x00e18c) & ~0x00020000u) | 0x00020000u);
+                    nv_reg_wr(0x614900, (nv_reg_rd(0x614900) & ~0xf0800000u) | 0x00800000u);
+                    nv_reg_wr(0x000200, (nv_reg_rd(0x000200) & ~0x40000000u));
+                    for (volatile unsigned d = 0; d < 400000u; d++) { }   /* ~10 ms */
+                } else {
+                    nv_vga_wr(port, (uint8_t)((nv_vga_rd(port) & mask) | data));
+                }
+            }
+            at += 5; break; }
         case 0x4c: {                                           /* I2C_BYTE */
             g_nv_skipped_i2c++;                                /* needs an I2C engine */
             at += 4 + (unsigned)nv_rom[at + 3] * 3; break; }
@@ -680,6 +740,125 @@ static int nv_run(unsigned at, int depth, int *exec, int *ops) {
     return 0;
 }
 
+static unsigned nv_run_body(unsigned at, int depth, int *exec, int *ops, unsigned *n) {
+    /* One pass of a REPEAT body: reuse nv_run, which returns the offset after
+     * END_REPEAT as a positive value. */
+    int r = nv_run(at, depth, exec, ops);
+    (void)n;
+    return r > 0 ? (unsigned)r : 0;
+}
+
+
+/* VRAM SIZE, THE WAY NOUVEAU ACTUALLY GETS IT (M2378).
+ *
+ * The previous check read 0x022548 as an "FBPA count" -- a register I made up.
+ * It is not how nouveau sizes memory, so "the FB is not answering" was partly
+ * a finding about my own invention. gf100_ram_ctor + gf100_ram_probe_fbp:
+ *
+ *   fbps  = rd32(0x022438)                  number of FBPs
+ *   fbpao = rd32(0x022554)                  bit n set = FBP n disabled
+ *   size  = rd32(0x11020c + fbp * 0x1000)   MiB behind FBP n
+ *
+ * The GT 710 has a known answer: nouveau printed "fb: 2048 MiB GDDR5" for this
+ * exact card. So this probe can be WRONG in a way that shows, which is the
+ * only kind worth having. Read before and after devinit for a real pair. */
+static void nv_vram_probe(const char *when) {
+    uint32_t fbps = nv_reg_rd(0x022438), fbpao = nv_reg_rd(0x022554);
+    uint64_t total = 0; unsigned live = 0;
+    for (unsigned f = 0; f < fbps && f < 8; f++) {
+        if (fbpao & (1u << f)) continue;
+        uint32_t mib = nv_reg_rd(0x11020c + f * 0x1000);
+        /* 0xBAD0____ AND 0xBADF____ are both NVIDIA PRI errors. Matching only
+         * the first let 0xBADF3000 through as "3135188992 MiB" before
+         * devinit (M2378) -- the mask has to be 0xFFF00000. */
+        if ((mib & 0xFFF00000u) == 0xBAD00000u) {
+            kprintf("[nv] %s: FBP %u size register reads %08x -- PRI error, FB not up\n",
+                    when, f, mib);
+            return;
+        }
+        total += mib; live++;
+    }
+    kprintf("[nv] %s: VRAM %lu MiB across %u of %u FBP(s) -- %s\n", when,
+            (unsigned long)total, live, fbps,
+            total == 2048 ? "MATCHES nouveau's 2048 MiB: memory is initialised"
+          : total == 0    ? "zero: memory not initialised"
+                          : "does NOT match nouveau's 2048 MiB");
+}
+
+
+/* ------------------------------------------------------------- GPIO ------
+ *
+ * 0x8e GPIO and 0xa9 GPIO_NE both call nvkm_gpio_reset(), which drives every
+ * GPIO the VBIOS lists to its default state. GPIOs switch power rails, fans
+ * and panel enables, so these are plausible POST blockers and were skipped
+ * only because this driver had no GPIO engine. This is gf119_gpio_reset (used
+ * by gk104, hence by GK208B), following nouveau exactly:
+ *
+ *   DCB    = rd16(0x36); ver >= 0x30 requires signature 0x4edcbdcb at +6
+ *   GPIO   = rd16(DCB + 0x0a), header per version
+ *   entry  = decoded per DCB GPIO version (<0x40 u16, 0x40 u32, >=0x41 u32+u8)
+ *   drive  = mask(0xd610 + line*4, 0x3000, ((dir^1)<<13) | (out<<12))
+ *            then mask(0xd604, 1, 1) -- the update strobe
+ *
+ * The DCB signature is a free falsifiability check: a wrong DCB pointer
+ * fails it instead of driving arbitrary pins from garbage. */
+static void nv_mask(uint32_t reg, uint32_t m, uint32_t v) {
+    nv_reg_wr(reg, (nv_reg_rd(reg) & ~m) | v);
+}
+static unsigned g_nv_gpio_driven;
+
+static int nv_gpio_reset(uint8_t match) {
+    unsigned dcb = nv_rd16(0x36);
+    if (!dcb || dcb + 8 >= nv_romlen) { kprintf("[nv] gpio: no DCB pointer at 0x36\n"); return -1; }
+    unsigned dver = nv_rom[dcb];
+    if (dver < 0x30 || dver >= 0x42 || nv_rom32(dcb + 6) != 0x4edcbdcbu) {
+        kprintf("[nv] gpio: DCB @%x ver %02x sig %08x -- not a DCB this driver trusts\n",
+                dcb, dver, nv_rom32(dcb + 6));
+        return -1;
+    }
+    if (nv_rom[dcb + 1] < 0x0c) return -1;
+    unsigned gt = nv_rd16(dcb + 0x0a);
+    if (!gt || gt + 4 >= nv_romlen) { kprintf("[nv] gpio: DCB has no GPIO table\n"); return -1; }
+    unsigned gver = nv_rom[gt], ghdr, gcnt, glen;
+    if (gver < 0x30)       { ghdr = 3; gcnt = nv_rom[gt + 2]; glen = nv_rom[gt + 1]; }
+    else if (gver <= 0x41) { ghdr = nv_rom[gt + 1]; gcnt = nv_rom[gt + 2]; glen = nv_rom[gt + 3]; }
+    else { kprintf("[nv] gpio: GPIO table version %02x unknown\n", gver); return -1; }
+
+    unsigned n = 0;
+    for (unsigned e = 0; e < gcnt && e < 64; e++) {
+        unsigned ent = gt + ghdr + e * glen;
+        if (ent + 5 >= nv_romlen) break;
+        uint32_t raw = nv_rom32(ent);
+        unsigned line, func, log0, log1;
+        if (gver < 0x40) {
+            unsigned info = nv_rd16(ent);
+            line = info & 0x1f; func = (info & 0x07e0) >> 5;
+            log0 = (info & 0x1800) >> 11; log1 = (info & 0x6000) >> 13;
+        } else if (gver < 0x41) {
+            line = raw & 0x1f; func = (raw & 0xff00) >> 8;
+            log0 = (raw & 0x18000000u) >> 27; log1 = (raw & 0x60000000u) >> 29;
+        } else {
+            uint8_t info1 = nv_rom[ent + 4];
+            line = raw & 0x3f; func = (raw & 0xff00) >> 8;
+            log0 = (info1 & 0x30) >> 4; log1 = (info1 & 0xc0) >> 6;
+        }
+        if (func == 0xff || (match != 0xff && match != func)) continue;
+        unsigned defs = !!(raw & 0x80);
+        unsigned lg = defs ? log1 : log0;
+        unsigned dir = !!(lg & 2), out = !!(lg & 1);
+        if (g_nv_exec) {
+            nv_mask(0x00d610 + line * 4, 0x00003000, ((dir ^ 1u) << 13) | (out << 12));
+            nv_mask(0x00d604, 0x00000001, 0x00000001);
+            uint8_t unk0 = (raw >> 16) & 0xff, unk1 = (raw >> 24) & 0x1f;
+            nv_mask(0x00d610 + line * 4, 0xff, unk0);
+            if (unk1) nv_mask(0x00d740 + (unk1 - 1) * 4, 0xff, line);
+        }
+        n++;
+    }
+    g_nv_gpio_driven += n;
+    return (int)n;
+}
+
 static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     nv_cond_table = cond_table;
     int exec = 1, ops = 0;
@@ -687,6 +866,7 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
             g_nv_exec ? "** EXECUTING ** (nvexec given: this WRITES to the GPU)"
                       : "dry run (computing every read/write, touching nothing; "
                         "-append nvexec to arm it)");
+    nv_vram_probe("BEFORE devinit");
     int r = nv_run(script0, 0, &exec, &ops);
     kprintf("[nv] devinit: %s after %d opcode(s), exec flag %d\n",
             r == 0 ? "COMPLETED" : "ABORTED", ops, exec);
@@ -704,11 +884,10 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
                 post, (post & 2) ? "does NOT need" : "STILL NEEDS");
         kprintf("[nv] AFTER devinit: 0x619f04 = %08x -> PRAMIN %s\n",
                 pram, (pram & 8) ? "IS NOW ENABLED" : "still not enabled");
-        uint32_t fbps = nv_reg_rd(0x022438), fbpas = nv_reg_rd(0x022548);
-        kprintf("[nv] AFTER devinit: FBP layout fbps=%u fbpas=%u%s\n",
-                fbps, fbpas, (fbps && fbpas) ? "  <-- now plausible" : "  (still not answering)");
+        nv_vram_probe("AFTER devinit");
     }
     if (g_nv_skipped_vga || g_nv_skipped_i2c || g_nv_skipped_gpio)
+        kprintf("[nv] devinit: drove %u GPIO line(s) to their VBIOS defaults\n", g_nv_gpio_driven);
         kprintf("[nv] devinit: SKIPPED %u VGA port, %u I2C, %u GPIO op(s) -- those need "
                 "engines this driver does not have yet, so this is NOT a complete POST "
                 "and saying so is the point\n",
@@ -1129,7 +1308,7 @@ int nvgpu_init(void) {
         for (unsigned i = 0; i < sizeof probe / sizeof probe[0]; i++) {
             volatile uint32_t *r = (volatile uint32_t *)(nv_bar0 + probe[i]);
             uint32_t save = *r;
-            if ((save & 0xFFFF0000u) == 0xBAD00000u) {
+            if ((save & 0xFFF00000u) == 0xBAD00000u) {
                 kprintf("[nv] MMIO probe %06x: reads %08x -- PRI error, register not "
                         "reachable (not a write-path failure)\n", probe[i], save);
                 continue;
