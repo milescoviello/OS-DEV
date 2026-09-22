@@ -10165,7 +10165,13 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * a browser that draws nothing. `virtio_gpu_has_3d()` is the same
          * two-facts-and-ed test the driver reports at boot, so this cannot
          * disagree with what the log says. */
-        if (virtio_gpu_has_3d()) {
+        /* AND ONLY WHEN THE HARDWARE PATH IS ASKED FOR (M2358). virtio_gpu_has_3d()
+         * alone is not the right condition: the GPU can be present and usable
+         * -- lxgl proves it -- while Firefox's hardware path still ends in a
+         * window that never paints. Tie this to the same flag that advertises
+         * wl_drm, so the two halves of the decision cannot disagree. */
+        {   extern int g_wl_drm_enable;
+        if (virtio_gpu_has_3d() && g_wl_drm_enable) {
             envp0[18] = "LIBGL_ALWAYS_SOFTWARE=0";
             envp0[19] = "MOZ_ACCELERATED=1";
             envp0[20] = "MOZ_X11_EGL=0";        /* there is no X11 here either way */
@@ -10179,7 +10185,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
             envp0[20] = "MOZ_X11_EGL=0";
             envp0[21] = "MOZ_DISABLE_GPU_PROCESS=1";
             envp0[22] = "MOZ_WEBRENDER_SOFTWARE=1";
-        }
+        }   }
         /* Claude Code runs a connectivity preflight against platform.claude.com
          * and exits if it does not like the answer. Our stack completes that
          * exchange -- the capture shows the TLS handshake finishing in 0.3s and

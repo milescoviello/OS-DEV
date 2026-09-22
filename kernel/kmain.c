@@ -976,6 +976,10 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * loop whose round trip is already several minutes. */
         if (cmdline_has(cl, "lxdrm"))      g_lxdrm = 1;    /* the DRM render node, asked directly (M2347) */
         if (cmdline_has(cl, "lxgl"))       g_lxgl = 1;     /* EGL -> Mesa virgl -> the host GPU (M2351) */
+        /* -append ffgpu: advertise wl_drm and let Firefox take the hardware
+         * path. OFF by default because it currently costs the page entirely
+         * (M2358) -- see the note on g_wl_drm_enable in wayland.c. */
+        if (cmdline_has(cl, "ffgpu"))    { extern int g_wl_drm_enable; g_wl_drm_enable = 1; }
         if (cmdline_has(cl, "lxdns"))      { g_lxabi_test = 1; g_lxdns = 1; }    /* hammer getaddrinfo instead of sampling it ten times per Claude boot (M2320) */
         if (cmdline_has(cl, "wlraw"))      g_wlraw = 1;
         if (cmdline_has(cl, "fftest"))     { g_lxabi_test = 1; g_wltest = 1; g_fftest = 1; }
@@ -1390,6 +1394,26 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     { extern void bcache_init(void); bcache_init(); }
 
     virtio_blk_init();
+
+    /* AND THE GPU BEFORE ANYTHING THAT DECIDES WHETHER THERE IS ONE (M2358).
+     *
+     * virtio_gpu_init() ran at line ~3806, ELEVEN HUNDRED LINES after Firefox
+     * is spawned at ~2661. So when app.c built the environment for it,
+     * `virtio_gpu_has_3d()` was false and M2352's conditional handed Firefox
+     * LIBGL_ALWAYS_SOFTWARE=1 -- on a boot where the GPU works. Mesa's
+     * `dri2_initialize_wayland` reads that as ForceSoftware and goes straight
+     * to `dri2_initialize_wayland_swrast`, never binding the wl_drm global we
+     * had just added for it. Symptom: our own test client logs
+     * `LXWL-GLOBAL: wl_drm v2 (name 9)` on the same boot where Firefox never
+     * binds it and never issues a single DRM ioctl.
+     *
+     * EXACTLY the shape of M2347's `lxdrm` probe asking a true question before
+     * the answer could be yes -- second time in one session, and both times a
+     * capability query ran earlier in kmain than the capability. A feature
+     * test is only meaningful after the feature exists, so the feature has to
+     * come up before anything that tests it. The init is idempotent and the
+     * original call site keeps its self-test. */
+    virtio_gpu_init();
 
     if (g_lxabi_test) {
         /* FIRST, because every other probe in this block -- and every program

@@ -1095,6 +1095,11 @@ int virtio_gpu_init(void) {
      * other four. It cost a debugging session: the PCI enumeration printed
      * `00:1c.0 1af4:1050` in the same boot that claimed no device was
      * attached, and the two statements cannot both be true. Say which. */
+    /* IDEMPOTENT, so the early call site and the original one can coexist
+     * (M2358) -- the same shape M2145 used for virtio_blk_init. Bringing the
+     * device up twice would reset it out from under a live scanout. */
+    if (vg.present) return 0;
+
     pci_device_t dev = pci_find(0x1AF4, 0x1050);
     if (!dev.valid)
         dev = pci_find(0x1AF4, 0x1010);

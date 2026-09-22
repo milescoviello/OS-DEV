@@ -22,6 +22,22 @@
 #
 # The dev laptop's own Mesa cannot be reused either: Gentoo's VIDEO_CARDS does
 # not include virgl, so there is no virtio_gpu_dri.so on the box at all.
+#
+# -Dlegacy-wayland=bind-wayland-display IS LOAD-BEARING (M2358). Mesa's
+# hardware Wayland path learns WHICH GPU to use from the compositor, and it has
+# exactly two sources:
+#
+#   * zwp_linux_dmabuf_v1 v4+, whose default feedback carries `main_device`;
+#   * wl_drm, whose `device` event names the node -- and that fallback is
+#     compiled in ONLY when this option is set (`-DHAVE_BIND_WL_DISPLAY`).
+#
+# Without either, `dri2_initialize_wayland_drm` returns false and Firefox falls
+# back to `dri2_initialize_wayland_swrast` -- which is exactly what it did:
+# glxtest loaded this very Mesa and then never opened a render node, zero DRM
+# ioctls in the whole boot. wl_drm is three events against dmabuf feedback's
+# format table and tranches, so it is the cheaper of the two to serve from our
+# own compositor. The dmabuf path is the modern one and is worth having later,
+# because it is also how a browser would hand us a GPU buffer to composite.
 set -e
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -65,6 +81,7 @@ if [ ! -d "$OUT/b" ]; then
         -Dgles2=enabled \
         -Dopengl=true \
         -Dglvnd=disabled \
+        -Dlegacy-wayland=bind-wayland-display \
         -Dlmsensors=disabled \
         -Dgallium-va=disabled \
         -Dgallium-extra-hud=false \
@@ -110,7 +127,12 @@ rm -rf "$OUT/stage/usr/include" "$OUT/stage/usr/lib64/pkgconfig"
 # libwayland-client are all staged already for Firefox. Checked, not assumed --
 # a missing DT_NEEDED presents as "libEGL.so.1 not found", which reads as a
 # Mesa problem rather than a staging one.
-for dep in libSPIRV-Tools.so; do
+# libwayland-server joined the list when -Dlegacy-wayland=bind-wayland-display
+# was turned on: the wl_drm fallback links libwayland_drm, which is built
+# against wayland-server even though it ends up inside a CLIENT library. Caught
+# by the closure check below rather than by a boot, which is the whole reason
+# that check exists. (M2358)
+for dep in libSPIRV-Tools.so libwayland-server.so.0; do
     if [ ! -e "$LXROOT/usr/lib64/$dep" ]; then
         src=$(ls /usr/lib64/$dep 2>/dev/null | head -1)
         [ -n "$src" ] || { echo "build-mesa-virgl: $dep not found on this host" >&2; exit 1; }

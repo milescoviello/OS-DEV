@@ -216,7 +216,8 @@ enum wl_kind { WLK_NONE = 0, WLK_COMPOSITOR, WLK_SHM, WLK_SEAT, WLK_XDG_WM_BASE,
                WLK_OUTPUT, WLK_DDM, WLK_DATA_DEVICE, WLK_DATA_SOURCE,
                WLK_SUBCOMPOSITOR, WLK_SUBSURFACE,
                WLK_REGION, WLK_XDG_POPUP, WLK_XDG_POSITIONER,
-               WLK_ACTIVATION, WLK_ACTIVATION_TOKEN };   /* xdg_activation_v1 (M2113) */
+               WLK_ACTIVATION, WLK_ACTIVATION_TOKEN,   /* xdg_activation_v1 (M2113) */
+               WLK_DRM };                              /* wl_drm: which GPU to use (M2358) */
 
 /* WHAT A SURFACE IS FOR -- and why a compositor has to know (M2058).
  *
@@ -271,6 +272,29 @@ static const struct wl_global g_globals[] = {
      * focus promise on it and, without it, gives up on focusing its own
      * window -- which is one half of why it believed it had none. */
     { "xdg_activation_v1",       1, WLK_ACTIVATION },
+    /* HOW A CLIENT LEARNS WHICH GPU TO USE (M2358).
+     *
+     * Mesa's hardware Wayland path does not go looking for a render node; it
+     * is TOLD which one to use, by the compositor, and it has exactly two
+     * sources: zwp_linux_dmabuf_v1 v4+ (whose default feedback carries
+     * `main_device`) or wl_drm (whose `device` event names the node). With
+     * neither, `dri2_initialize_wayland_drm` returns false and the client
+     * falls back to `dri2_initialize_wayland_swrast`.
+     *
+     * That is exactly what Firefox did: its glxtest probe loaded the
+     * virgl-only Mesa we built -- [glwatch] proves the open -- and then never
+     * opened a render node, zero DRM ioctls in the whole boot, and
+     * volumeshaderbm ran at 3 fps on the CPU while `lxgl` drew on the host
+     * iGPU on the same kernel.
+     *
+     * wl_drm is three events where dmabuf feedback is a format table in shared
+     * memory plus tranches, so it is the cheaper of the two to serve. It is
+     * ALSO enough on its own here, because presentation stays on wl_shm: this
+     * browser composites with software WebRender, so the only thing that needs
+     * the GPU is the offscreen WebGL context. The dmabuf path is the modern
+     * one and is worth having later -- it is how a client would hand us a GPU
+     * buffer to composite, which is a different and larger job. */
+    { "wl_drm",                  2, WLK_DRM },
 };
 #define WL_NGLOBAL (int)(sizeof(g_globals) / sizeof(g_globals[0]))
 
@@ -1029,6 +1053,34 @@ static int put_string(uint8_t *b, int p, const char *s) {
     return p;
 }
 
+/* THE HARDWARE PATH IS OPT-IN, BECAUSE IT CURRENTLY REGRESSES FIREFOX (M2358).
+ *
+ * Advertising wl_drm works exactly as intended: Firefox binds it, opens
+ * /dev/dri/renderD128 and queries the device -- VERSION, GETPARAM, GET_CAP all
+ * succeed, which is four DRM ioctls more than it ever managed before. And then
+ * it renders NOTHING. Window stuck at 64x32, 156 unread messages in its
+ * Wayland ring, no crash, no RESOURCE_CREATE: it stopped pumping its own queue
+ * somewhere inside EGL.
+ *
+ * That is a worse browser than the software path, which renders
+ * volumeshaderbm at 3 fps. A capability that turns a slow page into no page is
+ * not an improvement, and shipping it on by default to keep a number moving
+ * would be choosing the metric over the machine.
+ *
+ * So the global is behind `-append ffgpu`. Default boots keep the browser that
+ * works; the GPU path stays reachable for the work of finishing it. The likely
+ * remaining piece is presentation: once Mesa is in DRM mode it wants to
+ * allocate buffers through gbm and hand them over as dmabufs, and this
+ * compositor reads pixels from CPU memory and implements neither
+ * create_prime_buffer nor PRIME_HANDLE_TO_FD. That is a real capability, not a
+ * flag -- importing a GPU buffer and compositing it -- and it is the honest
+ * next milestone rather than something to paper over. */
+int g_wl_drm_enable;        /* -append ffgpu */
+
+static int wl_global_enabled(int idx) {
+    return !(g_globals[idx].kind == WLK_DRM && !g_wl_drm_enable);
+}
+
 static void send_global(struct wl_client *c, int idx) {
     uint8_t body[128];
     int p = 0;
@@ -1060,6 +1112,7 @@ static const char *wl_kind_name(int k) {
     case WLK_POINTER: return "wl_pointer";
     case WLK_KEYBOARD: return "wl_keyboard";
     case WLK_XDG_WM_BASE: return "xdg_wm_base";
+    case WLK_DRM: return "wl_drm";
     case WLK_ACTIVATION: return "xdg_activation_v1";
     case WLK_ACTIVATION_TOKEN: return "xdg_activation_token_v1";
     case WLK_XDG_SURFACE: return "xdg_surface";
@@ -1454,7 +1507,7 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
 
     if (obj == WL_DISPLAY_ID && opcode == WL_DISPLAY_GET_REGISTRY && alen >= 4) {
         c->registry = rd32(args);
-        for (int i = 0; i < WL_NGLOBAL; i++) send_global(c, i);
+        for (int i = 0; i < WL_NGLOBAL; i++) if (wl_global_enabled(i)) send_global(c, i);
         return;
     }
     if (obj == WL_DISPLAY_ID && opcode == WL_DISPLAY_SYNC && alen >= 4) {
@@ -1493,6 +1546,44 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
          * from outside it looks identical to a client that hung. (M1986) */
         kprintf("[wl] bind %s -> id %u\n",
                 (name >= 1 && name <= (uint32_t)WL_NGLOBAL) ? g_globals[name - 1].iface : "?", nid);
+        if (kind == WLK_DRM) {
+            /* THREE EVENTS, AND THE FIRST ONE IS THE WHOLE POINT (M2358).
+             *
+             * `device` names the node. Mesa opens it itself, and because
+             * `drmGetNodeTypeFromFd` reports DRM_NODE_RENDER for it -- minor
+             * 128, which our stat has reported since M2351 -- it sets
+             * `authenticated` immediately and asks us for nothing more. A
+             * PRIMARY node would need a drmGetMagic round trip through
+             * `authenticate`, which is why serving a render node is both
+             * simpler and the right thing.
+             *
+             * `format` has to name at least one FourCC Mesa recognises or its
+             * visual table stays empty; ARGB8888/XRGB8888 are the two every
+             * client wants. `capabilities(PRIME)` says descriptors rather than
+             * GEM names, which is what any client built this decade assumes.
+             *
+             * We do NOT implement create_prime_buffer: a dmabuf is a GPU
+             * buffer and this compositor reads pixels from CPU memory. That is
+             * sound here only because presentation stays on wl_shm -- software
+             * WebRender draws the window and only the offscreen WebGL context
+             * needs the GPU. A client that tries to present through wl_drm
+             * will hit the unhandled-request path and say so by name, which is
+             * the honest failure rather than a silent black window. */
+            uint8_t d[64]; int dp = 0;
+            dp = put_string(d, dp, "/dev/dri/renderD128");
+            wl_send(c, nid, 0 /* device */, d, dp);
+            {   static const uint32_t fmts[] = { 0x34325241u /* AR24 */, 0x34325258u /* XR24 */ };
+                for (unsigned k = 0; k < sizeof fmts / sizeof fmts[0]; k++) {
+                    uint8_t f[8]; wr32(f, fmts[k]);
+                    wl_send(c, nid, 1 /* format */, f, 4);
+                }
+            }
+            {   uint8_t cap[8]; wr32(cap, 1u /* WL_DRM_CAPABILITY_PRIME */);
+                wl_send(c, nid, 3 /* capabilities */, cap, 4);
+            }
+            kprintf("[wl] wl_drm: told the client to use /dev/dri/renderD128 "
+                    "(render node, PRIME) -- it can now pick hardware\n");
+        }
         if (kind == WLK_OUTPUT) {
             c->output = nid;                          /* remember it: wl_surface.enter needs it (M2247) */
             /* A monitor announces itself IMMEDIATELY on bind and ends with
