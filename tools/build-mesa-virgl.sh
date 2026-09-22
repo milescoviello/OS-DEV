@@ -1,4 +1,7 @@
-#!/bin/sh
+#!/bin/bash
+# bash, not sh: PIPESTATUS. The first cut used /bin/sh, piped ninja to `tail`,
+# and so silently ignored ninja failing -- it printed "==> what came out:" with
+# an empty listing and exited 0.
 # build-mesa-virgl — a Mesa that can ONLY do virgl, built for the guest.
 #
 #   tools/build-mesa-virgl.sh              build + stage into build/lxroot
@@ -40,9 +43,15 @@ cd "$OUT/$VER"
 # compositor. -Dplatforms=wayland for the same reason.
 if [ ! -d "$OUT/b" ]; then
     echo "==> configuring (virgl only, no LLVM, no GLX, wayland only)"
+    # --libdir=lib64 TO MATCH THE GUEST, NOT THE HOST DISTRO. The guest root is
+    # staged from a Gentoo box, so its libraries are in /usr/lib64 and /lib64,
+    # and that is what envp0's LD_LIBRARY_PATH lists. A Mesa installed into
+    # /usr/lib/x86_64-linux-gnu would be invisible to the loader -- the probe
+    # would fail to start with "libEGL.so.1 not found" and look like a Mesa
+    # problem rather than a path problem.
     meson setup "$OUT/b" \
         --prefix=/usr \
-        --libdir=lib/x86_64-linux-gnu \
+        --libdir=lib64 \
         --buildtype=release \
         -Dgallium-drivers=virgl \
         -Dvulkan-drivers= \
@@ -57,21 +66,26 @@ if [ ! -d "$OUT/b" ]; then
         -Dopengl=true \
         -Dglvnd=disabled \
         -Dlmsensors=disabled \
-        -Dvideo-codecs= \
         -Dgallium-va=disabled \
-        -Dgallium-vdpau=disabled \
         -Dgallium-extra-hud=false \
         -Dvalgrind=disabled \
         -Dlibunwind=disabled \
-        -Dzstd=disabled \
-        -Dtools= 2>&1 | tail -30
+        -Dtools= 2>&1 | tail -40 || { echo "build-mesa-virgl: meson setup FAILED" >&2; exit 1; }
 fi
 
+# PIPING TO `tail` THREW AWAY THE EXIT STATUS. The first run of this script
+# printed "==> building", "ninja: error: loading 'build.ninja'", and then
+# "==> what came out:" with an empty listing -- and exited 0. `set -e` cannot
+# see through a pipeline, so every stage needs its own check. Same class as
+# every other instrument in this tree that could not report failure.
 echo "==> building"
 ninja -C "$OUT/b" 2>&1 | tail -5
+[ "${PIPESTATUS[0]:-0}" = 0 ] || { echo "build-mesa-virgl: ninja FAILED" >&2; exit 1; }
 echo "==> installing to a staging root"
 rm -rf "$OUT/stage"
 DESTDIR="$OUT/stage" ninja -C "$OUT/b" install 2>&1 | tail -3
+[ "${PIPESTATUS[0]:-0}" = 0 ] || { echo "build-mesa-virgl: install FAILED" >&2; exit 1; }
+[ -d "$OUT/stage" ] || { echo "build-mesa-virgl: nothing was installed" >&2; exit 1; }
 
 echo
 echo "==> what came out (this is the number the LLVM argument is about):"
@@ -87,4 +101,8 @@ echo "==> staging into $LXROOT"
 mkdir -p "$LXROOT"
 ( cd "$OUT/stage" && tar cf - . ) | ( cd "$LXROOT" && tar xf - )
 echo "==> staged. DRI modules now in the guest:"
-ls -la "$LXROOT/usr/lib/x86_64-linux-gnu/dri/" 2>/dev/null | head
+ls -la "$LXROOT/usr/lib64/" 2>/dev/null | head -20
+# Mesa 26 has NO separate *_dri.so: the gallium driver is inside
+# libgallium-<ver>.so and libEGL links it with DT_NEEDED rather than dlopening
+# a per-driver module. So "no dri/ directory" is correct here, not a failure --
+# worth saying, because the Debian layout this was modelled on does have one.

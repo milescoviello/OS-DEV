@@ -10919,6 +10919,76 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     
     return base;
 }
+/* MAP A DRM OBJECT'S BACKING INTO THE PROCESS (M2350).
+ *
+ * VIRTGPU_MAP handed the caller an offset; this is the mmap that offset was
+ * for. The shape follows app_mmap_memfd_nl deliberately, because the hard-won
+ * lessons there apply here unchanged (M1985):
+ *
+ *  - the frames must be REFCOUNTED, because munmap and address-space teardown
+ *    both call pmm_free_frame on every present user page. Without a reference
+ *    the first unmap hands a live GPU buffer back to the PMM while the HOST is
+ *    still gathering from it -- and the host's reads would then see whatever
+ *    the next allocation put there, which presents as texture corruption with
+ *    no guest-side cause.
+ *  - a frame that cannot be refcounted must NOT be mapped. Refusing is the
+ *    honest answer; mapping it creates a page that will be freed from under
+ *    the device.
+ *
+ * Unlike a memfd these frames are the DEVICE's, not the kernel heap's, which
+ * is why drm.c owns them and hands over one frame at a time rather than a
+ * base pointer: the backing is a scatter list and has no contiguous kernel
+ * address to take. */
+static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
+    struct app *a = cur(); if (!a || !len) return 0;
+    if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 17) return 0;
+    uint64_t have = drm_map_size(off);
+    if (!have) return 0;                          /* no object at that offset */
+    len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (len > have) len = have;                   /* never map past the object */
+    uint64_t base = vma_find_gap(a, len, 0);
+    if (!base || vma_full(a)) return 0;
+    uint64_t done = 0;
+    for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
+        uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
+        if (!phys || !pmm_refcountable(phys)) break;
+        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) break;
+        pmm_addref(phys);
+        done = i + PAGE_SIZE;
+    }
+    if (done != len) {
+        /* MAP NO HOLE. A partial mapping is worse than none: the caller writes
+         * vertices into a range whose tail is unmapped and faults on a pointer
+         * it was told was valid. */
+        for (uint64_t i = 0; i < done; i += PAGE_SIZE) {
+            uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
+            vmm_unmap(base + i);
+            if (phys) pmm_free_frame(phys);
+        }
+        return 0;
+    }
+    /* RECORDED, or munmap and teardown cannot see it. Marked `shared` because
+     * the DEVICE is the other party: these pages are not private to this
+     * process even though no other process maps them, and a COW break on one
+     * would silently give the guest a copy while the host kept gathering from
+     * the original. */
+    int vs; VMA_NEW(a, vs);
+    a->vma[vs].start = base; a->vma[vs].len = len;
+    a->vma[vs].shared = 1;
+    a->vma[vs].mfd = -1;
+    a->vma[vs].foff = off;
+    a->vma[vs].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+    return base;
+}
+
+uint64_t app_mmap_drm(int fd, uint64_t len, uint64_t off) {
+    struct app *a_ = cur();
+    uint64_t f_ = vma_lock(a_);
+    uint64_t r_ = app_mmap_drm_nl(fd, len, off);
+    vma_unlock(a_, f_);
+    return r_;
+}
+
 uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
     struct app *a_ = cur();
     uint64_t f_ = vma_lock(a_);

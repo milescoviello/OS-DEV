@@ -105,3 +105,10 @@ int virtio_gpu_submit_3d(uint32_t ctx_id, const void *data, uint32_t size);
 /* Why virtio_gpu_init() returned -1. Five unrelated causes used to share one
  * message that named only the first of them. (M2348) */
 const char *virtio_gpu_why(void);
+
+/* Attach `n` (address, length) pairs as a resource's guest backing. The form a
+ * GL driver needs: asking the PMM for one contiguous multi-megabyte run is not
+ * a thing that reliably succeeds, and ATTACH_BACKING takes a list for exactly
+ * that reason. (M2349) */
+int virtio_gpu_attach_backing_sg(uint32_t res_id, const uint64_t *phys,
+                                 const uint32_t *len, uint32_t n);

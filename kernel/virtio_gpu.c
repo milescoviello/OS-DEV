@@ -324,9 +324,28 @@ struct virtio_gpu_mem_entry {
     uint32_t padding;
 } __attribute__((packed));
 
-/* ATTACH_BACKING is followed by nr_entries mem_entry structs. We attach the
- * backing as a SINGLE contiguous entry, so the request is the fixed head plus
- * exactly one entry. */
+/* A SCATTER LIST, BECAUSE CONTIGUITY IS NOT AVAILABLE ON DEMAND (M2349).
+ *
+ * The single-entry form below is what the 2D scanout uses, and it is exactly
+ * why the 2D scanout became unreliable: a 1280x800 backing is a thousand
+ * frames and it has to be ONE unbroken physical run. That worked for a while
+ * and then stopped, with nothing between the two boots but a few kilobytes of
+ * new BSS moving where the PMM had reached.
+ *
+ * A GL driver makes this far worse. Mesa allocates vertex buffers, uniform
+ * buffers, staging textures and readback surfaces continuously, at sizes it
+ * chooses, for the whole life of the process -- there is no moment at which
+ * asking for four megabytes of contiguous physical memory is a reasonable
+ * thing to do. ATTACH_BACKING takes `nr_entries` entries precisely so a guest
+ * does not have to: each entry is an (address, length) pair, and the device
+ * gathers them. So allocate frames however they come, coalesce the runs that
+ * happen to be adjacent, and hand over the list.
+ *
+ * GPU_SG_MAX 4096 entries covers a 16 MiB resource even in the worst case
+ * where no two frames are adjacent, at a 64 KiB static cost. */
+#define GPU_SG_MAX 4096
+
+/* ATTACH_BACKING is followed by nr_entries mem_entry structs. */
 struct virtio_gpu_resource_attach_backing {
     struct virtio_gpu_ctrl_hdr hdr;
     uint32_t resource_id;
@@ -958,6 +977,38 @@ int virtio_gpu_res_unref(uint32_t res_id) {
     hdr_init(&ru.hdr, VIRTIO_GPU_CMD_RESOURCE_UNREF);
     ru.resource_id = res_id; ru.padding = 0;
     return gpu_cmd(&ru, sizeof ru, &rp_3d, sizeof rp_3d) == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
+}
+
+/* The multi-entry request. Separate from `rq_attach` on purpose: the 2D path's
+ * fixed one-entry struct is still correct for the scanout, and widening it
+ * would make every 2D boot pay 64 KiB of BSS for a list it never uses. */
+static struct {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t nr_entries;
+    struct virtio_gpu_mem_entry entry[GPU_SG_MAX];
+} rq_attach_sg;
+
+int virtio_gpu_attach_backing_sg(uint32_t res_id, const uint64_t *phys,
+                                 const uint32_t *len, uint32_t n) {
+    if (!vg.present || !phys || !len || !n || n > GPU_SG_MAX) return -1;
+    gq_take();
+    hdr_init(&rq_attach_sg.hdr, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+    rq_attach_sg.resource_id = res_id;
+    rq_attach_sg.nr_entries  = n;
+    for (uint32_t i = 0; i < n; i++) {
+        rq_attach_sg.entry[i].addr    = phys[i];
+        rq_attach_sg.entry[i].length  = len[i];
+        rq_attach_sg.entry[i].padding = 0;
+    }
+    /* SEND ONLY THE ENTRIES WE FILLED. The descriptor length is what tells the
+     * device how much to read; sending sizeof(the whole array) would have it
+     * read 4096 entries of which most are zero, and a zero-length entry at a
+     * zero address is a request to gather physical page 0. */
+    uint32_t sz = (uint32_t)(sizeof rq_attach_sg.hdr + 8 + n * sizeof(struct virtio_gpu_mem_entry));
+    uint32_t t = gpu_cmd_locked(&rq_attach_sg, sz, &rp_3d, sizeof rp_3d);
+    gq_give();
+    return t == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -1;
 }
 
 int virtio_gpu_attach_backing_phys(uint32_t res_id, uint64_t phys, uint32_t len) {

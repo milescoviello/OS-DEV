@@ -307,6 +307,7 @@ void app_net_stall_watch(void);   /* report a socket that has gone quiet (M2016)
 extern int g_net_trace;   /* -append lxnettrace: trace socket byte counts (M2016) */
 int  app_fd_nonblock(int fd);                                  /* is O_NONBLOCK set on this fd? (M1965) */
 int  app_fd_set_nonblock(int fd, int on);                      /* fcntl(F_SETFL, O_NONBLOCK); 0/-1 (M1965) */
+uint64_t app_mmap_drm(int fd, uint64_t len, uint64_t off);   /* mmap a DRM render-node object by its VIRTGPU_MAP offset (M2350) */
 int  app_fd_obj(int fd);                                       /* the object index behind an fd (pipe no., memfd idx), or -1 (M2004) */
 int  app_fd_type(int fd);
 long app_memfd_size(int fd);                                   /* a memfd's size, or -1 if fd is not one (M2000) */

@@ -34,9 +34,13 @@
 #include "console.h"
 #include "string.h"
 #include "vmm.h"
+#include "pmm.h"
+#include "kheap.h"
+#include "app.h"
 
 #define DRM_IOCTL_VERSION                    0xc0406400ul
 #define DRM_IOCTL_GET_CAP                    0xc010640cul
+#define DRM_IOCTL_GEM_CLOSE                  0x40086409ul
 #define DRM_IOCTL_VIRTGPU_MAP                0xc0106441ul
 #define DRM_IOCTL_VIRTGPU_EXECBUFFER         0xc0406442ul
 #define DRM_IOCTL_VIRTGPU_GETPARAM           0xc0106443ul
@@ -69,6 +73,35 @@ struct drm_virtgpu_getparam { uint64_t param; uint64_t value; };
 struct drm_virtgpu_get_caps { uint32_t cap_set_id; uint32_t cap_set_ver;
                               uint64_t addr; uint32_t size; uint32_t pad; };
 
+/* More layouts, same provenance -- copied from <drm/virtgpu_drm.h> and
+ * <drm/drm.h>, sizes cross-checked against _IOC_SIZE of the ioctl numbers
+ * above (56, 16, 64, 44, 8, 16, 8). Note `drm_virtgpu_3d_transfer_*` puts
+ * `bo_handle` FIRST and then the box -- not the other way round, which is what
+ * you would guess from the wire format, where the box comes first. */
+struct drm_virtgpu_resource_create {
+    uint32_t target, format, bind, width, height, depth, array_size;
+    uint32_t last_level, nr_samples, flags, bo_handle, res_handle, size, stride;
+};
+struct drm_virtgpu_map { uint64_t offset; uint32_t handle; uint32_t pad; };
+struct drm_virtgpu_execbuffer {
+    uint32_t flags, size;
+    uint64_t command;
+    uint64_t bo_handles;
+    uint32_t num_bo_handles;
+    int32_t  fence_fd;
+    uint32_t ring_idx, syncobj_stride, num_in_syncobjs, num_out_syncobjs;
+    uint64_t in_syncobjs, out_syncobjs;
+};
+struct drm_virtgpu_3d_box { uint32_t x, y, z, w, h, d; };
+struct drm_virtgpu_3d_transfer {
+    uint32_t bo_handle;
+    struct drm_virtgpu_3d_box box;
+    uint32_t level, offset, stride, layer_stride;
+};
+struct drm_virtgpu_3d_wait { uint32_t handle, flags; };
+struct drm_virtgpu_resource_info { uint32_t bo_handle, res_handle, size, blob_mem; };
+struct drm_gem_close { uint32_t handle, pad; };
+
 /* VIRTGPU_PARAM_*, from the same header. */
 #define VIRTGPU_PARAM_3D_FEATURES        1
 #define VIRTGPU_PARAM_CAPSET_QUERY_FIX   2
@@ -90,7 +123,122 @@ struct drm_virtgpu_get_caps { uint32_t cap_set_id; uint32_t cap_set_ver;
  * contexts and resources arrive in M2348 and hang off here, which is why this
  * is a table and not a boolean. */
 #define DRM_NODES 16
-static struct { int used; } g_node[DRM_NODES];
+static struct {
+    int used;
+    int ctx;            /* has this node's virgl context been created? */
+} g_node[DRM_NODES];
+
+/* GEM OBJECTS.
+ *
+ * A "handle" is this table's index plus one, because handle 0 is reserved as
+ * invalid throughout the DRM uAPI -- `drm_virtgpu_3d_wait` documents it in so
+ * many words -- and an off-by-one that makes object 0 addressable turns "the
+ * caller passed nothing" into "the caller passed the first object".
+ *
+ * `res_id` is the HOST's name for the same thing and is deliberately a
+ * different number space: RESOURCE_ID 1 is the 2D scanout, so 3D ids start
+ * well clear of it. Reusing one counter for both would have a GL driver's
+ * first texture land on the display's resource.
+ *
+ * Backing is a scatter list of frames. Not contiguous, on purpose: see the
+ * note on virtio_gpu_attach_backing_sg -- asking the PMM for a contiguous
+ * multi-megabyte run is not a thing that reliably succeeds, and it is what
+ * made the 2D scanout unreliable. */
+#define DRM_BO_N      512
+#define DRM_BO_FRAMES 4096              /* 16 MiB per object */
+static struct drm_bo {
+    int      used;
+    int      node;                      /* which open node owns it */
+    uint32_t res_id;
+    uint32_t bytes;                     /* what the caller asked for */
+    uint32_t nframes;
+    uint64_t *frames;                   /* nframes physical addresses */
+} g_bo[DRM_BO_N];
+
+static uint32_t g_next_res = 64;        /* clear of RESOURCE_ID 1 */
+
+/* THE MAP OFFSET NAMESPACE. VIRTGPU_MAP hands userspace a file offset that a
+ * later mmap() of the same fd must resolve back to this object. Linux uses a
+ * real address-space allocator; one page-aligned slot per handle is enough
+ * here, and making it handle*16MiB means an offset can be decoded back to a
+ * handle by division, with no second table to keep in step with this one. */
+#define DRM_MAP_STRIDE (16ull * 1024 * 1024)
+
+static struct drm_bo *bo_of(uint32_t handle) {
+    if (!handle || handle > DRM_BO_N) return 0;
+    struct drm_bo *b = &g_bo[handle - 1];
+    return b->used ? b : 0;
+}
+
+static void bo_free(struct drm_bo *b) {
+    if (!b || !b->used) return;
+    if (b->res_id) virtio_gpu_res_unref(b->res_id);
+    if (b->frames) {
+        for (uint32_t i = 0; i < b->nframes; i++)
+            if (b->frames[i]) pmm_free_frame(b->frames[i]);
+        kfree(b->frames);
+    }
+    b->used = 0; b->frames = 0; b->nframes = 0; b->res_id = 0; b->bytes = 0;
+}
+
+/* Allocate `bytes` of guest backing as frames, coalesce adjacent ones into as
+ * few (addr,len) entries as they happen to form, and hand the list to the
+ * device. Returns 0 on success. */
+static int bo_attach_backing(struct drm_bo *b, uint32_t bytes) {
+    uint32_t nf = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (!nf || nf > DRM_BO_FRAMES) return -1;
+    b->frames = (uint64_t *)kmalloc(nf * sizeof(uint64_t));
+    if (!b->frames) return -1;
+    for (uint32_t i = 0; i < nf; i++) {
+        b->frames[i] = pmm_alloc_frame();
+        if (!b->frames[i]) { b->nframes = i; return -1; }
+        /* Zero it. A GL driver reads back buffers it has written and a texture
+         * it has not; handing over whatever the last process left there is an
+         * information leak across processes, not just uninitialised data. */
+        memset(hhdm(b->frames[i]), 0, PAGE_SIZE);
+    }
+    b->nframes = nf;
+
+    /* Coalesce into runs. */
+    static uint64_t sg_addr[DRM_BO_FRAMES];
+    static uint32_t sg_len[DRM_BO_FRAMES];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < nf; i++) {
+        if (n && sg_addr[n - 1] + sg_len[n - 1] == b->frames[i]) {
+            sg_len[n - 1] += PAGE_SIZE;
+        } else {
+            sg_addr[n] = b->frames[i]; sg_len[n] = PAGE_SIZE; n++;
+        }
+    }
+    return virtio_gpu_attach_backing_sg(b->res_id, sg_addr, sg_len, n);
+}
+
+/* The node's virgl context, created on first use. Lazily, because a process
+ * may open the node only to read its capabilities -- Mesa does exactly that
+ * during device enumeration -- and creating host GL state for a query that
+ * will be thrown away is a leak with no upside. */
+static uint32_t node_ctx(int node) {
+    if (node < 0 || node >= DRM_NODES) return 0;
+    uint32_t ctx = (uint32_t)node + 1;
+    if (!g_node[node].ctx) {
+        if (virtio_gpu_ctx_create(ctx, "osdev") != 0) return 0;
+        g_node[node].ctx = 1;
+    }
+    return ctx;
+}
+
+/* For app.c's mmap: which frame backs page `page` of the object named by map
+ * offset `off`, and how big is it. Kept here so the handle namespace has
+ * exactly one owner. */
+uint64_t drm_map_frame(uint64_t off, uint64_t page) {
+    struct drm_bo *b = bo_of((uint32_t)(off / DRM_MAP_STRIDE));
+    if (!b || page >= b->nframes) return 0;
+    return b->frames[page];
+}
+uint64_t drm_map_size(uint64_t off) {
+    struct drm_bo *b = bo_of((uint32_t)(off / DRM_MAP_STRIDE));
+    return b ? (uint64_t)b->nframes * PAGE_SIZE : 0;
+}
 
 int drm_open_node(void) {
     if (!virtio_gpu_has_3d()) return -1;
@@ -99,7 +247,15 @@ int drm_open_node(void) {
     return -1;
 }
 void drm_close_node(int id) {
-    if (id >= 0 && id < DRM_NODES) g_node[id].used = 0;
+    if (id < 0 || id >= DRM_NODES) return;
+    /* EVERY OBJECT THIS NODE MADE GOES WITH IT. A GL process that exits
+     * without calling GEM_CLOSE on each buffer -- which is every process that
+     * crashes, and most that do not -- would otherwise leak both guest frames
+     * and HOST GL resources, and the host ones are invisible from here. */
+    for (int i = 0; i < DRM_BO_N; i++)
+        if (g_bo[i].used && g_bo[i].node == id) bo_free(&g_bo[i]);
+    if (g_node[id].ctx) { virtio_gpu_ctx_destroy((uint32_t)id + 1); g_node[id].ctx = 0; }
+    g_node[id].used = 0;
 }
 
 /* WHICH PATHS ARE THIS DEVICE.
@@ -126,8 +282,13 @@ static void drm_seen(unsigned long req, const char *what, long rc) {
     kprintf("[drm] %s (0x%lx) -> %ld\n", what, req, rc);
 }
 
+/* The node behind a descriptor. app.c stores it in the fdent's `obj`. */
+static int drm_node_of_fd(int fd) {
+    int n = app_fd_obj(fd);
+    return (n >= 0 && n < DRM_NODES && g_node[n].used) ? n : -1;
+}
+
 long drm_ioctl(int fd, unsigned long req, void *uarg) {
-    (void)fd;
     if (!virtio_gpu_has_3d()) { drm_seen(req, "any ioctl with no 3D device", E_NODEV); return E_NODEV; }
 
     switch (req) {
@@ -248,22 +409,172 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
     }
 
     /* ---- the 3D submission path: named, and honestly unimplemented ------- */
-    case DRM_IOCTL_VIRTGPU_RESOURCE_CREATE:
-        drm_seen(req, "RESOURCE_CREATE -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
-    case DRM_IOCTL_VIRTGPU_RESOURCE_INFO:
-        drm_seen(req, "RESOURCE_INFO -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
-    case DRM_IOCTL_VIRTGPU_MAP:
-        drm_seen(req, "MAP -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
-    case DRM_IOCTL_VIRTGPU_EXECBUFFER:
-        drm_seen(req, "EXECBUFFER -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
+    /* ---- objects ---------------------------------------------------------- */
+    case DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: {
+        struct drm_virtgpu_resource_create rc;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof rc)) return E_FAULT;
+        memcpy(&rc, uarg, sizeof rc);
+        int node = drm_node_of_fd(fd);
+        uint32_t ctx = node_ctx(node);
+        if (!ctx) { drm_seen(req, "RESOURCE_CREATE but no virgl context", E_NODEV); return E_NODEV; }
+
+        int slot = -1;
+        for (int i = 0; i < DRM_BO_N; i++) if (!g_bo[i].used) { slot = i; break; }
+        if (slot < 0) { drm_seen(req, "RESOURCE_CREATE: object table full", E_NOSPC); return E_NOSPC; }
+        struct drm_bo *b = &g_bo[slot];
+        /* CLAIM THE SLOT BEFORE DOING ANYTHING THAT CAN BLOCK. Every command
+         * below goes to the device and yields; a second thread scanning this
+         * table in the meantime would pick the same free slot. Nine instances
+         * of exactly this in this codebase, so: claim first. */
+        memset(b, 0, sizeof *b);
+        b->used = 1; b->node = node;
+        b->res_id = __atomic_fetch_add(&g_next_res, 1, __ATOMIC_RELAXED);
+
+        if (virtio_gpu_res_create_3d(ctx, b->res_id, rc.target, rc.format, rc.bind,
+                                     rc.width, rc.height, rc.depth, rc.array_size,
+                                     rc.last_level, rc.nr_samples, rc.flags) != 0) {
+            b->used = 0;
+            drm_seen(req, "RESOURCE_CREATE: the device refused CREATE_3D", E_INVAL);
+            return E_INVAL;
+        }
+        /* `size` 0 means a host-only resource -- a renderbuffer the guest never
+         * touches. Giving it guest backing would allocate megabytes nothing
+         * reads. */
+        if (rc.size) {
+            if (bo_attach_backing(b, rc.size) != 0) {
+                bo_free(b);
+                drm_seen(req, "RESOURCE_CREATE: backing could not be allocated/attached", E_NOSPC);
+                return E_NOSPC;
+            }
+            b->bytes = rc.size;
+        }
+        if (virtio_gpu_ctx_attach(ctx, b->res_id, 1) != 0) {
+            bo_free(b);
+            drm_seen(req, "RESOURCE_CREATE: CTX_ATTACH_RESOURCE refused", E_INVAL);
+            return E_INVAL;
+        }
+        rc.bo_handle  = (uint32_t)slot + 1;
+        rc.res_handle = b->res_id;
+        memcpy(uarg, &rc, sizeof rc);
+        drm_seen(req, "RESOURCE_CREATE", 0);
+        return 0;
+    }
+
+    case DRM_IOCTL_VIRTGPU_RESOURCE_INFO: {
+        struct drm_virtgpu_resource_info ri;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof ri)) return E_FAULT;
+        memcpy(&ri, uarg, sizeof ri);
+        struct drm_bo *b = bo_of(ri.bo_handle);
+        if (!b) return E_INVAL;
+        ri.res_handle = b->res_id;
+        ri.size       = (uint32_t)b->nframes * PAGE_SIZE;
+        ri.blob_mem   = 0;
+        memcpy(uarg, &ri, sizeof ri);
+        drm_seen(req, "RESOURCE_INFO", 0);
+        return 0;
+    }
+
+    case DRM_IOCTL_VIRTGPU_MAP: {
+        struct drm_virtgpu_map mp;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof mp)) return E_FAULT;
+        memcpy(&mp, uarg, sizeof mp);
+        struct drm_bo *b = bo_of(mp.handle);
+        if (!b) return E_INVAL;
+        if (!b->nframes) {
+            /* A HOST-ONLY RESOURCE CANNOT BE MAPPED, and saying so is the
+             * point: returning an offset that mmap would then fail on moves
+             * the error one syscall away from its cause. */
+            drm_seen(req, "MAP of a resource with no guest backing", E_INVAL);
+            return E_INVAL;
+        }
+        mp.offset = (uint64_t)mp.handle * DRM_MAP_STRIDE;
+        memcpy(uarg, &mp, sizeof mp);
+        drm_seen(req, "MAP", 0);
+        return 0;
+    }
+
+    case DRM_IOCTL_GEM_CLOSE: {
+        struct drm_gem_close gc;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof gc)) return E_FAULT;
+        memcpy(&gc, uarg, sizeof gc);
+        struct drm_bo *b = bo_of(gc.handle);
+        if (!b) return E_INVAL;
+        bo_free(b);
+        drm_seen(req, "GEM_CLOSE", 0);
+        return 0;
+    }
+
+    /* ---- submission ------------------------------------------------------- */
+    case DRM_IOCTL_VIRTGPU_EXECBUFFER: {
+        struct drm_virtgpu_execbuffer eb;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof eb)) return E_FAULT;
+        memcpy(&eb, uarg, sizeof eb);
+        int node = drm_node_of_fd(fd);
+        uint32_t ctx = node_ctx(node);
+        if (!ctx) return E_NODEV;
+        if (!eb.command || !eb.size) return E_INVAL;
+        if (!vmm_user_ok(eb.command, eb.size)) return E_FAULT;
+        /* THE bo_handles LIST IS DELIBERATELY NOT PINNED, and that is sound
+         * ONLY because this submit is synchronous: virtio_gpu_submit_3d does
+         * not return until the device has consumed the command, so nothing
+         * the caller passed can be freed underneath it. The moment submission
+         * becomes asynchronous -- which is the obvious next performance move
+         * -- this becomes a use-after-free and the handles must be validated
+         * and referenced here. Written down because the bug it would cause
+         * would look like random host GL corruption. */
+        int rc = virtio_gpu_submit_3d(ctx, (const void *)(uintptr_t)eb.command, eb.size);
+        if (rc != 0) { drm_seen(req, "EXECBUFFER: the device refused SUBMIT_3D", E_INVAL); return E_INVAL; }
+        /* No out-fence fd: we have already waited. Reporting -1 is what an
+         * unset fence looks like, and Mesa handles it. */
+        if (eb.fence_fd >= 0) { eb.fence_fd = -1; memcpy(uarg, &eb, sizeof eb); }
+        drm_seen(req, "EXECBUFFER", 0);
+        return 0;
+    }
+
     case DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST:
-        drm_seen(req, "TRANSFER_TO_HOST -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
-    case DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST:
-        drm_seen(req, "TRANSFER_FROM_HOST -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
-    case DRM_IOCTL_VIRTGPU_WAIT:
-        drm_seen(req, "WAIT -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
+    case DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: {
+        struct drm_virtgpu_3d_transfer tr;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof tr)) return E_FAULT;
+        memcpy(&tr, uarg, sizeof tr);
+        struct drm_bo *b = bo_of(tr.bo_handle);
+        if (!b) return E_INVAL;
+        int node = drm_node_of_fd(fd);
+        uint32_t ctx = node_ctx(node);
+        if (!ctx) return E_NODEV;
+        int to_host = (req == DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST);
+        int rc = virtio_gpu_transfer_3d(ctx, b->res_id, to_host,
+                                        tr.box.x, tr.box.y, tr.box.z,
+                                        tr.box.w, tr.box.h, tr.box.d,
+                                        tr.offset, tr.level, tr.stride, tr.layer_stride);
+        if (rc != 0) {
+            drm_seen(req, to_host ? "TRANSFER_TO_HOST refused" : "TRANSFER_FROM_HOST refused", E_INVAL);
+            return E_INVAL;
+        }
+        drm_seen(req, to_host ? "TRANSFER_TO_HOST" : "TRANSFER_FROM_HOST", 0);
+        return 0;
+    }
+
+    case DRM_IOCTL_VIRTGPU_WAIT: {
+        struct drm_virtgpu_3d_wait wt;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof wt)) return E_FAULT;
+        memcpy(&wt, uarg, sizeof wt);
+        if (!bo_of(wt.handle)) return E_INVAL;
+        /* NOTHING TO WAIT FOR, HONESTLY. Every command this node issues is
+         * complete before its ioctl returns, so an object is never busy. This
+         * is a true answer today and a lie the instant submission goes
+         * asynchronous -- at which point this needs real fences, not a
+         * relaxation of the check. */
+        drm_seen(req, "WAIT (submission is synchronous: never busy)", 0);
+        return 0;
+    }
+
     case DRM_IOCTL_VIRTGPU_CONTEXT_INIT:
-        drm_seen(req, "CONTEXT_INIT -- not implemented yet (M2348)", E_NOTTY); return E_NOTTY;
+        /* We report VIRTGPU_PARAM_CONTEXT_INIT as 0, so a well-behaved Mesa
+         * does not call this. Answering EINVAL rather than ENOTTY says "the
+         * kernel understood and declines", which is what the feature bit
+         * already told it. */
+        drm_seen(req, "CONTEXT_INIT (we advertise it as unsupported)", E_INVAL);
+        return E_INVAL;
 
     default:
         /* AND SAY SO. An ioctl nobody named is the thing Mesa will have

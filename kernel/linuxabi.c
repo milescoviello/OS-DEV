@@ -4014,6 +4014,17 @@ static void lx_dispatch_body(struct registers *r) {
              * it -- and mapping one is the entire point of memfd. Both
              * processes that map the same object get the same physical pages,
              * which is what makes wl_shm a zero-copy pixel handoff. (M1977) */
+            /* A DRM render-node object, addressed by the offset VIRTGPU_MAP
+             * handed out. Like a memfd it has no path, so the file-backed
+             * route below cannot serve it. (M2350) */
+            if (fd >= 0 && app_fd_type(fd) == 17) {
+                uint64_t db = app_mmap_drm(fd, (uint64_t)len, (uint64_t)r->r9);
+                if (g_lx_systrace)
+                    kprintf("[lxmmap] drm fd=%d len=%lx off=%lx -> %lx\n",
+                            fd, (unsigned long)len, (unsigned long)r->r9, (unsigned long)db);
+                if (!db) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+                r->rax = db; break;
+            }
             if (fd >= 0 && app_fd_type(fd) == 3) {
                 uint64_t mb = app_mmap_memfd(fd, (uint64_t)len, (uint64_t)r->r9);
                 if (g_lx_systrace)

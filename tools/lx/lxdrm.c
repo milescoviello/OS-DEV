@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
 
@@ -94,6 +95,91 @@ int main(void) {
                    ((uint32_t *)caps)[0], ((uint32_t *)caps)[1], ((uint32_t *)caps)[2],
                    ((uint32_t *)caps)[3], ((uint32_t *)caps)[4], ((uint32_t *)caps)[5],
                    ((uint32_t *)caps)[6], ((uint32_t *)caps)[7]);
+    }
+
+    /* ---- part 2: an object, a mapping, and a round trip THROUGH the host ----
+     *
+     * Everything above is a conversation about capabilities. This is the part
+     * that proves the host actually holds our pages: create a 64x64 render
+     * target, mmap its guest backing, write a pattern, TRANSFER_TO_HOST, wipe
+     * the guest copy, TRANSFER_FROM_HOST, and compare.
+     *
+     * The wipe is the whole point. Without it the comparison passes whether or
+     * not either transfer did anything -- the bytes would still be in the
+     * buffer we wrote them to. It is the same trap as an fps counter on a page
+     * that never started: the check has to be one that a do-nothing
+     * implementation FAILS. */
+    {
+        struct drm_virtgpu_resource_create rc;
+        memset(&rc, 0, sizeof rc);
+        rc.target = 2;              /* PIPE_TEXTURE_2D */
+        rc.format = 1;              /* VIRGL_FORMAT_B8G8R8A8_UNORM */
+        rc.bind   = 2;              /* PIPE_BIND_RENDER_TARGET */
+        rc.width = 64; rc.height = 64; rc.depth = 1; rc.array_size = 1;
+        rc.size = 64 * 64 * 4; rc.stride = 64 * 4;
+        int r = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &rc);
+        OK(r == 0 && rc.bo_handle && rc.res_handle,
+           "RESOURCE_CREATE 64x64 BGRA -> rc %d (%s), bo_handle %u, res_handle %u",
+           r, r ? strerror(errno) : "ok", rc.bo_handle, rc.res_handle);
+        if (r != 0) { printf("LXDRM: RESULT FAIL (%d)\n", ++fails); close(fd); return 1; }
+
+        struct drm_virtgpu_map mp;
+        memset(&mp, 0, sizeof mp);
+        mp.handle = rc.bo_handle;
+        r = ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mp);
+        OK(r == 0, "MAP(handle %u) -> rc %d (%s), offset 0x%llx",
+           rc.bo_handle, r, r ? strerror(errno) : "ok", (unsigned long long)mp.offset);
+
+        unsigned char *p = MAP_FAILED;
+        if (r == 0) {
+            p = mmap(NULL, rc.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)mp.offset);
+            OK(p != MAP_FAILED, "mmap(%u bytes at that offset) -> %p (%s)",
+               rc.size, p, p == MAP_FAILED ? strerror(errno) : "ok");
+        }
+
+        if (p != MAP_FAILED) {
+            /* A pattern no zero-fill and no memcpy-of-itself can produce. */
+            for (unsigned i = 0; i < rc.size; i++) p[i] = (unsigned char)(i * 7 + 13);
+
+            struct drm_virtgpu_3d_transfer_to_host tr;   /* same layout as _from_host */
+            memset(&tr, 0, sizeof tr);
+            tr.bo_handle = rc.bo_handle;
+            tr.box.w = 64; tr.box.h = 64; tr.box.d = 1;
+            tr.stride = 64 * 4;
+            r = ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &tr);
+            OK(r == 0, "TRANSFER_TO_HOST(64x64) -> rc %d (%s)", r, r ? strerror(errno) : "ok");
+
+            /* WIPE, so the read-back cannot be satisfied by what is already here. */
+            memset(p, 0, rc.size);
+            int nonzero_after_wipe = 0;
+            for (unsigned i = 0; i < rc.size; i++) if (p[i]) { nonzero_after_wipe = 1; break; }
+            OK(!nonzero_after_wipe, "the guest buffer is zero after the wipe (so the "
+               "read-back below cannot pass by accident)");
+
+            r = ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST, &tr);
+            OK(r == 0, "TRANSFER_FROM_HOST(64x64) -> rc %d (%s)", r, r ? strerror(errno) : "ok");
+
+            unsigned bad = 0, first_bad = 0;
+            for (unsigned i = 0; i < rc.size; i++)
+                if (p[i] != (unsigned char)(i * 7 + 13)) { if (!bad) first_bad = i; bad++; }
+            OK(bad == 0, "the pattern came back through the HOST: %u of %u bytes differ%s",
+               bad, rc.size, bad ? "" : " -- the host really holds our pages");
+            if (bad) printf("LXDRM: first mismatch at %u: got %u, want %u\n",
+                            first_bad, p[first_bad], (unsigned char)(first_bad * 7 + 13));
+
+            struct drm_virtgpu_3d_wait wt;
+            memset(&wt, 0, sizeof wt);
+            wt.handle = rc.bo_handle;
+            r = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &wt);
+            OK(r == 0, "WAIT(handle %u) -> rc %d (%s)", rc.bo_handle, r, r ? strerror(errno) : "ok");
+            munmap(p, rc.size);
+        }
+
+        struct drm_gem_close gc;
+        memset(&gc, 0, sizeof gc);
+        gc.handle = rc.bo_handle;
+        r = ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        OK(r == 0, "GEM_CLOSE(handle %u) -> rc %d (%s)", rc.bo_handle, r, r ? strerror(errno) : "ok");
     }
 
     close(fd);

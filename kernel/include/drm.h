@@ -22,3 +22,10 @@ int  drm_is_node_path(const char *path);   /* 1 for /dev/dri/renderD128 (and car
 long drm_ioctl(int fd, unsigned long req, void *uarg);
 int  drm_open_node(void);                  /* returns a node id, or -1 */
 void drm_close_node(int id);
+
+/* For app.c's mmap of a render-node descriptor: which physical frame backs
+ * page `page` of the object named by VIRTGPU_MAP offset `off`, and how large
+ * that object is. The handle namespace has exactly one owner (drm.c) and this
+ * is how the mapping code asks it questions. (M2349) */
+uint64_t drm_map_frame(uint64_t off, uint64_t page);
+uint64_t drm_map_size(uint64_t off);
