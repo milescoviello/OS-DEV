@@ -544,36 +544,61 @@ static const struct sf sys_files[] = {
  * Gated on virtio_gpu_has_3d() throughout, so a boot with no GPU has no
  * /sys/dev/char entries to mislead anything. */
 #define DRM_SYS "/sys/dev/char/226:128/device"
-/* AND THE SUBSYSTEM IS virtio, NOT pci -- WHICH IS NOT A COSMETIC CHOICE.
+/* AND THE SUBSYSTEM IS pci -- RETRACTING A "CORRECTION" (M2354).
  *
- * The first cut of this table said `pci` and gave the real 1af4:1050 ids,
- * reasoning that the device genuinely is a PCI device. Both true, and it would
- * have made things WORSE, because of what Mesa does with the answer:
+ * This table said `pci` with the device's real 1af4:1050 ids. I changed it to
+ * `virtio` on the reasoning that Linux reports virtio (true: the DRM device's
+ * parent is the virtio device) and that Mesa's PCI-id table has no 1af4 entry,
+ * so succeeding at the PCI probe would return NULL. THE SECOND HALF WAS WRONG,
+ * read off an older Mesa. Mesa 26 does:
  *
- *     if (!loader_get_pci_id_for_fd(fd, &vendor_id, &chip_id)) {
- *         driver = loader_get_kernel_driver_name(fd);   <- "virtio_gpu" -> virgl
- *         return driver;
- *     }
- *     driver = loader_get_driver_for_fd_pci(vendor_id, chip_id);  <- a fixed table
+ *     driver = loader_get_pci_driver(fd);
+ *     if (!driver) driver = loader_get_kernel_driver_name(fd);
  *
- * Mesa's PCI-id table maps Intel, AMD and NVIDIA ids to drivers. 1af4:1050 is
- * in no such table, so succeeding at the PCI probe returns NULL and the driver
- * never loads -- while FAILING it falls through to the kernel driver name,
- * which is exactly the answer we want. Supplying more accurate information
- * would have taken the path that cannot work.
+ * -- it FALLS BACK. An unknown PCI id costs nothing.
  *
- * Linux does not report it as PCI either, and for a real reason: the DRM
- * device's parent is the VIRTIO device, whose parent is the PCI device. The
- * subsystem of the immediate parent is virtio. So this is both what Linux says
- * and what makes Mesa take the path that resolves.
+ * And libdrm requires PCI outright. `drmGetDevice2` is `drmGetDeviceFromDevId`,
+ * which contains:
  *
- * libdrm's virtio branch then wants MODALIAS to start with "virtio:", which is
- * where the device and vendor ids belong in this spelling -- d=0x10 is
- * virtio-gpu's device type, v=0x1af4 the vendor. */
+ *     subsystem_type = drmParseSubsystemType(maj, min);
+ *     if (subsystem_type != DRM_BUS_PCI)
+ *             return -ENODEV;
+ *
+ * Which is exactly what the probe then measured: `drmGetDevice2(fd) -> -19
+ * (No such device)`, `drmGetDevices2 -> 0 device(s)`, and therefore an empty
+ * EGL device list and "DRI2: failed to load driver" three layers up.
+ *
+ * Real Linux survives reporting virtio because drmParseSubsystemType, on
+ * seeing DRM_BUS_VIRTIO, re-reads the subsystem of the PARENT (`.../device/..`)
+ * and gets pci from the virtio device's PCI parent. Modelling that would mean
+ * a second synthetic level; reporting pci directly is the same answer with
+ * less machinery, and it is what `get_pci_path` -- which reads the ids below --
+ * expects to find anyway.
+ *
+ * Two lessons, both about reading rather than reasoning: libdrm's source was
+ * on this machine the whole time (/var/cache/distfiles), and one grep for
+ * ENODEV answered what four VM round trips could not. And a change justified
+ * by "this is more truthful" is still a regression if it is untested --
+ * this one replaced a working table with a broken one on a chain of
+ * plausible-sounding inference. */
 static const struct sf drm_sys_files[] = {
+    /* PCI_SLOT_NAME is what drmParsePciBusInfo sscanf's out of uevent; the four
+     * hex files are what parse_separate_sysfs_files reads (it skips `revision`
+     * unless DRM_DEVICE_GET_PCI_REVISION is asked for, but it costs nothing).
+     * Every value is what the kernel's own PCI enumeration printed:
+     * `00:1c.0  1af4:1050  class 03:80`. */
     { DRM_SYS "/uevent",
       "DRIVER=virtio_gpu\n"
-      "MODALIAS=virtio:d00000010v00001AF4\n" },
+      "PCI_CLASS=38000\n"
+      "PCI_ID=1AF4:1050\n"
+      "PCI_SUBSYS_ID=1AF4:1100\n"
+      "PCI_SLOT_NAME=0000:00:1c.0\n"
+      "MODALIAS=pci:v00001AF4d00001050sv00001AF4sd00001100bc03sc80i00\n" },
+    { DRM_SYS "/vendor",            "0x1af4\n" },
+    { DRM_SYS "/device",            "0x1050\n" },
+    { DRM_SYS "/revision",          "0x00\n" },
+    { DRM_SYS "/subsystem_vendor",  "0x1af4\n" },
+    { DRM_SYS "/subsystem_device",  "0x1100\n" },
 };
 #define NDRMSYSF (int)(sizeof(drm_sys_files)/sizeof(drm_sys_files[0]))
 
@@ -582,7 +607,7 @@ static const struct sf drm_sys_files[] = {
  * it. */
 static const char *drm_sys_dirs[] = {
     "/sys/dev", "/sys/dev/char", "/sys/dev/char/226:128",
-    DRM_SYS, DRM_SYS "/drm", "/sys/bus", "/sys/bus/virtio",
+    DRM_SYS, DRM_SYS "/drm", "/sys/bus", "/sys/bus/pci",
 };
 #define NDRMSYSD (int)(sizeof(drm_sys_dirs)/sizeof(drm_sys_dirs[0]))
 
@@ -590,7 +615,7 @@ static const char *drm_sys_dirs[] = {
  * component -- pointing it at a path we do not serve would fail in exactly the
  * same silent way as not having it at all. */
 #define DRM_SYS_SUBSYSTEM DRM_SYS "/subsystem"
-#define DRM_SYS_SUBSYS_TARGET "/sys/bus/virtio"
+#define DRM_SYS_SUBSYS_TARGET "/sys/bus/pci"
 
 int procfs_is_drm_symlink(const char *abs) {
     return virtio_gpu_has_3d() && peq(abs, DRM_SYS_SUBSYSTEM);

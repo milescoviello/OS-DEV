@@ -135,6 +135,29 @@ for lib in "$LXROOT"/usr/lib64/libEGL.so.1.0.0 "$LXROOT"/usr/lib64/libgallium-*.
 done
 [ "$miss" = 0 ] && echo "    all DT_NEEDED entries present" || \
     { echo "build-mesa-virgl: $miss unresolved dependency(ies)" >&2; exit 1; }
+# AND ASSERT THAT WHAT IS THERE IS WHAT WE BUILT (M2354).
+#
+# `stage-linux-tool.sh` copies a binary's whole `ldd` closure from this host,
+# and lxgl links against libEGL -- so tool staging will happily overwrite this
+# Mesa with the host's glvnd dispatch stub (88 KB against our 468 KB), whose
+# vendor library is not staged. It did exactly that, silently, the moment the
+# Makefile changed, and the resulting failure is WORD FOR WORD the failure a
+# real driver problem produces: "DRI2: failed to load driver". Twenty minutes
+# went into debugging a kernel that was fine.
+#
+# The Makefile now orders this step after .tools-staged so it always writes
+# last. This is the check that the ordering held.
+for f in libEGL.so.1.0.0 libGLESv2.so.2.0.0; do
+    want=$(stat -Lc %s "$OUT/stage/usr/lib64/$f" 2>/dev/null || echo 0)
+    got=$(stat -Lc %s "$LXROOT/usr/lib64/$f" 2>/dev/null || echo 0)
+    if [ "$want" = 0 ] || [ "$want" != "$got" ]; then
+        echo "build-mesa-virgl: $f in the guest root is $got bytes, ours is $want --" >&2
+        echo "                  something overwrote it (the host's glvnd stub, most likely)." >&2
+        exit 1
+    fi
+done
+echo "==> verified: the guest's libEGL/libGLESv2 are the ones just built"
+
 echo "==> staged. DRI modules now in the guest:"
 ls -la "$LXROOT/usr/lib64/" 2>/dev/null | head -20
 # Mesa 26 has NO separate *_dri.so: the gallium driver is inside

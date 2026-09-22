@@ -695,6 +695,26 @@ $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 # still newer than its prerequisites. That is how bash and git were added to
 # LXTOOLS and never actually staged, leaving every ext2 rebuild without them
 # while manual injections into the image kept being wiped.
+# MESA MUST BE STAGED AFTER .tools-staged, NOT BEFORE (M2354).
+#
+# `stage-linux-tool.sh` copies a binary's whole `ldd` closure from THIS HOST.
+# lxgl links against libEGL, so the closure includes the host's libEGL -- which
+# on this box is glvnd's 88 KB dispatch stub, and glvnd then dlopens a vendor
+# library named in /usr/share/glvnd/egl_vendor.d that is not staged. So tool
+# staging silently OVERWROTE the 468 KB virgl-only Mesa libEGL that had been
+# installed half an hour earlier, and did it only when the Makefile changed --
+# which is to say, it appeared as a regression in the middle of debugging
+# something else, with the same symptom the real bug had.
+#
+# It also means the Mesa staging was never part of the build at all: it had
+# been run by hand. A prerequisite that exists only in a shell history is not
+# a prerequisite. Ordered by the stamp dependency, so our Mesa is written last
+# and wins no matter what the closure drags in.
+$(LXROOT)/.mesa-staged: tools/build-mesa-virgl.sh $(LXROOT)/.tools-staged
+	@tools/build-mesa-virgl.sh >/dev/null || { echo "  MESA    FAILED -- see tools/build-mesa-virgl.sh"; exit 1; }
+	@echo "  MESA    $(LXROOT)/usr/lib64 (virgl only, no LLVM) staged AFTER the tool closure"
+	@touch $@
+
 $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools/lx/osdev-firefox-prefs.js
 	@mkdir -p $(LXROOT)
 	@for t in $(LXTOOLS); do tools/stage-linux-tool.sh $(LXROOT) $$t; done
@@ -833,7 +853,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 # The ext2 data volume (see the EXT2IMG block near the top). Sparse: `truncate`
 # reserves the size without writing it, and mke2fs only touches metadata, so a
 # 512M volume costs a few MB on the host until it is actually filled.
-$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged
+$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
 	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \
