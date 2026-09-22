@@ -23,7 +23,14 @@
 // does not.
 pref("gfx.webrender.software",       true);   // SWGL: rasterise on the CPU
 pref("gfx.webrender.all",            true);   // ...and use WebRender for everything
-pref("gfx.x11-egl.force-disabled",   true);   // never probe EGL; there is none
+// EGL EXISTS NOW (M2357). This said "never probe EGL; there is none" and that
+// stopped being true at M2356: /dev/dri/renderD128 answers a virgl driver and
+// `lxgl` reads back a pixel drawn by the host's iGPU. The pref is X11-specific
+// and this browser runs on Wayland either way, so flipping it is belt rather
+// than braces -- but leaving a pref named "force-disabled" set while trying to
+// measure hardware WebGL is exactly the kind of stale premise that costs a
+// day.
+pref("gfx.x11-egl.force-disabled",   false);
 // WEBGL, THROUGH SWGL (M2337). This was `true` with the note "a page asking
 // for WebGL must fail fast, not hang", which was the right call when the only
 // way to get a GL context was an EGL that does not exist in this image. But
@@ -42,6 +49,10 @@ pref("webgl.force-enabled",                                   true);
 pref("webgl.disable-fail-if-major-performance-caveat",        true);
 pref("webgl.disable-angle",                                   true);
 pref("webgl.enable-surface-texture",                          false);
+// 2D canvas STAYS on the CPU: its output has to land in a wl_shm buffer for our
+// compositor, and an accelerated 2D canvas would add a readback per frame for
+// no gain. WebGL is the thing we want on the GPU -- that is where the
+// volumetric fragment shader is. (M2357)
 pref("gfx.canvas.accelerated",                                false);
 // THE GPU PROCESS IS BACK ON (M2115). It was disabled because it died in a
 // respawn loop trying to create an EGL display -- but that was the EGL, and

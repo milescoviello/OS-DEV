@@ -5,6 +5,8 @@
 #   RUNFOR=90 tools/ffbench.sh URL                 how long to watch (default 60 s)
 #   NOBUILD=1 tools/ffbench.sh URL                 skip the build
 #   KEEP=1    tools/ffbench.sh URL                 leave the VM up to look at
+#   FFAPPEND="ffgl" tools/ffbench.sh URL             extra -append words (e.g. ffgl for
+#                                                    Firefox's own GL decision log)
 #   CLICK=594,518 tools/ffbench.sh URL               click there (PAGE pixels) first,
 #                                                    then measure -- for a benchmark
 #                                                    that waits behind a Start button
@@ -30,7 +32,7 @@ S=$(mktemp -d); SSH="ssh -o BatchMode=yes root@$H"
 [ -s ffurl.txt ] || { echo "ffbench: no URL given and ffurl.txt is empty" >&2; exit 2; }
 echo "==> $(grep -c . ffurl.txt) tab(s), $RUNFOR s of frames"
 
-APPEND="ffshow ffurl nonetdemo" CORES=${CORES:-8} MEM=${MEM:-8192} \
+APPEND="ffshow ffurl nonetdemo ${FFAPPEND:-}" CORES=${CORES:-8} MEM=${MEM:-8192} \
   PVE_HOST="$H" VMID="$V" NOBUILD="${NOBUILD:-0}" tools/pve-show.sh >/dev/null
 
 # WAIT FOR THE WINDOW, NOT A DURATION.

@@ -3242,6 +3242,13 @@ void desktop_run(void) {
              * second takes this branch instead, and the cost of this branch was
              * not in any budget. Same shape, its own counters, so the two can
              * be compared rather than conflated. */
+            /* START THE CLOCK ON THE FIRST FRAME, NOT AT ZERO (M2357). The
+             * first report read "300 in 0 ms = 0 fps", because g_pf_t0 was
+             * still 0 and `now > g_pf_t0` produced a delta of `now` -- no,
+             * worse: the guard `g_pf_t0 &&` made dt 0 and the rate 0. A
+             * frame-rate instrument whose first reading is always 0 fps is
+             * one more instrument that reports a number it did not measure. */
+            if (!g_pf_t0) g_pf_t0 = timer_ms();
             uint64_t p0 = rdtsc_now();
             fb_set_target(scenebuf);
             for (int i = 0; i < win_count; i++) {
@@ -3277,6 +3284,7 @@ void desktop_run(void) {
              * last guess here -- "a partial present must be cheaper" -- was
              * wrong and had to be reverted, so this measures instead. TSC
              * deltas, summed, reported once a second's worth of frames. */
+            if (!g_fr_t0) g_fr_t0 = timer_ms();      /* same, for the full-redraw path (M2357) */
             uint64_t t0 = rdtsc_now();
             render_scene();
             uint64_t t1 = rdtsc_now();

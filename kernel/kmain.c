@@ -402,6 +402,7 @@ static void ffshow_watch_task(void) {
 static volatile int g_wltest;                 /* -append wltest: bring the Wayland display up and run a real client (M1978) */
 static volatile int g_lxdesktop;              /* -append lxdesktop: stage the Linux environment, then go straight to the desktop (M2004) */
 static volatile int g_ffmozlog;               /* -append ffmozlog: ask Firefox itself where it is, via MOZ_LOG (M2010) */
+static volatile int g_ffgl;                   /* -append ffgl: ask Firefox why it is not using the GPU (M2357) */
 static volatile int g_ffshot;                 /* -append ffshot: Firefox headless, --screenshot to a real PNG (M2003) */
 static volatile int g_lxclaude_test;          /* -append lxclaudetest: run Claude Code alone, without the Node suite ahead of it (M1970) */
 /* -append lxask: THE PHASE 7 DEMO, and nothing else (M2056).
@@ -1029,6 +1030,15 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                                              g_ffshow = 0; }              /* the old screen-holding diagnostics (M2214) */
         if (cmdline_has(cl, "lxdesktop")) { g_lxabi_test = 1; g_lxdesktop = 1; }   /* the Linux environment + the desktop, no tests (M2004) */
         if (cmdline_has(cl, "ffmozlog"))   g_ffmozlog = 1;                /* + Firefox's OWN widget/Wayland logging, to stderr (M2010) */
+        /* AND ffgl IMPLIES lxout (M2357). The first ffgl run produced the line
+         * `[lx] env[33] = MOZ_LOG=timestamp,sync,DocumentChannel:5,...` -- so
+         * the spec reached the process -- and then NOTHING, not even from the
+         * DocumentChannel control that exists precisely to prove the mechanism
+         * works. The reason was not Firefox: MOZ_LOG writes to stderr, and
+         * guest stderr only reaches this log when `lxout` is on. A diagnostic
+         * flag that cannot deliver its own output is worse than no flag,
+         * because its silence reads as an answer. */
+        if (cmdline_has(cl, "ffgl"))     { g_ffgl = 1; extern int g_lx_out_log; g_lx_out_log = 1; }
         if (cmdline_has(cl, "ffshot"))     { g_lxabi_test = 1; g_ffshot = 1; }   /* Firefox HEADLESS, rendering a page to a PNG (M2003) */
         if (cmdline_has(cl, "wlverbose")) { g_wl_verbose = 1; g_unix_verbose = 1; }
         if (cmdline_has(cl, "wltest"))     { g_lxabi_test = 1; g_wltest = 1; }   /* Wayland: compositor + a real libwayland client (M1978) */
@@ -2325,6 +2335,27 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                         app_set_next_env("G_MESSAGES_DEBUG=all");
                         app_set_next_env("GIO_USE_VFS=local");
                     }
+                    if (g_ffgl) {
+                        /* WHY IS FIREFOX NOT USING THE GPU? (M2357)
+                         *
+                         * The GPU works: `lxgl` draws on the host iGPU and
+                         * reads the pixel back on the same kernel. Firefox, on
+                         * the same boot, never opens /dev/dri at all -- zero
+                         * [drm] lines -- and volumeshaderbm runs at 2.7 fps on
+                         * the software rasteriser. So the question is not
+                         * whether the hardware is reachable but what Firefox
+                         * DECIDED, and only Firefox can answer that.
+                         *
+                         * GLContext logs EGL initialisation and every reason a
+                         * context is refused; WebGL logs the backend choice.
+                         * DocumentChannel stays as the CONTROL -- it is the one
+                         * module M2132 confirmed produces output here, so its
+                         * presence tests that MOZ_LOG reached the process at
+                         * all. Without that, silence from GLContext and
+                         * "MOZ_LOG is not working" are indistinguishable,
+                         * which is the mistake M2253 made. */
+                        app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,GLContext:5,WebGL:5");
+                    }
                     /* AND IT IS OPT-IN AGAIN, BECAUSE IT COST 26 SECONDS (M2189).
                      *
                      * Measured, which is what I failed to do when turning it
@@ -2450,6 +2481,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                          * for it alongside tests the mechanism and the
                          * question in one boot. */
                         app_set_next_env("MOZ_LOG=timestamp,sync,DocumentChannel:5,Widget:5,nsWindow:5");
+
                         /* GDK'S OWN EVENT TRACE (M2253).
                          *
                          * Widget:5 turned out to log only window lifecycle --

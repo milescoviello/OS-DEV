@@ -12234,8 +12234,49 @@ int app_fifo_open(const char *path, int write) {
 
 /* open(path): a read-only FILE fd (M1193). Positioned reads via app_fd_read +
  * app_lseek; close via app_fd_close. Returns the fd (>=3), or -1. */
+/* DID ANYBODY GO LOOKING FOR THE GPU? (M2357)
+ *
+ * Firefox runs volumeshaderbm at 3 fps while `lxgl` draws on the host iGPU on
+ * the same kernel, and the boot log contains ZERO [drm] lines -- so Firefox
+ * never opened the render node. That leaves two very different explanations:
+ * it tried to load a GL stack and failed, or it never tried because something
+ * in its own configuration routed WebGL to the software rasteriser first.
+ *
+ * MOZ_LOG cannot settle it. This tree has recorded twice that it produces zero
+ * lines here (M2253, M2298), and the run that asked for GLContext:5 confirmed
+ * it again -- silent even for the control module. So ask the kernel instead:
+ * it sees every open, it cannot be compiled out, and "no process ever opened
+ * libEGL" is a fact rather than an absence of logging.
+ *
+ * One line per distinct path, so a browser that dlopens the same library in
+ * forty content processes costs one line. */
+static void app_open_gl_watch(const char *path) {
+    static const char *pats[] = { "dri/", "libEGL", "libgallium", "libGLESv2", "libgbm", "libdrm" };
+    static const char *seen[16]; static int nseen;
+    if (!path) return;
+    int hit = 0;
+    for (unsigned k = 0; k < sizeof pats / sizeof pats[0] && !hit; k++) {
+        for (int i = 0; path[i]; i++) {
+            int j = 0; while (pats[k][j] && path[i + j] == pats[k][j]) j++;
+            if (!pats[k][j]) { hit = 1; break; }
+        }
+    }
+    if (!hit) return;
+    for (int i = 0; i < nseen; i++) if (strcmp(seen[i], path) == 0) return;
+    if (nseen < 16) {
+        /* The table holds the fd entry's own copy, which outlives this call. */
+        static char store[16][192];
+        int k = 0; while (path[k] && k < 191) { store[nseen][k] = path[k]; k++; }
+        store[nseen][k] = 0;
+        seen[nseen] = store[nseen];
+        nseen++;
+        kprintf("[glwatch] pid %d opened \"%s\"\n", app_current_pid(), path);
+    }
+}
+
 int app_open(const char *path, int flags) {
     struct app *a = cur(); if (!a) return -1;
+    app_open_gl_watch(path);
     /* /dev/ptmx (M1274): open the MASTER end of a fresh pty pair (the slave then
      * appears at /dev/pts/<n>). /dev/pts/<n> opens that slave. Both become
      * type-11 fds over pty.c (obj = the pty endpoint id; master ids are even,
