@@ -1,6 +1,7 @@
 # What's next
 
-> **(M2351-M2355) OS-DEV RUNS OpenGL ES 3.2 ON THE HOST'S GPU.**
+> **(M2351-M2356) OS-DEV RUNS OpenGL ES 3.2 ON THE HOST'S GPU, AND A DRAW
+> COMES BACK CORRECT.**
 >
 > ```
 > LXGL: drmGetDevices2 -> 1 device(s)
@@ -11,7 +12,32 @@
 > LXGL: GL_VERSION  = OpenGL ES 3.2 Mesa 26.1.6
 > LXGL: is this the HOST GPU? YES -- virgl
 > [drm] EXECBUFFER (0xc0406442) -> 0
+> LXGL: clear+readback -> rgba(0,255,0,255), glGetError 0x0 (want green)
+> LXGL: RESULT PASS (0 check(s) failed)
 > ```
+>
+> A `glClear` to opaque green, executed by an Arrow Lake iGPU on the host, read
+> back into a ring-3 buffer in OS-DEV as exactly `rgba(0,255,0,255)`. The
+> readback is the assertion — a configured-but-dead context passes every other
+> check.
+>
+> **The last bug was a version number, and it is the third of a kind.** M2347
+> reported DRM 0.1.0 because that is what a real `virtio_gpu` reports; in this
+> uAPI the minor version is a capability bit
+> (`supports_fences = drm_version >= VIRGL_DRM_VERSION(0,1)`). At 0.1 Mesa
+> requests an out-fence descriptor, we produced none, `eb.fence_fd` stayed at
+> the `-1` Mesa had written, and waiting on that fence became `poll()` on a
+> negative fd — which poll correctly ignores, so an infinite wait became an
+> infinite sleep on nothing. Our poll was right; the claim was wrong. Found by
+> the stall report naming two blocked threads, `addr2line` resolving them to
+> `lx_poll_nap_sleep` and `app_futex`, and the observation that nothing in a
+> straight-line GL program has any business polling.
+>
+> All three bugs in this campaign share one root: **asserting a capability
+> instead of measuring one** — the `[budget]` block's hardcoded "UNDER TCG" on
+> a KVM host, the sysfs subsystem "corrected" to virtio on reasoning read off
+> an older Mesa, and a version number copied for verisimilitude. Each cost more
+> than its fix.
 >
 > Eight links: a ring-3 program calls EGL, Mesa's virgl driver turns GL into a
 > command stream, our DRM render node forwards it to virtio-gpu, QEMU hands it
