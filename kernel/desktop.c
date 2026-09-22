@@ -2780,16 +2780,35 @@ void desktop_run(void) {
                          * that still has them. Bracket the keypress with the
                          * real modifier keycodes, which is what a keyboard
                          * sends and what xkb expects to see. */
-                        if (ctrl_down)  wl_post_key(29, 1);   /* KEY_LEFTCTRL */
-                        if (alt_down)   wl_post_key(56, 1);   /* KEY_LEFTALT  */
-                        if (super_down) wl_post_key(125, 1);  /* KEY_LEFTMETA */
+                        /* RELEASE WHAT WE PRESSED, NOT WHAT IS HELD NOW (M2335).
+                         *
+                         * Both branches tested the LIVE ctrl_down/alt_down/
+                         * super_down. Those are updated from the raw scancode
+                         * layer, so a chord typed faster than this runs --
+                         * which is every chord from QMP send-key, and any brisk
+                         * human one -- can have Ctrl already released by the
+                         * time the closing branch is reached. The press went
+                         * out and the RELEASE DID NOT, so the modifier stayed
+                         * latched in the compositor and the NEXT plain letter
+                         * arrived as a shortcut: typing "neverssl.com" into the
+                         * address bar after Ctrl+L produced "everssl.com",
+                         * because the n was eaten as Ctrl+N.
+                         *
+                         * Latch the flags before sending. A press and its
+                         * release are one transaction; deciding each end
+                         * against separately-sampled state is how a keyboard
+                         * gets stuck. */
+                        int m_ctrl = ctrl_down, m_alt = alt_down, m_super = super_down;
+                        if (m_ctrl)  wl_post_key(29, 1);   /* KEY_LEFTCTRL */
+                        if (m_alt)   wl_post_key(56, 1);   /* KEY_LEFTALT  */
+                        if (m_super) wl_post_key(125, 1);  /* KEY_LEFTMETA */
                         if (nsh) wl_post_key(EV_LEFTSHIFT, 1);
                         wl_post_key(ev, 1);
                         wl_post_key(ev, 0);
                         if (nsh) wl_post_key(EV_LEFTSHIFT, 0);
-                        if (super_down) wl_post_key(125, 0);
-                        if (alt_down)   wl_post_key(56, 0);
-                        if (ctrl_down)  wl_post_key(29, 0);
+                        if (m_super) wl_post_key(125, 0);
+                        if (m_alt)   wl_post_key(56, 0);
+                        if (m_ctrl)  wl_post_key(29, 0);
                     }
                 }
             }

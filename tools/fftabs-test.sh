@@ -112,4 +112,61 @@ echo "   tab-strip edge transitions on the last shot: ${LEFT:-?} (a proxy for ta
                 || echo "   => TAB SWITCHING FAILED (see above)"
 echo "   shots in $S"
 wait $RUN 2>/dev/null || true
+# (the 7th-tab check below runs before the verdict -- M2334)
+
+# ---- a SEVENTH tab, opened from the running browser (M2334) ---------------
+#
+# Everything above proves Firefox can be STARTED with tabs. This proves the
+# running browser can make a new one: Ctrl+T, type an address, Enter. It is a
+# different path -- the tab strip grows, a fresh docshell is created, and the
+# address goes through the URL bar's parser rather than the command line.
+# QMP TAKES QCODE NAMES, NOT CHARACTERS. The first version sent each character
+# verbatim, so "example.org" arrived as "exampleorg" -- the '.' is named "dot"
+# and an unknown qcode is simply dropped. Enter then sent that to a search
+# engine and the new tab loaded a results page, which the test would happily
+# have called a success.
+# QMP TAKES QCODE NAMES, NOT CHARACTERS. Sending "." sends nothing -- the
+# qcode is "dot" -- so "example.org" arrived as "exampleorg", Enter treated
+# it as a search term, and the new tab loaded a Google results page. The tab
+# had opened correctly; the ADDRESS was mistyped by the harness. (M2335)
+type_str(){ for c in $(echo "$1" | sed 's/./& /g'); do
+      case "$c" in
+        .) q=dot ;; -) q=minus ;; /) q=slash ;; ,) q=comma ;;
+        *) q="$c" ;;
+      esac
+      printf '{"execute":"qmp_capabilities"}\n{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"%s"}]}}\n' "$q" \
+        | $SSH "socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp" >/dev/null 2>&1; done; }
+keyc(){ printf '{"execute":"qmp_capabilities"}\n{"execute":"send-key","arguments":{"keys":[%s]}}\n' "$1" \
+        | $SSH "socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp" >/dev/null 2>&1; }
+
+echo "   --- opening a 7th tab from the running browser ---"
+BEFORE7=$(title)
+keyc '{"type":"qcode","data":"ctrl"},{"type":"qcode","data":"t"}'; sleep 4
+type_str "example.org"
+# Enter, then Enter again, then a real load window. The first attempt sent one
+# `ret` and waited 20 s; the screendump showed the address typed correctly and
+# the bar still in edit mode, so the submit -- not the typing -- is what had
+# not happened. A second press costs nothing if the first worked.
+keyc '{"type":"qcode","data":"ret"}'; sleep 4
+keyc '{"type":"qcode","data":"kp_enter"}'
+# POLL FOR THE DOCUMENT, DO NOT SLEEP AT IT. A 40 s sleep caught the tab mid
+# fetch -- title "example.org/", stop button showing, content still blank --
+# and the assertion read that as a failure to navigate. The load had started
+# correctly; the harness looked too early.
+n=0
+while [ $n -lt 40 ]; do
+  case "$(title)" in *"Example Domain"*) break ;; esac
+  sleep 3; n=$((n+1))
+done
+shot tab7
+AFTER7=$(title)
+B7=$(urlbar "$S/tab7.ppm" 2>/dev/null || echo "?")
+echo "   after Ctrl+T + typing: title=$AFTER7 urlbar=$B7"
+case "$bars" in
+  *"$B7"*) echo "   => NEW TAB FAILED: the address bar matches a tab that already existed"; fail=1 ;;
+  *)       case "$AFTER7" in
+             *"Example Domain"*) echo "   => NEW TAB WORKS: Ctrl+T, typed an address, and it loaded" ;;
+             *) echo "   => NEW TAB INCONCLUSIVE: address bar is new but the title is $AFTER7"; fail=1 ;;
+           esac ;;
+esac
 exit $fail

@@ -11,6 +11,7 @@
  * from.
  */
 #include "keyboard.h"
+extern void kprintf(const char *fmt, ...);   /* M2335: the dropped-keystroke line */
 #include "interrupts.h"
 #include "io.h"
 #include <stdint.h>
@@ -46,11 +47,33 @@ static const char keymap_shift[128] = {
 static volatile char     ibuf[IBUF_SIZE];
 static volatile uint32_t ihead, itail;
 
+/* WHERE DOES A LOST KEYSTROKE GO? (M2335)
+ *
+ * Typing "example.net" into Firefox's address bar produced "exampl" and the
+ * missing five characters never arrived, even after ten seconds. Three places
+ * could have eaten them -- QEMU's 8042 queue (16 bytes, and each key is a
+ * make AND a break, so a 12-character URL is 24), this 256-entry ring, or the
+ * desktop's dequeue loop -- and the existing counters could not tell them
+ * apart: "18 dequeued, 18 forwarded" is consistent with all three.
+ *
+ * So count what was PUSHED and what this ring refused. pushed == dequeued
+ * means nothing was lost here and the loss is upstream in the 8042; pushed >
+ * dequeued with drops means this ring overflowed; pushed > dequeued with no
+ * drops means the desktop simply has not caught up yet. */
+uint64_t g_in_pushed, g_in_dropped;
+
 void input_push(char c) {
     uint32_t next = (ihead + 1) % IBUF_SIZE;
+    g_in_pushed++;
     if (next != itail) {          /* drop on overflow rather than clobber */
         ibuf[ihead] = c;
         ihead = next;
+    } else {
+        g_in_dropped++;
+        if (g_in_dropped <= 4)
+            kprintf("[kbd] ** the input ring is FULL: dropped a keystroke "
+                    "(%lu pushed, %lu dropped) **\n",
+                    (unsigned long)g_in_pushed, (unsigned long)g_in_dropped);
     }
 }
 

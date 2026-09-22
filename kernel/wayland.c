@@ -2614,6 +2614,7 @@ void wl_fs_health_line(void) {
         extern unsigned long g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short;
         extern unsigned long g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts;
         extern unsigned long g_dk_keys, g_dk_fwd, g_dk_mot, g_dk_btn; extern int g_dk_focus_kind;
+        extern uint64_t g_in_pushed, g_in_dropped;   /* M2335: where a lost keystroke went */
         unsigned wl_keys_sent(void);
         extern unsigned g_axis_sent;
         extern unsigned g_ptr_enters;   /* the per-client array below is what is printed (M2246) */
@@ -2708,7 +2709,8 @@ void wl_fs_health_line(void) {
                 "PIO says: %lu DISK-WAS-FINE (recovered), %lu disk really bad, %lu read failed | "
                 "tablet: %lu polls, %lu reports, %lu err, %lu short, last %d,%d btn %d | "
                 "td.cs %lx elem %lx frnum %lu cmd %lx sts %lx | "
-                "keys: %lu dequeued, %lu forwarded to wayland, focus kind %d, "
+                "keys: %lu PUSHED by the driver (%lu dropped by a full ring), %lu dequeued, "
+                "%lu forwarded to wayland, focus kind %d, "
                 "%lu SENT on the wire to %d client(s) with a wl_keyboard, %lu axis event(s) | "
                 "clients [slot/Toplevel/nPointer/nKeyboard]: %s | ptr fwd: %lu motion, %lu BUTTON | "
                 "peer-ready: %lu calls, %lu MATCHED an fd | "
@@ -2735,6 +2737,7 @@ void wl_fs_health_line(void) {
                 g_tab_polls, g_tab_reports, g_tab_errs, g_tab_short,
                 g_tab_lastx, g_tab_lasty, g_tab_lastbtn,
                 g_tab_cs, g_tab_elem, g_tab_frnum, g_tab_cmd, g_tab_sts,
+                (unsigned long)g_in_pushed, (unsigned long)g_in_dropped,
                 g_dk_keys, g_dk_fwd, g_dk_focus_kind,
                 (unsigned long)wl_keys_sent(), kbclients, (unsigned long)g_axis_sent, who, g_dk_mot, g_dk_btn,
                 g_peerready_calls, g_peerready_hits,
@@ -3446,13 +3449,65 @@ void wl_post_axis(int x, int y, int ticks_down) {
     }
 }
 
+/* THE MODIFIERS WERE SENT ONCE, ALL ZERO, AND NEVER AGAIN (M2335).
+ *
+ * wl_kbd_enter sends one wl_keyboard.modifiers with every field 0 -- correct
+ * at focus-in -- and nothing ever updated it. So a client was never told that
+ * Ctrl was held, and EVERY keyboard shortcut silently did nothing: Ctrl+T
+ * opened no tab, Ctrl+1..8 switched no tab, Ctrl+W closed nothing. The keys
+ * themselves arrived perfectly (waylandtest proves 'a' reaches the client as
+ * evdev 30 and libxkbcommon renders it), which is exactly why this was
+ * invisible -- typing worked, so the keyboard "worked".
+ *
+ * xkbcommon's default keymap numbers the modifiers Shift=0, Lock=1,
+ * Control=2, Mod1(Alt)=3, Mod2=4, Mod3=5, Mod4(Super)=6, Mod5=7, and
+ * mods_depressed is a mask over those indices. The compositor tracks the
+ * physical state from the evdev keycodes it is already forwarding.
+ *
+ * Sent BEFORE the key it qualifies: a client applies the modifier state it
+ * has when the key arrives, so a modifiers event after the key describes the
+ * next one. */
+#define WLM_SHIFT   (1u << 0)
+#define WLM_CTRL    (1u << 2)
+#define WLM_ALT     (1u << 3)
+#define WLM_SUPER   (1u << 6)
+
+static unsigned g_kbd_mods;          /* mods_depressed, xkb indices */
+
+static unsigned wl_mod_bit(unsigned keycode) {
+    switch (keycode) {
+        case 42: case 54:  return WLM_SHIFT;   /* LEFTSHIFT / RIGHTSHIFT */
+        case 29: case 97:  return WLM_CTRL;    /* LEFTCTRL  / RIGHTCTRL  */
+        case 56: case 100: return WLM_ALT;     /* LEFTALT   / RIGHTALT   */
+        case 125: case 126:return WLM_SUPER;   /* LEFTMETA  / RIGHTMETA  */
+        default: return 0;
+    }
+}
+
+static void wl_kbd_send_mods(struct wl_client *c) {
+    uint8_t m[20]; int p = 0;
+    wr32(m + p, ++c->serial); p += 4;
+    wr32(m + p, g_kbd_mods);  p += 4;          /* mods_depressed */
+    wr32(m + p, 0);           p += 4;          /* mods_latched */
+    wr32(m + p, 0);           p += 4;          /* mods_locked */
+    wr32(m + p, 0);           p += 4;          /* group */
+    wl_kbd_bcast(c, WL_KEYBOARD_EV_MODIFIERS, m, p);
+}
+
 void wl_post_key(unsigned keycode, int pressed) {
     int focus = wl_focus_client();
+    unsigned bit = wl_mod_bit(keycode);
+    if (bit) {                                  /* track it even with no client */
+        if (pressed) g_kbd_mods |= bit; else g_kbd_mods &= ~bit;
+    }
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
         if (i != focus || !c->used || !c->nkbd) continue;
         wl_kbd_enter(c);
+        /* State first, then the key it applies to. A modifier keycode is ALSO
+         * forwarded as an ordinary key, which is what xkbcommon expects. */
+        wl_kbd_send_mods(c);
         uint8_t b[16]; int p = 0;
         wr32(b + p, ++c->serial); p += 4;
         wr32(b + p, wl_now_ms()); p += 4;

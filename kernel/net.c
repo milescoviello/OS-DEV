@@ -2046,7 +2046,20 @@ static void tcp_send_seg(const uint8_t *dmac, const uint8_t *dip,
  * TLS connections while the boot self-test holds another and the desktop is
  * live, and a single burst on any one of them silently evicted every frame
  * belonging to the others. 64 x 1600 B is 100 KiB and removes the assumption. */
-#define PARK_N    64
+/* 64 -> 256 (M2336). 64 slots is about a twentieth of a second of a browser's
+ * traffic: while one socket polls, the other pollers pull a thousand frames
+ * off the card and park every one that is not theirs, so a handshake reply
+ * could be evicted before the connecting socket's park_take reached it. The
+ * symptom was specific and baffling: tabs opened at STARTUP loaded fine, and
+ * any tab opened afterwards could never load anything, because every new
+ * connect() timed out waiting for a SYN-ACK that had already been thrown
+ * away. 256 * 1600 bytes is 410 KB of BSS, against a machine that runs at 8 GB.
+ *
+ * The real fix is a per-connection queue rather than one shared ring; this is
+ * the proportionate one, and the eviction rule below makes the remaining
+ * pressure fall on the segments that can be re-sent rather than the one that
+ * cannot be waited for again. */
+#define PARK_N    256
 #define PARK_MAX  1600
 #define PARK_TTL  200            /* ticks (~2s at 100Hz) */
 static struct {
@@ -2085,9 +2098,47 @@ static void park_put(const uint8_t *f, int len) {
                                            * lost TCP segment, which is the most
                                            * expensive kind of quiet. (M2022) */
         g_park_evicted++;
-        uint64_t oldest = ~0ull; slot = 0;
-        for (int i = 0; i < PARK_N; i++)
+        /* SAY SO WHERE SOMEONE WILL SEE IT (M2336). M2022 wrote "a silent
+         * eviction here is a silently lost TCP segment, which is the most
+         * expensive kind of quiet" -- and then incremented a counter that
+         * nothing ever printed. Third counter today that was already correct
+         * with no reader (e1000_rx_dropped and the dangling-else commit log
+         * were the others).
+         *
+         * It matters because the evicted frame can be a SYN-ACK: with 64 slots
+         * against a browser whose other pollers pull a thousand frames off the
+         * card, a new connection's handshake reply can be thrown away before
+         * tcp_connect's park_take reaches it -- so connect() times out and a
+         * tab opened after startup can never load anything. */
+        if (g_park_evicted == 1 || g_park_evicted == 10 ||
+            g_park_evicted == 100 || g_park_evicted == 1000 ||
+            (g_park_evicted % 5000) == 0)
+            kprintf("[park] ** the TCP park ring is FULL: %lu segment(s) evicted "
+                    "(%d slots). An evicted SYN-ACK is a connection that cannot "
+                    "be opened. **\n", (unsigned long)g_park_evicted, PARK_N);
+        /* EVICT SOMETHING RE-SENDABLE. A data segment that goes missing is
+         * retransmitted by the peer; a SYN-ACK that goes missing costs the
+         * whole connection, because tcp_connect gives up after four SYNs. So
+         * pass over handshake replies and take the oldest ordinary segment;
+         * only if every slot holds a SYN-ACK does the oldest of those go. */
+        uint64_t oldest = ~0ull; slot = -1;
+        for (int i = 0; i < PARK_N; i++) {
+            if (!g_park[i].len) continue;
+            const uint8_t *f = g_park[i].buf;
+            int ihl = (f[14] & 0x0F) * 4;
+            int handshake = 0;
+            if (ihl >= 20 && 14 + ihl + 20 <= g_park[i].len) {
+                uint8_t fl = f[14 + ihl + 13];
+                handshake = (fl & TCP_SYN) && (fl & TCP_ACK);
+            }
+            if (handshake) continue;
             if (g_park[i].at < oldest) { oldest = g_park[i].at; slot = i; }
+        }
+        if (slot < 0) {                  /* every slot is a handshake: take the oldest */
+            oldest = ~0ull; slot = 0;
+            for (int i = 0; i < PARK_N; i++)
+                if (g_park[i].at < oldest) { oldest = g_park[i].at; slot = i; }
+        }
     }
     memcpy(g_park[slot].buf, f, (size_t)len);
     g_park[slot].len = len;
