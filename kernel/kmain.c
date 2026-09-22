@@ -51,7 +51,8 @@
 #include "virtio_net.h"
 #include "virtio_gpu.h"
 #include "svga.h"
-#include "nic.h"      /* nic_init — needed when the boot demo is skipped (M1909) */
+#include "nic.h"
+#include "e1000.h"      /* nic_init — needed when the boot demo is skipped (M1909) */
 #include "net.h"
 #include "netcon.h"
 #include "watchdog.h"
@@ -889,6 +890,9 @@ void kmain_budget(const char *when) {
             if (ipct >= 60)
                 kprintf("[budget]          move the wall clock. Find what the critical path WAITS FOR.\n");
         }
+        /* The NIC's own view, because a frame this machine never received is
+         * invisible to every counter above (M2365). */
+        e1000_report();
     }
 }
 
@@ -3852,7 +3856,16 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * Firefox cannot say which link broke. The assertion is GL_RENDERER
          * containing "virgl" and a clear that reads back green --
          * configured-but-dead contexts pass every other check. */
-        kprintf("[lxabi] the GL chain: EGL -> Mesa virgl -> our render node -> the host GPU...\n");
+        /* WAYLAND MODE WHEN THE HARDWARE PATH IS ON (M2363). `ffgpu` advertises
+         * wl_drm and is the configuration Firefox fails in, so run the probe
+         * the same way -- otherwise it tests a path nobody is complaining
+         * about. Surfaceless already passes; the Wayland platform is the one
+         * structural difference between this probe and the browser. */
+        { extern int g_wl_drm_enable;
+          if (g_wl_drm_enable) app_set_next_env("LXGL_WAYLAND=1"); }
+        kprintf("[lxabi] the GL chain: EGL -> Mesa virgl -> our render node -> the host GPU (%s)...\n",
+                ({ extern int g_wl_drm_enable; g_wl_drm_enable; })
+                    ? "WAYLAND platform, as Firefox does it" : "surfaceless");
         int grc = app_run_linux_sync("/disk2/lxgl", 0, 0, 60000);
         kprintf("[lxabi] lxgl exit -> %d\n", grc);
     }

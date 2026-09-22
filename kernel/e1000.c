@@ -20,6 +20,7 @@
 #include "string.h"
 #include "interrupts.h"   /* irq_install_handler — interrupt-driven RX (M1858) */
 #include "console.h"
+#include "nic.h"       /* nic_rx_total() for the RX report (M2365) */
 
 /* register offsets */
 #define REG_CTRL   0x0000
@@ -90,7 +91,27 @@
  * overflows means fewer dropped segments for the TCP layer's out-of-order
  * reassembly to recover. 64 descriptors fit one 4 KB frame (64*16 = 1024 B, and
  * RDLEN stays 128-byte aligned); each needs a 4 KB receive buffer (+128 KB). */
-#define RX_COUNT   64
+/* 64 -> 256 (M2365). MEASURED ON THE HOST, not guessed: during a page load
+ * `ip -s link show tap122i0` reported 1229 frames DROPPED in the tap's TX
+ * direction -- that is host-to-guest, i.e. frames the bridge had in hand and
+ * could not hand to this VM -- against 11806 delivered. A 9.4% inbound loss,
+ * and among the casualties were TLS handshake SYN-ACKs: a wire capture showed
+ * the server answering every SYN while tcp_connect timed out after four of
+ * them, each failure costing 4 x 1.2 s.
+ *
+ * Nothing in the guest could see it. QEMU's e1000 refuses a frame via
+ * can_receive() when no RX descriptor is free, and the net layer then drops it
+ * at the tap WITHOUT the card counting a miss -- so MPC and RNBC both read a
+ * truthful zero, our software ring never overflowed, and every in-guest
+ * instrument correctly reported no loss for frames that were never offered to
+ * the card at all.
+ *
+ * 64 descriptors is under a millisecond of gigabit line rate, against a kernel
+ * whose polling sleeps in 10 ms quanta (the 100 Hz tick), so a burst during any
+ * scheduling gap overruns the ring. 256 is the most that still fits the
+ * single 4 KiB frame the ring is allocated from (256 * 16 B = 4096 exactly, and
+ * RDLEN stays 128-byte aligned); the buffers cost 256 * 4 KiB = 1 MB. */
+#define RX_COUNT   256
 #define TX_COUNT   8
 #define BUF_SIZE   2048
 
@@ -237,6 +258,25 @@ static void e1000_drain_ring(void) {
         e1000_drain_stats();           /* the card's own drop counters (M2317) */
         rx_cur = (i + 1) % RX_COUNT;
     }
+}
+
+/* SOMETHING MUST READ THESE (M2365). e1000_irq_count() had no callers, so
+ * "is interrupt-driven RX actually delivering interrupts, or is the ring only
+ * ever drained when a thread happens to poll" was unanswerable -- and that is
+ * the difference between a ring that is too small and a ring nobody empties.
+ * Printed with the frame total so a drop rate can be computed, and with the
+ * ring size so a future change to it is visible in the log it appears in. */
+void e1000_report(void) {
+    if (!mmio) return;
+    e1000_drain_stats();
+    kprintf("[e1000] RX ring %d desc | %lu irq(s) | %lu frame(s) up | card dropped "
+            "%lu no-descriptor + %lu no-buffer | %lu died in our software ring\n",
+            RX_COUNT, (unsigned long)g_e1000_irqs, (unsigned long)nic_rx_total(),
+            (unsigned long)g_e1000_mpc, (unsigned long)g_e1000_rnbc,
+            (unsigned long)g_swrx_dropped);
+    kprintf("[e1000]   NOTE: a frame QEMU could not hand to us (no free descriptor) is "
+            "dropped AT THE TAP and appears in NONE of the above -- check "
+            "`ip -s link show tap<vmid>i0` TX dropped on the host.\n");
 }
 
 static void e1000_isr(struct registers *r) {

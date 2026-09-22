@@ -11,3 +11,4 @@ const uint8_t *e1000_mac(void);              /* our 6-byte hardware address */
 
 int  e1000_send(const void *frame, uint16_t len);          /* 0 on success   */
 int  e1000_receive(void *out, uint16_t max);               /* len, or 0 none */
+void e1000_report(void);   /* RX ring / irq / drop summary (M2365) */
