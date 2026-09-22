@@ -35,6 +35,7 @@ static unsigned nv_rd16(unsigned off);
 static uint32_t nv_rom32(unsigned o);
 static int      nvgpu_vbios_pramin(uint8_t *dst, unsigned len);
 static int      nv_gpio_reset(uint8_t match);
+static void     nv_vram_probe(const char *when);
 int             g_nv_exec;
 static unsigned g_nv_skipped_vga, g_nv_skipped_i2c, g_nv_skipped_gpio;
 
@@ -43,6 +44,8 @@ static volatile uint8_t *nv_bar0;
 static uint32_t      nv_boot0;
 static unsigned      g_nv_bitM_off, g_nv_bitM_len, g_nv_bitM_ver;
 static unsigned      g_nv_bit_i;     /* BIT 'I' offset, for the PMU args */
+/* nouveau's nvbios_addr remap (M2380): see nv_A(). */
+static unsigned      g_nv_img0, g_nv_imgd;
 static uint8_t      *nv_rom;
 static unsigned      nv_romlen;
 
@@ -119,7 +122,12 @@ static uint32_t nv_rd32(uint32_t reg) {
  * three milestones later as something unrelated.
  */
 #define NV_PROM_OFFSET  0x300000
-#define NV_PROM_SIZE    0x20000
+/* 128 KiB -> 256 KiB (M2380). The 128 KiB figure was my own arbitrary cap;
+ * nouveau's PROM reader goes to 1 MiB. On this card the ROM is 235008 bytes
+ * in FIVE images, and the DEVINIT ucode lives in image 2 (0x1f400-0x2d000),
+ * mostly past the old limit -- so the application could never have been
+ * uploaded from what this driver copied, whatever the pointers said. */
+#define NV_PROM_SIZE    0x40000
 
 static int nvgpu_vbios(void) {
     uint32_t cfg50 = pci_read32(nv.bus, nv.slot, nv.func, 0x50);
@@ -255,10 +263,18 @@ static int nvgpu_vbios(void) {
      * bigger than its first image" is visible rather than inferred. */
     {   unsigned img = 0, total = 0;
         for (int n = 0; n < 8 && img + 0x1a < nv_romlen; n++) {
-            if (nv_rom[img] != 0x55 || nv_rom[img+1] != 0xAA) break;
+            /* nouveau's nvbios_imagen accepts three ROM signatures and
+             * nvbios_pcirTe three data-structure signatures. Accepting only
+             * 55AA/PCIR hid images 2-4 -- including the one that holds the
+             * DEVINIT ucode -- because they are "NV"/NPDS (M2380). */
+            unsigned sig = (unsigned)nv_rom[img] | ((unsigned)nv_rom[img+1] << 8);
+            if (sig != 0xAA55 && sig != 0xBB77 && sig != 0x4E56) break;
             unsigned pc = img + ((unsigned)nv_rom[img+0x18] | ((unsigned)nv_rom[img+0x19] << 8));
-            if (pc + 0x16 >= nv_romlen || nv_rom[pc] != 'P' || nv_rom[pc+1] != 'C' ||
-                nv_rom[pc+2] != 'I' || nv_rom[pc+3] != 'R') break;
+            if (pc + 0x16 >= nv_romlen) break;
+            int ok_pcir = (nv_rom[pc]=='P'&&nv_rom[pc+1]=='C'&&nv_rom[pc+2]=='I'&&nv_rom[pc+3]=='R') ||
+                          (nv_rom[pc]=='N'&&nv_rom[pc+1]=='P'&&nv_rom[pc+2]=='D'&&nv_rom[pc+3]=='S') ||
+                          (nv_rom[pc]=='R'&&nv_rom[pc+1]=='G'&&nv_rom[pc+2]=='I'&&nv_rom[pc+3]=='S');
+            if (!ok_pcir) break;
             unsigned ilen = ((unsigned)nv_rom[pc+0x10] | ((unsigned)nv_rom[pc+0x11] << 8)) * 512;
             unsigned ctype = nv_rom[pc+0x14], last = nv_rom[pc+0x15] & 0x80;
             /* NPDE OVERRIDES PCIR (nouveau's nvbios_imagen). For any image
@@ -278,11 +294,18 @@ static int nvgpu_vbios(void) {
             }
             kprintf("[nv] VBIOS: image %d @ %x, %u bytes, code type %02x%s\n",
                     n, img, ilen, ctype, last ? " (last)" : "");
+            if (n == 0) g_nv_img0 = ilen;
+            else if (ctype == 0xe0 && !g_nv_imgd) g_nv_imgd = img;
+            if (ctype == 0x70) last = 0x80;                  /* nouveau: type 0x70 is last */
             total = img + ilen;
             if (last || !ilen) break;
             img += ilen;
         }
         kprintf("[nv] VBIOS: %u bytes of images in a %u-byte window\n", total, nv_romlen);
+        kprintf("[nv] VBIOS: image remap -- image0 is %u bytes, first type-0xe0 image at %x: "
+                "%s\n", g_nv_img0, g_nv_imgd,
+                g_nv_imgd ? "pointers past image 0 are re-based onto it, as nouveau does"
+                          : "NO type-0xe0 image, so no remap (pointers are used raw)");
     }
     return 0;
 }
@@ -411,7 +434,36 @@ static int nvgpu_bit(void) {
  * These offsets are from the nouveau source on this machine, not memory --
  * the BIT header layout was already guessed wrong once today and produced
  * "70 entries of 50 bytes" of pure garbage. */
+/* THE IMAGE REMAP, WITHOUT WHICH EVERY POINTER PAST IMAGE 0 IS WRONG (M2380).
+ *
+ * nouveau, in nvkm_bios_new, with the comment "Some tables have weird
+ * pointers that need adjustment before they're dereferenced. I'm not
+ * entirely sure why...":
+ *
+ *     image0_size = size of image 0;
+ *     imaged_addr = base of the first image of type 0xe0;
+ *     nvbios_addr: if (addr >= image0_size) addr = addr - image0_size + imaged_addr;
+ *
+ * Pointers inside the VBIOS are written for a layout in which NVIDIA's own
+ * images follow image 0 directly. An EFI image (67584 bytes here) was
+ * inserted between them afterwards, and nothing re-based the pointers.
+ *
+ * Not applying this is the entire reason M2373 and M2374 declared the GT 1030
+ * unPOSTable. BIT 'p' says the PMU table is at 0xece4; read raw, that is 228
+ * bytes into the EFI image and parses as "ver 7f hdr 41 len 175 count 219",
+ * and the "DEVINIT descriptor 0x300b0ecc outside every image" came out of
+ * that garbage. Remapped, 0xece4 -> 0x1f4e4 is "ver 01 hdr 6 len 6 count 5"
+ * with a DEVINIT entry whose boot/code/data are 256/15120/1248 bytes. */
+static unsigned nv_A(unsigned a) {
+    if (g_nv_img0 && g_nv_imgd && a >= g_nv_img0) return a - g_nv_img0 + g_nv_imgd;
+    return a;
+}
+static uint8_t nv_rom8(unsigned off) {
+    off = nv_A(off);
+    return (nv_rom && off < nv_romlen) ? nv_rom[off] : 0;
+}
 static unsigned nv_rd16(unsigned off) {
+    off = nv_A(off);
     if (!nv_rom || off + 1 >= nv_romlen) return 0;
     return (unsigned)nv_rom[off] | ((unsigned)nv_rom[off + 1] << 8);
 }
@@ -562,17 +614,40 @@ static int nv_walk(unsigned at, int depth, uint8_t *seen, unsigned *subs, int *n
  * write, not a substitute for it. */
 
 static uint32_t nv_rom32(unsigned o) {
+    o = nv_A(o);
     if (!nv_rom || o + 3 >= nv_romlen) return 0;
     return (uint32_t)nv_rom[o] | ((uint32_t)nv_rom[o+1] << 8) |
            ((uint32_t)nv_rom[o+2] << 16) | ((uint32_t)nv_rom[o+3] << 24);
 }
+/* init_nvreg, WHICH EVERY nouveau SCRIPT REGISTER ACCESS GOES THROUGH (M2379).
+ *
+ * Script register addresses are not raw offsets. nouveau clears the low two
+ * bits, and on NV_50+ treats bits 31/30/29 as FLAGS -- +head*0x800,
+ * +or*0x800, +link*0x80 -- rather than address bits. During a POST head, OR
+ * and link are unset and resolve to 0, and gf100 has no .mmio hook, so for
+ * this card it reduces to clearing those five bits.
+ *
+ * This driver did none of it, so a flagged address like 0x80xxxxxx failed
+ * the 16 MiB bound below and the write was SILENTLY DROPPED. Counted, so it
+ * is visible whether this ROM actually uses such addresses. */
+static unsigned g_nv_reg_lowbits, g_nv_reg_flagged, g_nv_reg_oob;
+static uint32_t nv_xlate(uint32_t reg) {
+    if (reg & 0x3u) g_nv_reg_lowbits++;
+    if (reg & 0xE0000000u) g_nv_reg_flagged++;
+    reg &= ~0x00000003u;
+    reg &= ~0xE0000000u;                          /* head/OR/link = 0 during POST */
+    if (reg + 3 >= (16u << 20)) { g_nv_reg_oob++; return ~0u; }
+    return reg;
+}
 static uint32_t nv_reg_rd(uint32_t reg) {
-    if (!nv_bar0 || reg + 3 >= (16u << 20)) return 0;
+    reg = nv_xlate(reg);
+    if (!nv_bar0 || reg == ~0u) return 0;
     return *(volatile uint32_t *)(nv_bar0 + reg);
 }
 static void nv_reg_wr(uint32_t reg, uint32_t val) {
     if (!g_nv_exec) return;                      /* dry run */
-    if (!nv_bar0 || reg + 3 >= (16u << 20)) return;
+    reg = nv_xlate(reg);
+    if (!nv_bar0 || reg == ~0u) return;
     *(volatile uint32_t *)(nv_bar0 + reg) = val;
 }
 /* VGA registers on NV_50+ live in MMIO at BAR0+0x601000 (nvkm_wrport). */
@@ -583,6 +658,19 @@ static void nv_vga_wr(unsigned port, uint8_t v) {
 static uint8_t nv_vga_rd(unsigned port) {
     if (!nv_bar0) return 0;
     return *(volatile uint8_t *)(nv_bar0 + 0x601000 + port);
+}
+
+/* A real delay, from the calibrated TSC (timer_cycles_per_ms, M2139), not a
+ * guessed busy loop. Falls back to a conservative spin if uncalibrated. */
+static unsigned g_nv_ctime_calls, g_nv_ctime_waited, g_nv_ctime_timeouts;
+static void nv_mdelay(unsigned ms) {
+    extern uint64_t timer_cycles_per_ms(void);
+    uint64_t cpm = timer_cycles_per_ms();
+    if (!cpm) { for (volatile unsigned long d = 0; d < 4000000ul * ms; d++) { } return; }
+    uint64_t t0, t;
+    __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
+    do { __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t) :: "rdx");
+    } while (t - t0 < cpm * ms);
 }
 
 static uint32_t nv_shift(uint32_t d, uint8_t sh) {
@@ -640,8 +728,29 @@ static int nv_run(unsigned at, int depth, int *exec, int *ops) {
         case 0x38:                                             /* NOT: invert exec */
             *exec = !*exec; at += 1; break;
         case 0x56: {                                           /* CONDITION_TIME */
-            uint8_t c = nv_rom[at + 1];
-            if (!nv_cond_met(c)) *exec = 0;                    /* retry loop is a wait */
+            /* A POLLING WAIT, NOT A SINGLE CHECK (M2379). nouveau:
+             *     wait = min(retry * 50, 100);
+             *     while (wait--) { if (met) return; mdelay(20); }
+             *     init_exec_set(init, false);
+             * i.e. it waits up to 2 s for a condition -- a PLL locking, memory
+             * training settling -- and only suspends execution if it NEVER
+             * becomes true. This checked ONCE and, if the PLL had not locked
+             * at that exact instant, skipped the whole block that follows.
+             * Memory stopping at 512 of 2048 MiB is what that looks like. */
+            uint8_t c = nv_rom[at + 1], retry = nv_rom[at + 2];
+            if (*exec) {
+                unsigned wait = (unsigned)retry * 50u;
+                if (wait > 100) wait = 100;
+                int met = 0; unsigned polls = 0;
+                while (wait--) {
+                    polls++;
+                    if (nv_cond_met(c)) { met = 1; break; }
+                    nv_mdelay(20);
+                }
+                if (!met) *exec = 0;
+                g_nv_ctime_calls++; if (polls > 1) g_nv_ctime_waited++;
+                if (!met) g_nv_ctime_timeouts++;
+            }
             at += 3; break; }
         case 0x90: {                                           /* COPY_ZM_REG */
             uint32_t sreg = nv_rom32(at + 1), dreg = nv_rom32(at + 5);
@@ -763,9 +872,21 @@ static unsigned nv_run_body(unsigned at, int depth, int *exec, int *ops, unsigne
  * exact card. So this probe can be WRONG in a way that shows, which is the
  * only kind worth having. Read before and after devinit for a real pair. */
 static void nv_vram_probe(const char *when) {
-    uint32_t fbps = nv_reg_rd(0x022438), fbpao = nv_reg_rd(0x022554);
+    /* gf108_ram_probe_fbp_amount, WHICH IS WHAT KEPLER USES (M2379). The
+     * first version copied gf100_ram_probe_fbp_amount -- one FBPA per FBP --
+     * and read 512 MiB. gk104_ram points at the gf108 variant instead, which
+     * takes the FBPA count from 0x02243c and SUMS every FBPA behind each FBP.
+     * 512 x 4 = 2048, which is exactly nouveau's number for this card, so the
+     * "partial POST" may have been nothing but this probe under-counting. */
+    uint32_t fbps = nv_reg_rd(0x022438), fbpat = nv_reg_rd(0x02243c);
+    uint32_t fbpao = nv_reg_rd(0x022554);
+    unsigned per = (fbps && fbpat >= fbps && fbpat < 64) ? fbpat / fbps : 1;
+    kprintf("[nv] %s: %u FBP(s), %u FBPA(s) total -> %u per FBP, disabled mask %08x\n",
+            when, fbps, fbpat, per, fbpao);
     uint64_t total = 0; unsigned live = 0;
-    for (unsigned f = 0; f < fbps && f < 8; f++) {
+    for (unsigned fbp = 0; fbp < fbps && fbp < 8; fbp++)
+    for (unsigned k = 0; k < per; k++) {
+        unsigned f = fbp * per + k;
         if (fbpao & (1u << f)) continue;
         uint32_t mib = nv_reg_rd(0x11020c + f * 0x1000);
         /* 0xBAD0____ AND 0xBADF____ are both NVIDIA PRI errors. Matching only
@@ -778,8 +899,8 @@ static void nv_vram_probe(const char *when) {
         }
         total += mib; live++;
     }
-    kprintf("[nv] %s: VRAM %lu MiB across %u of %u FBP(s) -- %s\n", when,
-            (unsigned long)total, live, fbps,
+    kprintf("[nv] %s: VRAM %lu MiB across %u live FBPA(s) -- %s\n", when,
+            (unsigned long)total, live,
             total == 2048 ? "MATCHES nouveau's 2048 MiB: memory is initialised"
           : total == 0    ? "zero: memory not initialised"
                           : "does NOT match nouveau's 2048 MiB");
@@ -862,6 +983,21 @@ static int nv_gpio_reset(uint8_t match) {
 static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     nv_cond_table = cond_table;
     int exec = 1, ops = 0;
+    /* HOST-SIDE SCRIPTS ARE A FERMI/KEPLER MECHANISM ONLY (M2380).
+     * nouveau: gf100_devinit (post = nv04_devinit_post -> nvbios_post) runs
+     * init scripts on the CPU; gm200_devinit, used by every chip from GM20x
+     * (0x120) on, uploads a PMU application and lets THE PMU run them. On
+     * those parts the scripts contain PMU-only opcodes (0xac, 0xaf) and are
+     * not meant for the host at all. So on 0x120+ this interpreter is
+     * forced to a dry run even under nvexec -- it stays useful as a decoder,
+     * and it cannot issue a write the reference driver would never issue. */
+    unsigned chip = (nv_boot0 >> 20) & 0x1ff;
+    int saved_exec = g_nv_exec;
+    if (chip >= 0x120 && g_nv_exec) {
+        kprintf("[nv] devinit: chipset %x is Maxwell2+ -- its init scripts are PMU input, "
+                "so the host interpreter runs DRY; the PMU path does the real POST\n", chip);
+        g_nv_exec = 0;
+    }
     kprintf("[nv] devinit: %s the script\n",
             g_nv_exec ? "** EXECUTING ** (nvexec given: this WRITES to the GPU)"
                       : "dry run (computing every read/write, touching nothing; "
@@ -870,6 +1006,7 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     int r = nv_run(script0, 0, &exec, &ops);
     kprintf("[nv] devinit: %s after %d opcode(s), exec flag %d\n",
             r == 0 ? "COMPLETED" : "ABORTED", ops, exec);
+    g_nv_exec = saved_exec;
     /* RE-READ THE STATE AFTER, NOT BEFORE (M2377).
      *
      * Every POST indicator -- 0x2240c, 0x619f04, the FB registers -- was
@@ -888,6 +1025,12 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     }
     if (g_nv_skipped_vga || g_nv_skipped_i2c || g_nv_skipped_gpio)
         kprintf("[nv] devinit: drove %u GPIO line(s) to their VBIOS defaults\n", g_nv_gpio_driven);
+        kprintf("[nv] devinit: register addresses -- %u had low bits set, %u carried "
+                "head/OR/link FLAGS, %u were out of range after translation\n",
+                g_nv_reg_lowbits, g_nv_reg_flagged, g_nv_reg_oob);
+        kprintf("[nv] devinit: CONDITION_TIME ran %u time(s): %u had to WAIT for their "
+                "condition, %u TIMED OUT and suspended execution\n",
+                g_nv_ctime_calls, g_nv_ctime_waited, g_nv_ctime_timeouts);
         kprintf("[nv] devinit: SKIPPED %u VGA port, %u I2C, %u GPIO op(s) -- those need "
                 "engines this driver does not have yet, so this is NOT a complete POST "
                 "and saying so is the point\n",
@@ -999,15 +1142,33 @@ static int nvgpu_pmu_devinit(unsigned da, unsigned bit_i_off) {
     kprintf("[nv] pmu: %s DEVINIT\n", g_nv_exec
             ? "** UPLOADING AND EXECUTING **" : "dry run (no register is written)");
 
-    if (g_nv_exec) {                      /* falcon reset, per gm200_flcn_* */
-        pmu_wr(PMU_BASE + 0x048, pmu_rd(PMU_BASE + 0x048) & ~3u);
-        pmu_wr(PMU_BASE + 0x014, 0xFFFFFFFFu);
-        pmu_wr(PMU_BASE + 0x040, pmu_rd(PMU_BASE + 0x040));
-        int ok = 0;
-        for (int t = 0; t < 100000; t++)
-            if (!(pmu_rd(PMU_BASE + 0x10c) & 6)) { ok = 1; break; }
-        if (!ok) { kprintf("[nv] pmu: memory scrubbing never finished -- falcon not ready\n"); return -1; }
-        pmu_wr(PMU_BASE + 0x084, nv_boot0);
+    if (g_nv_exec) {
+        /* nvkm_falcon_reset for GP102's PMU = gm200_flcn_disable +
+         * gm200_flcn_enable, with gp102_flcn_reset_eng rather than a PMC-bit
+         * toggle (gp102_pmu_flcn sets .reset_eng and NOT .reset_pmc).
+         * The first version of this omitted the 0x3c0 engine-reset pulse
+         * entirely, so it would have uploaded ucode into a falcon that had
+         * never been reset (M2380). */
+        pmu_wr(PMU_BASE + 0x048, pmu_rd(PMU_BASE + 0x048) & ~3u);   /* IRQ enables off */
+        pmu_wr(PMU_BASE + 0x014, 0xFFFFFFFFu);                      /* IRQMCLR */
+        for (int pass = 0; pass < 2; pass++) {                      /* disable, then enable */
+            pmu_wr(PMU_BASE + 0x3c0, pmu_rd(PMU_BASE + 0x3c0) | 1u);
+            nv_mdelay(1);                                           /* >= 10 us */
+            pmu_wr(PMU_BASE + 0x3c0, pmu_rd(PMU_BASE + 0x3c0) & ~1u);
+            int ok = 0;
+            for (int t = 0; t < 10; t++) {                          /* nouveau: 10 ms */
+                if (!(pmu_rd(PMU_BASE + 0x10c) & 6)) { ok = 1; break; }
+                nv_mdelay(1);
+            }
+            if (!ok) {
+                kprintf("[nv] pmu: falcon memory scrubbing never finished (pass %d, "
+                        "0x10a10c=%08x) -- refusing to upload into a falcon that is not ready\n",
+                        pass, pmu_rd(PMU_BASE + 0x10c));
+                return -1;
+            }
+        }
+        pmu_wr(PMU_BASE + 0x084, nv_reg_rd(0x000000));              /* PMC_BOOT_0 */
+        kprintf("[nv] pmu: falcon reset complete (engine-reset pulse x2, scrubbing done)\n");
     }
 
     unsigned wb = nv_pmu_code(boot_pmu, boot_rom, boot_sz, 0);
@@ -1031,6 +1192,11 @@ static int nvgpu_pmu_devinit(unsigned da, unsigned bit_i_off) {
             if (pmu_rd(0x10a040) & 0x00002000) { done = 1; break; }
         kprintf("[nv] pmu: DEVINIT %s (0x10a040 = %x)\n",
                 done ? "SIGNALLED COMPLETE" : "TIMED OUT", pmu_rd(0x10a040));
+        {   uint32_t post = nv_reg_rd(0x02240c);
+            kprintf("[nv] AFTER PMU devinit: 0x2240c = %08x -> the card %s POSTing\n", post,
+                    (post & 2) ? "does NOT need" : "STILL NEEDS");
+            nv_vram_probe("AFTER PMU devinit");
+        }
         return done ? 0 : -1;
     }
     kprintf("[nv] pmu:   would then load tables from BIT 'I' +14/+16 (%x/%u) and boot "
@@ -1062,14 +1228,14 @@ static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p
                 nv_rom[tbl+4],nv_rom[tbl+5],nv_rom[tbl+6],nv_rom[tbl+7],
                 nv_rom[tbl+8],nv_rom[tbl+9],nv_rom[tbl+10],nv_rom[tbl+11],
                 nv_rom[tbl+12],nv_rom[tbl+13],nv_rom[tbl+14],nv_rom[tbl+15]);
-    if (!tbl || tbl >= nv_romlen) {
+    if (!tbl || nv_A(tbl) >= nv_romlen) {
         kprintf("[nv] pmu: table pointer %x is outside the %u-byte ROM\n", tbl, nv_romlen);
         return -1;
     }
-    unsigned ver = nv_rom[tbl], hdr = nv_rom[tbl+1], len = nv_rom[tbl+2], cnt = nv_rom[tbl+3];
+    unsigned ver = nv_rom8(tbl), hdr = nv_rom8(tbl+1), len = nv_rom8(tbl+2), cnt = nv_rom8(tbl+3);
     kprintf("[nv] pmu: table @ %x  ver %02x header %u entry %u count %u\n",
             tbl, ver, hdr, len, cnt);
-    if (!len || !cnt || tbl + hdr + cnt * len > nv_romlen) {
+    if (!len || !cnt || nv_A(tbl + hdr + cnt * len) > nv_romlen) {
         kprintf("[nv] pmu: that header does not fit the ROM -- misparse, not data.\n");
         return -1;
     }
@@ -1088,7 +1254,7 @@ static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p
             if (o + h + c * l > nv_romlen) continue;
             unsigned devinit = 0, plausible = 1;
             for (unsigned i = 0; i < c && plausible; i++) {
-                unsigned e = o + h + i * l, ty = nv_rom[e], dp = nv_rom32(e + 2);
+                unsigned e = o + h + i * l, ty = nv_rom8(e), dp = nv_rom32(e + 2);
                 if (ty == 0x04) devinit = dp;
                 if (dp && (dp >= nv_romlen)) plausible = 0;      /* entry points off the end */
             }
@@ -1110,11 +1276,11 @@ static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p
     int found = 0;
     for (unsigned i = 0; i < cnt; i++) {
         unsigned e = tbl + hdr + i * len;
-        unsigned type = nv_rom[e], da = nv_rom32(e + 2);
+        unsigned type = nv_rom8(e), da = nv_rom32(e + 2);
         const char *what = type == 0x04 ? "  <-- DEVINIT" : type == 0x01 ? "  <-- PRE_OS" : "";
         kprintf("[nv] pmu:   [%u] type %02x data %x%s\n", i, type, da, what);
         if (type != 0x04) continue;
-        if (!da || da + 0x30 > nv_romlen) {
+        if (!da || nv_A(da + 0x30) > nv_romlen) {
             kprintf("[nv] pmu:   DEVINIT descriptor at %x is out of range\n", da);
             continue;
         }
@@ -1133,8 +1299,8 @@ static int nvgpu_pmu_find(unsigned bit_p_off, unsigned bit_p_len, unsigned bit_p
         kprintf("[nv] pmu:     data: rom %x -> pmu %x, %u bytes\n", data_rom, data_pmu, data_sz);
         /* Microcode is kilobytes. Anything else means a misread descriptor. */
         int sane = boot_sz && boot_sz < 0x10000 && code_sz && code_sz < 0x40000 &&
-                   data_sz < 0x40000 && boot_rom + boot_sz + code_sz <= nv_romlen &&
-                   data_rom + data_sz <= nv_romlen;
+                   data_sz < 0x40000 && nv_A(boot_rom + boot_sz + code_sz) <= nv_romlen &&
+                   nv_A(data_rom + data_sz) <= nv_romlen;
         kprintf("[nv] pmu:     %s\n", sane
                 ? "sizes and ranges are sane -- this is a real PMU image to upload."
                 : "** THESE SIZES ARE NOT PLAUSIBLE. Do not upload this. **");
