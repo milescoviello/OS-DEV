@@ -1304,6 +1304,7 @@ static unsigned long lx_thread_calls(void) { return g_thr_calls[task_current_id(
  * and /proc/kmsg only once the window manager owns the framebuffer. So this is
  * the same bytes, in a form you can grep. */
 int g_lx_out_log;
+unsigned long g_claude_exec_ms;   /* when `claude` was exec()d, so time-to-prompt is a subtraction (M2359) */
 static void lx_emit(const char *b, unsigned long n) {
     app_t *dst = app_out_to();
     /* The lxout mirror moved into app_write_to (M2056) -- it has to cover the
@@ -5170,6 +5171,23 @@ static void lx_dispatch_body(struct registers *r) {
          * `gpu`, `rdd`, `utility`, `forkserver`), and the two arguments before
          * it are the parent pid and the "is for browser" flag, so the tail of
          * the vector identifies the process completely. */
+        /* STAMP THE LAUNCH, so time-to-prompt is a subtraction rather than a
+         * guess (M2359). The markers in app.c report ms since boot; without
+         * this the log says when the prompt appeared but not what to measure
+         * it from, and the number the goal names is launch-to-prompt.
+         *
+         * OUTSIDE the `if (na > 0)` and its brace-less arms on purpose: this
+         * file has already been bitten twice by a statement that looked
+         * guarded and was not (M2298's GDK_DEBUG, M2332's dangling else). */
+        {   extern unsigned long g_claude_exec_ms;
+            const char *e = path;
+            for (int i = 0; e && e[i]; i++)
+                if (e[i]=='c'&&e[i+1]=='l'&&e[i+2]=='a'&&e[i+3]=='u'&&e[i+4]=='d'&&e[i+5]=='e') {
+                    g_claude_exec_ms = timer_ms();
+                    kprintf("[claude] LAUNCHED at %lu ms since boot\n", g_claude_exec_ms);
+                    break;
+                }
+        }
         if (na > 0) {
             if (na >= 4)
                 kprintf("[exec] pid %d -> %s (%d args, type '%s', from pid %s)\n",

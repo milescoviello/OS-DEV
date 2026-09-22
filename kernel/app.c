@@ -3161,6 +3161,67 @@ void app_write_to(app_t *dest, const char *buf, unsigned len) {
      * everything. This is the one funnel every windowed write passes through
      * -- fd 1, fd 2, and every dup of either -- so the mirror belongs here. */
     { extern int g_lx_out_log; if (g_lx_out_log) console_write_n(buf, len); }
+    /* TIME-TO-PROMPT, WHICH NOTHING MEASURED (M2359).
+     *
+     * The goal names "Claude Code to its prompt" as one of the numbers a human
+     * feels, at ~60 s against a 20 s target, and there has never been an
+     * instrument for it -- every Claude measurement in this tree times
+     * `claude -p`, which is the headless path and finishes when an ANSWER
+     * arrives, not when a prompt appears.
+     *
+     * Two markers, because they are different events and only the second is
+     * the prompt. FIRST OUTPUT is when the process stops loading and starts
+     * talking. ALT SCREEN -- ESC [ ? 1 0 4 9 h -- is the exact byte sequence a
+     * TUI sends to take over the terminal, which is the moment the prompt box
+     * is about to be drawn and the closest thing to "it is ready" that does
+     * not require looking at pixels.
+     *
+     * One-shot each, keyed on the process, so this costs a strcmp per write
+     * and two lines per boot. It reports for ANY process, not just Claude:
+     * naming the program in the line is cheaper than guessing which one is
+     * interesting, and a second TUI would be worth seeing too. */
+    {   static int said_first, said_alt;
+        extern unsigned long g_claude_exec_ms;
+        if (len > 0 && (!said_first || !said_alt)) {
+            const char *exe = app_exe_str(a);
+            int is_tui = 0;
+            if (exe) for (int i = 0; exe[i]; i++)
+                if (exe[i] == 'c' && exe[i+1] == 'l' && exe[i+2] == 'a' &&
+                    exe[i+3] == 'u' && exe[i+4] == 'd' && exe[i+5] == 'e') { is_tui = 1; break; }
+            if (is_tui && !said_first) {
+                said_first = 1;
+                kprintf("[claude] FIRST OUTPUT at %lu ms since boot (%lu ms after launch)\n",
+                        (unsigned long)timer_ms(),
+                        g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
+            }
+            /* THE ALT-SCREEN MARKER MUST NOT REQUIRE THE WRITER TO BE CLAUDE
+             * (M2359). First cut keyed both markers on the writing process's
+             * exe, and neither fired on a boot where the TUI demonstrably came
+             * up -- the screendump shows Claude's own trust prompt drawn in the
+             * shell window. The reason: an interactive program writes through a
+             * PTY and the bytes reach this funnel attributed to the SHELL that
+             * owns the window, not to the program that produced them.
+             *
+             * `ESC [ ? 1 0 4 9 h` is specific enough on its own -- nothing else
+             * in this system asks for the alternate screen -- so match it from
+             * any writer and name the exe rather than filtering on it. An
+             * instrument that only fires when it already knows the answer is
+             * not measuring anything. */
+            if (!said_alt) {
+                for (unsigned long i = 0; i + 7 < (unsigned long)len; i++)
+                    if (buf[i] == 0x1b && buf[i+1] == '[' && buf[i+2] == '?' &&
+                        buf[i+3] == '1' && buf[i+4] == '0' && buf[i+5] == '4' &&
+                        buf[i+6] == '9' && buf[i+7] == 'h') {
+                        said_alt = 1;
+                        kprintf("[tui] ALT SCREEN at %lu ms since boot by \"%s\" -- "
+                                "TIME TO PROMPT %lu ms after the last claude launch\n",
+                                (unsigned long)timer_ms(), exe ? exe : "?",
+                                g_claude_exec_ms ? (unsigned long)timer_ms() - g_claude_exec_ms : 0ul);
+                        break;
+                    }
+            }
+        }
+    }
     grid_write(a, buf, len);      /* the SAME terminal a native app writes to (M2004) */
 }
 
