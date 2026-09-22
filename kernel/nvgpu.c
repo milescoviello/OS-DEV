@@ -19,6 +19,7 @@
 #include "pci.h"
 #include "vmm.h"
 #include "console.h"
+#include "kheap.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -28,6 +29,8 @@
 static pci_device_t  nv;
 static volatile uint8_t *nv_bar0;
 static uint32_t      nv_boot0;
+static uint8_t      *nv_rom;
+static unsigned      nv_romlen;
 
 /* A BAR pair, 64-bit aware. Returns the base; *size gets the region length and
  * *is64 whether this BAR consumed the next slot too.
@@ -84,6 +87,134 @@ static volatile uint8_t *map_mmio(uint64_t phys, uint64_t len) {
 static uint32_t nv_rd32(uint32_t reg) {
     return *(volatile uint32_t *)(nv_bar0 + reg);
 }
+
+/* ---------------------------------------------------------------- VBIOS --
+ *
+ * devinit (step 4) executes scripts that live in the card's own VBIOS, so
+ * before any of that can be written the ROM has to be readable and provably
+ * the right ROM. This is also the second falsifiable check on the register
+ * window: PMC_BOOT_0 proves offset 0 works, the ROM proves a mapping 3 MiB
+ * deep into the aperture works AND that the bytes coming back are structured
+ * data rather than a pattern.
+ *
+ * The PROM aperture is at BAR0+0x300000. ROM shadowing has to be turned off
+ * first or the read returns the shadow copy in system memory rather than the
+ * card: PCI config 0x50 bit 0 is NV_PBUS_PCI_NV_20_ROM_SHADOW. Restore it
+ * afterwards, unconditionally -- leaving shadowing off changes how every
+ * later ROM access behaves, which is the kind of state change that shows up
+ * three milestones later as something unrelated.
+ */
+#define NV_PROM_OFFSET  0x300000
+#define NV_PROM_SIZE    0x20000
+
+static int nvgpu_vbios(void) {
+    uint32_t cfg50 = pci_read32(nv.bus, nv.slot, nv.func, 0x50);
+    pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50 & ~1u);   /* shadow OFF */
+
+    const volatile uint8_t *rom = nv_bar0 + NV_PROM_OFFSET;
+    uint8_t b0 = rom[0], b1 = rom[1];
+    int ok = (b0 == 0x55 && b1 == 0xAA);
+    if (!ok) {
+        kprintf("[nv] VBIOS: PROM at BAR0+%x starts %02x %02x, not 55 AA -- no ROM "
+                "signature. devinit cannot be written against a ROM we cannot read.\n",
+                NV_PROM_OFFSET, b0, b1);
+        pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50);
+        return -1;
+    }
+    unsigned romlen = (unsigned)rom[2] * 512;
+
+    /* PCIR: the PCI Data Structure the ROM header points at. Its vendor and
+     * DEVICE id must match the card we are talking to -- that is what makes
+     * this a check rather than a hex dump. */
+    unsigned pcir = (unsigned)rom[0x18] | ((unsigned)rom[0x19] << 8);
+    unsigned vend = 0, devid = 0; int pcir_ok = 0;
+    if (pcir && pcir + 8 < NV_PROM_SIZE &&
+        rom[pcir] == 'P' && rom[pcir+1] == 'C' && rom[pcir+2] == 'I' && rom[pcir+3] == 'R') {
+        vend  = (unsigned)rom[pcir+4] | ((unsigned)rom[pcir+5] << 8);
+        devid = (unsigned)rom[pcir+6] | ((unsigned)rom[pcir+7] << 8);
+        pcir_ok = 1;
+    }
+    pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50);         /* shadow restored */
+
+    kprintf("[nv] VBIOS: signature 55 AA, %u bytes, PCIR at %x\n", romlen, pcir);
+    if (!pcir_ok) {
+        kprintf("[nv] VBIOS: no PCIR structure where the header points -- the ROM is "
+                "readable but not parseable; treat its contents as unknown.\n");
+        return -1;
+    }
+    kprintf("[nv] VBIOS: PCIR says vendor %04x device %04x\n", vend, devid);
+    if (vend != nv.vendor_id || devid != nv.device_id) {
+        kprintf("[nv] VBIOS: ** THAT DOES NOT MATCH THE CARD (%04x:%04x). We are "
+                "reading somebody else's ROM, or the aperture is misplaced. **\n",
+                nv.vendor_id, nv.device_id);
+        return -1;
+    }
+    kprintf("[nv] VBIOS: matches the card -- the ROM is ours, and BAR0 is coherent "
+            "3 MiB deep, not just at offset 0.\n");
+
+    /* Copy it into RAM once. Everything after this parses structures with
+     * back-references and bounds checks, and doing that against MMIO means
+     * every field read is a device access with the ROM shadow state having to
+     * be right at that instant. One copy, then plain memory. */
+    if (romlen == 0 || romlen > NV_PROM_SIZE) romlen = NV_PROM_SIZE;
+    nv_rom = (uint8_t *)kmalloc(romlen);
+    if (!nv_rom) { kprintf("[nv] VBIOS: no memory for a %u-byte copy\n", romlen); return -1; }
+    cfg50 = pci_read32(nv.bus, nv.slot, nv.func, 0x50);
+    pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50 & ~1u);
+    for (unsigned k = 0; k < romlen; k++) nv_rom[k] = rom[k];
+    pci_write32(nv.bus, nv.slot, nv.func, 0x50, cfg50);
+    nv_romlen = romlen;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ BIT --
+ *
+ * The VBIOS's table of tables. devinit's scripts hang off the 'I' entry, so
+ * this is the last hop before there is something to execute.
+ *
+ * The header layout was determined by PARSING THE REAL ROM, not from memory:
+ * a first attempt using a half-remembered field order produced 70 entries of
+ * 50 bytes with random ids, which is exactly what a wrong offset looks like.
+ * Ground truth for this card, checked on the host before this code was
+ * written: token at 0x1e0, header_len 12, entry_size 6, 17 entries, and the
+ * 'I' entry at off 0x02b3 len 34. 16 of 17 ids are ASCII letters -- that
+ * ratio is the check, because a misparse destroys it immediately. */
+static int nvgpu_bit(void) {
+    if (!nv_rom) return -1;
+    unsigned bit = 0;
+    for (unsigned k = 0; k + 5 < nv_romlen; k++)
+        if (nv_rom[k] == 0xFF && nv_rom[k+1] == 0xB8 &&
+            nv_rom[k+2] == 'B' && nv_rom[k+3] == 'I' && nv_rom[k+4] == 'T') { bit = k; break; }
+    if (!bit) { kprintf("[nv] BIT: no \\xff\\xb8BIT token in %u bytes of ROM\n", nv_romlen); return -1; }
+
+    unsigned hlen = nv_rom[bit + 8], esz = nv_rom[bit + 9], nent = nv_rom[bit + 10];
+    if (!esz || !nent || bit + hlen + nent * esz > nv_romlen) {
+        kprintf("[nv] BIT: header at %x says hlen %u esz %u entries %u -- that does not "
+                "fit in the ROM, so the layout is wrong, not the data.\n", bit, hlen, esz, nent);
+        return -1;
+    }
+
+    unsigned letters = 0, init_off = 0, init_len = 0;
+    for (unsigned e = 0; e < nent; e++) {
+        const uint8_t *q = nv_rom + bit + hlen + e * esz;
+        uint8_t id = q[0];
+        if ((id >= 'A' && id <= 'Z') || (id >= 'a' && id <= 'z')) letters++;
+        if (id == 'I') { init_len = (unsigned)q[2] | ((unsigned)q[3] << 8);
+                         init_off = (unsigned)q[4] | ((unsigned)q[5] << 8); }
+    }
+    kprintf("[nv] BIT at %x: %u entries of %u bytes (header %u), %u/%u ids are letters\n",
+            bit, nent, esz, hlen, letters, nent);
+    if (letters * 2 < nent) {
+        kprintf("[nv] BIT: most ids are not letters -- this is a MISPARSE, not a ROM.\n");
+        return -1;
+    }
+    if (!init_off) { kprintf("[nv] BIT: no 'I' entry -- no devinit scripts to run.\n"); return -1; }
+    kprintf("[nv] BIT: 'I' (devinit) at %x, %u bytes -- devinit has something to execute.\n",
+            init_off, init_len);
+    return 0;
+}
+
+int nvgpu_bit_probe(void) { return nvgpu_bit(); }
 
 int nvgpu_present(void)   { return nv.valid; }
 uint32_t nvgpu_boot0(void){ return nv_boot0; }
@@ -151,5 +282,6 @@ int nvgpu_init(void) {
                                "register reads over a higher-half BAR mapping."
                              : "An NVIDIA chip is answering, but it is not the GP108 "
                                "this campaign expects -- check which card got passed.");
+    if (nvgpu_vbios() == 0) nvgpu_bit();   /* devinit's scripts live in there (M2369) */
     return 0;
 }
