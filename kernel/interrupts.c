@@ -242,6 +242,21 @@ void isr_dispatch(struct registers *r) {
          * anything else from timer_handler here: those scan ALL apps globally
          * per call, so running them once per core per tick would fire them
          * (cores) times too often instead of once. */
+        /* 1000 Hz for the SLEEPER SCAN, 100 Hz for everything else (M2341).
+         *
+         * The scan is what makes a 1 ms sleep last 1 ms instead of rounding up
+         * to the next 10 ms boundary -- measured as 22520 ms of pure overshoot
+         * on a single boot-to-page. The accounting below must NOT speed up
+         * with it: task_cpu_tick charges a tick's worth of CPU, and alarms and
+         * cpu limits are per-tick deadlines, so running them at 1000 Hz would
+         * charge ten times over and fire alarms ten times early. */
+        extern void task_wake_sleepers(void);
+        task_wake_sleepers();
+        {   static volatile unsigned char sub[16];
+            int me = smp_current_cpu() & 15;
+            if (++sub[me] < 10) { sched_tick(); return; }
+            sub[me] = 0;
+        }
         task_cpu_tick(timer_tick_ms(), (r->cs & 3) == 3);
         app_alarm_tick();
         app_cpulimit_tick();

@@ -1412,6 +1412,21 @@ static inline uint64_t nap_tsc(void) {
     unsigned lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
+/* WHY DID THE NAP END? (M2341)
+ *
+ * The budget says 4408 naps actually slept 29050 ms while asking for 6608,
+ * on a boot that is 89% IDLE and takes 29.7 s to put a page on screen. That
+ * is a latency-bound boot -- but "29 s of sleeping" is only RECOVERABLE if
+ * those naps were waiting for something that had already arrived. A nap that
+ * ran its full deadline with nothing pending is a thread with no work, and
+ * shortening it buys nothing but CPU burn.
+ *
+ * So split them: WOKEN means somebody called task_wake before the deadline --
+ * the wake path worked and the latency is whatever remains. EXPIRED means the
+ * deadline ran out, which is either genuine idling or a missing wake. The two
+ * need opposite responses, and the aggregate cannot tell them apart. */
+unsigned long g_poll_nap_woken, g_poll_nap_expired, g_poll_nap_late_ms;
+
 void lx_poll_nap_sleep(int ms) {
     int slot = (int)(task_current_id() & (LX_NAPPERS - 1));
     g_lx_pollnap[slot] = 1;
@@ -1419,6 +1434,15 @@ void lx_poll_nap_sleep(int ms) {
     uint64_t t0 = nap_tsc();
     task_sleep_ms((uint64_t)ms);
     uint64_t cpm = timer_cycles_per_ms();
+    {   /* Woken early, or ran its course? Compared in CYCLES: timer_ms() has
+         * exactly the 10 ms granularity being measured. */
+        unsigned long real = cpm ? (unsigned long)((nap_tsc() - t0) / cpm) : 0;
+        if (cpm && real + 1 < (unsigned long)ms) g_poll_nap_woken++;
+        else {
+            g_poll_nap_expired++;
+            if (cpm && real > (unsigned long)ms) g_poll_nap_late_ms += real - (unsigned long)ms;
+        }
+    }
     if (cpm) g_poll_nap_real_ms += (unsigned long)((nap_tsc() - t0) / cpm);
     __atomic_sub_fetch(&g_lx_nappers, 1, __ATOMIC_RELAXED);
     g_lx_pollnap[slot] = 0;

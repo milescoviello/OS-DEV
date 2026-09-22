@@ -53,7 +53,7 @@ typedef struct task {
     int           policy;      /* SCHED_OTHER (CFS) / SCHED_FIFO / SCHED_RR; RT classes preempt OTHER (M1172) */
     int           rt_priority; /* 1..99 for FIFO/RR; higher preempts lower (0 for OTHER) (M1172) */
     int           rt_ticks;    /* SCHED_RR: timeslice ticks left before rotating among equal-priority RR tasks (M1172) */
-    uint64_t      wake_at;     /* if BLOCKED via task_sleep_ms: timer_ms() deadline (0 = not a timed sleep) */
+    uint64_t      wake_at;     /* if BLOCKED via task_sleep_ms: timer_ns() deadline, NANOSECONDS (0 = not a timed sleep) -- ms until M2341 */
     int           off_cpu;     /* a DEAD task has finished its final context_switch and is no longer
                                  * executing on its own kernel stack. task_exit sets TASK_DEAD and then
                                  * RELEASES THE RUN-QUEUE LOCK before switching away -- so between those

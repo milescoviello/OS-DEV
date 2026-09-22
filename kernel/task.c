@@ -246,6 +246,8 @@ static uint32_t nice_to_weight(int nice) {
 }
 static uint64_t g_min_vruntime;   /* floor: the smallest vruntime among runnable tasks (monotonic non-decreasing) */
 #define RR_QUANTUM 5              /* SCHED_RR timeslice in timer ticks before rotating among equal-priority RR tasks (M1172) */
+void task_sleep_hint_ns(uint64_t when);   /* M2342: forward -- defined with the sleeper scan */
+
 static void sched_place_wake(task_t *t) {   /* a waking task can't be below the floor (no unfair head start; no starvation) */
     if (t && t->vruntime < g_min_vruntime) t->vruntime = g_min_vruntime;
 }
@@ -973,7 +975,8 @@ void task_block_timeout(uint64_t deadline_ms) {
         return;
     }
     current->wchan = (uint64_t)__builtin_return_address(0);
-    current->wake_at = deadline_ms;
+    current->wake_at = deadline_ms * 1000000ull;   /* the API stays ms; wake_at is ns (M2341) */
+    task_sleep_hint_ns(current->wake_at);         /* M2342 */
     current->state = TASK_BLOCKED;
     rq_lock_give();
     switch_to_next();
@@ -1033,8 +1036,9 @@ void task_wake(task_t *t) {
          * the moment the switch completes -- one tick late and correct, rather
          * than immediate and unsafe. */
         t->wake_pending = 1;
-        t->wake_at = timer_ms();
+        t->wake_at = timer_ns();               /* ns since M2341 */
         if (!t->wake_at) t->wake_at = 1;       /* 0 means "not a timed sleep" */
+        task_sleep_hint_ns(t->wake_at);        /* due immediately (M2342) */
     } else if (t) {
         /* It is not blocked YET. Every blocking caller in this kernel is
          * "check the condition, release the lock, then block", and a waker on
@@ -1116,7 +1120,22 @@ void task_sleep_ms(uint64_t ms) {
     }
     uint64_t f = irq_save();
     current->wchan = (uint64_t)__builtin_return_address(0);   /* the sleep's caller, for WCHAN (M1166) */
-    current->wake_at = timer_ms() + ms;           /* 0 ms still parks until the next tick */
+    /* NANOSECONDS, NOT MILLISECONDS (M2341).
+     *
+     * timer_ms() is `ticks * 1000 / tick_hz`, so at 100 Hz it advances in 10 ms
+     * steps: a 1 ms sleep recorded now+1 against a clock that jumps by 10, and
+     * therefore lasted until the next tick boundary no matter what it asked
+     * for. Measured on a boot-to-page: 3881 naps ran their deadline out and
+     * 22520 ms of that was pure OVERSHOOT past what they requested -- on a
+     * boot that takes 29.7 s and is 89% idle.
+     *
+     * timer_ns() already exists (M2114) and is fine-grained: whole ticks from
+     * the PIT plus the remainder from the TSC. Using it here, together with a
+     * sleeper scan that runs faster than 100 Hz, is what makes a 1 ms sleep
+     * last 1 ms. timer_ticks() and every tick-expressed timeout in the kernel
+     * are untouched -- that is the whole reason not to just raise the tick. */
+    current->wake_at = timer_ns() + ms * 1000000ull;   /* 0 ms still parks until the next scan */
+    task_sleep_hint_ns(current->wake_at);              /* M2342 */
     current->state = TASK_BLOCKED;
     switch_to_next();                             /* yields; woken by the timer scan */
     irq_restore(f);
@@ -1126,10 +1145,36 @@ void task_sleep_ms(uint64_t ms) {
  * timed-sleep deadline has passed. The ring is tiny, so a full scan per tick is
  * cheap; only BLOCKED tasks with a non-zero wake_at are sleepers. */
 
+/* THE SCAN HAS TO BE CHEAP BEFORE IT CAN BE FREQUENT (M2342).
+ *
+ * M2341 raised this to 1000 Hz per core to make a 1 ms sleep last 1 ms, and
+ * forgot that the scan WALKS THE WHOLE TASK RING under the global run-queue
+ * lock with interrupts off. At 100 Hz on 8 cores with ~150 tasks that is
+ * ~120k iterations a second; at 1000 Hz it is 1.2 MILLION, all serialised on
+ * one lock. The boot went from 29.7 s to still probing ATA after 34 minutes.
+ * Frequency without cost is not an optimisation.
+ *
+ * So keep the soonest deadline in a single variable and make the common tick
+ * one load and one compare. Only when something is actually due does anyone
+ * take the lock and walk. The value is a HINT and is allowed to be early --
+ * an early walk is merely wasted work -- so it is written without the lock and
+ * only ever moved EARLIER by a new sleeper, which is the safe direction. */
+static volatile uint64_t g_next_wake_ns;
+
+void task_sleep_hint_ns(uint64_t when) {
+    uint64_t cur_hint = __atomic_load_n(&g_next_wake_ns, __ATOMIC_RELAXED);
+    if (!cur_hint || when < cur_hint) __atomic_store_n(&g_next_wake_ns, when, __ATOMIC_RELAXED);
+}
+
 void task_wake_sleepers(void) {
     if (!current) return;
+    {   /* O(1) in the overwhelmingly common case: nothing is due. */
+        uint64_t hint = __atomic_load_n(&g_next_wake_ns, __ATOMIC_RELAXED);
+        if (hint && timer_ns() < hint) return;
+    }
     rq_lock_take();
-    uint64_t now = timer_ms();
+    uint64_t now = timer_ns();                     /* ns since M2341 */
+    uint64_t soonest = 0;                          /* rebuilt below (M2342) */
     task_t *t = current;
     do {
         /* Leave it for the next tick rather than racing its own switch. */
@@ -1139,8 +1184,14 @@ void task_wake_sleepers(void) {
             t->ready_since = now;       /* re-entered the run queue (M1148) */
             sched_place_wake(t);        /* clamp vruntime up to the floor (M1171) */
         }
+        /* Rebuild the hint from what is still asleep, since we are walking
+         * anyway. Zero means "no timed sleepers" and disables the fast path
+         * until the next sleeper registers one. */
+        if (t->state == TASK_BLOCKED && t->wake_at &&
+            (!soonest || t->wake_at < soonest)) soonest = t->wake_at;
         t = t->next;
     } while (t != current);
+    __atomic_store_n(&g_next_wake_ns, soonest, __ATOMIC_RELAXED);
     rq_lock_give();
 }
 

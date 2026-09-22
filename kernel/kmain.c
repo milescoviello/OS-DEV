@@ -644,6 +644,43 @@ static inline uint64_t km_tsc(void) {
     uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
+
+/* WHO IS RUNNING US -- MEASURED, NOT ASSERTED (M2343).
+ *
+ * What used to sit at the bottom of this function was the string "so MOST OF
+ * THE BOOT IS GUEST CODE UNDER TCG, and no amount of work on the disk, the
+ * faults or the console will change how long it takes." It was printed
+ * whenever the largest named cost fell under half of busy -- that is, it was a
+ * conclusion drawn from a residual the instrument could not account for, which
+ * is exactly backwards. And it was FALSE: the machine this project develops on
+ * runs KVM, so there was no TCG in the reading at all. Being wrong in the
+ * confident direction, it spent months telling every reader that the work
+ * which later took click-to-pixel from 224 ms to 34 ms was pointless.
+ *
+ * Nothing in the tree had ever asked. So ask: CPUID.1:ECX[31] is the
+ * hypervisor-present bit, and leaf 0x40000000 returns a 12-byte vendor
+ * signature in EBX:ECX:EDX. QEMU's emulator answers "TCGTCGTCGTCG" and its
+ * accelerator answers "KVMKVMKVM\0\0\0", which is the entire distinction the
+ * old line was guessing at. */
+static const char *km_hypervisor(void) {
+    static char sig[16];
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+    if (!((c >> 31) & 1)) return "BARE METAL (no hypervisor-present bit)";
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x40000000u), "c"(0u));
+    if (a < 0x40000000u) return "a hypervisor that declines to name itself";
+    for (int i = 0; i < 4; i++) {
+        sig[i]     = (char)((b >> (i * 8)) & 0xff);
+        sig[i + 4] = (char)((c >> (i * 8)) & 0xff);
+        sig[i + 8] = (char)((d >> (i * 8)) & 0xff);
+    }
+    sig[12] = 0;
+    if (sig[0] == 'T' && sig[1] == 'C' && sig[2] == 'G')
+        return "QEMU TCG -- every guest instruction is EMULATED";
+    if (sig[0] == 'K' && sig[1] == 'V' && sig[2] == 'M')
+        return "KVM -- guest code runs NATIVE on the host CPU";
+    return sig;
+}
 /* Print every budget against that denominator. Called at the two moments that
  * matter: when a client has painted (what the user waits for) and when the
  * desktop takes over (the end of the scrolling wall of text). */
@@ -768,6 +805,11 @@ void kmain_budget(const char *when) {
                     "SLEPT (the tick is 100 Hz, so a 1 ms nap lasts until the next one), plus "
                     "%lu yields, in poll/epoll (concurrent: NOT a share of the wall clock)\n",
                     g_poll_nap_ms, g_poll_naps, g_poll_nap_real_ms, g_poll_yields);
+            {   extern unsigned long g_poll_nap_woken, g_poll_nap_expired, g_poll_nap_late_ms;
+                kprintf("[budget]   polling  %7lu nap(s) ended because somebody WOKE them, %lu ran "
+                        "their deadline out (%lu ms of that was overshoot past what they asked "
+                        "for) -- only the woken ones had work waiting\n",
+                        g_poll_nap_woken, g_poll_nap_expired, g_poll_nap_late_ms); }
         }
         {   /* AND HOW LATE THE ANSWERS WERE (M2322). The naps above are what
              * this costs a waiter; this is what it cost the one waiter whose
@@ -813,14 +855,37 @@ void kmain_budget(const char *when) {
     }
     kprintf("[budget]   console  %7lu Mcycles elapsed   %lu lines, %lu full-screen scrolls\n",
             con / 1000000, ln, sc);
+    kprintf("[budget]   running under: %s\n", km_hypervisor());
     if (busy) {
         uint64_t named = io > pf ? io : pf;          /* the fault bucket contains the disk one */
         named += con;
+        uint64_t npct = named * 100 / busy;
+        if (npct > 100) npct = 100;                 /* elapsed sums can exceed busy; see above */
+        uint64_t upct = 100 - npct;
         kprintf("[budget]   the largest NAMED cost is %lu Mcycles against %lu Mcycles busy: at most %lu%%\n",
-                named / 1000000, busy / 1000000, named * 100 / busy);
-        if (named * 100 / busy < 50)
-            kprintf("[budget]   so MOST OF THE BOOT IS GUEST CODE UNDER TCG, and no amount of work on\n"
-                    "[budget]   the disk, the faults or the console will change how long it takes.\n");
+                named / 1000000, busy / 1000000, npct);
+        /* THE NAMED RESIDUAL. Every bucket above is something somebody
+         * instrumented; this is the part nobody has. It is the only honest
+         * summary line this function can print, because it is the one number
+         * that says what the instrument does NOT know. */
+        kprintf("[budget]   UNATTRIBUTED %lu Mcycles = %lu%% of busy -- %s\n",
+                (busy - (named < busy ? named : busy)) / 1000000, upct,
+                upct > 25 ? "THE BUDGET CANNOT SAY WHERE THAT WENT. Do not draw a "
+                            "conclusion from it; go instrument it."
+                          : "within tolerance: the named buckets do explain this boot.");
+        /* AND THE SHAPE, which is the question the old line was really trying
+         * to answer and answered wrong. If most of the available core-time went
+         * to `hlt`, then no named cost getting cheaper can move the wall clock,
+         * because nothing was waiting on a core -- it was waiting on a reply.
+         * That is a measured statement about THIS boot, and it flips with the
+         * measurement instead of being compiled in. */
+        {   uint64_t ipct = avail ? idle * 100 / avail : 0;
+            kprintf("[budget]   SHAPE: %lu%% of core-time was IDLE, so this boot is %s\n", ipct,
+                    ipct >= 60 ? "LATENCY-bound: making the named work cheaper cannot"
+                               : "THROUGHPUT-bound: the named work is on the critical path");
+            if (ipct >= 60)
+                kprintf("[budget]          move the wall clock. Find what the critical path WAITS FOR.\n");
+        }
     }
 }
 

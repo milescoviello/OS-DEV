@@ -123,6 +123,20 @@ static void pit_udelay(uint32_t us) {
  * the BSP would just double-tick it for no benefit) — this is APs only. */
 static uint32_t g_lapic_timer_count;   /* calibrated initial-count for TICK_HZ; 0 = not calibrated (uniprocessor) */
 #define TICK_HZ 100                    /* matches kernel/timer.c's PIT tick_hz */
+/* THE SLEEPER SCAN NEEDS TO BE FASTER THAN THE TICK (M2341).
+ *
+ * M2341 made task_sleep_ms record a NANOSECOND deadline, which is necessary
+ * and not sufficient: a scan that only runs at 100 Hz still notices a 1 ms
+ * deadline up to 10 ms late. So run this per-core timer at 1000 Hz and let the
+ * handler do the cheap thing (scan for expired sleepers) every time and the
+ * accounting (task_cpu_tick, alarms, cpu limits) only every tenth, so those
+ * keep their 100 Hz cadence and are not charged ten times over.
+ *
+ * kernel/timer.c's PIT stays at 100 Hz, so timer_ticks() and every timeout
+ * expressed in ticks -- UDPQ_TTL 500, PARK_TTL 200, tcp_connect's 120 --
+ * are completely unaffected. That is the entire reason for doing it here
+ * rather than raising the global tick. */
+#define LAPIC_HZ 1000
 
 /* Run once, on the BSP, before any AP starts: count how many LAPIC timer
  * ticks occur in a known PIT-timed window, at divide-by-16, to compute the
@@ -138,9 +152,11 @@ static void lapic_timer_calibrate(void) {
     lapic_wr(LAPIC_TIMER_ICR, 0);                /* stop it (one-shot from the max count) */
     uint32_t elapsed = 0xFFFFFFFFu - remaining;  /* ticks counted in 10 ms */
     uint32_t per_ms = elapsed / 10;
-    g_lapic_timer_count = per_ms * (1000 / TICK_HZ);
-    kprintf("[smp] LAPIC timer calibrated: %u ticks/ms, initial-count=%u for %d Hz\n",
-            per_ms, g_lapic_timer_count, TICK_HZ);
+    g_lapic_timer_count = per_ms * (1000 / LAPIC_HZ);
+    if (!g_lapic_timer_count) g_lapic_timer_count = per_ms;   /* never zero */
+    kprintf("[smp] LAPIC timer calibrated: %u ticks/ms, initial-count=%u for %d Hz "
+            "(sleeper scan; accounting still %d Hz)\n",
+            per_ms, g_lapic_timer_count, LAPIC_HZ, TICK_HZ);
 }
 
 /* Program THIS core's own LAPIC timer to fire vector 0x42 (a local,
