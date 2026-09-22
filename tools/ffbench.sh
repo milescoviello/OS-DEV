@@ -88,6 +88,60 @@ case "$TITLE" in
       exit 3 ;;
 esac
 
+# DID THE BENCHMARK ACTUALLY START? (M2362)
+#
+# Every volumeshaderbm number reported before this check was the IDLE PAGE.
+# The click went to (594,518), which was the Start button's centre in one
+# layout and ~26 px left of it in the one the browser actually renders at
+# 1280 px wide -- so the screendumps showed a black canvas with the Start
+# button still on it, and the [fps] meter dutifully counted the page's own
+# repaints. Three separate "3-7 fps" and "13.5 fps" readings, none of them the
+# shader.
+#
+# A running volumetric shader fills the canvas with bright colour; a stopped
+# one is near-black. Sample the canvas centre and refuse to report a frame
+# rate when it is dark, because "the benchmark is slow" and "the benchmark is
+# not running" are opposite conclusions that look identical in a frame count.
+if [ -n "${CANVAS:-1}" ]; then
+    $SSH "rm -f $D/c.ppm; echo 'screendump $D/c.ppm' | qm monitor $V >/dev/null 2>&1;
+          n=0; while [ \$n -lt 40 ]; do a=\$(stat -c %s $D/c.ppm 2>/dev/null||echo 0); sleep 0.3;
+            b=\$(stat -c %s $D/c.ppm 2>/dev/null||echo 0);
+            [ \"\$a\" = \"\$b\" ] && [ \"\$a\" != 0 ] && break; n=\$((n+1)); done" >/dev/null 2>&1
+    scp -q "root@$H:$D/c.ppm" "$S/canvas.ppm" 2>/dev/null || true
+    BRIGHT=$(python3 - "$S/canvas.ppm" <<'PY'
+import sys
+try:
+    d = open(sys.argv[1],'rb').read()
+except Exception:
+    print(-1); raise SystemExit
+# P6 header: magic, w h, maxval, then binary
+parts = d.split(b'\n', 3)
+if len(parts) < 4 or parts[0] != b'P6': print(-1); raise SystemExit
+w, h = (int(x) for x in parts[1].split())
+px = parts[3]
+# the benchmark canvas sits roughly x 170..1190, y 250..720 at 1280x960
+tot = n = 0
+for y in range(300, 700, 17):
+    for x in range(250, 1100, 23):
+        i = (y*w + x)*3
+        if i+2 < len(px):
+            tot += px[i] + px[i+1] + px[i+2]; n += 1
+print(tot // (3*n) if n else -1)
+PY
+)
+    command -v magick >/dev/null 2>&1 && magick "$S/canvas.ppm" "$S/canvas.png" 2>/dev/null
+    echo "==> canvas mean brightness: $BRIGHT (0-255; a stopped benchmark is near-black)"
+    echo "==> post-click screendump: $S/canvas.png"
+    echo "$S" > /tmp/ffbench.last
+    if [ "$BRIGHT" != "-1" ] && [ "$BRIGHT" -lt 25 ]; then
+        echo ">>> THE BENCHMARK IS NOT RUNNING. The canvas is dark, which means the"
+        echo "    Start click missed or the shader never began. Refusing to report a"
+        echo "    frame rate for an idle page."
+        [ "${KEEP:-0}" = 1 ] || $SSH "qm stop $V" >/dev/null 2>&1 || true
+        exit 4
+    fi
+fi
+
 # MARK THE LOG, so the frames counted are the ones AFTER the page had a window
 # -- the load itself commits plenty and would inflate the number.
 MARK=$($SSH "grep -ac '\[fps\]' $D/boot.log 2>/dev/null || echo 0")

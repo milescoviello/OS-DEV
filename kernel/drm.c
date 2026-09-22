@@ -41,6 +41,8 @@
 #define DRM_IOCTL_VERSION                    0xc0406400ul
 #define DRM_IOCTL_GET_CAP                    0xc010640cul
 #define DRM_IOCTL_GEM_CLOSE                  0x40086409ul
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD         0xc00c642dul
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE         0xc00c642eul
 #define DRM_IOCTL_VIRTGPU_MAP                0xc0106441ul
 #define DRM_IOCTL_VIRTGPU_EXECBUFFER         0xc0406442ul
 #define DRM_IOCTL_VIRTGPU_GETPARAM           0xc0106443ul
@@ -101,6 +103,12 @@ struct drm_virtgpu_3d_transfer {
 struct drm_virtgpu_3d_wait { uint32_t handle, flags; };
 struct drm_virtgpu_resource_info { uint32_t bo_handle, res_handle, size, blob_mem; };
 struct drm_gem_close { uint32_t handle, pad; };
+struct drm_prime_handle { uint32_t handle; uint32_t flags; int32_t fd; };
+
+/* drmGetCap capability ids and the PRIME bits, from <drm/drm.h>. */
+#define DRM_CAP_PRIME            0x5
+#define DRM_PRIME_CAP_IMPORT     0x1
+#define DRM_PRIME_CAP_EXPORT     0x2
 
 /* VIRTGPU_PARAM_*, from the same header. */
 #define VIRTGPU_PARAM_3D_FEATURES        1
@@ -397,10 +405,22 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
          * the host happens to return for it. A capset the renderer does not
          * publish is a different thing from an empty one, and Mesa asks about
          * both. */
-        if (gc.cap_set_id != virtio_gpu_capset_id()) {
-            drm_seen(req, "GET_CAPS(capset we were not offered)", E_INVAL);
-            return E_INVAL;
+        /* ONE-SHOT PER IOCTL NUMBER HID THE ANSWER (M2362). `drm_seen` reports
+         * each request type once, so two GET_CAPS calls with different capset
+         * ids collapse into one line -- and the line kept was the REFUSAL of
+         * capset 6, which made it impossible to tell whether the capset 2
+         * fetch Mesa actually needs had succeeded. Report per capset id. */
+        {   static unsigned char said[8];
+            unsigned idx = gc.cap_set_id < 8 ? gc.cap_set_id : 7;
+            if (!said[idx]) {
+                said[idx] = 1;
+                kprintf("[drm] GET_CAPS capset %u ver %u size %u -> %s\n",
+                        gc.cap_set_id, gc.cap_set_ver, gc.size,
+                        gc.cap_set_id == virtio_gpu_capset_id() ? "serving it"
+                                                                : "REFUSED, not offered");
+            }
         }
+        if (gc.cap_set_id != virtio_gpu_capset_id()) return E_INVAL;
         if (gc.size > virtio_gpu_capset_size()) gc.size = virtio_gpu_capset_size();
         if (!vmm_user_ok(gc.addr, gc.size)) return E_FAULT;
         /* Into a kernel staging buffer first, then out to the user. The device
@@ -421,10 +441,34 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_get_cap gp;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof gp)) return E_FAULT;
         memcpy(&gp, uarg, sizeof gp);
-        /* Every DRM_CAP_* here is about DUMB BUFFERS, PRIME sharing and
-         * modesetting, none of which a render node has. Zero is the correct
-         * answer for a render-only node and is what Linux returns. */
+        /* AND DRM_CAP_PRIME IS NOT ZERO -- MY OWN FALSE CLAIM, RETRACTED (M2362).
+         *
+         * This used to answer 0 to every capability, with a comment asserting
+         * that "zero is the correct answer for a render-only node and is what
+         * Linux returns". Both halves were wrong: Linux's virtio_gpu reports
+         * IMPORT|EXPORT here, and Mesa derives an EGL capability straight from
+         * it --
+         *
+         *     if (fd != -1 && drmGetCap(fd, DRM_CAP_PRIME, &cap) == 0)
+         *             caps->dmabuf = cap;            (u_screen.c)
+         *     dri2_dpy->has_dmabuf_import = (caps & DRM_PRIME_CAP_IMPORT) > 0;
+         *
+         * -- and then refuses the whole hardware path without it:
+         *
+         *     libEGL warning: wayland-egl: display does not support prime
+         *     Failed to create WebGL context: FEATURE_FAILURE_NO_DISPLAY
+         *     Exhausted GL driver options.
+         *
+         * That single zero is why Firefox's WebGL fell back to software on a
+         * machine whose GPU `lxgl` can draw on. Answering 3 to make the
+         * warning go away would be claiming a capability we do not have --
+         * the exact mistake that produced the pci/virtio regression and the
+         * DRM-version deadlock earlier today. So PRIME is IMPLEMENTED below
+         * and reported here, and the two cannot drift because the value is
+         * derived from whether the ioctls exist. */
         gp.value = 0;
+        if (gp.capability == DRM_CAP_PRIME)
+            gp.value = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
         memcpy(uarg, &gp, sizeof gp);
         drm_seen(req, "GET_CAP", 0);
         return 0;
@@ -523,6 +567,50 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         if (!b) return E_INVAL;
         bo_free(b);
         drm_seen(req, "GEM_CLOSE", 0);
+        return 0;
+    }
+
+    /* ---- PRIME: a buffer object as a descriptor (M2362) --------------------
+     *
+     * What Mesa wants from PRIME here is the ability to name a buffer with a
+     * file descriptor and get it back again -- that is what
+     * `createImageFromDmaBufs` is built on, and what the EGL capability above
+     * promises. Export hands out a descriptor that refers to the same object;
+     * import turns it back into a handle.
+     *
+     * This is deliberately a HANDLE-NAMING implementation, not a cross-device
+     * buffer share: the descriptor is meaningful to this DRM node, which is
+     * exactly the case Mesa exercises when a process exports a buffer and
+     * re-imports it as an EGLImage. Passing one to a different device would
+     * need real dmabuf semantics, and that is a separate capability -- said
+     * here rather than discovered later, because a half-kept promise in this
+     * area is what the GET_CAP comment above is an apology for. */
+    case DRM_IOCTL_PRIME_HANDLE_TO_FD: {
+        struct drm_prime_handle ph;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof ph)) return E_FAULT;
+        memcpy(&ph, uarg, sizeof ph);
+        struct drm_bo *b = bo_of(ph.handle);
+        if (!b) { drm_seen(req, "PRIME_HANDLE_TO_FD on an unknown handle", E_INVAL); return E_INVAL; }
+        int fd = app_drm_prime_fd(ph.handle);
+        if (fd < 0) { drm_seen(req, "PRIME_HANDLE_TO_FD: no descriptor available", E_MFILE); return E_MFILE; }
+        ph.fd = fd;
+        memcpy(uarg, &ph, sizeof ph);
+        drm_seen(req, "PRIME_HANDLE_TO_FD", fd);
+        return 0;
+    }
+
+    case DRM_IOCTL_PRIME_FD_TO_HANDLE: {
+        struct drm_prime_handle ph;
+        if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof ph)) return E_FAULT;
+        memcpy(&ph, uarg, sizeof ph);
+        int h = app_drm_prime_handle_of(ph.fd);
+        if (h <= 0 || !bo_of((uint32_t)h)) {
+            drm_seen(req, "PRIME_FD_TO_HANDLE: that descriptor names no object", E_INVAL);
+            return E_INVAL;
+        }
+        ph.handle = (uint32_t)h;
+        memcpy(uarg, &ph, sizeof ph);
+        drm_seen(req, "PRIME_FD_TO_HANDLE", h);
         return 0;
     }
 

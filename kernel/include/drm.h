@@ -29,3 +29,8 @@ void drm_close_node(int id);
  * is how the mapping code asks it questions. (M2349) */
 uint64_t drm_map_frame(uint64_t off, uint64_t page);
 uint64_t drm_map_size(uint64_t off);
+
+/* PRIME: name a DRM buffer object with a descriptor and get it back (M2362).
+ * Implemented in app.c because it needs the process fd table. */
+int app_drm_prime_fd(uint32_t bo_handle);    /* a new fd naming that object, or -1 */
+int app_drm_prime_handle_of(int fd);         /* the object a prime fd names, or -1 */

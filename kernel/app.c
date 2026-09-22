@@ -12355,6 +12355,25 @@ static void app_open_gl_watch(const char *path) {
     }
 }
 
+/* PRIME descriptors (M2362). fd type 18 names a DRM buffer object; `obj` is
+ * the GEM handle. It is not a memfd and not a file -- it exists so a GL driver
+ * can export a buffer, hand the descriptor around, and import it again, which
+ * is what EGL's createImageFromDmaBufs is built on and what DRM_CAP_PRIME
+ * promises. Close is a no-op beyond releasing the slot: the OBJECT's lifetime
+ * belongs to its GEM handle, not to any descriptor naming it. */
+int app_drm_prime_fd(uint32_t bo_handle) {
+    struct app *a = cur(); if (!a || !bo_handle) return -1;
+    int fd = app_fd_claim(a);
+    if (fd < 0) return -1;
+    a->fd[fd] = (struct fdent){ 1, 18, 1, (int)bo_handle, {0}, 0 };
+    return fd;
+}
+int app_drm_prime_handle_of(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 18) return -1;
+    return a->fd[fd].obj;
+}
+
 int app_open(const char *path, int flags) {
     struct app *a = cur(); if (!a) return -1;
     app_open_gl_watch(path);
