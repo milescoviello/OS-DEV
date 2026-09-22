@@ -41,6 +41,7 @@
 #include "ata.h"
 #include "journal.h"   /* write-ahead journal + its in-guest crash-recovery self-test (M1865) */
 #include "pci.h"
+#include "nvgpu.h"
 #include "ahci.h"
 #include "virtio_blk.h"
 #include "virtio_rng.h"
@@ -290,6 +291,9 @@ static volatile int g_ffwl;                   /* -append ffwl: run Firefox again
  * reporting into boot.log from a watcher thread while the screen shows the
  * actual window. */
 static volatile int g_ffshow;
+/* -append fbres=WxH (M2367): pick the display mode at boot so a resolution
+ * A/B costs a flag, not a rebuild. 0 = use fbcon's own preference list. */
+int g_fbres_w, g_fbres_h;
 static volatile int g_ffdata;                 /* -append ffdata: render a data: URL instead of the staged file, so the filesystem is not part of the question (M2107) */
 /* ext2 -> blockdev cache drop (M2220). The ctx ext2 carries for a mounted
  * volume is the blockdev index, cast through a pointer the same way
@@ -1007,6 +1011,21 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * The first cut set g_ffurl and nothing else, so `-append ffurl`
          * booted to a desktop with no browser in it at all -- the flag that
          * spawns Firefox is this one, and a URL with no spawn is not a mode. */
+        {   const char *q = cl;                     /* fbres=WxH (M2367) */
+            while (*q) {
+                if (q[0]=='f'&&q[1]=='b'&&q[2]=='r'&&q[3]=='e'&&q[4]=='s'&&q[5]=='=') {
+                    const char *v = q + 6; int w = 0, h = 0;
+                    while (*v >= '0' && *v <= '9') w = w*10 + (*v++ - '0');
+                    if (*v == 'x' || *v == 'X') {
+                        v++;
+                        while (*v >= '0' && *v <= '9') h = h*10 + (*v++ - '0');
+                    }
+                    if (w > 0 && h > 0) { g_fbres_w = w; g_fbres_h = h; }
+                    break;
+                }
+                q++;
+            }
+        }
         if (cmdline_has(cl, "ffwl") || cmdline_has(cl, "ffshow") ||
             cmdline_has(cl, "ffnet") || cmdline_has(cl, "ffurl") ||
             cmdline_has(cl, "ffin") || cmdline_has(cl, "ffnav") || cmdline_has(cl, "gtksub")) {
@@ -1247,6 +1266,12 @@ void kmain(uint64_t mb_info, uint64_t magic) {
     kprintf("[ ok ] PCI devices on the bus:\n");
     pci_enumerate();
     kprintf("\n");
+
+    /* A REAL GPU, IF ONE WAS PASSED THROUGH (M2368). Runs right after the bus
+     * walk so "the card is not on the bus" and "the card is on the bus and the
+     * driver cannot talk to it" are separated by two lines of log, not by
+     * guesswork. No-op with a clear reason on any VM without one. */
+    nvgpu_init();
 
     audio_init();     /* bring up audio: HDA if present, else AC'97 (no-op if neither) */
     kprintf("[ ok ] audio output: %s\n", audio_name());

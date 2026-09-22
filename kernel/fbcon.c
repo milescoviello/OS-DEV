@@ -11,6 +11,7 @@
  */
 #include "fbcon.h"
 #include "fb.h"
+#include "console.h"
 #include "font.h"
 
 static int cols, rows, cx, cy;
@@ -57,8 +58,45 @@ int fbcon_init(void) {
      * video request), use it as-is. Otherwise ask the Bochs DISPI driver for a
      * 1280x960x32 mode (QEMU std-VGA). DISPI absent + no Multiboot FB -> -1,
      * leaving the boot mode untouched (no black screen). */
-    if (fb_width() == 0 && fb_init(1280, 960) != 0)
-        return -1;
+    /* 1280x960 -> 2560x1440 (M2367). This hardcoded pair was the ACTUAL screen
+     * size: QEMU's -kernel multiboot loader ignores our header's video request
+     * (there is no "[ ok ] Multiboot framebuffer" line in any boot log), so
+     * fb_width() is 0 here and this call is what sets the mode. Editing the
+     * boot header alone changed nothing.
+     *
+     * The goal requires the browser to be measured at 1440p or better, and a
+     * benchmark run at a smaller resolution than claimed is not a measurement.
+     * Largest first, falling back so a host with less video memory still comes
+     * up rather than going black: 2560x1440x32 needs 14.75 MB, over QEMU's
+     * 16 MB stdvga default once the console's own use is counted, so
+     * tools/pve-run.sh asks for `--vga std,memory=32`. bochs_vbe_set_mode
+     * refuses a mode the BAR cannot hold, which is what makes the fallback
+     * safe rather than hopeful. */
+    if (fb_width() == 0) {
+        /* An explicit -append fbres=WxH wins, so a resolution A/B is a flag
+         * rather than a rebuild (M2367). */
+        extern int g_fbres_w, g_fbres_h;
+        if (g_fbres_w && g_fbres_h && fb_init(g_fbres_w, g_fbres_h) == 0) {
+            kprintf("[fb] %dx%d 32-bpp via Bochs DISPI (requested by fbres=)\n",
+                    g_fbres_w, g_fbres_h);
+            goto sized;
+        }
+        static const struct { int w, h; } modes[] = {
+            { 2560, 1440 }, { 1920, 1200 }, { 1280, 960 },
+        };
+        unsigned i = 0;
+        for (; i < sizeof modes / sizeof modes[0]; i++)
+            if (fb_init(modes[i].w, modes[i].h) == 0) break;
+        if (i == sizeof modes / sizeof modes[0])
+            return -1;
+        /* SAY WHICH ONE (M2367). Nothing printed the mode, so "the screenshot
+         * is 1280x960" and "the mode-set failed back to 1280x960" looked
+         * identical -- and the first 1440p attempt changed the boot header,
+         * which this path never reads, with no way to tell from the log. */
+        kprintf("[fb] %dx%d 32-bpp via Bochs DISPI%s\n", modes[i].w, modes[i].h,
+                i ? " (a LARGER mode was refused -- not enough video memory)" : "");
+    }
+sized:
     cols = fb_width() / font_width;
     rows = fb_height() / font_height;
     cx = cy = 0;

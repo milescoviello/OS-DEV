@@ -50,8 +50,12 @@
 
 /* Sanity ceiling: refuse absurd requests. 1920x1200x4 = ~9.2 MB, well within
  * QEMU's default 16 MB of VGA memory; anything bigger we reject outright. */
-#define VBE_MAX_W  1920
-#define VBE_MAX_H  1200
+/* 1920x1200 -> 2560x1440 (M2367): the cap was below the 1440p the browser is
+ * required to be measured at, so the DISPI fallback path could not have
+ * reached it even when the loader could. The BAR-size check below is the real
+ * guard -- it refuses a mode the video memory cannot hold. */
+#define VBE_MAX_W  2560
+#define VBE_MAX_H  1440
 
 static void vbe_write(uint16_t index, uint16_t value) {
     outw(VBE_DISPI_IOPORT_INDEX, index);

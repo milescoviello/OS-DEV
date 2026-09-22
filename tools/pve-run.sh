@@ -180,7 +180,9 @@ $SSH "qm set $VMID --tablet 1" >/dev/null 2>&1 || true
 # which is the only way a guest can reach a real GPU here. Set explicitly on
 # every run rather than left sticky in the VM config, because a display type
 # left over from a previous experiment is a confound nobody would look for.
-$SSH "qm set $VMID --vga ${VGA:-std}" >/dev/null 2>&1 || true
+# 32 MB of video memory (M2367): at 2560x1440x32 the framebuffer alone is
+# 14.75 MB, which does not fit comfortably in stdvga's 16 MB default.
+$SSH "qm set $VMID --vga ${VGA:-std},memory=32" >/dev/null 2>&1 || true
 
 # A 3D DEVICE THAT IS NOT THE DISPLAY (M2346).
 #

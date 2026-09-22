@@ -54,11 +54,32 @@ echo "==> window: $STATE"
 # So: click, settle, THEN mark the log.
 if [ -n "${CLICK:-}" ]; then
     CX=$(echo "$CLICK" | cut -d, -f1); CY=$(echo "$CLICK" | cut -d, -f2)
-    AX=$(( CX * 32768 / 1280 )); AY=$(( CY * 32768 / 960 ))
-    echo "==> clicking page pixel ($CX,$CY) -> abs ($AX,$AY)"
+    # THE SCREEN IS NOT ALWAYS 1280x960 (M2367). These divisors were hardcoded,
+    # so the moment the display moved to 2560x1440 every click landed at half
+    # the intended position -- silently, because a click on empty page
+    # background looks exactly like a click that worked. Read the real
+    # geometry out of a screendump instead of assuming it.
+    $SSH "rm -f $D/geom.ppm; echo 'screendump $D/geom.ppm' | qm monitor $V >/dev/null 2>&1;
+          n=0; while [ \$n -lt 40 ]; do a=\$(stat -c %s $D/geom.ppm 2>/dev/null||echo 0); sleep 0.3;
+            b=\$(stat -c %s $D/geom.ppm 2>/dev/null||echo 0);
+            [ \"\$a\" = \"\$b\" ] && [ \"\$a\" != 0 ] && break; n=\$((n+1)); done"
+    GEOM=$($SSH "head -2 $D/geom.ppm | tail -1")
+    SW=$(echo "$GEOM" | awk '{print $1}'); SH=$(echo "$GEOM" | awk '{print $2}')
+    case "$SW" in ''|*[!0-9]*) echo ">>> FATAL: could not read screen geometry"; exit 5;; esac
+    AX=$(( CX * 32768 / SW )); AY=$(( CY * 32768 / SH ))
+    echo "==> screen is ${SW}x${SH}; clicking page pixel ($CX,$CY) -> abs ($AX,$AY)"
     Q="socat - UNIX-CONNECT:/var/run/qemu-server/$V.qmp"
     printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","arguments":{"events":[{"type":"abs","data":{"axis":"x","value":%s}},{"type":"abs","data":{"axis":"y","value":%s}}]}}\n' "$AX" "$AY" | $SSH "$Q" >/dev/null 2>&1
     sleep 1
+    # CLICK TWICE (M2367). The first click on an unfocused window is consumed
+    # by click-to-focus -- the compositor activates the window and the press
+    # never reaches the client. Verified by screendump: cursor sitting exactly
+    # on the Start button, title bar newly highlighted, canvas still black.
+    # The second click is the one the page sees. A benchmark that silently
+    # measured an idle canvas is precisely the failure this script exists to
+    # refuse, so do not rely on the window happening to be focused already.
+    printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":true,"button":"left"}}]}}\n{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":false,"button":"left"}}]}}\n' | $SSH "$Q" >/dev/null 2>&1
+    sleep 2
     printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":true,"button":"left"}}]}}\n' | $SSH "$Q" >/dev/null 2>&1
     sleep 1
     printf '{"execute":"qmp_capabilities"}\n{"execute":"input-send-event","arguments":{"events":[{"type":"btn","data":{"down":false,"button":"left"}}]}}\n' | $SSH "$Q" >/dev/null 2>&1
@@ -119,10 +140,13 @@ parts = d.split(b'\n', 3)
 if len(parts) < 4 or parts[0] != b'P6': print(-1); raise SystemExit
 w, h = (int(x) for x in parts[1].split())
 px = parts[3]
-# the benchmark canvas sits roughly x 170..1190, y 250..720 at 1280x960
+# The canvas region as a FRACTION of the screen, not pixels: the sample box
+# was written for 1280x960 and at 2560x1440 it covered only the top-left
+# quadrant -- mostly browser chrome, which is bright, so a stopped benchmark
+# would have read as a running one. (M2367)
 tot = n = 0
-for y in range(300, 700, 17):
-    for x in range(250, 1100, 23):
+for y in range(int(h*0.31), int(h*0.73), max(1, h//56)):
+    for x in range(int(w*0.20), int(w*0.86), max(1, w//56)):
         i = (y*w + x)*3
         if i+2 < len(px):
             tot += px[i] + px[i+1] + px[i+2]; n += 1

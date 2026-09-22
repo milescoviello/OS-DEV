@@ -34,8 +34,13 @@ align 4
     ; It reports the LFB base + geometry back in the multiboot info, which kmain
     ; consumes via fb_init_mb() (falling back to the Bochs std-VGA path if absent).
     dd 0            ; mode_type: 0 = linear graphics framebuffer
-    dd 1280         ; preferred width
-    dd 960          ; preferred height
+    ; 1280x960 -> 2560x1440 (M2367). The goal requires the browser to be
+    ; measured at 1440p or better, so the DISPLAY must be that big -- shrinking
+    ; the screen is exactly the kind of "adjustment" that makes a frame rate
+    ; meaningless. 2560*1440*4 = 14.75 MB, so the std-VGA BAR needs more than
+    ; QEMU's 16 MB default to be comfortable; pve-run.sh asks for 32 MB.
+    dd 2560         ; preferred width
+    dd 1440         ; preferred height
     dd 32           ; preferred depth (bpp)
 
 ; --- Multiboot2 header (bare-metal graphics) -------------------------------
@@ -53,8 +58,8 @@ mb2_start:
     dw 5                                           ; tag type 5 = framebuffer request
     dw 0                                           ; flags
     dd 20                                          ; tag size
-    dd 1280                                        ; preferred width
-    dd 960                                         ; preferred height
+    dd 2560                                        ; preferred width (M2367)
+    dd 1440                                        ; preferred height
     dd 32                                          ; preferred depth (bpp)
     align 8
     dw 0                                           ; end tag (type 0)
