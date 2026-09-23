@@ -20,6 +20,9 @@
 #include "vmm.h"
 #include "console.h"
 #include "kheap.h"
+#include "task.h"
+#include "vfs.h"
+#include "syscall.h"         /* struct statx */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -871,7 +874,509 @@ static unsigned nv_run_body(unsigned at, int depth, int *exec, int *ops, unsigne
  * The GT 710 has a known answer: nouveau printed "fb: 2048 MiB GDDR5" for this
  * exact card. So this probe can be WRONG in a way that shows, which is the
  * only kind worth having. Read before and after devinit for a real pair. */
+/* PASCAL SIZES VRAM FROM ONE REGISTER (M2382).
+ *
+ * The probe below ports gf100_ram_ctor + gf108_ram_probe_fbp_amount, which is
+ * right for Kepler (gk104_ram) and WRONG for GP108: its fb is gp102_fb, whose
+ * ram is gp102_ram_new, which never probes FBPAs at all -- it asks
+ * fb->func->vidmem.size, i.e. gp102_fb_vidmem_size:
+ *
+ *     data = rd32(0x100ce0);
+ *     size = (u64)((data >> 4) & 0x3f) << ((data & 0xf) + 20);
+ *     if (data & 0x40000000) size = size / 16 * 15;
+ *
+ * The "PRI error, FB not up" after the GT 1030 POSTed (M2381) was this
+ * driver reading 0x022554 and 0x11020c -- Fermi/Kepler registers that do not
+ * exist on Pascal. Checked which variant GP108 lands on before porting it;
+ * the two before it had both been the wrong one. */
+/* THE CLOCK CEILING, MEASURED EARLY (M2383).
+ *
+ * The goal's own risk clause: nouveau cannot reclock Pascal -- nv138_chipset
+ * has NO .clk entry, while GP10B right below it does -- so the card runs at
+ * whatever the VBIOS devinit left it at, and 30 fps depends on that number.
+ *
+ * The VBIOS does not answer it: this ROM's perf table is version 0x50 and its
+ * vpstate 0x20, and nouveau parses neither (0x40 and 0x10 only). I decoded
+ * them with the older layouts once and got "5700 MHz" -- discarded.
+ *
+ * So read the hardware. This is gk104_clk's read path, which nouveau also
+ * uses for Maxwell1 (GM107): the same PLL block at 0x137000 on every part it
+ * drives. It is READ-ONLY. It is also UNVERIFIED on Pascal -- the raw
+ * registers are printed beside every decoded value, so a wrong layout shows
+ * up as an impossible number rather than as a plausible lie. The definitive
+ * figure is a timed shader, once GR runs. */
+static uint64_t g_nv_bar1_phys, g_nv_bar1_size;
+static unsigned g_nv_vram_mib;
+static uint32_t g_nv_crystal;
+static uint32_t nv_clk_pll(uint32_t pll, int depth);
+static uint32_t nv_clk_vco(uint32_t dsrc, int depth) {
+    return nv_clk_pll((nv_reg_rd(dsrc) & 0x100) ? 0x00e820 : 0x00e800, depth + 1);
+}
+static uint32_t nv_clk_div(int doff, uint32_t dsrc, uint32_t dctl, int depth) {
+    uint32_t ssrc = nv_reg_rd(dsrc + doff * 4), sctl = nv_reg_rd(dctl + doff * 4);
+    switch (ssrc & 3) {
+    case 0:  return ((ssrc & 0x30000) != 0x30000) ? g_nv_crystal : 108000;
+    case 2:  return 100000;
+    case 3: {
+        uint32_t v = nv_clk_vco(dsrc + doff * 4, depth);
+        return (sctl & 0x80000000u) ? v * 2 / ((sctl & 0x3f) + 2) : v;
+    }
+    default: return 0;
+    }
+}
+static uint32_t nv_clk_pll(uint32_t pll, int depth) {
+    if (depth > 4) return 0;
+    uint32_t ctrl = nv_reg_rd(pll), coef = nv_reg_rd(pll + 4);
+    uint32_t P = (coef >> 16) & 0x3f, N = (coef >> 8) & 0xff, M = coef & 0xff, ref;
+    uint16_t fN = 0xf000;
+    if (!(ctrl & 1) || !M) return 0;
+    switch (pll) {
+    case 0x00e800: case 0x00e820: ref = g_nv_crystal; P = 1; break;
+    case 0x132000: ref = nv_clk_pll(0x132020, depth + 1); P = (coef & 0x10000000u) ? 2 : 1; break;
+    case 0x132020: ref = nv_clk_div(0, 0x137320, 0x137330, depth + 1); fN = nv_reg_rd(pll + 0x10) >> 16; break;
+    case 0x137000: case 0x137020: case 0x137040: case 0x1370e0:
+        ref = nv_clk_div((pll & 0xff) / 0x20, 0x137120, 0x137140, depth + 1); break;
+    default: return 0;
+    }
+    if (!P) P = 1;
+    uint64_t v = (uint64_t)ref * N + (((uint64_t)(uint16_t)(fN + 4096) * ref) >> 13);
+    return (uint32_t)(v / (M * P));
+}
+static uint32_t nv_clk_read(int idx) {
+    uint32_t sctl = nv_reg_rd(0x137250 + idx * 4), sclk, sdiv;
+    if (idx < 7) {
+        if (nv_reg_rd(0x137100) & (1u << idx)) { sclk = nv_clk_pll(0x137000 + idx * 0x20, 0); sdiv = 1; }
+        else                                    { sclk = nv_clk_div(idx, 0x137160, 0x1371d0, 0); sdiv = 0; }
+    } else {
+        uint32_t ssrc = nv_reg_rd(0x137160 + idx * 4);
+        sclk = nv_clk_div(idx, 0x137160, 0x1371d0, 0); sdiv = 0;
+        if ((ssrc & 3) == 3 && (ssrc & 0x100)) {
+            if (ssrc & 0x40000000u) sclk = nv_clk_pll(0x1370e0, 0);
+            sdiv = 1;
+        }
+    }
+    if (sctl & 0x80000000u) {
+        sdiv = sdiv ? ((sctl >> 8) & 0x3f) + 2 : (sctl & 0x3f) + 2;
+        return sclk * 2 / sdiv;
+    }
+    return sclk;
+}
+static void nv_clk_report(const char *when) {
+    uint32_t strap = nv_reg_rd(0x101000) & 0x00400040u;
+    g_nv_crystal = strap == 0x00400000u ? 27000 : strap == 0x00400040u ? 25000
+                 : strap == 0x00000040u ? 14318 : 13500;
+    kprintf("[nv] clk %s: raw 137100=%08x 137000=%08x/%08x 137250=%08x 137120=%08x 137140=%08x 1373f4=%08x 132000=%08x/%08x 132020=%08x/%08x\n",
+            when, nv_reg_rd(0x137100), nv_reg_rd(0x137000), nv_reg_rd(0x137004), nv_reg_rd(0x137250),
+            nv_reg_rd(0x137120), nv_reg_rd(0x137140), nv_reg_rd(0x1373f4),
+            nv_reg_rd(0x132000), nv_reg_rd(0x132004), nv_reg_rd(0x132020), nv_reg_rd(0x132024));
+    uint32_t mem = 0, m = nv_reg_rd(0x1373f4) & 0xf;
+    if (m == 1) mem = nv_clk_pll(0x132020, 0); else if (m == 2) mem = nv_clk_pll(0x132000, 0);
+    uint32_t gpcpll = nv_reg_rd(0x137000);
+    if ((gpcpll & 0xFFF00000u) == 0xBAD00000u)
+        kprintf("[nv] clk %s: GPC PLL 0x137000 reads %08x -- a PRI error, so NO gpc clock is claimed. "
+                "On Pascal the clock block answers only NVIDIA's signed PMU firmware, which is why "
+                "nouveau has no .clk for GP108; the GPC number must come from timing real work.\n",
+                when, gpcpll);
+    kprintf("[nv] clk %s: crystal %u kHz | mem %u MHz  pmu %u MHz%s  (Kepler-layout decode, UNVERIFIED on Pascal; "
+            "GT 1030 GDDR5 is rated 1502 MHz, core 1227 base / 1468 boost)\n",
+            when, g_nv_crystal, mem / 1000, nv_clk_read(0x0c) / 1000,
+            ((gpcpll & 0xFFF00000u) == 0xBAD00000u) ? "" : "  (gpc/rop decoded below)");
+    if ((gpcpll & 0xFFF00000u) != 0xBAD00000u)
+        kprintf("[nv] clk %s: gpc %u MHz  rop %u MHz\n", when, nv_clk_read(0) / 1000, nv_clk_read(1) / 1000);
+}
+
+/* THE GPU MMU, PROVEN BY A ROUND TRIP (M2384).
+ *
+ * Goal step 4. Everything after this -- channels, pushbuffers, GR, Mesa's
+ * buffer objects -- lives behind the card's own page tables, so the first
+ * thing to establish is that we can build them and that the card walks them.
+ *
+ * Pascal's MMU is "version 2": five levels for 4 KiB pages, per nouveau's
+ * gp100_vmm_desc_12 and NVIDIA's published dev_mmu.h --
+ *     PD3 2 bits | PD2 9 | PD1 9 | PD0 8 (16-byte DUAL entries) | PT 9 | 12
+ *     PDE        = aperture << 1 | addr >> 4        (VRAM aperture = 1)
+ *     dual PDE   = { big-page PDE, SMALL-page PDE } (small in the high qword)
+ *     PTE        = valid | aperture << 1 | addr >> 4 | kind << 56  (VRAM = 0)
+ * and an instance block holding the PD3 address at 0x200 (bit 10 = ver2
+ * format, bit 11 = 64 KiB big pages, as gp100_vmm_join) and the limit at
+ * 0x208. BAR1 -- PCI BAR1, the CPU's window onto VRAM -- is bound to that
+ * block through 0x1704, exactly as gf100_bar_bar1_init.
+ *
+ * Everything is built in VRAM through the PRAMIN window (0x1700), which is
+ * how this driver already reads the VBIOS shadow, so no step depends on a
+ * mapping this test is trying to create.
+ *
+ * THE ORACLE IS TRANSLATION, NOT ACCESS. BAR1 page N is mapped to VRAM page
+ * (3 - N): a reversed mapping. An identity window, a BAR that ignores the
+ * page tables, or a PRAMIN alias would all return page N's own tag; only a
+ * card walking OUR tables returns page (3 - N)'s. Then the write direction:
+ * a word stored through BAR1 must appear at the translated address when read
+ * back through PRAMIN. */
+#define NV_MMU_BASE   0x10000000u          /* 256 MiB into VRAM: clear of the VGA/VBIOS areas */
+#define NV_MMU_INST   (NV_MMU_BASE + 0x0000)
+#define NV_MMU_PD3    (NV_MMU_BASE + 0x1000)
+#define NV_MMU_PD2    (NV_MMU_BASE + 0x2000)
+#define NV_MMU_PD1    (NV_MMU_BASE + 0x3000)
+#define NV_MMU_PD0    (NV_MMU_BASE + 0x4000)
+#define NV_MMU_PT     (NV_MMU_BASE + 0x5000)
+#define NV_MMU_DATA   (NV_MMU_BASE + 0x100000)
+static uint32_t g_nv_pramin_win = 0xffffffffu;
+static void nv_vram_win(uint32_t a) {
+    if ((a >> 16) != g_nv_pramin_win) { g_nv_pramin_win = a >> 16; nv_reg_wr(0x1700, g_nv_pramin_win); }
+}
+static void nv_vram_wr32(uint32_t a, uint32_t v) {
+    nv_vram_win(a); *(volatile uint32_t *)(nv_bar0 + 0x700000 + (a & 0xffff)) = v;
+}
+static uint32_t nv_vram_rd32(uint32_t a) {
+    nv_vram_win(a); return *(volatile uint32_t *)(nv_bar0 + 0x700000 + (a & 0xffff));
+}
+static void nv_vram_wr64(uint32_t a, uint64_t v) { nv_vram_wr32(a, (uint32_t)v); nv_vram_wr32(a + 4, (uint32_t)(v >> 32)); }
+static int nv_wait(uint32_t reg, uint32_t mask, uint32_t want, unsigned ms) {
+    for (unsigned t = 0; t <= ms; t++) {
+        if ((nv_reg_rd(reg) & mask) == want) return 1;
+        nv_mdelay(1);
+    }
+    return 0;
+}
+static volatile uint32_t *g_nv_b1;
+static int nv_mmu_bar1_test(void) {
+    if (!g_nv_bar1_phys || g_nv_bar1_size < (1u << 20)) { kprintf("[nv] mmu: no BAR1 aperture recorded -- skipped\n"); return 0; }
+    if (g_nv_vram_mib < 512) { kprintf("[nv] mmu: VRAM not verified (%u MiB) -- skipped\n", g_nv_vram_mib); return 0; }
+    uint32_t saved1700 = nv_reg_rd(0x1700);
+    g_nv_pramin_win = 0xffffffffu;
+
+    /* zero every table page: a zero entry is an invalid one */
+    for (uint32_t a = NV_MMU_INST; a < NV_MMU_PT + 0x1000; a += 4) nv_vram_wr32(a, 0);
+    /* tag four data pages and scribble a sentinel over their write slot */
+    for (int n = 0; n < 4; n++) {
+        nv_vram_wr32(NV_MMU_DATA + n * 0x1000,       0xC0DE0000u | n);
+        nv_vram_wr32(NV_MMU_DATA + n * 0x1000 + 0x40, 0x5EED0000u | n);
+    }
+    nv_vram_wr64(NV_MMU_PD3, (1ull << 1) | (NV_MMU_PD2 >> 4));
+    nv_vram_wr64(NV_MMU_PD2, (1ull << 1) | (NV_MMU_PD1 >> 4));
+    nv_vram_wr64(NV_MMU_PD1, (1ull << 1) | (NV_MMU_PD0 >> 4));
+    nv_vram_wr64(NV_MMU_PD0 + 0, 0);                                   /* no big-page table */
+    nv_vram_wr64(NV_MMU_PD0 + 8, (1ull << 1) | (NV_MMU_PT >> 4));      /* small-page table   */
+    for (int n = 0; n < 4; n++)                                        /* REVERSED mapping   */
+        nv_vram_wr64(NV_MMU_PT + n * 8, 1ull | ((uint64_t)(NV_MMU_DATA + (3 - n) * 0x1000) >> 4));
+    nv_vram_wr64(NV_MMU_INST + 0x200, (1ull << 10) | (1ull << 11) | NV_MMU_PD3);
+    nv_vram_wr64(NV_MMU_INST + 0x208, g_nv_bar1_size - 1);
+    /* read one table entry back: if PRAMIN writes do not land, say so here */
+    uint32_t pt0 = nv_vram_rd32(NV_MMU_PT), inst200 = nv_vram_rd32(NV_MMU_INST + 0x200);
+    kprintf("[nv] mmu: tables built in VRAM @%x (PT[0] reads back %08x, inst+0x200 %08x)\n",
+            NV_MMU_BASE, pt0, inst200);
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+
+    uint32_t old1704 = nv_reg_rd(0x1704);
+    nv_reg_wr(0x1704, 0x80000000u | (NV_MMU_INST >> 12));
+    int bound = nv_wait(0x1710, 0x3, 0, 2000);
+    /* invalidate: gf100_vmm_invalidate with gp100's 64-bit PDB, PAGE_ALL|HUB_ONLY */
+    int slot = 0;                                    /* ANY free slot, not all of them */
+    for (unsigned t = 0; t <= 2000 && !(slot = !!(nv_reg_rd(0x100c80) & 0x00ff0000u)); t++) nv_mdelay(1);
+    uint64_t pdb = (uint64_t)(NV_MMU_PD3 >> 12) << 4;                  /* aperture 0 = VRAM */
+    nv_reg_wr(0x100cb8, (uint32_t)pdb);
+    nv_reg_wr(0x100cec, (uint32_t)(pdb >> 32));
+    nv_reg_wr(0x100cbc, 0x80000000u | 0x1 | 0x4);
+    int inval = nv_wait(0x100c80, 0x00008000u, 0x00008000u, 2000);
+    kprintf("[nv] mmu: BAR1 bound (0x1704 %08x -> %08x, 0x1710 %s), invalidate slot %s / %s\n",
+            old1704, nv_reg_rd(0x1704), bound ? "idle" : "STUCK BUSY",
+            slot ? "free" : "none", inval ? "queued" : "NOT ACKED");
+
+    volatile uint32_t *b1 = (volatile uint32_t *)map_mmio(g_nv_bar1_phys, 0x20000);
+    if (!b1) { kprintf("[nv] mmu: could not map BAR1\n"); return 0; }
+    g_nv_b1 = b1;
+    int ok_rd = 0;
+    for (int n = 0; n < 4; n++) {
+        uint32_t v = b1[n * 0x400], want = 0xC0DE0000u | (3 - n);
+        kprintf("[nv] mmu: BAR1 page %d reads %08x (tag of VRAM page %d would be %08x) %s\n",
+                n, v, 3 - n, want, v == want ? "TRANSLATED" : v == (0xC0DE0000u | n) ? "IDENTITY -- tables ignored" : "WRONG");
+        ok_rd += v == want;
+    }
+    b1[0x10] = 0xB1A5B1A5u;                                            /* BAR1 page 0, +0x40 */
+    nv_reg_wr(0x070000, 1);
+    int fl = nv_wait(0x070000, 0x2, 0, 2000);
+    g_nv_pramin_win = 0xffffffffu;
+    uint32_t landed = nv_vram_rd32(NV_MMU_DATA + 3 * 0x1000 + 0x40);   /* page 0 -> VRAM page 3 */
+    uint32_t other  = nv_vram_rd32(NV_MMU_DATA + 0 * 0x1000 + 0x40);
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+    kprintf("[nv] mmu: write via BAR1 page 0 -> VRAM page 3 reads %08x (want b1a5b1a5), page 0 still %08x (want 5eed0000), flush %s\n",
+            landed, other, fl ? "done" : "TIMED OUT");
+    int pass = ok_rd == 4 && landed == 0xB1A5B1A5u && other == 0x5EED0000u;
+    kprintf("[nv] mmu: %s -- %s\n", pass ? "PASS" : "FAIL",
+            pass ? "the card walks OUR five-level page tables, both directions"
+                 : "see the lines above for which direction broke");
+    return pass;
+}
+
+/* WHICH ENGINE IS ON WHICH RUNLIST (M2384) -- read-only, gk104_top_parse.
+ *
+ * The first channel must NOT go on the GR runlist: switching GR's context is
+ * FECS's job, and FECS is signed firmware that is not loaded yet, so a GR
+ * channel would hang at its first context load. A copy engine's context is
+ * switched by the host itself. The device-info table at 0x22700 names every
+ * engine with its runlist, and 0x2390+i*4 says which runlists each PBDMA
+ * serves (gk104_fifo_oneinit), so this is where the first channel's home is
+ * read, not assumed. */
+static int g_nv_ce_runl = -1, g_nv_ce_reset = -1, g_nv_gr_runl = -1, g_nv_ce_pbdma = -1;
+static uint32_t g_nv_npbdma;
+static struct { uint32_t type; int runl, reset; } g_nv_eng[16];
+static int g_nv_neng;
+static void nv_top_report(void) {
+    static const char *const names[] = { "GR", "CE0", "CE1", "CE2", "?", "?", "?", "?", "MSPDEC", "MSPPP",
+                                         "MSVLD", "MSENC", "VIC", "SEC2", "NVENC", "NVENC1", "NVDEC", "?",
+                                         "IOCTRL", "LCE", "GSP", "NVJPG" };
+    uint32_t type = ~0u, inst = 0, addr = 0; int runl = -1, eng = -1, reset = -1, intr = -1, fault = -1, n = 0;
+    for (int i = 0; i < 64; i++) {
+        uint32_t d = nv_reg_rd(0x022700 + i * 4);
+        if ((d & 0xFFF00000u) == 0xBAD00000u) { kprintf("[nv] top: entry %d reads %08x -- PRI error, table not readable\n", i, d); return; }
+        switch (d & 3) {
+        case 0: continue;
+        case 1:
+            inst = (d >> 26) & 0xf; addr = d & 0x00fff000u;
+            if (d & 4) fault = (d >> 3) & 0x7f;
+            break;
+        case 2:
+            if (d & 0x20) eng   = (d >> 26) & 0xf;
+            if (d & 0x10) runl  = (d >> 21) & 0xf;
+            if (d & 0x08) intr  = (d >> 15) & 0x1f;
+            if (d & 0x04) reset = (d >> 9) & 0x1f;
+            break;
+        case 3: type = (d >> 2) & 0x1fffffff; break;
+        }
+        if (d & 0x80000000u) continue;
+        const char *nm = type < sizeof(names) / sizeof(names[0]) ? names[type] : "?";
+        kprintf("[nv] top: %s inst %u  runlist %d  engine %d  addr %06x  reset %d  intr %d  fault %d\n",
+                nm, inst, runl, eng, addr, reset, intr, fault);
+        if (g_nv_neng < 16) { g_nv_eng[g_nv_neng].type = type; g_nv_eng[g_nv_neng].runl = runl; g_nv_eng[g_nv_neng].reset = reset; g_nv_neng++; }
+        if (type == 0) g_nv_gr_runl = runl;
+        type = ~0u; inst = 0; addr = 0; runl = eng = reset = intr = fault = -1; n++;
+    }
+    uint32_t npb = nv_reg_rd(0x002004) & 0xff;
+    g_nv_npbdma = npb;
+    kprintf("[nv] top: %d engine(s); %u PBDMA(s):", n, npb);
+    for (uint32_t i = 0; i < npb && i < 16; i++) kprintf(" pbdma%u->runlists %03x", i, nv_reg_rd(0x002390 + i * 4));
+    /* A COPY ENGINE THAT DOES NOT SHARE GR'S RUNLIST (M2385). The first
+     * version took the first CE it saw -- LCE0, which on GP108 sits on
+     * runlist 0 WITH GR, so the channel landed on the one runlist this
+     * comment says to avoid, and never ran. */
+    for (int e = 0; e < g_nv_neng && g_nv_ce_runl < 0; e++) {
+        uint32_t t = g_nv_eng[e].type;
+        if ((t == 1 || t == 2 || t == 3 || t == 0x13) && g_nv_eng[e].runl >= 0 && g_nv_eng[e].runl != g_nv_gr_runl) {
+            g_nv_ce_runl = g_nv_eng[e].runl; g_nv_ce_reset = g_nv_eng[e].reset;
+        }
+    }
+    for (uint32_t i = 0; i < npb && i < 16 && g_nv_ce_runl >= 0; i++)
+        if (nv_reg_rd(0x002390 + i * 4) & (1u << g_nv_ce_runl)) { g_nv_ce_pbdma = (int)i; break; }
+    kprintf("\n[nv] top: GR is on runlist %d; first channel goes on runlist %d (a copy engine of its own: "
+            "host-switched, no firmware), served by PBDMA %d\n", g_nv_gr_runl, g_nv_ce_runl, g_nv_ce_pbdma);
+}
+
+
+/* THE FIRST CHANNEL: THE CARD EXECUTES A COMMAND STREAM OF OURS (M2385).
+ *
+ * The smallest proof that the command processor runs our work, with no
+ * firmware anywhere in the path: one channel, one GPFIFO entry, one five-word
+ * pushbuffer whose only job is a host SEMAPHORE RELEASE -- a PBDMA method
+ * (0x10-0x1c, class-independent), so neither GR nor FECS is involved. If the
+ * payload appears at the semaphore's address and USERD's GP_GET advances to
+ * GP_PUT, the host fetched our GPFIFO through our page tables, parsed our
+ * method header, and wrote memory on our behalf.
+ *
+ * Every step is nouveau's, for the chip it actually uses:
+ *   gm107_chan    bind = 0x800000 <- 0x80000000 | inst>>12, start = 0x800004 |= 0x400
+ *   gk104 ramfc   the RAMFC words at 0x08..0xfc (USERD, GP_BASE, limit2, devm = BIT(0))
+ *   gp100 runl    a TSG header (gk110_runl_insert_cgrp, .force on gp100) then the
+ *                 channel: chid | runq<<14, inst>>12; commit 0x2270/0x2274,
+ *                 wait for 0x2284 pending to clear
+ *   gk104 fifo    0x2254 = 0x10000000 | USERD's BAR1 address >> 12; PBDMAs on via
+ *                 0x204; gk208 runq init
+ * and the channel lives on a COPY ENGINE's runlist, read from the TOP table,
+ * because a GR channel's first context load needs FECS.
+ *
+ * FIFO and PBDMA interrupts stay MASKED: OS-DEV has no NVIDIA interrupt
+ * handler yet, and an unmasked line would storm. Their status registers
+ * latch regardless and are read back below.
+ *
+ * GPU VA 0x10000-0x1ffff maps 1:1 onto VRAM NV_MMU_BASE + VA, in the same
+ * page tables the BAR1 test proved, so the CPU reaches every structure
+ * through BAR1 at the same offset the GPU uses. */
+#define NV_CH_INST    0x10000u
+#define NV_CH_USERD   0x11000u
+#define NV_CH_RUNL    0x12000u
+#define NV_CH_GPFIFO  0x13000u
+#define NV_CH_PUSH    0x14000u
+#define NV_CH_SEM     0x15000u
+#define NV_CH_PAYLOAD 0xFACE1030u
+static void nv_channel_test(void) {
+    if (g_nv_ce_runl < 0 || !g_nv_b1) { kprintf("[nv] chan: no copy-engine runlist or no BAR1 -- skipped\n"); return; }
+    int runl = g_nv_ce_runl;
+    uint32_t saved1700 = nv_reg_rd(0x1700);
+    g_nv_pramin_win = 0xffffffffu;
+
+    /* engines on: PFIFO (bit 8) and the copy engine's own reset bit; PBDMAs via 0x204 */
+    uint32_t pmc0 = nv_reg_rd(0x000200), want = pmc0 | 0x100u | (g_nv_ce_reset >= 0 ? 1u << g_nv_ce_reset : 0);
+    nv_reg_wr(0x000200, want);
+    uint32_t pbmask = g_nv_npbdma >= 32 ? 0xffffffffu : (1u << g_nv_npbdma) - 1;
+    nv_reg_wr(0x000204, pbmask);
+    for (uint32_t i = 0; i < g_nv_npbdma && i < 16; i++) {                /* gk208_runq_init */
+        uint32_t o = i * 0x2000;
+        nv_reg_wr(0x04013c + o, nv_reg_rd(0x04013c + o) & ~0x10000100u);
+        nv_reg_wr(0x040108 + o, 0xffffffffu);
+        nv_reg_wr(0x040148 + o, 0xffffffffu);
+        nv_reg_wr(0x04012c + o, 0x000f4240u);
+    }
+    nv_reg_wr(0x002a04, nv_reg_rd(0x002a04) | 0xbfffffffu);
+    nv_reg_wr(0x002100, 0xffffffffu);
+    kprintf("[nv] chan: PMC 0x200 %08x -> %08x, 0x204 = %08x (%u PBDMAs), CE reset bit %d, runlist %d\n",
+            pmc0, nv_reg_rd(0x000200), nv_reg_rd(0x000204), g_nv_npbdma, g_nv_ce_reset, runl);
+
+    /* the structures, zeroed, then filled -- all in VRAM through PRAMIN */
+    for (uint32_t a = NV_CH_INST; a < NV_CH_SEM + 0x1000; a += 4) nv_vram_wr32(NV_MMU_BASE + a, 0);
+    nv_vram_wr32(NV_MMU_BASE + NV_CH_SEM, 0xDEADDEADu);                   /* sentinel */
+    const uint32_t hdr = 0x20000000u | (4u << 16) | (0u << 13) | (0x0010u >> 2);
+    const uint32_t push[5] = { hdr, 0, NV_CH_SEM, NV_CH_PAYLOAD, 0x01000002u }; /* SEM A,B,C,D = RELEASE, 4 bytes */
+    for (int i = 0; i < 5; i++) nv_vram_wr32(NV_MMU_BASE + NV_CH_PUSH + i * 4, push[i]);
+    nv_vram_wr32(NV_MMU_BASE + NV_CH_GPFIFO + 0, NV_CH_PUSH);
+    nv_vram_wr32(NV_MMU_BASE + NV_CH_GPFIFO + 4, 5u << 10);              /* length in dwords */
+    const uint32_t ci = NV_MMU_BASE + NV_CH_INST, userd = NV_MMU_BASE + NV_CH_USERD;
+    nv_vram_wr32(ci + 0x08, userd);            nv_vram_wr32(ci + 0x0c, 0);
+    nv_vram_wr32(ci + 0x10, 0x0000face);       nv_vram_wr32(ci + 0x30, 0xfffff902);
+    nv_vram_wr32(ci + 0x48, NV_CH_GPFIFO);     nv_vram_wr32(ci + 0x4c, 9u << 16);   /* 512 entries */
+    nv_vram_wr32(ci + 0x84, 0x20400000);       nv_vram_wr32(ci + 0x94, 0x30000000 | 1u);
+    nv_vram_wr32(ci + 0x9c, 0x00000100);       nv_vram_wr32(ci + 0xac, 0x0000001f);
+    nv_vram_wr32(ci + 0xe4, 0);                nv_vram_wr32(ci + 0xe8, 0);          /* not priv; chid 0 */
+    nv_vram_wr32(ci + 0xb8, 0xf8000000);       nv_vram_wr32(ci + 0xf8, 0x10003080);
+    nv_vram_wr32(ci + 0xfc, 0x10000010);
+    nv_vram_wr64(ci + 0x200, (1ull << 10) | (1ull << 11) | NV_MMU_PD3);  /* same VMM as BAR1 */
+    nv_vram_wr64(ci + 0x208, g_nv_bar1_size - 1);
+    const uint32_t rl = NV_MMU_BASE + NV_CH_RUNL;
+    nv_vram_wr32(rl + 0, (1u << 26) | (128u << 18) | (3u << 14) | 0x2000u | 0);  /* TSG 0, 1 channel */
+    nv_vram_wr32(rl + 4, 0);
+    nv_vram_wr32(rl + 8, 0 | (0u << 14));                                /* chid 0, runq 0 */
+    nv_vram_wr32(rl + 12, ci >> 12);
+    for (uint32_t va = 0x10000; va < 0x20000; va += 0x1000)               /* VA -> NV_MMU_BASE + VA */
+        nv_vram_wr64(NV_MMU_PT + (va >> 12) * 8, 1ull | ((uint64_t)(NV_MMU_BASE + va) >> 4));
+    uint32_t chk = nv_vram_rd32(NV_MMU_BASE + NV_CH_PUSH);
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+
+    for (unsigned t = 0; t <= 2000 && !(nv_reg_rd(0x100c80) & 0x00ff0000u); t++) nv_mdelay(1);
+    uint64_t pdb = (uint64_t)(NV_MMU_PD3 >> 12) << 4;
+    nv_reg_wr(0x100cb8, (uint32_t)pdb); nv_reg_wr(0x100cec, (uint32_t)(pdb >> 32));
+    nv_reg_wr(0x100cbc, 0x80000000u | 0x1);                               /* PAGE_ALL, every TLB */
+    int inval = nv_wait(0x100c80, 0x00008000u, 0x00008000u, 2000);
+    uint32_t viab1 = g_nv_b1[NV_CH_PUSH / 4];
+    kprintf("[nv] chan: structures built (push[0] %08x via PRAMIN, %08x via BAR1), TLB invalidate %s\n",
+            chk, viab1, inval ? "queued" : "NOT ACKED");
+
+    nv_reg_wr(0x002254, 0x10000000u | (NV_CH_USERD >> 12));
+    nv_reg_wr(0x800000, 0x80000000u | (ci >> 12));                        /* bind chid 0 */
+    nv_reg_wr(0x800004, nv_reg_rd(0x800004) | 0x400u);                    /* enable */
+    uint32_t blk = nv_reg_rd(0x002630);                                   /* gk104_runl_allow */
+    nv_reg_wr(0x002630, blk & ~(1u << runl));
+    nv_reg_wr(0x002270, (0u << 28) | (rl >> 12));
+    nv_reg_wr(0x002274, ((uint32_t)runl << 20) | 2);
+    int rlok = nv_wait(0x002284 + runl * 8, 0x00100000u, 0, 2000);
+    kprintf("[nv] chan: bound + enabled (0x800000 %08x, 0x800004 %08x), runlist %d committed: %s, sched block %08x -> %08x\n",
+            nv_reg_rd(0x800000), nv_reg_rd(0x800004), runl, rlok ? "not pending" : "STILL PENDING",
+            blk, nv_reg_rd(0x002630));
+
+    g_nv_b1[(NV_CH_USERD + 0x8c) / 4] = 1;                                 /* GP_PUT = 1: go */
+    nv_reg_wr(0x070000, 1); nv_wait(0x070000, 0x2, 0, 2000);
+    uint32_t sem = 0, gpget = 0; unsigned ms = 0;
+    for (; ms <= 2000; ms++) {
+        sem = g_nv_b1[NV_CH_SEM / 4]; gpget = g_nv_b1[(NV_CH_USERD + 0x88) / 4];
+        if (sem == NV_CH_PAYLOAD && gpget == 1) break;
+        nv_mdelay(1);
+    }
+    uint32_t pb = g_nv_ce_pbdma >= 0 ? (uint32_t)g_nv_ce_pbdma * 0x2000 : 0;
+    kprintf("[nv] chan: after %u ms: semaphore %08x (want %08x), USERD GP_GET %u (want 1), "
+            "chan 0x800004 %08x (status %u), PFIFO intr %08x\n",
+            ms, sem, NV_CH_PAYLOAD, gpget, nv_reg_rd(0x800004), (nv_reg_rd(0x800004) >> 24) & 0xf,
+            nv_reg_rd(0x002100));
+    kprintf("[nv] chan: PBDMA %d: intr0 %08x  mthd-addr %08x  data %08x  chid %08x  intr1 %08x (%08x %08x)\n",
+            g_nv_ce_pbdma, nv_reg_rd(0x040108 + pb), nv_reg_rd(0x0400c0 + pb), nv_reg_rd(0x0400c4 + pb),
+            nv_reg_rd(0x040120 + pb), nv_reg_rd(0x040148 + pb), nv_reg_rd(0x040150 + pb), nv_reg_rd(0x040154 + pb));
+    int pass = sem == NV_CH_PAYLOAD && gpget == 1;
+    kprintf("[nv] chan: %s -- %s\n", pass ? "PASS" : "FAIL",
+            pass ? "the GT 1030 fetched OUR GPFIFO, parsed OUR pushbuffer, and released OUR semaphore"
+                 : sem == 0xDEADDEADu ? "the semaphore was never written; see the channel/intr state above"
+                                      : "the semaphore holds something unexpected");
+    nv_reg_wr(0x800004, nv_reg_rd(0x800004) | 0x800u);                    /* stop: gk104_chan_stop */
+}
+
+/* NVIDIA'S SIGNED FIRMWARE, FROM OUR ROOT FILESYSTEM (M2386).
+ *
+ * Goal step 5 (ACR/secure boot, then FECS/GPCCS for GR) consumes the gp108
+ * blobs the Makefile stages into the ext2 root -- 20 files, counted there.
+ * They are read from the VFS, which does not exist yet when nvgpu_init runs
+ * (PCI enumeration is long before the disks mount), and where the disks
+ * mount depends on which controller they sit behind. So the late half of
+ * the driver is a kernel thread that waits until the firmware is actually
+ * readable, instead of a call placed at a line of kmain that is right for
+ * one VM's disk layout. */
+#define NV_FW_ROOT "/disk2/lib/firmware/nvidia/gp108/"
+static const char *const nv_fw_files[] = {
+    "acr/bl.bin", "acr/ucode_load.bin", "acr/unload_bl.bin", "acr/ucode_unload.bin",
+    "gr/fecs_bl.bin", "gr/fecs_inst.bin", "gr/fecs_data.bin", "gr/fecs_sig.bin",
+    "gr/gpccs_bl.bin", "gr/gpccs_inst.bin", "gr/gpccs_data.bin", "gr/gpccs_sig.bin",
+    "gr/sw_ctx.bin", "gr/sw_nonctx.bin", "gr/sw_bundle_init.bin", "gr/sw_method_init.bin",
+    "sec2/desc.bin", "sec2/image.bin", "sec2/sig.bin", "nvdec/scrubber.bin",
+};
+static uint8_t *nv_fw_load(const char *rel, unsigned *len) {
+    char path[128]; unsigned n = 0;
+    for (const char *p = NV_FW_ROOT; *p && n < sizeof(path) - 1; ) path[n++] = *p++;
+    for (const char *p = rel; *p && n < sizeof(path) - 1; ) path[n++] = *p++;
+    path[n] = 0;
+    struct statx st;
+    if (vfs_stat(path, &st) != 0) { kprintf("[nv] fw: %s: NOT FOUND\n", path); return NULL; }
+    unsigned long sz = st.stx_size;
+    uint8_t *b = kmalloc(sz ? sz : 1);
+    if (!b) { kprintf("[nv] fw: %s: no memory for %lu bytes\n", path, sz); return NULL; }
+    long got = vfs_read(path, b, sz);
+    if (got < 0 || (unsigned long)got != sz) {         /* a short read is not a firmware image */
+        kprintf("[nv] fw: %s: read %ld of %lu bytes -- refused\n", path, got, sz);
+        kfree(b); return NULL;
+    }
+    *len = (unsigned)sz;
+    return b;
+}
+static void nvgpu_late_task(void) {
+    struct statx st; unsigned waited = 0;
+    while (vfs_stat(NV_FW_ROOT "acr/bl.bin", &st) != 0 && waited < 120000) { task_sleep_ms(100); waited += 100; }
+    if (waited >= 120000) { kprintf("[nv] fw: the root filesystem never offered " NV_FW_ROOT " -- step 5 cannot start\n"); task_exit(); }
+    unsigned ok = 0, total = 0;
+    for (unsigned i = 0; i < sizeof(nv_fw_files) / sizeof(nv_fw_files[0]); i++) {
+        unsigned len = 0; uint8_t *b = nv_fw_load(nv_fw_files[i], &len);
+        if (!b) continue;
+        uint32_t w0 = len >= 4 ? (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24 : 0;
+        kprintf("[nv] fw: %s %u bytes, word0 %08x\n", nv_fw_files[i], len, w0);
+        ok++; total += len; kfree(b);
+    }
+    kprintf("[nv] fw: %u of %u gp108 firmware files read from the root filesystem (%u bytes) after %u ms\n",
+            ok, (unsigned)(sizeof(nv_fw_files) / sizeof(nv_fw_files[0])), total, waited);
+    task_exit();
+}
+
+static void nv_vram_probe_gp102(const char *when) {
+    uint32_t d = nv_reg_rd(0x100ce0);
+    if ((d & 0xFFF00000u) == 0xBAD00000u) {
+        kprintf("[nv] %s: 0x100ce0 reads %08x -- PRI error, FB not up\n", when, d);
+        return;
+    }
+    uint32_t lmag = (d >> 4) & 0x3f, lsca = d & 0xf;
+    uint64_t bytes = (uint64_t)lmag << (lsca + 20);
+    if (d & 0x40000000u) bytes = bytes / 16 * 15;
+    uint64_t mib = bytes >> 20;
+    g_nv_vram_mib = (unsigned)mib;
+    kprintf("[nv] %s: 0x100ce0 = %08x -> VRAM %lu MiB -- %s\n", when, d, (unsigned long)mib,
+            mib == 2048 ? "MATCHES nouveau's 2048 MiB: memory is initialised"
+          : mib == 0    ? "zero: memory not initialised"
+                        : "does NOT match nouveau's 2048 MiB");
+}
+
 static void nv_vram_probe(const char *when) {
+    unsigned chip = (nv_boot0 >> 20) & 0x1ff;
+    if (chip >= 0x132 && chip <= 0x13f) { nv_vram_probe_gp102(when); return; }   /* GP102..GP108 */
     /* gf108_ram_probe_fbp_amount, WHICH IS WHAT KEPLER USES (M2379). The
      * first version copied gf100_ram_probe_fbp_amount -- one FBPA per FBP --
      * and read 512 MiB. gk104_ram points at the gf108 variant instead, which
@@ -1003,6 +1508,7 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
                       : "dry run (computing every read/write, touching nothing; "
                         "-append nvexec to arm it)");
     nv_vram_probe("BEFORE devinit");
+    nv_clk_report("BEFORE devinit");
     int r = nv_run(script0, 0, &exec, &ops);
     kprintf("[nv] devinit: %s after %d opcode(s), exec flag %d\n",
             r == 0 ? "COMPLETED" : "ABORTED", ops, exec);
@@ -1025,9 +1531,9 @@ static void nvgpu_devinit_run(unsigned script0, unsigned cond_table) {
     }
     if (g_nv_skipped_vga || g_nv_skipped_i2c || g_nv_skipped_gpio)
         kprintf("[nv] devinit: drove %u GPIO line(s) to their VBIOS defaults\n", g_nv_gpio_driven);
-        kprintf("[nv] devinit: register addresses -- %u had low bits set, %u carried "
-                "head/OR/link FLAGS, %u were out of range after translation\n",
-                g_nv_reg_lowbits, g_nv_reg_flagged, g_nv_reg_oob);
+    kprintf("[nv] devinit: register addresses -- %u had low bits set, %u carried "
+            "head/OR/link FLAGS, %u were out of range after translation\n",
+            g_nv_reg_lowbits, g_nv_reg_flagged, g_nv_reg_oob);
         kprintf("[nv] devinit: CONDITION_TIME ran %u time(s): %u had to WAIT for their "
                 "condition, %u TIMED OUT and suspended execution\n",
                 g_nv_ctime_calls, g_nv_ctime_waited, g_nv_ctime_timeouts);
@@ -1196,6 +1702,12 @@ static int nvgpu_pmu_devinit(unsigned da, unsigned bit_i_off) {
             kprintf("[nv] AFTER PMU devinit: 0x2240c = %08x -> the card %s POSTing\n", post,
                     (post & 2) ? "does NOT need" : "STILL NEEDS");
             nv_vram_probe("AFTER PMU devinit");
+            nv_clk_report("AFTER PMU devinit");
+            if (post & 2) {
+                nv_top_report();
+                if (nv_mmu_bar1_test()) nv_channel_test();
+                task_create(nvgpu_late_task, 0, 0);          /* step 5 starts once the root is mounted */
+            }
         }
         return done ? 0 : -1;
     }
@@ -1372,6 +1884,10 @@ int nvgpu_bit_probe(void) { return nvgpu_bit(); }
  * never measured. */
 static void nvgpu_vram(void) {
     if (!nv_bar0) return;
+    /* Pascal answers through 0x100ce0 (M2383): this FBPA walk read PRI-error
+     * words on the GT 1030 and summed them into "3135188992 MiB". */
+    unsigned chip = (nv_boot0 >> 20) & 0x1ff;
+    if (chip >= 0x132 && chip <= 0x13f) { nv_vram_probe("at init"); return; }
     uint32_t fbps  = nv_reg_rd(0x022438);
     uint32_t fbpao = nv_reg_rd(0x021c14);
     uint32_t fbpas = nv_reg_rd(0x022458);
@@ -1388,7 +1904,12 @@ static void nvgpu_vram(void) {
         uint32_t fbpa = fbp * fbpas, sub = 0;
         for (uint32_t k = 0; k < fbpas; k++, fbpa++) {
             if (fbpao & (1u << fbpa)) continue;
-            sub += nv_reg_rd(0x90020c + fbpa * 0x4000);
+            uint32_t v = nv_reg_rd(0x90020c + fbpa * 0x4000);
+            if ((v & 0xFFF00000u) == 0xBAD00000u) {
+                kprintf("[nv] fb: FBPA %u size reads %08x -- a PRI error, not a size; no VRAM size claimed.\n", fbpa, v);
+                return;
+            }
+            sub += v;
         }
         if (sub) { live++; total += sub; }
     }
@@ -1437,6 +1958,7 @@ int nvgpu_init(void) {
                     (unsigned long)base, (unsigned long)(sz >= (1u<<20) ? sz >> 20 : sz >> 10),
                     sz >= (1u<<20) ? "MiB" : "KiB");
         if (i == 0) { b0 = base; b0sz = sz; }
+        if (i == 1) { g_nv_bar1_phys = base; g_nv_bar1_size = sz; }
         if (is64) i++;                       /* the pair consumed the next slot */
     }
 

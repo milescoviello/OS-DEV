@@ -1,5 +1,95 @@
 # What's next
 
+> **(M2386) NVIDIA'S SIGNED GP108 FIRMWARE LOADS FROM OS-DEV'S OWN ROOT
+> FILESYSTEM** -- all 20 files, 205,892 bytes, each size-checked against its
+> `statx`. The four ACR images start with `0x10de`, the header magic nouveau
+> checks. The ext2 root does not exist yet when `nvgpu_init` runs, and where
+> it mounts depends on the VM's disk controller. So the driver's late half
+> is a kernel thread that waits until the firmware is actually readable,
+> rather than a call placed at one line of kmain. This is the input to goal
+> step 5 (ACR, then FECS/GPCCS for GR).
+
+> **(M2385) THE GT 1030 RUNS A COMMAND STREAM OF OURS.**
+>
+> ```
+> [nv] top: GR is on runlist 0; first channel goes on runlist 5 (a copy engine of its own), served by PBDMA 2
+> [nv] chan: after 0 ms: semaphore face1030 (want face1030), USERD GP_GET 1 (want 1)
+> [nv] chan: PBDMA 2: intr0 00000000  mthd-addr 00000000  data 00000000
+> [nv] chan: PASS -- the GT 1030 fetched OUR GPFIFO, parsed OUR pushbuffer, and released OUR semaphore
+> ```
+>
+> The test is one channel with one GPFIFO entry and a five-word pushbuffer.
+> Its only job is a host SEMAPHORE RELEASE, which is a PBDMA method, so no
+> firmware is involved anywhere in the path. The payload appeared at the
+> semaphore's GPU virtual address and GP_GET advanced to GP_PUT. The host
+> fetched our GPFIFO through the page tables M2384 proved, parsed our method
+> header, and wrote memory for us. **Goal step 4 is done:** devinit, VRAM, the
+> GPU MMU, and a FIFO channel that executes work.
+>
+> The channel structures are nouveau's, for the chip it actually uses:
+> - RAMFC words from `gk104_chan_ramfc_write`;
+> - binding per `gm107_chan`;
+> - a runlist of one channel group and one channel, per `gp100_runl` (it
+>   forces a group);
+> - PBDMA and runq init per `gk208`.
+>
+> FIFO and PBDMA interrupts stay masked, because there is no NVIDIA interrupt
+> handler yet; their status registers latch regardless and are read back.
+>
+> **The first attempt did not run, and the reason was mine.** It put the
+> channel on the first copy engine the TOP table named. That was LCE0, which
+> on GP108 shares **runlist 0 with GR**, the one runlist the code's own
+> comment said to avoid, because switching GR context is FECS's job and FECS
+> is signed firmware. The channel reached ON_PBDMA and stopped there. The
+> table itself answered the question: LCE2 and LCE3 have runlists 5 and 6 to
+> themselves, and the selector now refuses GR's runlist.
+
+> **(M2383-M2384) THE GT 1030 HAS 2048 MiB OF WORKING VRAM, AND IT WALKS OUR
+> PAGE TABLES. ITS MEMORY RUNS AT 405 MHz.**
+>
+> ```
+> [nv] BEFORE devinit:    0x100ce0 = 00000000 -> VRAM 0 MiB -- memory not initialised
+> [nv] AFTER PMU devinit: 0x100ce0 = 00000206 -> VRAM 2048 MiB -- MATCHES nouveau's 2048 MiB
+> [nv] mmu: BAR1 page 0 reads c0de0003 (tag of VRAM page 3 would be c0de0003) TRANSLATED
+>   ... pages 1-3 likewise, reversed ...
+> [nv] mmu: write via BAR1 page 0 -> VRAM page 3 reads b1a5b1a5, page 0 still 5eed0000
+> [nv] mmu: PASS -- the card walks OUR five-level page tables, both directions
+> ```
+>
+> **VRAM (M2383).** The "PRI error, FB not up" after M2381's POST was not a
+> privring problem, as M2381 guessed. It was this driver reading Fermi and
+> Kepler FBPA registers that Pascal does not have. GP108's fb is `gp102_fb`,
+> which sizes memory from one register, `0x100ce0`. It reads 0 before the PMU
+> devinit and exactly 2 GiB after, so the POST really did bring up the
+> memory controller. I nearly ported the wrong probe a third time, and checked
+> which variant GP108 actually uses before writing it.
+>
+> **THE CLOCK CEILING, EARLY, AS THE GOAL DEMANDS.** nouveau cannot reclock
+> GP108: `nv138_chipset` has no `.clk` at all. Measured on the card after
+> POST:
+> - **Memory is at 405 MHz** against a rated 1502 MHz for this GDDR5, which is
+>   27% of the rated bandwidth. 405 MHz is exactly NVIDIA's idle (P8) memory
+>   clock, which corroborates a decode that borrows Kepler's layout.
+> - **The GPC clock cannot be read.** Its PLL at `0x137000` returns PRI error
+>   `0xbadf5040` even after POST, while the memory PLL at `0x132000` answers.
+>   The report now refuses to claim a GPC number and says so. The GPC figure
+>   will come from timing real work once GR runs.
+>
+> I first decoded the VBIOS perf tables for this. Their versions (0x50 and
+> 0x20) are ones nouveau does not parse, and the result ("5700 MHz") was
+> discarded.
+>
+> **THE GPU MMU (M2384)** is goal step 4's core. Pascal's version-2 format has
+> five levels for 4 KiB pages (PD3 2 bits, PD2 9, PD1 9, PD0 8 with 16-byte
+> dual entries, PT 9). It is built from nouveau's `gp100_vmm_desc_12` and
+> NVIDIA's published `dev_mmu.h`. The tables live in VRAM, written through the
+> PRAMIN window. BAR1 is bound to them through `0x1704`, and the TLB is
+> invalidated with gp100's 64-bit PDB. **The oracle is translation, not
+> access:** BAR1 page N maps to VRAM page 3-N. An identity window, a BAR that
+> ignores the tables, or a PRAMIN alias would each return page N's own tag.
+> All four pages returned the reversed tag, and a word written through BAR1
+> landed at the translated address.
+
 > **(M2382) THE DISK IMAGE IS BUILT WHERE IT BOOTS -- NOTHING BIG LEAVES THE
 > LAPTOP.**
 >
