@@ -1207,6 +1207,80 @@ static void nv_top_report(void) {
 #define NV_CH_PUSH    0x14000u
 #define NV_CH_SEM     0x15000u
 #define NV_CH_PAYLOAD 0xFACE1030u
+/* MEMORY BANDWIDTH, MEASURED ON THE CARD (M2389) -- the goal's clock-risk
+ * clause wants numbers early, and the memory clock reads 405 MHz against a
+ * rated 1502. A copy engine turns that into a measured rate: PASCAL_DMA_COPY_A
+ * (0xc0b5) on the channel M2385 proved, nouveau's own Kepler+ BO move
+ * (nve0_bo_move_copy: OFFSET_IN/OUT, PITCH, LINE_LENGTH, LINE_COUNT, then
+ * LAUNCH_DMA 0x386 = non-pipelined | flush | pitch->pitch | multi-line),
+ * 128 x 512 KiB VRAM->VRAM, then a host semaphore release with wait-for-idle.
+ * Timed on the CPU from GP_PUT to the semaphore; the destination is then
+ * checked against the source pattern, so a copy that did not happen cannot
+ * report a rate. */
+static void nv_mmu_invalidate(void);
+#define NV_CE_SRC   0x100000u      /* VA == offset from NV_MMU_BASE, 512 KiB each */
+#define NV_CE_DST   0x180000u
+#define NV_CE_PUSH  0x60000u       /* 8 KiB pushbuffer */
+#define NV_CE_N     128
+static void nv_ce_bandwidth(void) {
+    uint32_t saved1700 = nv_reg_rd(0x1700); g_nv_pramin_win = 0xffffffffu;
+    for (uint32_t va = NV_CE_SRC; va < NV_CE_DST + 0x80000; va += 0x1000)
+        nv_vram_wr64(NV_MMU_PT + (va >> 12) * 8, 1ull | ((uint64_t)(NV_MMU_BASE + va) >> 4));
+    for (uint32_t va = NV_CE_PUSH; va < NV_CE_PUSH + 0x2000; va += 0x1000)
+        nv_vram_wr64(NV_MMU_PT + (va >> 12) * 8, 1ull | ((uint64_t)(NV_MMU_BASE + va) >> 4));
+    for (uint32_t i = 0; i < 0x80000; i += 4) {                         /* pattern in, sentinel out */
+        nv_vram_wr32(NV_MMU_BASE + NV_CE_SRC + i, 0xA5000000u ^ i);
+        nv_vram_wr32(NV_MMU_BASE + NV_CE_DST + i, 0x11111111u);
+    }
+    nv_vram_wr32(NV_MMU_BASE + NV_CH_SEM, 0xDEADDEADu);
+    uint32_t w = 0, pb = NV_MMU_BASE + NV_CE_PUSH;
+    #define PD(v) nv_vram_wr32(pb + 4 * w++, (v))
+    PD(0x20000000u | (1u << 16) | (4u << 13) | (0x0000u >> 2)); PD(0xc0b5u);        /* SET_OBJECT */
+    for (int n = 0; n < NV_CE_N; n++) {
+        PD(0x20000000u | (8u << 16) | (4u << 13) | (0x0400u >> 2));
+        PD(0); PD(NV_CE_SRC); PD(0); PD(NV_CE_DST);
+        PD(4096); PD(4096); PD(4096); PD(0x80000u / 4096);
+        PD(0x80000000u | (0x386u << 16) | (4u << 13) | (0x0300u >> 2));             /* LAUNCH_DMA, immediate */
+    }
+    PD(0x20000000u | (4u << 16) | (0u << 13) | (0x0010u >> 2));
+    PD(0); PD(NV_CH_SEM); PD(0xCE0DA7A0u); PD(0x01000002u);                        /* release after WFI */
+    #undef PD
+    nv_vram_wr32(NV_MMU_BASE + NV_CH_GPFIFO + 8, NV_CE_PUSH);
+    nv_vram_wr32(NV_MMU_BASE + NV_CH_GPFIFO + 12, w << 10);
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+    nv_mmu_invalidate();
+
+    extern uint64_t timer_cycles_per_ms(void);
+    uint64_t cpm = timer_cycles_per_ms(), t0, t1;
+    __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
+    g_nv_b1[(NV_CH_USERD + 0x8c) / 4] = 2;                                          /* GP_PUT = 2 */
+    nv_reg_wr(0x070000, 1);
+    uint32_t sem = 0;
+    for (unsigned ms = 0; ms <= 5000; ms++) {
+        if ((sem = g_nv_b1[NV_CH_SEM / 4]) == 0xCE0DA7A0u) break;
+        for (int k = 0; k < 20; k++) (void)nv_reg_rd(0x000000);                   /* ~tens of us, no ms quantum */
+    }
+    __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t1) :: "rdx");
+    uint64_t us = cpm ? (t1 - t0) * 1000 / cpm : 0;
+    g_nv_pramin_win = 0xffffffffu;
+    unsigned bad = 0;
+    for (uint32_t i = 0; i < 0x80000; i += 0x4000 - 4)                            /* spot-check 2 words per 16 KiB */
+        if (nv_vram_rd32(NV_MMU_BASE + NV_CE_DST + i) != (0xA5000000u ^ i)) bad++;
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+    uint64_t bytes = (uint64_t)NV_CE_N * 0x80000u;
+    kprintf("[nv] ce: %u copies x 512 KiB via PASCAL_DMA_COPY_A: semaphore %08x after %lu us, %u of %u spot-checks wrong\n",
+            NV_CE_N, sem, (unsigned long)us, bad, (unsigned)(0x80000u / (0x4000 - 4) + 1));
+    if (sem == 0xCE0DA7A0u && !bad && us)
+        kprintf("[nv] ce: %lu MiB copied in %lu us = %lu MB/s copy, %lu MB/s of DRAM traffic (read+write). "
+                "At the rated 1502 MHz GDDR5 x 64-bit the card peaks near 48000 MB/s.\n",
+                (unsigned long)(bytes >> 20), (unsigned long)us, (unsigned long)(bytes / us),
+                (unsigned long)(2 * bytes / us));
+    else
+        kprintf("[nv] ce: FAIL -- %s; PBDMA %d intr0 %08x, PFIFO intr %08x\n",
+                sem != 0xCE0DA7A0u ? "the copies never completed" : "the destination does not match the source",
+                g_nv_ce_pbdma, nv_reg_rd(0x040108 + (g_nv_ce_pbdma > 0 ? g_nv_ce_pbdma : 0) * 0x2000), nv_reg_rd(0x002100));
+}
+
 static void nv_channel_test(void) {
     if (g_nv_ce_runl < 0 || !g_nv_b1) { kprintf("[nv] chan: no copy-engine runlist or no BAR1 -- skipped\n"); return; }
     int runl = g_nv_ce_runl;
@@ -1301,6 +1375,7 @@ static void nv_channel_test(void) {
             pass ? "the GT 1030 fetched OUR GPFIFO, parsed OUR pushbuffer, and released OUR semaphore"
                  : sem == 0xDEADDEADu ? "the semaphore was never written; see the channel/intr state above"
                                       : "the semaphore holds something unexpected");
+    if (pass) nv_ce_bandwidth();
     nv_reg_wr(0x800004, nv_reg_rd(0x800004) | 0x800u);                    /* stop: gk104_chan_stop */
 }
 

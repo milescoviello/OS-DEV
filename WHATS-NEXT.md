@@ -1,5 +1,32 @@
 # What's next
 
+> **(M2389) MEASURED MEMORY BANDWIDTH: ABOUT 1.55 GB/s AGAINST A RATED ~48
+> GB/s.**
+>
+> ```
+> [nv] ce: 128 copies x 512 KiB via PASCAL_DMA_COPY_A: semaphore ce0da7a0 after 86331 us, 0 of 33 spot-checks wrong
+> [nv] ce: 64 MiB copied in 86331 us = 777 MB/s copy, 1554 MB/s of DRAM traffic (read+write)
+> ```
+>
+> The goal's risk clause wants the clock ceiling measured early and reported
+> with numbers. The memory PLL reads 405 MHz (M2383). This turns it into a
+> measured rate: a copy engine (`PASCAL_DMA_COPY_A`, nouveau's own Kepler+ BO
+> move, `LAUNCH_DMA 0x386`) on the channel M2385 proved, 128 x 512 KiB
+> VRAM->VRAM, then a host semaphore release after wait-for-idle. It is timed
+> from GP_PUT to the semaphore, and the destination is checked against the
+> source pattern. **About 3% of the rated bandwidth.**
+>
+> What it does and does not show:
+> - It is consistent with the whole card sitting at its boot/idle clock
+>   state. Only NVIDIA's signed PMU firmware can reclock Pascal, and it was
+>   never released.
+> - It measures the copy path, which is itself clocked, so it is a lower
+>   bound on DRAM bandwidth.
+> - The decisive number is the **GPC (shader) clock**, and its PLL is
+>   locked. The plan is a shader that reads the SM cycle counter and the
+>   global nanosecond timer. It needs GR running, which is the next
+>   milestone anyway. The 30 fps call waits for that number.
+
 > **(M2388) FECS AND GPCCS RUN NVIDIA'S SIGNED FIRMWARE UNDER OS-DEV, AND
 > FECS ANSWERS OUR METHODS. GOAL STEP 5 IS DONE.**
 >
