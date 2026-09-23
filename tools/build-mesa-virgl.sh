@@ -42,7 +42,13 @@ set -e
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 LXROOT=${LXROOT:-$ROOT/build/lxroot}
-OUT=${OUT:-/tmp/mesa-virgl}
+# NOUVEAU TOO (M2390): goal step 6 reuses Mesa's nvc0 gallium driver as-is,
+# the way virgl's was. Recent Mesa carries its own copy of libdrm_nouveau
+# (src/gallium/winsys/nouveau/drm), so nothing extra is needed on the build
+# host. Each driver list gets its own build dir: reconfiguring an existing
+# one in place is how a stale virgl-only build would survive the change.
+GALLIUM=${GALLIUM:-virgl,nouveau}
+OUT=${OUT:-/tmp/mesa-$(echo "$GALLIUM" | tr ',' '-')}
 SRC=$(ls /var/cache/distfiles/mesa-*.tar.xz 2>/dev/null | sort -V | tail -1)
 [ -n "$SRC" ] || { echo "build-mesa-virgl: no mesa tarball in /var/cache/distfiles" >&2; exit 2; }
 VER=$(basename "$SRC" .tar.xz)
@@ -58,7 +64,7 @@ cd "$OUT/$VER"
 # server here and never will be -- the display path is our own Wayland
 # compositor. -Dplatforms=wayland for the same reason.
 if [ ! -d "$OUT/b" ]; then
-    echo "==> configuring (virgl only, no LLVM, no GLX, wayland only)"
+    echo "==> configuring ($GALLIUM, no LLVM, no GLX, wayland only)"
     # --libdir=lib64 TO MATCH THE GUEST, NOT THE HOST DISTRO. The guest root is
     # staged from a Gentoo box, so its libraries are in /usr/lib64 and /lib64,
     # and that is what envp0's LD_LIBRARY_PATH lists. A Mesa installed into
@@ -69,7 +75,7 @@ if [ ! -d "$OUT/b" ]; then
         --prefix=/usr \
         --libdir=lib64 \
         --buildtype=release \
-        -Dgallium-drivers=virgl \
+        -Dgallium-drivers="$GALLIUM" \
         -Dvulkan-drivers= \
         -Dllvm=disabled \
         -Dshared-llvm=disabled \

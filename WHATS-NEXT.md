@@ -1,5 +1,48 @@
 # What's next
 
+> **(M2390) MESA'S NVC0 DRIVER RUNS AGAINST OS-DEV'S OWN NOUVEAU RENDER NODE,
+> UP TO THE ONE THING IT CANNOT HAVE YET.**
+>
+> ```
+> LXNVDRM: ok   VERSION name "nouveau" / 1.3.1
+> LXNVDRM: ok   NVIF DEVICE_INFO -> platform 3 (PCIE), chipset 138, rev a1, 2048 MiB
+> LXNVDRM: ok   GETPARAM CHIPSET_ID 138 / PCI_VENDOR 10de / FB_SIZE 2048 MiB
+> LXNVDRM: ok   drmGetDevice2 -> 0: bus PCI, 10de:1d01 at 00:10.0
+> [nvdrm] GETPARAM 20 -> EINVAL             (Mesa's loader: no zink, use nvc0)
+> [nvdrm] NVIF NEW oclass 0080 -> device    (nouveau_device_new)
+> [nvdrm] GETPARAM 8 / 9                    (FB_SIZE, AGP_SIZE)
+> [nvdrm] CHANNEL_ALLOC -> refused: GR has no hardware init ... nvc0_screen_create stops HERE.
+> LXNVDRM: RESULT PASS (0 check(s) failed)
+> ```
+>
+> Goal step 6, the parts that do not need GR:
+> - **Mesa.** It is rebuilt with nouveau's nvc0 beside virgl. Mesa 26
+>   carries its own copy of libdrm_nouveau, so nothing extra is needed.
+> - **`kernel/nvdrm.c`.** It serves the contract that copy asks of a render
+>   node, read from its source: VERSION `nouveau` 1.3.1 (the floor it
+>   enforces), NVIF device-new and device-info, and GETPARAM. Every answer is
+>   what `nvgpu.c` measured: PMC_BOOT_0, `0x100ce0`, PCI config space.
+> - **sysfs for libdrm.** procfs generates the files libdrm's
+>   `drmGetDevice2` reads from the card's real PCI config.
+>
+> The probe asks each question itself, because nvc0 answers a wrong answer
+> by quietly not loading. Its first run found what Mesa would have hidden:
+> `drmGetDevice2 -> -19`. Three checks in the synthetic `/dev` were still
+> "virtio only", so libdrm saw no render node. The fix made that check pass;
+> the run before it is the revert proof.
+>
+> **`CHANNEL_ALLOC` is refused by name.** A graphics channel needs GR's
+> hardware init and a golden context, and this driver does not have them.
+> That work was stopped by a safety filter while being written, and I cannot
+> reproduce it. **So steps 6-7 stop here**, and the shader-clock measurement
+> the 30 fps call depends on (it needs GR) stays unmeasured.
+>
+> **Also seen, not yet explained:** 1 of 3 GT 1030 boots panicked with an
+> Invalid Opcode at `rip=0x3`. The stack pointer was at the top of a fresh
+> kernel stack, right after the driver created its firmware thread, which
+> points at `current->entry` in `thread_trampoline`. It did not reproduce on
+> the next two boots of the same image.
+
 > **(M2389) MEASURED MEMORY BANDWIDTH: ABOUT 1.55 GB/s AGAINST A RATED ~48
 > GB/s.**
 >

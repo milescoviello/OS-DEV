@@ -265,6 +265,7 @@ static volatile int g_lxtool_test;            /* -append lxtooltest: drive the B
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
+static volatile int g_lxnvdrm;                /* -append lxnvdrm: what Mesa's nvc0 asks the GT 1030's render node (M2390) */
 static volatile int g_lxdrm;                  /* -append lxdrm: does the DRM render node answer the four questions Mesa asks? (M2347) */
 static volatile int g_lxgl;                   /* -append lxgl: eight links from a GL call to the host iGPU (M2351) */
 static volatile int g_lxdns_spawned;          /* lxdns already runs alongside the browser -- do not ALSO run the quiet-machine arms (M2321) */
@@ -983,6 +984,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * first -- a minute and a half of unrelated work per measurement, on a
          * loop whose round trip is already several minutes. */
         if (cmdline_has(cl, "lxdrm"))      g_lxdrm = 1;    /* the DRM render node, asked directly (M2347) */
+        if (cmdline_has(cl, "lxnvdrm"))    g_lxnvdrm = 1;  /* the nouveau render node, asked directly (M2390) */
         if (cmdline_has(cl, "lxgl"))       g_lxgl = 1;     /* EGL -> Mesa virgl -> the host GPU (M2351) */
         /* -append ffgpu: advertise wl_drm and let Firefox take the hardware
          * path. OFF by default because it currently costs the page entirely
@@ -3897,6 +3899,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
                     ? "WAYLAND platform, as Firefox does it" : "surfaceless");
         int grc = app_run_linux_sync("/disk2/lxgl", 0, 0, 60000);
         kprintf("[lxabi] lxgl exit -> %d\n", grc);
+    }
+    if (g_lxnvdrm) {
+        kprintf("[lxabi] the nouveau render node: VERSION, NVIF, GETPARAM, drmGetDevice2, then Mesa's nvc0 via gbm...\n");
+        int nrc = app_run_linux_sync("/disk2/lxnvdrm", 0, 0, 60000);
+        kprintf("[lxabi] lxnvdrm exit -> %d\n", nrc);
     }
     if (g_lxdrm) {
         /* THE RENDER NODE, ASKED DIRECTLY (M2347). The program that will

@@ -2190,6 +2190,7 @@ static int nvgpu_pmu_devinit(unsigned da, unsigned bit_i_off) {
         {   uint32_t post = nv_reg_rd(0x02240c);
             kprintf("[nv] AFTER PMU devinit: 0x2240c = %08x -> the card %s POSTing\n", post,
                     (post & 2) ? "does NOT need" : "STILL NEEDS");
+            { extern int g_nv_posted_ext; g_nv_posted_ext = !!(post & 2); }
             nv_vram_probe("AFTER PMU devinit");
             nv_clk_report("AFTER PMU devinit");
             if (post & 2) {
@@ -2411,6 +2412,12 @@ static void nvgpu_vram(void) {
 
 int nvgpu_present(void)   { return nv.valid; }
 uint32_t nvgpu_boot0(void){ return nv_boot0; }
+int g_nv_posted_ext;
+int nvgpu_drm_ok(void) { return nv.valid && g_nv_posted_ext; }
+void nvgpu_pci_bdf(unsigned *b, unsigned *s, unsigned *f) { *b = nv.bus; *s = nv.slot; *f = nv.func; }
+uint16_t nvgpu_device_id(void) { return nv.device_id; }
+uint32_t nvgpu_pci_cfg(unsigned off) { return nv.valid ? pci_read32(nv.bus, nv.slot, nv.func, off & 0xfc) : 0; }
+uint64_t nvgpu_vram_bytes(void) { return (uint64_t)g_nv_vram_mib << 20; }
 
 int nvgpu_init(void) {
     /* Any NVIDIA display device, not just the one id we expect: "no 10de:1d01"

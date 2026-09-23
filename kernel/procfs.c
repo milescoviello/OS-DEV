@@ -617,8 +617,49 @@ static const char *drm_sys_dirs[] = {
 #define DRM_SYS_SUBSYSTEM DRM_SYS "/subsystem"
 #define DRM_SYS_SUBSYS_TARGET "/sys/bus/pci"
 
+/* THE SAME FILES FOR THE NVIDIA CARD (M2390), generated from its real PCI
+ * config space -- Mesa's loader maps vendor 0x10de to "nouveau" from exactly
+ * these, and drmParsePciBusInfo reads the slot out of uevent. One DRM
+ * personality per boot: virgl's table when there is a virtio 3D device,
+ * this when OS-DEV's own driver POSTed a GT 1030. */
+int nvgpu_drm_ok(void);
+void nvgpu_pci_bdf(unsigned *bus, unsigned *slot, unsigned *func);
+uint32_t nvgpu_pci_cfg(unsigned off);
+static int drm_sys_on(void) { return virtio_gpu_has_3d() || nvgpu_drm_ok(); }
+static int shex(char *b, int p, int max, uint32_t v, int digits, int upper) {
+    for (int i = digits - 1; i >= 0 && p < max - 1; i--) {
+        unsigned d = (v >> (i * 4)) & 0xf;
+        b[p++] = (char)(d < 10 ? '0' + d : (upper ? 'A' : 'a') + d - 10);
+    }
+    return p;
+}
+static long nv_sys_read(const char *abs, char *b, int max) {
+    uint32_t id = nvgpu_pci_cfg(0x00), sub = nvgpu_pci_cfg(0x2c), cls = nvgpu_pci_cfg(0x08);
+    uint32_t ven = id & 0xffff, dev = id >> 16, sven = sub & 0xffff, sdev = sub >> 16;
+    unsigned bus, slot, fn; nvgpu_pci_bdf(&bus, &slot, &fn);
+    int p = 0;
+    if (peq(abs, DRM_SYS "/uevent")) {
+        p = sapp(b, p, max, "DRIVER=nouveau\nPCI_CLASS="); p = shex(b, p, max, cls >> 8, 5, 1);
+        p = sapp(b, p, max, "\nPCI_ID=");        p = shex(b, p, max, ven, 4, 1); p = sapp(b, p, max, ":"); p = shex(b, p, max, dev, 4, 1);
+        p = sapp(b, p, max, "\nPCI_SUBSYS_ID="); p = shex(b, p, max, sven, 4, 1); p = sapp(b, p, max, ":"); p = shex(b, p, max, sdev, 4, 1);
+        p = sapp(b, p, max, "\nPCI_SLOT_NAME=0000:"); p = shex(b, p, max, bus, 2, 0); p = sapp(b, p, max, ":");
+        p = shex(b, p, max, slot, 2, 0); p = sapp(b, p, max, "."); p = shex(b, p, max, fn, 1, 0);
+        p = sapp(b, p, max, "\n");
+    } else {
+        uint32_t v; int w = 4;
+        if      (peq(abs, DRM_SYS "/vendor"))           v = ven;
+        else if (peq(abs, DRM_SYS "/device"))           v = dev;
+        else if (peq(abs, DRM_SYS "/subsystem_vendor")) v = sven;
+        else if (peq(abs, DRM_SYS "/subsystem_device")) v = sdev;
+        else if (peq(abs, DRM_SYS "/revision"))       { v = cls & 0xff; w = 2; }
+        else return -1;
+        p = sapp(b, p, max, "0x"); p = shex(b, p, max, v, w, 0); p = sapp(b, p, max, "\n");
+    }
+    b[p] = 0; return p;
+}
+
 int procfs_is_drm_symlink(const char *abs) {
-    return virtio_gpu_has_3d() && peq(abs, DRM_SYS_SUBSYSTEM);
+    return drm_sys_on() && peq(abs, DRM_SYS_SUBSYSTEM);
 }
 const char *procfs_drm_symlink_target(const char *abs) {
     return procfs_is_drm_symlink(abs) ? DRM_SYS_SUBSYS_TARGET : 0;
@@ -648,13 +689,16 @@ static long sysfs_read(const char *abs, char *b, int max) {
             p = sapp(b, p, max, sys_files[i].text);
             b[p] = 0; return p;
         }
-    if (virtio_gpu_has_3d())
+    if (virtio_gpu_has_3d()) {
         for (int i = 0; i < NDRMSYSF; i++)
             if (peq(abs, drm_sys_files[i].path)) {
                 int p = 0;
                 p = sapp(b, p, max, drm_sys_files[i].text);
                 b[p] = 0; return p;
             }
+    } else if (nvgpu_drm_ok()) {
+        return nv_sys_read(abs, b, max);
+    }
     return -1;
 }
 static int sysfs_has(const char *abs) {
@@ -662,7 +706,7 @@ static int sysfs_has(const char *abs) {
         peq(abs, "/sys/devices/system/cpu/possible") ||
         peq(abs, "/sys/devices/system/cpu/present")) return 1;
     for (int i = 0; i < NSYSF; i++) if (peq(abs, sys_files[i].path)) return 1;
-    if (virtio_gpu_has_3d()) {
+    if (drm_sys_on()) {
         for (int i = 0; i < NDRMSYSF; i++) if (peq(abs, drm_sys_files[i].path)) return 1;
         if (peq(abs, DRM_SYS_SUBSYSTEM)) return 1;
     }
@@ -677,7 +721,7 @@ static int proc_pid_path(const char *abs, int *pid, const char **file);   /* def
  * slash is accepted on each, because callers spell directories both ways and a
  * path that exists only without its slash is a bug waiting for one caller. */
 static int procfs_is_drm_sysdir(const char *abs) {
-    if (!virtio_gpu_has_3d()) return 0;
+    if (!drm_sys_on()) return 0;
     for (int i = 0; i < NDRMSYSD; i++) {
         if (peq(abs, drm_sys_dirs[i])) return 1;
         {   const char *d = drm_sys_dirs[i]; int k = 0;
@@ -740,7 +784,7 @@ int procfs_exists(const char *abs, int *chardev) {
          * same rule app_open applies. A node that stats as present and then
          * refuses to open reads as a broken driver; absent reads as a machine
          * without a GPU, and only the second is true. (M2351) */
-        if (peq(f, "dri/renderD128") && virtio_gpu_has_3d()) { if (chardev) *chardev = 1; return 1; }
+        if (peq(f, "dri/renderD128") && drm_sys_on()) { if (chardev) *chardev = 1; return 1; }   /* virgl OR the GT 1030 (M2390) */
         for (int i = 0; i < NDEV; i++) if (peq(f, dev_files[i])) { if (chardev) *chardev = 1; return 1; }
         return 0;
     }
@@ -1216,7 +1260,7 @@ int procfs_list(const char *dir, vfs_dirent *out, int max) {
             out[n].name[k] = 0; out[n].size = 0; out[n].date = out[n].time = 0; n++;
         }
     } else if (peq(dir, "/dev/dri") || peq(dir, "/dev/dri/")) {
-        if (virtio_gpu_has_3d() && n < max) {
+        if (drm_sys_on() && n < max) {
             const char *s2 = "renderD128";
             int k = 0; while (s2[k] && k < 62) { out[n].name[k] = s2[k]; k++; }
             out[n].name[k] = 0; out[n].size = 0; out[n].date = out[n].time = 0; n++;
@@ -1225,7 +1269,7 @@ int procfs_list(const char *dir, vfs_dirent *out, int max) {
         /* `dri` is in this listing but not in dev_files, because dev_files is
          * the character-device table and this is a directory. A program that
          * scans /dev looking for a GPU needs to SEE it here. (M2351) */
-        if (virtio_gpu_has_3d() && n < max) {
+        if (drm_sys_on() && n < max) {
             const char *d2 = "dri";
             int k = 0; while (d2[k] && k < 62) { out[n].name[k] = d2[k]; k++; }
             out[n].name[k] = 0; out[n].size = 0; out[n].date = out[n].time = 0; n++;

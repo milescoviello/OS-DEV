@@ -134,6 +134,7 @@ struct drm_prime_handle { uint32_t handle; uint32_t flags; int32_t fd; };
 static struct {
     int used;
     int ctx;            /* has this node's virgl context been created? */
+    int nv;             /* a nouveau node, served by nvdrm.c (M2390) */
 } g_node[DRM_NODES];
 
 /* GEM OBJECTS.
@@ -248,10 +249,20 @@ uint64_t drm_map_size(uint64_t off) {
     return b ? (uint64_t)b->nframes * PAGE_SIZE : 0;
 }
 
+/* WHICH GPU A NODE IS (M2390). virtio-gpu's 3D device when the VM has one;
+ * otherwise OS-DEV's own NVIDIA driver, if it found a card and POSTed it.
+ * One personality per boot -- a VM with a passed-through GT 1030 has no
+ * virgl device, and the render node is the real card's. */
+long nvdrm_ioctl(unsigned long req, void *uarg);
+int  nvgpu_drm_ok(void);
 int drm_open_node(void) {
-    if (!virtio_gpu_has_3d()) return -1;
+    int nv = 0;
+    if (!virtio_gpu_has_3d()) {
+        if (!nvgpu_drm_ok()) return -1;
+        nv = 1;
+    }
     for (int i = 0; i < DRM_NODES; i++)
-        if (!g_node[i].used) { g_node[i].used = 1; return i; }
+        if (!g_node[i].used) { g_node[i].used = 1; g_node[i].nv = nv; return i; }
     return -1;
 }
 void drm_close_node(int id) {
@@ -262,8 +273,8 @@ void drm_close_node(int id) {
      * and HOST GL resources, and the host ones are invisible from here. */
     for (int i = 0; i < DRM_BO_N; i++)
         if (g_bo[i].used && g_bo[i].node == id) bo_free(&g_bo[i]);
-    if (g_node[id].ctx) { virtio_gpu_ctx_destroy((uint32_t)id + 1); g_node[id].ctx = 0; }
-    g_node[id].used = 0;
+    if (g_node[id].ctx && !g_node[id].nv) { virtio_gpu_ctx_destroy((uint32_t)id + 1); g_node[id].ctx = 0; }
+    g_node[id].used = 0; g_node[id].nv = 0;
 }
 
 /* WHICH PATHS ARE THIS DEVICE.
@@ -297,6 +308,9 @@ static int drm_node_of_fd(int fd) {
 }
 
 long drm_ioctl(int fd, unsigned long req, void *uarg) {
+    {   int nd = drm_node_of_fd(fd);
+        if (nd >= 0 && g_node[nd].nv) return nvdrm_ioctl(req, uarg);
+    }
     if (!virtio_gpu_has_3d()) { drm_seen(req, "any ioctl with no 3D device", E_NODEV); return E_NODEV; }
 
     switch (req) {
