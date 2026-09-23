@@ -1,5 +1,37 @@
 # What's next
 
+> **(M2388) FECS AND GPCCS RUN NVIDIA'S SIGNED FIRMWARE UNDER OS-DEV, AND
+> FECS ANSWERS OUR METHODS. GOAL STEP 5 IS DONE.**
+>
+> ```
+> [nv] sec2: RTOS up after 1 ms: init msg unit 01 size 32 type 0, 2 queues
+> [nv] sec2:   cmdq: index 0, EMEM 01000000, 128 bytes
+> [nv] sec2:   msgq: index 0, EMEM 01000080, 128 bytes
+> [nv] sec2: BOOTSTRAP_FALCON FECS -> reply unit 08 seq 1 (sent 1), error 00000000, falcon 2
+> [nv] sec2: BOOTSTRAP_FALCON GPCCS -> reply unit 08 seq 2 (sent 2), error 00000000, falcon 3
+> [nv] gr: FECS 0x409800 = 00000001 after 1 ms
+> [nv] gr: FECS answers method 0x10 (context image size): 273664 bytes after 1 ms
+> ```
+>
+> After the ACR halts, SEC2 holds its own signed RTOS. Started, it posts an
+> init message naming its command and message queues. `ACR_BOOTSTRAP_FALCON`
+> (unit 0x08) through that queue makes it reset FECS and GPCCS and load their
+> verified images out of our WPR. Started, FECS reports ready and answers
+> method 0x10 with the size of a GR context image. There is no interrupt
+> handler, so everything nouveau does from SEC2's IRQ is done here by
+> polling the queue registers.
+>
+> Three wrong turns, each read off the card rather than argued:
+> - **GR was switched off.** PMC `0x200` after devinit has GR's bit (12,
+>   from TOP) clear, and a falcon cannot be loaded inside a disabled engine.
+> - **The init message read back as zeros, then as PRI errors.** A queue
+>   address is DMEM or EMEM by its value (at or above `0x01000000` it is
+>   EMEM). Worse, I captured the tail pointer before starting the RTOS; it
+>   was 0. The RTOS writes both pointers itself and then raises SWGEN0, and
+>   that is when nouveau reads them. Dumping the raw pointers settled both.
+> - **None of it needed GR's full hardware init first.** That is next (step
+>   D: `sw_nonctx`, the exception masks, zbc, then the golden context).
+
 > **(M2387) NVIDIA'S SIGNED ACR RUNS ON THE GT 1030 UNDER OS-DEV, AND LOCKS
 > OUR WRITE-PROTECTED REGION.**
 >

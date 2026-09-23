@@ -1487,13 +1487,13 @@ static int nv_lsfw_sec2(struct nv_lsfw *l) {
     return 1;
 }
 
-static void nv_acr_run(void) {
+static int nv_acr_run(void) {
     static struct nv_lsfw ls[3];
     if (!nv_lsfw_gr(&ls[0], LSF_FECS, "gr/fecs_") || !nv_lsfw_gr(&ls[1], LSF_GPCCS, "gr/gpccs_") || !nv_lsfw_sec2(&ls[2])) {
-        kprintf("[nv] acr: could not assemble the LS firmware -- stopped\n"); return;
+        kprintf("[nv] acr: could not assemble the LS firmware -- stopped\n"); return 0;
     }
     for (int i = 0; i < 3; i++)
-        if (ls[i].sig_size != 192) { kprintf("[nv] acr: falcon %d signature is %u bytes, not lsf_signature_v1's 192 -- stopped\n", ls[i].id, ls[i].sig_size); return; }
+        if (ls[i].sig_size != 192) { kprintf("[nv] acr: falcon %d signature is %u bytes, not lsf_signature_v1's 192 -- stopped\n", ls[i].id, ls[i].sig_size); return 0; }
 
     /* gp102_acr_wpr_layout */
     uint32_t w = ALN(11 * 24, 256) + 0x100;
@@ -1561,6 +1561,7 @@ static void nv_acr_run(void) {
     /* reset (disable + enable), then gp102_acr_load_setup on the descriptor at dmem_base_img */
     fl_disable(); int en = fl_enable();
     uint8_t *d = img + dbase;
+    int pass = 0;
     put32(d + 0x210, 1); put32(d + 0x21c, 2);
     put32(d + 0x220, wpr_start >> 8); put32(d + 0x224, wpr_end >> 8); put32(d + 0x228, 1);
     put32(d + 0x22c, 0xf); put32(d + 0x230, 0xc); put32(d + 0x234, 0x2); put32(d + 0x238, shadow >> 8);
@@ -1613,13 +1614,143 @@ static void nv_acr_run(void) {
     nv_reg_wr(0x100cd4, 3); uint64_t wl = ((uint64_t)(nv_reg_rd(0x100cd4) & 0xffffff00u) << 8) + 0x20000;
     kprintf("[nv] acr: HS ACR %s after %u ms: mbox0 %08x (want 0) mbox1 %08x; memory controller WPR %lx-%lx (ours %x-%x)\n",
             halted ? "HALTED" : "DID NOT HALT", ms, mb0, mb1, (unsigned long)ws, (unsigned long)wl, wpr_start, wpr_end);
-    int pass = halted && mb0 == 0 && ws == wpr_start && wl == wpr_end;
+    pass = halted && mb0 == 0 && ws == wpr_start && wl == wpr_end;
     kprintf("[nv] acr: %s -- %s\n", pass ? "PASS" : "FAIL",
             pass ? "NVIDIA's signed ACR ran on SEC2 and locked OUR WPR" :
             mb0 == 0xcafebeefu ? "the ACR never wrote its mailbox (did not start, or trapped early)"
                                : "see mbox0 -- the ACR's own error code");
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+    return pass;
 out:
     nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+    return 0;
+}
+
+/* ============================================================================
+ * SEC2'S RTOS STARTS FECS AND GPCCS (M2388).
+ *
+ * After the ACR halts, SEC2 holds its own signed LS firmware -- an RTOS --
+ * and is started with a plain falcon start (nvkm_sec2_init). It announces
+ * itself with an init message in its message queue, naming where in EMEM its
+ * command and message queues live (gp102_sec2_initmsg). Commands are 4-byte
+ * headers (unit, size, flags, seq) + payload, pushed at the command queue's
+ * head; replies come back in the message queue carrying the same seq
+ * (falcon/cmdq.c, msgq.c). ACR_CMD_BOOTSTRAP_FALCON (unit 0x08) is what makes
+ * SEC2 reset FECS/GPCCS and load their verified images out of the WPR.
+ *
+ * No interrupt handler exists, so everything nouveau does from SEC2's IRQ is
+ * done here by polling the queue registers themselves.
+ *
+ * GR must be ENABLED in PMC first: after devinit 0x200 reads 40002121, and
+ * GR's bit (12, from TOP) is clear -- a falcon cannot be reset or loaded
+ * inside an engine that is switched off.
+ * ========================================================================== */
+/* A QUEUE ADDRESS IS DMEM OR EMEM BY VALUE (nvkm_falcon_pio): at or above
+ * emem_addr (0x01000000) it is EMEM, below it the same number is DMEM. The
+ * first version assumed EMEM and read the init message back as zeros. */
+static void sec2_emem_rd(uint32_t a, uint8_t *dst, uint32_t len) {
+    int em = a >= 0x01000000u;
+    fl_wr(em ? 0xac0 : 0x1c0, (1u << 25) | (em ? a - 0x01000000u : a));
+    for (uint32_t i = 0; i < len; i += 4) put32(dst + i, fl_rd(em ? 0xac4 : 0x1c4));
+}
+static void sec2_emem_wr(uint32_t a, const uint8_t *src, uint32_t len) {
+    int em = a >= 0x01000000u;
+    fl_wr(em ? 0xac0 : 0x1c0, (1u << 24) | (em ? a - 0x01000000u : a));
+    for (uint32_t i = 0; i < len; i += 4) fl_wr(em ? 0xac4 : 0x1c4, le32(src + i));
+}
+static uint32_t g_cq_head, g_cq_tail, g_cq_off, g_cq_size, g_mq_head, g_mq_tail, g_mq_off;
+/* one message from SEC2's msgq into m (<=128 bytes); returns its size or 0 */
+static uint32_t sec2_msg(uint8_t *m, unsigned ms) {
+    uint32_t pos = fl_rd(g_mq_tail), head;
+    for (unsigned t = 0; t <= ms; t++) { head = fl_rd(g_mq_head); if (head != pos) break; nv_mdelay(1); }
+    if (head == pos) return 0;
+    if (head < pos) pos = g_mq_off;                                    /* the ring looped */
+    sec2_emem_rd(pos, m, 4);
+    uint32_t sz = m[1];
+    if (sz < 4 || sz > 128) { kprintf("[nv] sec2: message of %u bytes -- refused\n", sz); return 0; }
+    if (sz > 4) sec2_emem_rd(pos + 4, m + 4, ALN(sz - 4, 4));
+    fl_wr(g_mq_tail, pos + ALN(sz, 4));
+    return sz;
+}
+static int sec2_bootstrap(int id, uint8_t seq) {
+    uint8_t c[16] = { 0x08, 16, 0x3, seq, 0 /* BOOTSTRAP_FALCON */ };
+    put32(c + 8, 0);                                                   /* FLAGS_RESET_YES */
+    put32(c + 12, (uint32_t)id);
+    uint32_t pos = fl_rd(g_cq_head);
+    if (pos + 16 + 4 > g_cq_off + g_cq_size) { kprintf("[nv] sec2: cmdq would need a rewind -- not implemented\n"); return 0; }
+    sec2_emem_wr(pos, c, 16);
+    fl_wr(g_cq_head, pos + 16);
+    uint8_t m[128];
+    uint32_t sz = sec2_msg(m, 1000);
+    if (!sz) { kprintf("[nv] sec2: BOOTSTRAP_FALCON %d: no reply in 1000 ms\n", id); return 0; }
+    uint32_t err = sz >= 12 ? le32(m + 8) : ~0u, fid = sz >= 16 ? le32(m + 12) : ~0u;
+    kprintf("[nv] sec2: BOOTSTRAP_FALCON %s -> reply unit %02x seq %u (sent %u), error %08x, falcon %u\n",
+            id == LSF_FECS ? "FECS" : "GPCCS", m[0], m[3], seq, err, fid);
+    return m[0] == 0x08 && m[3] == seq && err == 0 && fid == (uint32_t)id;
+}
+static void fl_start(uint32_t base) {                                  /* nvkm_falcon_v1_start */
+    if (nv_reg_rd(base + 0x100) & (1u << 6)) nv_reg_wr(base + 0x130, 2);
+    else nv_reg_wr(base + 0x100, 2);
+}
+static void nv_rtos_and_gr_falcons(void) {
+    /* nvkm_sec2_init */
+    fl_wr(0x014, 0xffffffffu);
+    fl_start(SEC2_BASE);
+    g_mq_head = 0xa30; g_mq_tail = 0xa34;
+    /* THE RTOS SETS BOTH QUEUE POINTERS ITSELF, then raises SWGEN0 (0x40 in
+     * 0x008) -- which is when nouveau reads the tail (recv_initmsg). The
+     * first version captured the tail BEFORE the start, got 0, and read
+     * locked DMEM at address 0 while the message sat in EMEM. */
+    unsigned ms = 0;
+    for (; ms <= 2000 && !(fl_rd(0x008) & 0x40); ms++) nv_mdelay(1);
+    uint32_t pos = fl_rd(0xa34), head = fl_rd(0xa30);
+    fl_wr(0x004, 0x40);
+    if (head == pos) {
+        kprintf("[nv] sec2: RTOS sent no init message in 2000 ms (cpuctl %08x mbox %08x/%08x irqstat %08x)\n",
+                fl_rd(0x100), fl_rd(0x040), fl_rd(0x044), fl_rd(0x008));
+        return;
+    }
+    uint8_t im[32];
+    sec2_emem_rd(pos, im, 32);
+    kprintf("[nv] sec2: msgq tail %08x head %08x (%s); bytes:", pos, head, pos >= 0x01000000u ? "EMEM" : "DMEM");
+    for (int k = 0; k < 32; k += 4) kprintf(" %08x", le32(im + k));
+    kprintf("\n");
+    fl_wr(0xa34, pos + 32);
+    kprintf("[nv] sec2: RTOS up after %u ms: init msg unit %02x size %u type %u, %u queues\n",
+            ms, im[0], im[1], im[4], im[5]);
+    if (im[0] != 0x01 || im[4] != 0x00 || im[1] != 32) { kprintf("[nv] sec2: not the gp102 init message -- stopped\n"); return; }
+    for (int q = 0; q < 2; q++) {
+        const uint8_t *qi = im + 8 + q * 8;
+        uint32_t off = le32(qi), sz = (uint32_t)qi[4] | (uint32_t)qi[5] << 8, idx = qi[6], qid = qi[7];
+        kprintf("[nv] sec2:   %s: index %u, EMEM %08x, %u bytes\n", qid ? "msgq" : "cmdq", idx, off, sz);
+        if (qid == 0) { g_cq_head = 0xa00 + idx * 8; g_cq_tail = 0xa04 + idx * 8; g_cq_off = off; g_cq_size = sz; }
+        else          { g_mq_head = 0xa30 + idx * 8; g_mq_tail = 0xa34 + idx * 8; g_mq_off = off; }
+    }
+    /* GR on, then have SEC2 bootstrap FECS and GPCCS out of the WPR */
+    uint32_t pmc = nv_reg_rd(0x000200);
+    nv_reg_wr(0x000200, pmc | (1u << 12)); (void)nv_reg_rd(0x000200);
+    kprintf("[nv] gr: PMC 0x200 %08x -> %08x (GR enabled)\n", pmc, nv_reg_rd(0x000200));
+    int f = sec2_bootstrap(LSF_FECS, 1), g = sec2_bootstrap(LSF_GPCCS, 2);
+    if (!f || !g) { kprintf("[nv] gr: SEC2 did not bootstrap both falcons -- stopped\n"); return; }
+    /* gf100_gr_init_ctxctl_ext: start both, wait for FECS to say ready */
+    nv_reg_wr(0x409800, 0); nv_reg_wr(0x41a10c, 0); nv_reg_wr(0x40910c, 0);
+    fl_start(0x41a000);
+    fl_start(0x409000);
+    for (ms = 0; ms <= 2000 && !(nv_reg_rd(0x409800) & 1); ms++) nv_mdelay(1);
+    uint32_t r = nv_reg_rd(0x409800);
+    kprintf("[nv] gr: FECS 0x409800 = %08x after %u ms (FECS cpuctl %08x, GPCCS cpuctl %08x)\n",
+            r, ms, nv_reg_rd(0x409100), nv_reg_rd(0x41a100));
+    if (!(r & 1)) { kprintf("[nv] gr: FAIL -- FECS never signalled ready\n"); return; }
+    /* gf100_gr_fecs_set_watchdog_timeout + discover_image_size (method 0x10) */
+    nv_reg_wr(0x409800, 0); nv_reg_wr(0x409500, 0x7fffffff); nv_reg_wr(0x409504, 0x21);
+    nv_mdelay(1);
+    nv_reg_wr(0x409800, 0); nv_reg_wr(0x409500, 0); nv_reg_wr(0x409504, 0x10);
+    uint32_t size = 0;
+    for (ms = 0; ms <= 2000 && !(size = nv_reg_rd(0x409800)); ms++) nv_mdelay(1);
+    kprintf("[nv] gr: FECS answers method 0x10 (context image size): %u bytes after %u ms\n", size, ms);
+    kprintf("[nv] gr: %s -- %s\n", size ? "PASS" : "FAIL",
+            size ? "FECS and GPCCS run NVIDIA's signed firmware and FECS answers our methods"
+                 : "FECS is up but did not answer method 0x10");
 }
 
 static void nvgpu_late_task(void) {
@@ -1636,7 +1767,7 @@ static void nvgpu_late_task(void) {
     }
     kprintf("[nv] fw: %u of %u gp108 firmware files read from the root filesystem (%u bytes) after %u ms\n",
             ok, (unsigned)(sizeof(nv_fw_files) / sizeof(nv_fw_files[0])), total, waited);
-    if (ok == sizeof(nv_fw_files) / sizeof(nv_fw_files[0])) nv_acr_run();
+    if (ok == sizeof(nv_fw_files) / sizeof(nv_fw_files[0]) && nv_acr_run()) nv_rtos_and_gr_falcons();
     task_exit();
 }
 
