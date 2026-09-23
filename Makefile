@@ -607,13 +607,13 @@ $(LXROOT)/hello.c: tools/lx/hello.c
 # generated -- these are the same files this host Makefile compiles.
 $(LXROOT)/.src-staged: $(wildcard kernel/*.c kernel/include/*.h boot/*.asm kernel/asm/*.asm) tools/lx/Makefile.kernel
 	@mkdir -p $(LXROOT)/src/build
-	@cp -r kernel boot linker.ld $(LXROOT)/src/ 2>/dev/null || true
+	@cp -rp kernel boot linker.ld $(LXROOT)/src/ 2>/dev/null || true
 	@rm -f $(LXROOT)/src/kernel/testmod.c
-	@cp -f tools/lx/Makefile.kernel $(LXROOT)/src/Makefile
+	@cp -fp tools/lx/Makefile.kernel $(LXROOT)/src/Makefile
 	@# The 128 prebuilt userspace ELFs kernel/asm/user_blob.asm incbin's, plus
 	@# the AP trampoline. This milestone rebuilds the KERNEL from source; the
 	@# applications are reused as blobs, which is stated plainly in the docs.
-	@cp -f build/*.elf build/*.bin build/*.ko $(LXROOT)/src/build/ 2>/dev/null || true
+	@cp -fp build/*.elf build/*.bin build/*.ko $(LXROOT)/src/build/ 2>/dev/null || true
 	@printf '#include "ksyms.h"\nconst struct ksym ksyms[]={{0,0}};\nconst int ksyms_count=0;\n' > $(LXROOT)/src/ksyms_stub.c
 	@# A REAL GIT REPOSITORY for the staged tree (M2056).
 	@#
@@ -729,7 +729,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@# reads like a missing program rather than a missing symlink. (M2041)
 	@mkdir -p $(LXROOT)/bin
 	@for t in bash git grep sed awk; do \
-	    if [ -f $(LXROOT)/usr/bin/$$t ]; then cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t; fi; \
+	    if [ -f $(LXROOT)/usr/bin/$$t ]; then cp -fp $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t; fi; \
 	 done
 	@echo "  STAGE   /bin aliases (bash git grep sed awk) -- execve uses the /bin path"
 	@# GCC's own FREESTANDING headers (stdint.h, stddef.h, stdarg.h, the
@@ -737,7 +737,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@# compiler, not of libc -- and cc1 finds them via a path relative to the
 	@# driver, so they have to land at exactly the host's absolute path.
 	@gi="$$(gcc -print-file-name=include 2>/dev/null)"; \
-	 if [ -d "$$gi" ]; then mkdir -p $(LXROOT)$$gi && cp -r "$$gi/." $(LXROOT)$$gi/ && \
+	 if [ -d "$$gi" ]; then mkdir -p $(LXROOT)$$gi && cp -rp "$$gi/." $(LXROOT)$$gi/ && \
 	   echo "  STAGE   gcc freestanding headers <- $$gi"; fi
 	@# ...and AGAIN at /lib/gcc/..., because cc1's include prefix is computed
 	@# from the DRIVER'S argv[0]: exec'd as /usr/bin/gcc it looks in
@@ -746,7 +746,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@# real binary lives three levels deeper.
 	@gi="$$(gcc -print-file-name=include 2>/dev/null)"; \
 	 if [ -d "$$gi" ]; then mkdir -p $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15 && \
-	   cp -r "$$gi" $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15/ && \
+	   cp -rp "$$gi" $(LXROOT)/lib/gcc/x86_64-pc-linux-gnu/15/ && \
 	   echo "  STAGE   gcc freestanding headers (also at /lib/gcc/...)"; fi
 	@# ...AND cc1/collect2 AT /libexec/gcc/..., for exactly the reason the
 	@# headers are duplicated above (M2061). The gcc driver finds its
@@ -769,7 +769,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@# mke2fs -d preserves the mode, so 1777 is what lands on the volume.
 	@mkdir -p $(LXROOT)/tmp $(LXROOT)/var/tmp && chmod 1777 $(LXROOT)/tmp $(LXROOT)/var/tmp
 	@echo "  STAGE   /tmp and /var/tmp (mode 1777) -- a tool that cannot write a temp file cannot run"
-	@mkdir -p $(LXROOT)/bin && for t in mkdir rm cp touch printf; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
+	@mkdir -p $(LXROOT)/bin && for t in mkdir rm cp touch printf; do cp -fp $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@tools/stage-linux-tool.sh $(LXROOT) bash
 	@# PHASE 6: Node. 102 MB and 21 shared libraries (libuv, c-ares, OpenSSL,
 	@# ICU, nghttp2, simdjson) -- staged whole and unmodified, exactly like the
@@ -787,7 +787,7 @@ $(LXROOT)/.tools-staged: tools/stage-linux-tool.sh $(LXROOT)/lxwl Makefile tools
 	@# looking in /usr/bin, then skips). (M1978)
 	@if [ -f $(LXROOT)/lxwl ]; then tools/stage-linux-tool.sh $(LXROOT) lxwl $(abspath $(LXROOT)/lxwl); fi
 	@for t in echo cat ls; do tools/stage-linux-tool.sh $(LXROOT) $$t; done
-	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -f $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
+	@mkdir -p $(LXROOT)/bin && for t in echo cat ls; do cp -fp $(LXROOT)/usr/bin/$$t $(LXROOT)/bin/$$t 2>/dev/null || true; done
 	@# PHASE 7: Claude Code. A single 214 MB dynamically-linked ELF (a Node
 	@# single-executable app -- the runtime and the JS are bundled into one
 	@# image), so it stages exactly like node did and needs no npm tree. Only
@@ -882,11 +882,31 @@ $(LXROOT)/.fw-staged: $(LXROOT)/.tools-staged
 	fi
 	@touch $@
 
-$(BUILD)/ext2.img: $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged $(LXROOT)/.fw-staged
+# THE IMAGE IS BUILT WHERE IT IS BOOTED, NOT ON THE LAPTOP (M2382).
+#
+# ext2.img is nothing but `mke2fs -d $(LXROOT)`, and $(LXROOT) changes on every
+# kernel source edit because the source tree is staged into it (/src). So every
+# deploy used to push a fresh 4.6 GB image from the laptop -- over tailscale,
+# twice in parallel when two hosts were in play, from a disk 98% full. The user
+# told me more than once not to stage on the laptop; I kept doing it.
+#
+# `make lxroot-ready` stages the DIRECTORY and stops. tools/pve-stage.sh then
+# mirrors it onto TrueNAS as a per-file delta (a source edit moves kilobytes),
+# and each Proxmox host builds its own image on local disk from that mirror
+# with the SAME flags -- MKE2FS_FLAGS is the single definition both use.
+EXT2_DEPS := $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged $(LXROOT)/.fw-staged
+MKE2FS_FLAGS := -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent
+
+.PHONY: lxroot-ready
+lxroot-ready: $(EXT2_DEPS)
+
+print-%:
+	@echo '$($*)'
+
+$(BUILD)/ext2.img: $(EXT2_DEPS)
 	@mkdir -p $(BUILD)
 	@rm -f $@ && truncate -s $(EXT2SIZE) $@
-	@mke2fs -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent \
-	        -d $(LXROOT) $@ >/dev/null 2>&1
+	@mke2fs $(MKE2FS_FLAGS) -d $(LXROOT) $@ >/dev/null 2>&1
 	@echo "  MKE2FS  $@ ($(EXT2SIZE), 4K blocks, classic ext2, Linux binaries staged in)"
 	@# A FULL IMAGE MUST SAY SO AT BUILD TIME (M2305). It stayed silently at
 	@# 0.0% free for who knows how many milestones, and the symptom that

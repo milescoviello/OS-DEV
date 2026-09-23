@@ -33,8 +33,8 @@ BIN=$(readlink -f "$BIN")
 # is what argv[0]-relative lookups and RUNPATH-relative ($ORIGIN) resolution
 # expect; /usr/bin/<name> is what a person types.
 mkdir -p "$ROOT$(dirname "$BIN")" "$ROOT/usr/bin"
-cp -f "$BIN" "$ROOT$BIN"
-[ "$ROOT$BIN" = "$ROOT/usr/bin/$NAME" ] || cp -f "$BIN" "$ROOT/usr/bin/$NAME"
+cp -fp "$BIN" "$ROOT$BIN"
+[ "$ROOT$BIN" = "$ROOT/usr/bin/$NAME" ] || cp -fp "$BIN" "$ROOT/usr/bin/$NAME"
 
 # ldd prints the RESOLVED path of every dependency, transitively, which is
 # exactly the closure ld.so will ask for. linux-vdso.so.1 has no file (the
@@ -45,7 +45,7 @@ for so in $(ldd "$BIN" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
     r=$(readlink -f "$so" 2>/dev/null) || continue
     [ -f "$r" ] || continue
     mkdir -p "$ROOT$(dirname "$so")"
-    cp -f "$r" "$ROOT$so"
+    cp -fp "$r" "$ROOT$so"
     # ...and again in /usr/lib64, which IS a default ld.so search directory.
     # A library outside the default paths is found on the host only through
     # /etc/ld.so.cache, and we have no cache: node's libstdc++ lives under
@@ -54,7 +54,7 @@ for so in $(ldd "$BIN" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
     # binary cache would be fiddly; a second copy on a path ld.so already
     # searches is the same answer for a few megabytes.
     mkdir -p "$ROOT/usr/lib64"
-    cp -f "$r" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
+    cp -fp "$r" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
     n=$((n+1))
 done
 
@@ -87,14 +87,14 @@ for extra in libEGL.so.1 libGLdispatch.so.0 libglapi.so.0 libgbm.so.1 \
         [ -f "$d/$extra" ] || continue
         r=$(readlink -f "$d/$extra") || continue
         mkdir -p "$ROOT/usr/lib64" "$ROOT/lib64"
-        cp -f "$r" "$ROOT/usr/lib64/$extra" 2>/dev/null || true
-        cp -f "$r" "$ROOT/lib64/$extra"     2>/dev/null || true
+        cp -fp "$r" "$ROOT/usr/lib64/$extra" 2>/dev/null || true
+        cp -fp "$r" "$ROOT/lib64/$extra"     2>/dev/null || true
         for so in $(ldd "$r" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
             rr=$(readlink -f "$so" 2>/dev/null) || continue
             [ -f "$rr" ] || continue
             mkdir -p "$ROOT$(dirname "$so")"
-            cp -f "$rr" "$ROOT$so" 2>/dev/null || true
-            cp -f "$rr" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
+            cp -fp "$rr" "$ROOT$so" 2>/dev/null || true
+            cp -fp "$rr" "$ROOT/usr/lib64/$(basename "$so")" 2>/dev/null || true
             n=$((n+1))
         done
         n=$((n+1))
@@ -107,8 +107,8 @@ for extra in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
         [ -f "$d/$extra" ] || continue
         r=$(readlink -f "$d/$extra") || continue
         mkdir -p "$ROOT/lib64" "$ROOT/usr/lib64"
-        cp -f "$r" "$ROOT/lib64/$extra"     2>/dev/null || true
-        cp -f "$r" "$ROOT/usr/lib64/$extra" 2>/dev/null || true
+        cp -fp "$r" "$ROOT/lib64/$extra"     2>/dev/null || true
+        cp -fp "$r" "$ROOT/usr/lib64/$extra" 2>/dev/null || true
         n=$((n+1))
         break
     done
@@ -123,9 +123,9 @@ for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
           /etc/ssl/cert.pem; do
     [ -f "$ca" ] || continue
     mkdir -p "$ROOT/etc/ssl/certs" "$ROOT/etc/pki/tls/certs"
-    cp -f "$ca" "$ROOT/etc/ssl/certs/ca-certificates.crt"
-    cp -f "$ca" "$ROOT/etc/ssl/cert.pem"
-    cp -f "$ca" "$ROOT/etc/pki/tls/certs/ca-bundle.crt"
+    cp -fp "$ca" "$ROOT/etc/ssl/certs/ca-certificates.crt"
+    cp -fp "$ca" "$ROOT/etc/ssl/cert.pem"
+    cp -fp "$ca" "$ROOT/etc/pki/tls/certs/ca-bundle.crt"
     break
 done
 

@@ -29,7 +29,7 @@ mkdir -p "$LOGS"
 if [ "${NOBUILD:-0}" != 1 ]; then
     echo "==> building"
     make build/kernel32.elf >/dev/null
-    make build/ext2.img >/dev/null
+    make lxroot-ready >/dev/null
 fi
 PIN=$(md5sum build/kernel32.elf | cut -d' ' -f1)
 echo "==> pinned to $PIN, $N boot(s) per arm, $CORES core(s), CAP=$CAP"

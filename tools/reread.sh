@@ -11,7 +11,7 @@ N=${N:-3}; CORES=${CORES:-8}; CAP=${CAP:-380}
 APPEND=${APPEND:-"ffnet lxout nonetdemo"}
 if [ "${NOBUILD:-0}" != 1 ]; then
     make build/kernel32.elf >/dev/null
-    make build/ext2.img   >/dev/null
+    make lxroot-ready   >/dev/null
 fi
 PIN=$(md5sum build/kernel32.elf | cut -d' ' -f1); echo "==> pinned $PIN"
 mkdir -p build/ablogs

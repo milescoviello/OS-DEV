@@ -26,7 +26,7 @@ URL=${URL:-https://volumeshaderbm.com/start/}
 # the run. The arithmetic caught it: the guest logged 45 connects (28 ok, 17
 # failed = ~96 SYNs) against 48 SYNs on the wire. Build first, then arm.
 make build/kernel32.elf >/dev/null || { echo "FATAL: build failed"; exit 2; }
-make build/ext2.img    >/dev/null || { echo "FATAL: ext2 build failed"; exit 2; }
+make lxroot-ready    >/dev/null || { echo "FATAL: ext2 build failed"; exit 2; }
 
 MAC=$($SSH "qm config $V" | sed -nE 's/^net0:.*=([0-9A-Fa-f:]{17}),.*/\1/p')
 [ -n "$MAC" ] || { echo "FATAL: could not read VM $V's MAC from qm config"; exit 2; }

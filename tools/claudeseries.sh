@@ -28,12 +28,12 @@ mkdir -p "$LOGS"
 
 if [ "${NOBUILD:-0}" != 1 ]; then
     make build/kernel32.elf >/dev/null
-    make build/ext2.img   >/dev/null
+    make lxroot-ready   >/dev/null
 fi
 
 # AN EXPIRED CREDENTIAL IS NOT A CLAUDE FAILURE (M2291).
 #
-# M2239 made the in-guest token a make prerequisite, so `make build/ext2.img`
+# M2239 made the in-guest token a make prerequisite, so `make lxroot-ready`
 # restages it whenever the host's is newer. Every series here runs with
 # NOBUILD=1 -- which is correct, because rebuilding mid-series changes the
 # kernel digest the run is pinned to -- and that skips the restage too. A
@@ -54,7 +54,7 @@ sys.exit(0 if left > 300 else 1)
 PYEOF
     then
         echo "    -> expired (or under 5 min). Restaging from the host and rebuilding the image."
-        make build/ext2.img >/dev/null || exit 1
+        make lxroot-ready >/dev/null || exit 1
     fi
 fi
 PIN=$(md5sum build/kernel32.elf | cut -d' ' -f1)

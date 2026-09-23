@@ -4,9 +4,10 @@
 # WHY THIS EXISTS. tools/pve-deploy.sh predates the ext2 root filesystem: it
 # ships kernel32.elf and, optionally, fat.img -- and every Linux binary, the
 # whole glibc/GTK/Firefox closure and OS-DEV's own source tree now live in
-# ext2.img, which is regenerated on EVERY kernel source change. So a deploy has
-# to move 3.2 GB, and rsync --inplace --no-whole-file does it in seconds once
-# the first copy is there.
+# ext2.img, which is regenerated on EVERY kernel source change. That image is
+# no longer shipped: since M2382 tools/pve-stage.sh sends the laptop's lxroot
+# DELTA to TrueNAS and the node builds ext2.img on its own disk. Nothing big
+# leaves the laptop.
 #
 # WHY pve-ultra AND NOT THE LAPTOP. The laptop's UEFI has VT-x disabled, so
 # /dev/kvm cannot exist there and everything is TCG. This node has KVM, 20
@@ -53,9 +54,9 @@ cd "$(dirname "$0")/.."
 OSDEV_RUN_T0=$(date -u +%s)
 
 if [ "${NOBUILD:-0}" != 1 ]; then
-    echo "==> building kernel + ext2 image..."
+    echo "==> building kernel + staging lxroot (the node builds ext2.img)..."
     make build/kernel32.elf >/dev/null
-    make build/ext2.img >/dev/null
+    make lxroot-ready >/dev/null
 fi
 
 # AN EXPIRED CREDENTIAL IS NOT A CLAUDE FAILURE -- AND THE GUARD HAS TO LIVE
@@ -86,7 +87,7 @@ PYEOF
         then
             echo "    -> expired (or under 5 min). Restaging and rebuilding the image,"
             echo "       because measuring a Claude demo against a dead token measures the clock."
-            make build/ext2.img >/dev/null || exit 1
+            make lxroot-ready >/dev/null || exit 1
         fi
     fi
     ;;
@@ -101,9 +102,8 @@ esac
 echo "==> stopping VM $VMID so the images are not in use..."
 $SSH "qm stop $VMID >/dev/null 2>&1 || true; sleep 1" >/dev/null 2>&1 || true
 
-echo "==> syncing to $PVE_HOST:$PVE_DIR (incremental)..."
-rsync -a --inplace --no-whole-file \
-      build/kernel32.elf build/fat.img build/ext2.img "root@$PVE_HOST:$PVE_DIR/"
+# THE IMAGE IS BUILT ON THE NODE (M2382) -- see tools/pve-stage.sh.
+PVE_HOST=$PVE_HOST PVE_DIR=$PVE_DIR VMID=$VMID tools/pve-stage.sh
 
 # PROVE THE NODE IS RUNNING WHAT WAS JUST BUILT (M2156).
 #

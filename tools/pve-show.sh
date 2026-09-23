@@ -37,15 +37,14 @@ SSH="ssh -o BatchMode=yes root@$PVE_HOST"
 if [ "${NOBUILD:-0}" != 1 ]; then
     echo "==> building..."
     make build/kernel32.elf >/dev/null
-    make build/ext2.img >/dev/null
+    make lxroot-ready >/dev/null
 fi
 
 echo "==> stopping VM $VMID so the images are not in use..."
 $SSH "qm stop $VMID >/dev/null 2>&1 || true; sleep 1" >/dev/null 2>&1 || true
 
-echo "==> syncing..."
-rsync -a --inplace --no-whole-file \
-      build/kernel32.elf build/fat.img build/ext2.img "root@$PVE_HOST:$PVE_DIR/"
+# THE IMAGE IS BUILT ON THE NODE (M2382) -- see tools/pve-stage.sh.
+PVE_HOST=$PVE_HOST PVE_DIR=$PVE_DIR VMID=$VMID tools/pve-stage.sh || exit 1
 # Same digest guard as pve-run.sh: rsync's quick check is size + mtime, so a
 # rebuild that lands on the same size can transfer nothing (M2156).
 L=$(md5sum build/kernel32.elf | cut -d' ' -f1)
