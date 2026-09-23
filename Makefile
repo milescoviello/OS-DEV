@@ -886,8 +886,8 @@ $(LXROOT)/.fw-staged: $(LXROOT)/.tools-staged
 #
 # ext2.img is nothing but `mke2fs -d $(LXROOT)`, and $(LXROOT) changes on every
 # kernel source edit because the source tree is staged into it (/src). So every
-# deploy used to push a fresh 4.6 GB image from the laptop -- over tailscale,
-# twice in parallel when two hosts were in play, from a disk 98% full. The user
+# deploy used to push a fresh 4.6 GB image from the laptop over a slow link,
+# twice in parallel when two hosts were in play. The user
 # told me more than once not to stage on the laptop; I kept doing it.
 #
 # `make lxroot-ready` stages the DIRECTORY and stops. tools/pve-stage.sh then

@@ -6,7 +6,7 @@
 #
 # Before this, every deploy rsynced build/ext2.img -- 4.6 GB, regenerated on
 # every kernel edit because the source tree is staged into it -- from the
-# laptop over tailscale. The user said not to stage on the laptop. Now:
+# laptop over a slow link. The user said not to stage on the laptop. Now:
 #
 #   laptop  --(per-file delta, -z)---->  TrueNAS  $STAGE/lxroot
 #   TrueNAS --(LAN, owner fixed)------>  node     $MIRROR

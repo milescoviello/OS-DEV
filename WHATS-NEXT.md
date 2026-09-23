@@ -8,16 +8,16 @@
 > ==> TrueNAS -> 192.168.1.5: mirror + image... built ext2.img (4600M, 1131 MB free) in 17s
 > ```
 >
-> Every deploy used to push a fresh 4.6 GB `ext2.img` from the laptop, which
-> reaches the lab over tailscale from a disk 98% full. It was rebuilt on every
+> Every deploy used to push a fresh 4.6 GB `ext2.img` from the laptop over a
+> slow link. It was rebuilt on every
 > kernel edit because the source tree is staged into it (`/src`). Twice in a
 > row the pushes ran in parallel to two hosts. The user said not to stage on
 > the laptop; I kept doing it.
 >
 > `ext2.img` is nothing but `mke2fs -d build/lxroot`, so now:
 > `make lxroot-ready` stages the directory and stops. `tools/pve-stage.sh`
-> then sends the per-file delta to TrueNAS (192.168.1.47, already NFS-mounted
-> on both nodes). Each node mirrors that onto its own disk and runs mke2fs
+> then sends the per-file delta to the NAS (already NFS-mounted on both
+> nodes). Each node mirrors that onto its own disk and runs mke2fs
 > there with the Makefile's own `MKE2FS_FLAGS`. The node-built image matches
 > the laptop's: identical features, inode and block counts, free blocks, and
 > owners. After a one-time 160 s seed, a source edit costs seconds.
