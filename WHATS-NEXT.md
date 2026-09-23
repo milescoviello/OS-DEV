@@ -1,5 +1,50 @@
 # What's next
 
+> **(M2380-M2381) OS-DEV'S FROM-SCRATCH DRIVER POSTS A REAL NVIDIA GT 1030.**
+>
+> ```
+> [nv] 0x2240c = 00000000 -> the card NEEDS POSTing
+> [nv] pmu: falcon reset complete (engine-reset pulse x2, scrubbing done)
+> [nv] pmu: DEVINIT SIGNALLED COMPLETE (0x10a040 = 40007007)
+> [nv] AFTER PMU devinit: 0x2240c = 00000002 -> the card does NOT need POSTing
+> ```
+>
+> Bit 1 of `0x2240c` is nouveau's own POST test, and it flipped. The card
+> comes up cold behind vfio, and OS-DEV reset its PMU falcon, uploaded the
+> VBIOS's own DEVINIT application (boot 256 B, code 15120 B, data 1248 B),
+> loaded the tables and boot scripts, and started it. DEVINIT reported done.
+>
+> **This retracts M2373 and M2374**, which declared the GT 1030 impossible
+> because a DEVINIT descriptor pointed "outside every VBIOS image". It did
+> not. VBIOS pointers are written for a layout in which NVIDIA's images follow
+> image 0 directly; an EFI image was inserted between them afterwards, and
+> nouveau silently re-bases every read past image 0 onto the first type-0xe0
+> image (its own comment: "Some tables have weird pointers... I'm not
+> entirely sure why"). I had validated nouveau's field layouts carefully and
+> never its read path, so the "proven negative" was a parse of garbage.
+>
+> Found by taking the reference driver's own image instead of reasoning:
+> nouveau bound on the host exposes a 235008-byte `vbios.rom` in five images,
+> where this driver had seen two -- it only accepted 55AA/PCIR (images 2-4
+> are "NV"/NPDS), capped the ROM copy at 128 KiB, and applied no remap.
+>
+> Two fixes before anything was armed: GP102's falcon reset needs the
+> `0x10a3c0` engine-reset pulse, which the first version omitted; and the
+> host-side script interpreter is now forced dry on Maxwell2+, because on
+> those parts the scripts are PMU input and nouveau never runs them on the
+> CPU.
+>
+> **Not yet up:** the framebuffer registers still read `0xbadf1100` after the
+> POST. Those are PRI errors -- they sit behind the privileged-register ring,
+> which nouveau initialises as its own subdev *after* devinit. So VRAM size
+> is not yet measurable, and nouveau's 2048 MiB stays a pending check, not a
+> claim.
+>
+> **The GT 710 detour** (M2376-M2379) built a host-side Kepler devinit
+> interpreter that measurably changes real silicon. It does not transfer to
+> the 1030, whose devinit is PMU-based, and the 710 cannot reach 30 fps --
+> which the user pointed out, correctly.
+
 > **(M2375) THE RESET MECHANISM, NAMED AND ELIMINATED.** M2373 said "QEMU
 > resets the card at VM start" without saying how. There was a specific
 > mechanism: vfio-pci drops an idle passthrough device into D3hot, and
