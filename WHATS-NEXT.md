@@ -1,5 +1,41 @@
 # What's next
 
+> **(M2387) NVIDIA'S SIGNED ACR RUNS ON THE GT 1030 UNDER OS-DEV, AND LOCKS
+> OUR WRITE-PROTECTED REGION.**
+>
+> ```
+> [nv] acr: WPR image 154880 bytes; shadow 20000000, WPR 20040000-20080000
+> [nv] acr: debug fuse clear -> PRODUCTION signature; falcon enabled
+> [nv] acr: SEC2 bound to our VMM (bind 5, idle), IMEM 65536 B, bootloader 512 B at fe00 tag fd
+> [nv] acr: HS ACR HALTED after 3 ms: mbox0 00000000 (want 0);
+>           memory controller WPR 20040000-20080000 (ours 20040000-20080000)
+> [nv] acr: PASS -- NVIDIA's signed ACR ran on SEC2 and locked OUR WPR
+> ```
+>
+> On Pascal, GR's falcons run only NVIDIA-signed code, and only after the ACR
+> (itself signed, "heavy secure") has verified them into a write-protected
+> region of VRAM. On GP108 the ACR runs on SEC2. The oracle is `0x100cd4`:
+> the WPR bounds the memory controller enforces. Only the signed ACR can set
+> them, and they read back as exactly our region. It worked on the first
+> boot.
+>
+> The steps, each nouveau's for this chip:
+> - **The WPR image.** FECS and GPCCS are assembled from bl+inst+data+sig,
+>   SEC2 from sig+image+desc. The image (WPR headers, LSB headers with each
+>   192-byte signature, the images, and bootloader descriptors
+>   pre-relocated to the WPR) is built in the shadow half of a 512 KiB
+>   allocation.
+> - **The ACR image.** Its production signature is patched in, chosen by
+>   SEC2's debug fuse. Its descriptor gets our two regions.
+> - **Loading it.** The image is mapped into our own VMM. SEC2 is bound to
+>   that VMM through an instance block, its 512-byte bootloader is PIO'd to
+>   the top of IMEM, and the bootloader DMAs the rest in from our virtual
+>   address.
+>
+> A reading error of mine nearly cost a milestone: 10 minutes of silence in
+> `boot.log` looked like a hang. That was the PREVIOUS boot's log, while this
+> run was still staging. Check the timestamp before believing a log.
+
 > **(M2386) NVIDIA'S SIGNED GP108 FIRMWARE LOADS FROM OS-DEV'S OWN ROOT
 > FILESYSTEM** -- all 20 files, 205,892 bytes, each size-checked against its
 > `statx`. The four ACR images start with `0x10de`, the header magic nouveau

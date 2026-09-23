@@ -1340,6 +1340,288 @@ static uint8_t *nv_fw_load(const char *rel, unsigned *len) {
     *len = (unsigned)sz;
     return b;
 }
+/* ============================================================================
+ * GOAL STEP 5: ACR ON SEC2 (M2387).
+ *
+ * On Pascal, GR's two falcons (FECS, GPCCS) will only run NVIDIA-signed code,
+ * and only after the ACR -- an NVIDIA-signed "heavy secure" program -- has
+ * verified them into a write-protected region (WPR) of VRAM. On GP108 the ACR
+ * runs on SEC2 (gp108_acr_load_fwif: NVKM_ACR_HSF_SEC2), and SEC2's own
+ * signed RTOS is then what starts FECS and GPCCS on request.
+ *
+ * This is nouveau's sequence, followed step by step for the chip it uses:
+ *   lsfw.c        FECS/GPCCS from bl+inst+data+sig; SEC2 from sig+image+desc
+ *   gp102.c       wpr_layout, wpr_build(_lsb), wpr_alloc (shadow | wpr halves),
+ *                 wpr_patch (+wpr_start), load_setup (two regions, >>8)
+ *   gp108.c       the ACR's own bootloader descriptor (flcn_bl_dmem_desc_v2,
+ *                 ctx_dma VIRT), GR's LS descriptors (ctx_dma UCODE)
+ *   falcon/fw.c   ctor_hs (0x10de indirection for patch_loc/patch_sig),
+ *                 boot: patch sig -> reset -> setup -> load -> boot
+ *   falcon/gm200  signature (debug fuse at +0x408), enable/disable, bind_inst,
+ *                 PIO (IMEM 256-byte tagged blocks), boot + halt + mbox0
+ * The oracle is 0x100cd4: the WPR bounds the memory controller enforces. Only
+ * the signed ACR can program them, so reading OUR region back from there
+ * means NVIDIA's firmware ran on this card, under this driver.
+ * ========================================================================== */
+#define SEC2_BASE       0x087000u
+#define SEC2_PMC_BIT    14                     /* TOP: SEC2 reset 14 */
+#define NV_ACR_INST     0x20000u               /* VRAM NV_MMU_BASE + this */
+#define NV_ACR_HS_VA    0x40000u               /* HS image: VA == offset from NV_MMU_BASE */
+#define NV_WPR_BASE     0x20000000u            /* 512 MiB into VRAM, 256 KiB aligned */
+enum { LSF_FECS = 2, LSF_GPCCS = 3, LSF_SEC2 = 7 };
+struct nv_lsfw {
+    int id; uint32_t flags; int sec2;
+    uint8_t *img; uint32_t img_size; uint8_t *sig; uint32_t sig_size;
+    uint32_t bl_size, bl_imem_off, app_start, app_size, app_entry;
+    uint32_t rc_off, rc_size, rd_off, rd_size, ucode_size, data_size;
+    uint32_t off_lsb, off_img, off_bld;
+};
+static uint32_t le32(const uint8_t *b) { return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24; }
+static void put32(uint8_t *b, uint32_t v) { b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24; }
+#define ALN(x, a) (((x) + (a) - 1) & ~((uint32_t)(a) - 1))
+static uint32_t fl_rd(uint32_t o) { return nv_reg_rd(SEC2_BASE + o); }
+static void fl_wr(uint32_t o, uint32_t v) { nv_reg_wr(SEC2_BASE + o, v); }
+static void fl_mask(uint32_t o, uint32_t m, uint32_t v) { fl_wr(o, (fl_rd(o) & ~m) | v); }
+
+static void nv_vram_write(uint32_t a, const uint8_t *b, uint32_t len) {
+    for (uint32_t i = 0; i < len; i += 4) {
+        uint32_t w = 0;
+        for (uint32_t k = 0; k < 4 && i + k < len; k++) w |= (uint32_t)b[i + k] << (8 * k);
+        nv_vram_wr32(a + i, w);
+    }
+}
+static void nv_mmu_invalidate(void) {
+    for (unsigned t = 0; t <= 2000 && !(nv_reg_rd(0x100c80) & 0x00ff0000u); t++) nv_mdelay(1);
+    uint64_t pdb = (uint64_t)(NV_MMU_PD3 >> 12) << 4;
+    nv_reg_wr(0x100cb8, (uint32_t)pdb); nv_reg_wr(0x100cec, (uint32_t)(pdb >> 32));
+    nv_reg_wr(0x100cbc, 0x80000000u | 0x1);
+    nv_wait(0x100c80, 0x00008000u, 0x00008000u, 2000);
+}
+/* gm200_flcn_reset_wait_mem_scrubbing / gp102_flcn_reset_eng / enable / disable */
+static int fl_scrub(void) {
+    for (unsigned t = 0; t <= 10; t++) { if (!(fl_rd(0x10c) & 6)) return 1; nv_mdelay(1); }
+    return 0;
+}
+static int fl_reset_eng(void) {
+    fl_mask(0x3c0, 1, 1); nv_mdelay(1); fl_mask(0x3c0, 1, 0);
+    return fl_scrub();
+}
+static int fl_enable(void) {
+    int ok = fl_reset_eng();
+    nv_reg_wr(0x000200, nv_reg_rd(0x000200) | (1u << SEC2_PMC_BIT)); (void)nv_reg_rd(0x000200);
+    ok &= fl_scrub();
+    fl_wr(0x084, nv_reg_rd(0x000000));
+    return ok;
+}
+static int fl_disable(void) {
+    fl_mask(0x048, 3, 0);
+    fl_wr(0x014, 0xffffffffu);
+    nv_reg_wr(0x000200, nv_reg_rd(0x000200) & ~(1u << SEC2_PMC_BIT)); (void)nv_reg_rd(0x000200);
+    return fl_reset_eng();
+}
+static void fl_imem_wr(uint32_t dst, const uint8_t *b, uint32_t len, uint32_t tag, int sec) {
+    fl_wr(0x180, (sec ? 1u << 28 : 0) | 1u << 24 | dst);
+    for (uint32_t i = 0; i < len; i += 256, tag++) {
+        fl_wr(0x188, tag);
+        for (uint32_t k = 0; k < 256; k += 4) fl_wr(0x184, i + k + 3 < len ? le32(b + i + k) : 0);
+    }
+}
+static void fl_dmem_wr(uint32_t dst, const uint8_t *b, uint32_t len) {
+    fl_wr(0x1c0, 1u << 24 | dst);
+    for (uint32_t i = 0; i < len; i += 4) fl_wr(0x1c4, le32(b + i));
+}
+
+static const char *nv_cat(char *n, const char *a, const char *b) {
+    unsigned i = 0;
+    while (*a && i < 47) n[i++] = *a++;
+    while (*b && i < 47) n[i++] = *b++;
+    n[i] = 0;
+    return n;
+}
+/* nvkm_acr_lsfw_load_bl_inst_data_sig */
+static int nv_lsfw_gr(struct nv_lsfw *l, int id, const char *pfx) {
+    char n[48]; unsigned bl_len, in_len, da_len, sg_len;
+    uint8_t *bl = nv_fw_load(nv_cat(n, pfx, "bl.bin"), &bl_len);
+    uint8_t *in = nv_fw_load(nv_cat(n, pfx, "inst.bin"), &in_len);
+    uint8_t *da = nv_fw_load(nv_cat(n, pfx, "data.bin"), &da_len);
+    uint8_t *sg = nv_fw_load(nv_cat(n, pfx, "sig.bin"), &sg_len);
+    if (!bl || !in || !da || !sg || bl_len < 24) return 0;
+    uint32_t hoff = le32(bl + 12), doff = le32(bl + 16);
+    if (hoff + 24 > bl_len || doff > bl_len) return 0;
+    uint32_t start_tag = le32(bl + hoff + 0), code_size = le32(bl + hoff + 12);
+    l->id = id; l->sec2 = 0; l->flags = id == LSF_GPCCS ? 0x8 : 0;  /* FORCE_PRIV_LOAD for GPCCS */
+    l->sig = sg; l->sig_size = sg_len;
+    l->bl_size = ALN(code_size, 256); l->bl_imem_off = start_tag << 8;
+    l->app_start = l->bl_size; l->app_entry = 0;
+    l->rc_off = 0; l->rc_size = ALN(in_len, 256);
+    l->rd_off = l->rc_size; l->rd_size = ALN(da_len, 256);
+    l->app_size = l->rc_size + l->rd_size;
+    l->img_size = l->bl_size + l->app_size;
+    l->img = kmalloc(l->img_size);
+    if (!l->img) return 0;
+    for (uint32_t i = 0; i < l->img_size; i++) l->img[i] = 0;
+    for (uint32_t i = 0; i < l->bl_size && doff + i < bl_len; i++) l->img[i] = bl[doff + i];
+    for (uint32_t i = 0; i < in_len; i++) l->img[l->app_start + l->rc_off + i] = in[i];
+    for (uint32_t i = 0; i < da_len; i++) l->img[l->app_start + l->rd_off + i] = da[i];
+    l->ucode_size = ALN(l->rd_off, 256) + l->bl_size;
+    l->data_size = l->app_size + l->bl_size - l->ucode_size;
+    kfree(bl); kfree(in); kfree(da);
+    return 1;
+}
+/* nvkm_acr_lsfw_load_sig_image_desc_v1 + nvkm_acr_lsfw_from_desc */
+static int nv_lsfw_sec2(struct nv_lsfw *l) {
+    unsigned sg_len, im_len, de_len;
+    uint8_t *sg = nv_fw_load("sec2/sig.bin", &sg_len), *im = nv_fw_load("sec2/image.bin", &im_len);
+    uint8_t *de = nv_fw_load("sec2/desc.bin", &de_len);
+    if (!sg || !im || !de || de_len < 132) return 0;
+    l->id = LSF_SEC2; l->sec2 = 1; l->flags = 0;
+    l->sig = sg; l->sig_size = sg_len; l->img = im; l->img_size = im_len;
+    l->bl_size = ALN(le32(de + 84), 256); l->bl_imem_off = le32(de + 88);
+    l->app_size = ALN(le32(de + 100), 256); l->app_start = le32(de + 96);
+    l->app_entry = le32(de + 108);
+    l->rc_off = le32(de + 116); l->rc_size = le32(de + 120);
+    l->rd_off = le32(de + 124); l->rd_size = le32(de + 128);
+    l->ucode_size = ALN(l->rd_off, 256) + l->bl_size;
+    l->data_size = l->app_size + l->bl_size - l->ucode_size;
+    kfree(de);
+    return 1;
+}
+
+static void nv_acr_run(void) {
+    static struct nv_lsfw ls[3];
+    if (!nv_lsfw_gr(&ls[0], LSF_FECS, "gr/fecs_") || !nv_lsfw_gr(&ls[1], LSF_GPCCS, "gr/gpccs_") || !nv_lsfw_sec2(&ls[2])) {
+        kprintf("[nv] acr: could not assemble the LS firmware -- stopped\n"); return;
+    }
+    for (int i = 0; i < 3; i++)
+        if (ls[i].sig_size != 192) { kprintf("[nv] acr: falcon %d signature is %u bytes, not lsf_signature_v1's 192 -- stopped\n", ls[i].id, ls[i].sig_size); return; }
+
+    /* gp102_acr_wpr_layout */
+    uint32_t w = ALN(11 * 24, 256) + 0x100;
+    for (int i = 0; i < 3; i++) {
+        w = ALN(w, 256);  ls[i].off_lsb = w; w += 240;
+        w = ALN(w, 4096); ls[i].off_img = w; w += ls[i].img_size;
+        w = ALN(w, 256);  ls[i].off_bld = w; w += 256;               /* ALIGN(sizeof bl_dmem_desc_v2, 256) */
+        kprintf("[nv] acr: LSF %d: lsb %05x img %05x (%u B: bl %u app %u ucode %u data %u) bld %05x\n",
+                ls[i].id, ls[i].off_lsb, ls[i].off_img, ls[i].img_size, ls[i].bl_size, ls[i].app_size,
+                ls[i].ucode_size, ls[i].data_size, ls[i].off_bld);
+    }
+    uint32_t half = ALN(w, 0x40000);
+    uint32_t shadow = NV_WPR_BASE, wpr_start = shadow + half, wpr_end = wpr_start + half;
+    kprintf("[nv] acr: WPR image %u bytes; shadow %08x, WPR %08x-%08x\n", w, shadow, wpr_start, wpr_end);
+
+    /* gp102_acr_wpr_build (+ wpr_patch folded in: every DMA base gets +wpr_start) */
+    uint32_t saved1700 = nv_reg_rd(0x1700); g_nv_pramin_win = 0xffffffffu;
+    for (uint32_t a = 0; a < w; a += 4) nv_vram_wr32(shadow + a, 0);
+    for (int i = 0; i < 3; i++) {
+        struct nv_lsfw *l = &ls[i];
+        uint8_t hdr[24];
+        put32(hdr + 0, l->id); put32(hdr + 4, l->off_lsb); put32(hdr + 8, LSF_SEC2);
+        put32(hdr + 12, l->id != LSF_SEC2); put32(hdr + 16, le32(l->sig + 80)); put32(hdr + 20, 1);
+        nv_vram_write(shadow + i * 24, hdr, 24);
+        uint8_t lsb[240];
+        for (int k = 0; k < 192; k++) lsb[k] = l->sig[k];
+        uint32_t t[12] = { l->off_img, l->ucode_size, l->data_size, l->bl_size, l->bl_imem_off, l->off_bld, 256,
+                           l->app_start + l->rc_off, l->rc_size, l->app_start + l->rd_off, l->rd_size, l->flags };
+        for (int k = 0; k < 12; k++) put32(lsb + 192 + k * 4, t[k]);
+        nv_vram_write(shadow + l->off_lsb, lsb, 240);
+        nv_vram_write(shadow + l->off_img, l->img, l->img_size);
+        uint8_t bd[84];
+        for (int k = 0; k < 84; k++) bd[k] = 0;
+        uint64_t code = (uint64_t)wpr_start + l->off_img + l->app_start + (l->sec2 ? 0 : l->rc_off);
+        uint64_t data = (uint64_t)wpr_start + l->off_img + l->app_start + l->rd_off;
+        put32(bd + 32, l->sec2 ? 6 : 0);                                /* FALCON_SEC2_DMAIDX_UCODE / DMAIDX_UCODE */
+        put32(bd + 36, (uint32_t)code); put32(bd + 40, (uint32_t)(code >> 32));
+        put32(bd + 44, l->rc_off); put32(bd + 48, l->rc_size); put32(bd + 60, l->app_entry);
+        put32(bd + 64, (uint32_t)data); put32(bd + 68, (uint32_t)(data >> 32)); put32(bd + 72, l->rd_size);
+        if (l->sec2) { put32(bd + 76, 1); put32(bd + 80, 0x01000000u); } /* argc 1, argv = emem_addr */
+        nv_vram_write(shadow + l->off_bld, bd, 84);
+    }
+    nv_vram_wr32(shadow + 3 * 24, 0xffffffffu);                         /* WPR_HEADER_V1_FALCON_ID_INVALID */
+    uint32_t chk = nv_vram_rd32(shadow + 0), chk2 = nv_vram_rd32(shadow + ls[2].off_img);
+
+    /* the HS ACR: falcon/fw.c nvkm_falcon_fw_ctor_hs on acr/ucode_load.bin + acr/bl.bin */
+    unsigned hl, bll; uint8_t *hs = nv_fw_load("acr/ucode_load.bin", &hl), *blb = nv_fw_load("acr/bl.bin", &bll);
+    if (!hs || !blb || le32(hs) != 0x10de || le32(blb) != 0x10de) { kprintf("[nv] acr: HS images missing or not 0x10de -- stopped\n"); goto out; }
+    uint32_t hh = le32(hs + 12), hdoff = le32(hs + 16), hdsz = le32(hs + 20);
+    uint32_t sig_dbg_off = le32(hs + hh + 0), sig_prod_off = le32(hs + hh + 8), sig_prod_sz = le32(hs + hh + 12);
+    uint32_t loc = le32(hs + le32(hs + hh + 16)), sgo = le32(hs + le32(hs + hh + 20)), lh = le32(hs + hh + 24);
+    uint32_t nsc_off = le32(hs + lh + 0), nsc_sz = le32(hs + lh + 4), dbase = le32(hs + lh + 8), dsz = le32(hs + lh + 12);
+    uint32_t napps = le32(hs + lh + 16), app0 = le32(hs + lh + 20), app0sz = le32(hs + lh + 20 + 4 * napps);
+    uint8_t *img = hs + hdoff;
+    kprintf("[nv] acr: HS image %u B; non-sec %x+%x, sec %x+%x, data %x+%x, sig %u B patched at %x\n",
+            hdsz, nsc_off, nsc_sz, app0, app0sz, dbase, dsz, sig_prod_sz, loc);
+    uint32_t bhoff = le32(blb + 12), bdoff = le32(blb + 16);
+    uint32_t b_tag = le32(blb + bhoff + 0), b_code_off = le32(blb + bhoff + 8), b_code_sz = le32(blb + bhoff + 12);
+
+    /* signature: gm200_flcn_fw_signature enables the falcon, reads the debug fuse */
+    fl_enable();
+    int dbg = !!(fl_rd(0x408) & 0x00100000u);
+    const uint8_t *sgsrc = hs + (dbg ? sig_dbg_off : sig_prod_off) + sgo;
+    for (uint32_t k = 0; k < sig_prod_sz; k++) img[loc + k] = sgsrc[k];
+    /* reset (disable + enable), then gp102_acr_load_setup on the descriptor at dmem_base_img */
+    fl_disable(); int en = fl_enable();
+    uint8_t *d = img + dbase;
+    put32(d + 0x210, 1); put32(d + 0x21c, 2);
+    put32(d + 0x220, wpr_start >> 8); put32(d + 0x224, wpr_end >> 8); put32(d + 0x228, 1);
+    put32(d + 0x22c, 0xf); put32(d + 0x230, 0xc); put32(d + 0x234, 0x2); put32(d + 0x238, shadow >> 8);
+    /* the image into VRAM, mapped at NV_ACR_HS_VA, and an instance block for SEC2's virtual DMA */
+    nv_vram_write(NV_MMU_BASE + NV_ACR_HS_VA, img, hdsz);
+    for (uint32_t va = NV_ACR_HS_VA; va < NV_ACR_HS_VA + ALN(hdsz, 4096); va += 0x1000)
+        nv_vram_wr64(NV_MMU_PT + (va >> 12) * 8, 1ull | ((uint64_t)(NV_MMU_BASE + va) >> 4));
+    for (uint32_t a = 0; a < 0x1000; a += 4) nv_vram_wr32(NV_MMU_BASE + NV_ACR_INST + a, 0);
+    nv_vram_wr64(NV_MMU_BASE + NV_ACR_INST + 0x200, (1ull << 10) | (1ull << 11) | NV_MMU_PD3);
+    nv_vram_wr64(NV_MMU_BASE + NV_ACR_INST + 0x208, g_nv_bar1_size - 1);
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+    nv_mmu_invalidate();
+    kprintf("[nv] acr: debug fuse %s -> %s signature; falcon %s; WPR shadow reads back %08x / SEC2 img %08x\n",
+            dbg ? "SET" : "clear", dbg ? "DEBUG" : "PRODUCTION", en ? "enabled" : "ENABLE TIMED OUT", chk, chk2);
+
+    /* gm200_flcn_fw_load: bind the instance block */
+    fl_mask(0x048, 1, 1);
+    fl_mask(0x604, 7, 0);
+    fl_wr(0x054, (1u << 30) | (0u << 28) | ((NV_MMU_BASE + NV_ACR_INST) >> 12));
+    fl_mask(0x090, 0x10000, 0x10000);
+    fl_mask(0x0a4, 0x8, 0x8);
+    int b5 = 0, b0 = 0;
+    for (unsigned t = 0; t <= 10 && !b5; t++) { b5 = (fl_rd(0x008) & 8) && ((fl_rd(0x0dc) >> 12) & 7) == 5; if (!b5) nv_mdelay(1); }
+    fl_mask(0x004, 8, 8); fl_mask(0x058, 2, 2);
+    for (unsigned t = 0; t <= 10 && !b0; t++) { b0 = ((fl_rd(0x0dc) >> 12) & 7) == 0; if (!b0) nv_mdelay(1); }
+    /* the bootloader at the top of IMEM, then its descriptor into DMEM 0 */
+    uint32_t imem = (fl_rd(0x108) & 0x1ff) << 8, boot_addr = b_tag << 8;
+    fl_imem_wr(imem - b_code_sz, blb + bdoff + b_code_off, b_code_sz, b_tag, 0);
+    uint8_t bd[84];
+    for (int k = 0; k < 84; k++) bd[k] = 0;
+    uint64_t cb = NV_ACR_HS_VA, db = (uint64_t)NV_ACR_HS_VA + dbase;
+    put32(bd + 32, 1);                                                  /* FALCON_DMAIDX_VIRT */
+    put32(bd + 36, (uint32_t)cb); put32(bd + 40, (uint32_t)(cb >> 32));
+    put32(bd + 44, nsc_off); put32(bd + 48, nsc_sz);
+    put32(bd + 52, ALN(app0, 0x100)); put32(bd + 56, app0sz);
+    put32(bd + 64, (uint32_t)db); put32(bd + 68, (uint32_t)(db >> 32)); put32(bd + 72, dsz);
+    fl_dmem_wr(0, bd, 84);
+    kprintf("[nv] acr: SEC2 bound to our VMM (%s, %s), IMEM %u B, bootloader %u B at %x tag %x\n",
+            b5 ? "bind 5" : "BIND NOT 5", b0 ? "idle" : "BIND NOT IDLE", imem, b_code_sz, imem - b_code_sz, b_tag);
+
+    /* gm200_flcn_fw_boot */
+    fl_wr(0x040, 0xcafebeefu);
+    fl_wr(0x104, boot_addr);
+    fl_wr(0x100, 2);
+    unsigned ms = 0; int halted = 0;
+    for (; ms <= 2000 && !(halted = !!(fl_rd(0x100) & 0x10)); ms++) nv_mdelay(1);
+    uint32_t mb0 = fl_rd(0x040), mb1 = fl_rd(0x044);
+    fl_mask(0x004, 0xffffffffu, 0x10);
+    nv_reg_wr(0x100cd4, 2); uint64_t ws = (uint64_t)(nv_reg_rd(0x100cd4) & 0xffffff00u) << 8;
+    nv_reg_wr(0x100cd4, 3); uint64_t wl = ((uint64_t)(nv_reg_rd(0x100cd4) & 0xffffff00u) << 8) + 0x20000;
+    kprintf("[nv] acr: HS ACR %s after %u ms: mbox0 %08x (want 0) mbox1 %08x; memory controller WPR %lx-%lx (ours %x-%x)\n",
+            halted ? "HALTED" : "DID NOT HALT", ms, mb0, mb1, (unsigned long)ws, (unsigned long)wl, wpr_start, wpr_end);
+    int pass = halted && mb0 == 0 && ws == wpr_start && wl == wpr_end;
+    kprintf("[nv] acr: %s -- %s\n", pass ? "PASS" : "FAIL",
+            pass ? "NVIDIA's signed ACR ran on SEC2 and locked OUR WPR" :
+            mb0 == 0xcafebeefu ? "the ACR never wrote its mailbox (did not start, or trapped early)"
+                               : "see mbox0 -- the ACR's own error code");
+out:
+    nv_reg_wr(0x1700, saved1700); g_nv_pramin_win = 0xffffffffu;
+}
+
 static void nvgpu_late_task(void) {
     struct statx st; unsigned waited = 0;
     while (vfs_stat(NV_FW_ROOT "acr/bl.bin", &st) != 0 && waited < 120000) { task_sleep_ms(100); waited += 100; }
@@ -1354,6 +1636,7 @@ static void nvgpu_late_task(void) {
     }
     kprintf("[nv] fw: %u of %u gp108 firmware files read from the root filesystem (%u bytes) after %u ms\n",
             ok, (unsigned)(sizeof(nv_fw_files) / sizeof(nv_fw_files[0])), total, waited);
+    if (ok == sizeof(nv_fw_files) / sizeof(nv_fw_files[0])) nv_acr_run();
     task_exit();
 }
 
