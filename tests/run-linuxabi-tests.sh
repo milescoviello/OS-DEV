@@ -24,7 +24,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: linuxabi test ($QEMU not fou
 
 SLOG=$(mktemp /tmp/osdev_lxabi.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and running a host-built static-PIE Linux binary..."
@@ -82,10 +82,10 @@ echo "PASS: Linux ABI — a real static-PIE Linux binary runs under OS-DEV"
 # killed), and QEMU takes a WRITE LOCK on a raw drive image -- so a second
 # instance opening the same ext2 volume silently fails to start and produces an
 # empty log. Reap it first.
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 SLOG2=$(mktemp /tmp/osdev_lxfault.XXXXXX.log)
 QPID2=""
-cleanup2() { [ -n "$QPID2" ] && { kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; }; rm -f "$SLOG2"; }
+cleanup2() { [ -n "$QPID2" ] && { pkill -KILL -P "$QPID2" 2>/dev/null || true; kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; }; rm -f "$SLOG2"; }
 trap 'rc=$?; cleanup2; exit $rc' EXIT
 
 echo "booting with a deliberately-faulting Linux binary (console-lock deadlock regression)..."
@@ -140,9 +140,9 @@ echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console
 # proving nothing about the code it was added for.
 if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     SLOG3=$(mktemp /tmp/osdev_lxavx.XXXXXX.log)
-    kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; QPID2=""
+    pkill -KILL -P "$QPID2" 2>/dev/null || true; kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; QPID2=""
     QPID3=""
-    cleanup3() { [ -n "$QPID3" ] && { kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; }; rm -f "$SLOG3"; }
+    cleanup3() { [ -n "$QPID3" ] && { pkill -KILL -P "$QPID3" 2>/dev/null || true; kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; }; rm -f "$SLOG3"; }
     trap 'rc=$?; cleanup3; exit $rc' EXIT
 
     echo "booting with -cpu max to exercise the XSAVE/AVX path..."
@@ -999,9 +999,9 @@ LXWAIT: reaped 40/40 children
     # process) and because bundling it into lxfulltest would make one failure
     # indistinguishable from the other.
     SLOG4=$(mktemp /tmp/osdev_lxtool.XXXXXX.log)
-    kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; QPID3=""
+    pkill -KILL -P "$QPID3" 2>/dev/null || true; kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; QPID3=""
     QPID4=""
-    cleanup4() { [ -n "$QPID4" ] && { kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; }; rm -f "$SLOG4"; }
+    cleanup4() { [ -n "$QPID4" ] && { pkill -KILL -P "$QPID4" 2>/dev/null || true; kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; }; rm -f "$SLOG4"; }
     trap 'rc=$?; cleanup4; exit $rc' EXIT
 
     echo "booting to assemble+link a program with the borrowed host toolchain..."
@@ -1108,9 +1108,9 @@ LXWAIT: reaped 40/40 children
     # programs; bundling them made a WORKING compile fail for want of
     # wall-clock, and made one failure indistinguishable from the other.
     SLOG5=$(mktemp /tmp/osdev_lxgcc.XXXXXX.log)
-    kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; QPID4=""
+    pkill -KILL -P "$QPID4" 2>/dev/null || true; kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; QPID4=""
     QPID5=""
-    cleanup5() { [ -n "$QPID5" ] && { kill -9 "$QPID5" 2>/dev/null || true; wait "$QPID5" 2>/dev/null || true; }; rm -f "$SLOG5"; }
+    cleanup5() { [ -n "$QPID5" ] && { pkill -KILL -P "$QPID5" 2>/dev/null || true; kill -9 "$QPID5" 2>/dev/null || true; wait "$QPID5" 2>/dev/null || true; }; rm -f "$SLOG5"; }
     trap 'rc=$?; cleanup5; exit $rc' EXIT
 
     echo "booting to compile OS-DEV's OWN kernel/elf.c with the in-guest gcc..."

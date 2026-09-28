@@ -44,7 +44,7 @@ echo "host readelf says $LIB file offset $FILEOFF is library vaddr 0x$WANT"
 
 SLOG=$(mktemp /tmp/osdev_faultvaddr.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and asking the kernel to resolve the same offset..."
@@ -62,7 +62,7 @@ while [ $i -lt 360 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 if grep -aq "KERNEL PANIC" "$SLOG"; then
     echo "FAIL: KERNEL PANIC during the fault-vaddr test:"

@@ -26,7 +26,7 @@ D0=$(mktemp /tmp/osdev_raidA.XXXXXX.img)
 D1=$(mktemp /tmp/osdev_raidB.XXXXXX.img)
 D2=$(mktemp /tmp/osdev_raidC.XXXXXX.img)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$LOG" "$D0" "$D1" "$D2"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$LOG" "$D0" "$D1" "$D2"; exit "$rc"; }
 trap cleanup EXIT
 
 if ! command -v "$QEMU" >/dev/null 2>&1; then
@@ -52,7 +52,7 @@ while [ $i -lt 70 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 fail=0
 require() {

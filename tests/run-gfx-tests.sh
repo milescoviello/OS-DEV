@@ -30,7 +30,7 @@ QPID=""
 # teardown, then exit with the captured code.
 cleanup() {
     rc=$?
-    if [ -n "$QPID" ]; then kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; fi
+    if [ -n "$QPID" ]; then pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; fi
     rm -rf "$TMP" 2>/dev/null || true
     exit "$rc"
 }

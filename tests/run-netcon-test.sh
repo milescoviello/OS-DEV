@@ -26,7 +26,7 @@ TMP=$(mktemp -d /tmp/osdev_netcon.XXXXXX)
 SOCK=$TMP/mon.sock
 SLOG=$TMP/serial.log
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 for t in "$QEMU" python3; do

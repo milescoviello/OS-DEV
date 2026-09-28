@@ -18,7 +18,7 @@ KERNEL=build/kernel32.elf
 DISK=build/fat.img
 LOG=$(mktemp /tmp/osdev_boot.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$LOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$LOG"; exit "$rc"; }
 trap cleanup EXIT
 
 if ! command -v "$QEMU" >/dev/null 2>&1; then
@@ -97,7 +97,7 @@ while [ $i -lt 40 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3   # let the last few lines flush
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 fail=0
 

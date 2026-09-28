@@ -23,7 +23,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: firefox test ($QEMU not foun
 
 SLOG=$(mktemp /tmp/osdev_ff.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting and running Firefox in-guest (minutes: a 268 MB install under TCG)..."
@@ -41,7 +41,7 @@ while [ $i -lt 3600 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 f=0
 if grep -aq "KERNEL PANIC" "$SLOG"; then

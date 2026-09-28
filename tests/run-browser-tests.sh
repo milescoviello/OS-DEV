@@ -21,7 +21,7 @@ if ! command -v python3 >/dev/null 2>&1; then echo "SKIP: browser test (python3 
 TMP=$(mktemp -d /tmp/osdev_browser.XXXXXX)
 SOCK=$TMP/mon.sock; SLOG=$TMP/serial.log; PPM=$TMP/browser.ppm
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP" 2>/dev/null || true; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP" 2>/dev/null || true; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting + launching the browser (Apps menu -> Browser), capturing framebuffer..."

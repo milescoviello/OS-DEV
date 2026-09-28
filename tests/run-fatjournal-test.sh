@@ -17,7 +17,7 @@ TMP=$(mktemp -d /tmp/osdev_fatjournal.XXXXXX)
 DISK=$TMP/fat.img
 LOG=$TMP/serial.log
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 if ! command -v "$QEMU" >/dev/null 2>&1; then echo "SKIP: fatjournal test ($QEMU not found)"; exit 0; fi
@@ -37,7 +37,7 @@ while [ $i -lt 80 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 if grep -qiF "KERNEL PANIC" "$LOG"; then echo "  CRASH: kernel panicked in the fatjournal test"; tail -6 "$LOG"; exit 1; fi
 if grep -qE "fatjournal\].*: OK" "$LOG"; then

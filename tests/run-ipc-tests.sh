@@ -24,7 +24,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: ipc test ($QEMU not found)";
 
 SLOG=$(mktemp /tmp/osdev_ipc.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting kernel headless and running the POSIX IPC self-test (COM1 capture)..."
@@ -42,7 +42,7 @@ while [ $i -lt 160 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 if ! grep -q "memfd self-test:" "$SLOG" 2>/dev/null; then
     echo "FAIL: the memfd self-test never ran (boot problem, not a memfd regression)"

@@ -31,7 +31,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: firefox page test ($QEMU not
 TMP=$(mktemp -d /tmp/osdev_ffpage.XXXXXX)
 SLOG=$TMP/serial.log
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and rendering a real page with Gecko (this is slow: it is a browser)..."
@@ -54,7 +54,7 @@ while [ $i -lt 1800 ]; do
     sleep 1; i=$((i+1))
 done
 sleep 1
-kill -9 "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; QPID=""
 
 f=0
 if grep -aq "firefox --screenshot -> 0" "$SLOG"; then

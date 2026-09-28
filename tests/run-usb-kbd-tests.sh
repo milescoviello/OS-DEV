@@ -34,7 +34,7 @@ LOG=$TMP/serial.log
 QPID=""
 cleanup() {
     rc=$?
-    if [ -n "$QPID" ]; then kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; fi
+    if [ -n "$QPID" ]; then pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; fi
     rm -rf "$TMP" 2>/dev/null || true
     exit "$rc"
 }
@@ -102,7 +102,7 @@ while [ $i -lt 90 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 fail=0
 require() {
