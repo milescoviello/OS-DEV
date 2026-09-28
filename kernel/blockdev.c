@@ -460,19 +460,6 @@ void blockdev_drop_cache(int i, uint64_t lba, uint32_t count) {
  * rather than copied, so the two cannot drift apart again. */
 #define BLOCKDEV_MAX_BATCH ((uint32_t)ata_dma_max_sectors())
 
-/* Read one sector (dev i, lba) into dst, via the cache. The per-device lock spans
- * lookup->read->install so a concurrent write's invalidation can't race between
- * the raw_read and the install and strand a stale sector in the cache (M1885). */
-static int bread(int i, uint64_t lba, uint8_t *dst) {
-    if (is_ata_backed(i)) return raw_read(i, lba, 1, dst) < 0 ? -1 : 0;   /* ATA: driver caches coherently */
-    blk_lock_take(i);
-    if (bcache_lookup(BCACHE_OWNER_BLK(i), lba, dst)) { blk_lock_give(i); return 0; }  /* hit */
-    int r = raw_read(i, lba, 1, dst);                               /* miss */
-    if (r >= 0) bcache_install(BCACHE_OWNER_BLK(i), lba, dst);
-    blk_lock_give(i);
-    return r < 0 ? -1 : 0;
-}
-
 /* Raised with the cache in M2154-M2155, for the same reason ATA's was: at 128
  * entries one big read had to bypass the cache to avoid flushing it, and
  * against tens of thousands of entries a 128-sector read is a fraction of a
@@ -670,7 +657,7 @@ int blockdev_write(int i, uint64_t lba, uint32_t count, const void *buf) {
     }
     if (is_ata_backed(i)) {
         /* ATA path: ata_write_drive already invalidates the ATA-owner cache under
-         * ata_lock (and we keep no BLK-owner copy for ATA — see bread), so no
+         * ata_lock (and we keep no BLK-owner copy for ATA — see is_ata_backed), so no
          * blockdev-level cache work is needed and it stays coherent (M1885). */
         r = raw_write(i, lba, count, buf);
     } else {

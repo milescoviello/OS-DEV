@@ -1117,7 +1117,7 @@ long procfs_read(const char *abs, void *buf, unsigned long max) {
                     "17 15 0:16 / /dev rw,nosuid - devtmpfs devtmpfs rw,mode=755\n"
                     "18 17 0:17 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n"
                     "19 15 0:18 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n";
-                int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; }
+                int n = 0; while (c[n] && (unsigned long)n < max - 1) { ((char *)buf)[n] = c[n]; n++; }
                 ((char *)buf)[n] = 0; return n;
             }
             /* ...and the older per-process view of the same thing, which is
@@ -1130,10 +1130,10 @@ long procfs_read(const char *abs, void *buf, unsigned long max) {
                     "devtmpfs /dev devtmpfs rw,nosuid,mode=755 0 0\n"
                     "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
                     "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n";
-                int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; }
+                int n = 0; while (c[n] && (unsigned long)n < max - 1) { ((char *)buf)[n] = c[n]; n++; }
                 ((char *)buf)[n] = 0; return n;
             }
-            if (peq(file, "cgroup")) { const char *c = "0::/\n"; int n = 0; while (c[n] && n < max - 1) { ((char *)buf)[n] = c[n]; n++; } ((char *)buf)[n] = 0; return n; }
+            if (peq(file, "cgroup")) { const char *c = "0::/\n"; int n = 0; while (c[n] && (unsigned long)n < max - 1) { ((char *)buf)[n] = c[n]; n++; } ((char *)buf)[n] = 0; return n; }
             if (peq(file, "wss"))     return gen_pid_wss((char *)buf, (int)max, pid, proc);
             if (peq(file, "oom_score")) return gen_pid_oom((char *)buf, (int)max, proc);            /* OOM victim score (M1277) */
             if (peq(file, "oom_score_adj")) return gen_pid_oom_score_adj((char *)buf, (int)max, proc);  /* OOM tuning bias rw (M1282) */
