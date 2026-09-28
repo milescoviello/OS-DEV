@@ -4877,7 +4877,7 @@ static void lx_dispatch_body(struct registers *r) {
         /* 64 -> 1024, and from the HEAP rather than a shared static (M1962).
          *
          * A directory listing that stops at 64 entries is a silent wrong
-         * answer, not an error: GNU make's $(wildcard kernel/*.c) saw only the
+         * answer, not an error: GNU make's wildcard over kernel's *.c files saw only the
          * first 64 of OS-DEV's 136 kernel sources, so the build linked a
          * PARTIAL object list and came back as pages of "undefined reference
          * to kmalloc / pci_find / wav_parse" -- every one of them a file

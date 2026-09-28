@@ -490,7 +490,7 @@ int vfs_list_path(const char *path, vfs_dirent *out, int max) {
          * `static fatvol_dirent fe[64]` with max clamped to 64 -- a silent
          * wrong answer for any directory with more entries, and a shared
          * buffer besides. OS-DEV's own kernel/ has 136 .c files, so GNU make's
-         * $(wildcard kernel/*.c) saw 62 of them and the in-guest build linked a
+         * wildcard over kernel's *.c files saw 62 of them and the in-guest build linked a
          * PARTIAL object list; it came back as pages of "undefined reference to
          * kmalloc / pci_find / wav_parse", every one a file alphabetically
          * after the cut, with nothing pointing at directory listing. */

@@ -12,6 +12,10 @@
 ;
 ; Everything here is the classic osdev "x86_64 bare bones" trampoline.
 
+; Absolute addressing is what this file has always assembled to; say so, since
+; NASM deprecates leaving 64-bit code's addressing mode implicit.
+default abs
+
 MB_MAGIC    equ 0x1BADB002          ; multiboot1 magic the loader searches for
 MB_FLAGS    equ (1 << 0) | (1 << 1) | (1 << 2) ; bit0: page-align, bit1: memory map, bit2: request a linear framebuffer (GRUB / bare metal)
 MB_CHECKSUM equ -(MB_MAGIC + MB_FLAGS)

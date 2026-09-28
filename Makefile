@@ -34,6 +34,13 @@ CFLAGS  := -std=gnu11 -ffreestanding -nostdlib \
 
 ASFLAGS := -f elf64
 LDFLAGS := -n -T linker.ld
+# The kernel image has an RWX load segment ON PURPOSE: .jitexec (linker.ld) is
+# where the eBPF JIT and the module loader put code they generate. W^X is not
+# enforced through ELF segment flags here but in the page tables, by
+# vmm_harden_kernel, which leaves exactly that range executable and writable.
+# So binutils >= 2.39's warning about it is expected; silence it so a new
+# warning in the link stands out. Probed, because older ld rejects the flag.
+LDFLAGS += $(shell $(LD) --help 2>/dev/null | grep -q -- --no-warn-rwx-segments && echo --no-warn-rwx-segments)
 
 # -m 256M: QEMU's ~128M default starves the heaviest app — Quake needs its 18 MB
 # PAK + a multi-MB hunk on top of the kernel (incl. the 40 MB JS arena), so it

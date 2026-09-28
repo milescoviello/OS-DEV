@@ -9,6 +9,10 @@
 ; that SYS_exit can come back here (return_to_kernel) and resume the kernel
 ; right after the enter_user() call — a one-way longjmp out of userspace.
 
+; Absolute addressing is what this file has always assembled to; say so, since
+; NASM deprecates leaving 64-bit code's addressing mode implicit.
+default abs
+
 section .bss
 global kernel_resume_rsp
 kernel_resume_rsp: resq 1

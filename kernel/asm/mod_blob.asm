@@ -9,3 +9,6 @@ global testmod_ko_start, testmod_ko_end
 testmod_ko_start:
         incbin "build/testmod.ko"
 testmod_ko_end:
+
+; No executable stack (the linker otherwise assumes one for this object).
+section .note.GNU-stack noalloc noexec nowrite progbits

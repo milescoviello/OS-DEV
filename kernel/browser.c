@@ -1011,8 +1011,8 @@ static int parse_style_auto_margins(const char *s, int n) {
  * and explicit `margin:auto` now follow the real rule. */
 /* Solves the block's column and reports TWO geometries, because CSS needs both
  * and they differ whenever there is padding (M1897):
- *   *cl/*cr  -> the CONTENT box: where text lays out and wraps.
- *   *pbl/*pbr -> the PADDING box: what a background paints over (CSS 2.1 §14.2,
+ *   *cl, *cr   -> the CONTENT box: where text lays out and wraps.
+ *   *pbl, *pbr -> the PADDING box: what a background paints over (CSS 2.1 §14.2,
  *                background covers the padding box, not the content box).
  * Passing the content box as a background rect makes a padded block's background
  * hug its text instead of extending around it. `pbl`/`pbr` may be NULL for
@@ -1126,7 +1126,7 @@ static int  css_match_list(browser_t *b, const char *tag, const char *attrs, int
  * if src= is present and non-empty it is returned unchanged (zero regression).
  * When src is absent or empty we try srcset= (first candidate URL, stripping
  * the optional " 320w" / " 2x" descriptor), then data-src=, data-original=,
- * data-lazy-src= — first non-empty wins.  Returns 1 and sets *v/*vl to a
+ * data-lazy-src= — first non-empty wins.  Returns 1 and sets *v and *vl to a
  * slice within attrs[0..attrlen); returns 0 if no usable URL found. */
 static int img_src_attr(const char *attrs, int attrlen,
                         const char **v, int *vl) {
