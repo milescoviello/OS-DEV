@@ -12371,6 +12371,7 @@ long app_pwrite(int fd, const void *buf, unsigned long len, long off) {
 }
 static void epoll_ref(int idx);    /* defined with the epoll table below (M1220) */
 static void epoll_unref(int idx);
+static void epoll_forget_fd(struct app *a, int fd);
 /* O_NONBLOCK as a real per-fd property (M1965). fcntl(F_SETFL) used to be a
  * no-op that returned 0, which is the worst of both worlds: the caller
  * believes the fd is non-blocking and then a read blocks its event loop
@@ -12406,6 +12407,7 @@ int app_fd_type(int fd) {
 
 int app_fd_close(int fd) {
     struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    epoll_forget_fd(a, fd);                  /* leave every interest set this process put it in */
     if (a->fd[fd].type == 1) pipe_close_end(a->fd[fd].obj, a->fd[fd].write_end);
     else if (a->fd[fd].type == 3) memfd_unref(a->fd[fd].obj);   /* drop a memfd reference (M1212) */
     else if (a->fd[fd].type == 6) epoll_unref(a->fd[fd].obj);   /* drop an epoll reference (M1220) */
@@ -12444,6 +12446,7 @@ int app_dup2(int oldfd, int newfd) {
     struct app *a = cur(); if (!a || oldfd < 0 || oldfd >= APP_NFD || !a->fd[oldfd].used) return -1;
     if (newfd < 0 || newfd >= APP_NFD) return -1;
     if (oldfd == newfd) return newfd;
+    if (a->fd[newfd].used) epoll_forget_fd(a, newfd);   /* the old file at newfd is closed */
     if (a->fd[newfd].used && a->fd[newfd].type == 1) pipe_close_end(a->fd[newfd].obj, a->fd[newfd].write_end);
     else if (a->fd[newfd].used && a->fd[newfd].type == 3) memfd_unref(a->fd[newfd].obj);   /* (M1212) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 6) epoll_unref(a->fd[newfd].obj);   /* (M1220) */
@@ -13507,17 +13510,93 @@ long app_sendfile(int out_fd, int in_fd, long *off, unsigned long count) {
  * it owns in ONE instance, so 32 is an arbitrary ceiling on how much a program
  * may do at once -- and hitting it looked like a random socket failure. */
 #define EP_MAX 256
-static struct epollobj { int used, refs, n; struct { int fd, events, last_ready, disarmed; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
-static void epoll_ref(int idx)   { if (idx >= 0 && idx < NEPOLL && epolls[idx].used) epolls[idx].refs++; }
-static void epoll_unref(int idx) { if (idx >= 0 && idx < NEPOLL && epolls[idx].used && --epolls[idx].refs <= 0) epolls[idx].used = 0; }
+/* `owner` is the pid that registered an item: see epoll_forget_fd. */
+static struct epollobj { int used, refs, n; volatile int lk;
+                         struct { int fd, events, last_ready, disarmed, owner; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
+/* TWO LOCKS, FOR TWO KINDS OF SHARING.
+ *
+ * The TABLE is shared by every process: creating an instance was a scan for a
+ * free slot and a separate claim, so two processes could be handed one
+ * instance, and the refcount was a plain ++/-- on an object fork and
+ * SCM_RIGHTS share. g_ep_lk covers the claim and the count.
+ *
+ * An instance's ITEMS are shared by every thread that holds it -- libuv's
+ * worker threads epoll_ctl while the loop thread sits in epoll_wait -- and a
+ * DEL moves the last item into the hole, so a scan running beside it could
+ * skip a live item or read one twice, and two ADDs of one fd could both pass
+ * the EEXIST check. `lk` covers every read and write of the items. It is
+ * spin-then-yield without masking interrupts, because a scan calls
+ * app_fd_ready on each item and that can poll a NIC. */
+static volatile int g_ep_lk;
+static inline uint64_t ep_tab_take(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_ep_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static inline void ep_tab_give(uint64_t f) {
+    __atomic_store_n(&g_ep_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+static void ep_lk_take(struct epollobj *e) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&e->lk, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void ep_lk_give(struct epollobj *e) { __atomic_store_n(&e->lk, 0, __ATOMIC_RELEASE); }
+static void epoll_ref(int idx) {
+    if (idx < 0 || idx >= NEPOLL) return;
+    uint64_t f = ep_tab_take();
+    if (epolls[idx].used) epolls[idx].refs++;
+    ep_tab_give(f);
+}
+static void epoll_unref(int idx) {
+    if (idx < 0 || idx >= NEPOLL) return;
+    uint64_t f = ep_tab_take();
+    if (epolls[idx].used && --epolls[idx].refs <= 0) epolls[idx].used = 0;
+    ep_tab_give(f);
+}
+/* A CLOSED DESCRIPTOR LEAVES THE INTEREST SETS IT WAS IN.
+ *
+ * Items are keyed by fd NUMBER. Close fd 7 without EPOLL_CTL_DEL -- which
+ * Linux allows, because it drops the registration when the file goes -- and
+ * the item stayed, so the next socket or pipe to be handed number 7 was
+ * reported ready under the OLD registration's data. For an event loop that
+ * data is a pointer to the watcher it freed along with the old descriptor.
+ *
+ * Only the closing process's own registrations go. A forked child closing the
+ * descriptors it inherited is the normal prelude to exec, and on Linux that
+ * does not touch the parent's registrations, because the parent's copy keeps
+ * the file open; removing by number alone would have silently deafened the
+ * parent's event loop. (Linux keys on the open file, so a registration also
+ * survives close() when a dup of the fd is still open. Keying by number here
+ * cannot express that, and dropping it is the failure that cannot corrupt
+ * anything.) */
+static void epoll_forget_fd(struct app *a, int fd) {
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].epwatch) return;
+    for (int f = 0; f < APP_NFD; f++) {
+        if (!a->fd[f].used || a->fd[f].type != 6) continue;
+        int idx = a->fd[f].obj;
+        if (idx < 0 || idx >= NEPOLL) continue;
+        struct epollobj *e = &epolls[idx];
+        ep_lk_take(e);
+        for (int i = 0; i < e->n; ) {
+            if (e->items[i].fd == fd && e->items[i].owner == a->pid) e->items[i] = e->items[--e->n];
+            else i++;
+        }
+        ep_lk_give(e);
+    }
+}
 
 int app_epoll_create(void) {
     struct app *a = cur(); if (!a) return -1;
-    int idx = -1; for (int i = 0; i < NEPOLL; i++) if (!epolls[i].used) { idx = i; break; }
+    int idx = -1;
+    uint64_t tf = ep_tab_take();
+    for (int i = 0; i < NEPOLL; i++) if (!epolls[i].used) { idx = i; break; }
+    if (idx >= 0) { epolls[idx].used = 1; epolls[idx].refs = 1; epolls[idx].n = 0; }
+    ep_tab_give(tf);
     if (idx < 0) return -1;
-    epolls[idx].used = 1; epolls[idx].refs = 1; epolls[idx].n = 0;
     int fd = -1; fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
-    if (fd < 0) { epolls[idx].used = 0; return -1; }
+    if (fd < 0) { epoll_unref(idx); return -1; }
     a->fd[fd] = (struct fdent){ 1, 6, 0, idx, {0}, 0, 0 };   /* used, type=epoll, obj=idx */
     return fd;
 }
@@ -13534,32 +13613,39 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
     struct app *a = cur();
     if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -9;   /* EBADF */
     if (fd < 0 || fd >= APP_NFD) return -9;                                                           /* EBADF */
+    if (op != EPOLL_CTL_DEL && !a->fd[fd].used) return -9;                  /* EBADF: nothing to watch */
+    if (fd == epfd) return -22;                                               /* EINVAL: an instance cannot watch itself */
     struct epollobj *e = &epolls[a->fd[epfd].obj];
+    int rc = -22;                                                             /* EINVAL: unknown op */
+    ep_lk_take(e);
     if (op == EPOLL_CTL_ADD) {
-        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) return -17;   /* EEXIST: already registered */
-        if (e->n >= EP_MAX) return -28;                                        /* ENOSPC: instance full */
-        e->items[e->n].fd = fd; e->items[e->n].events = (int)events; e->items[e->n].data = data;
-        e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
-        e->items[e->n].disarmed = 0;     /* EPOLLONESHOT has not fired yet (M2016) */
-        e->n++;
-        a->fd[fd].epwatch = 1;           /* this descriptor is worth a drain check (M2059) */
-        return 0;
-    }
-    if (op == EPOLL_CTL_MOD) {
+        rc = 0;
+        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { rc = -17; break; }   /* EEXIST: already registered */
+        if (!rc && e->n >= EP_MAX) rc = -28;                                   /* ENOSPC: instance full */
+        if (!rc) {
+            e->items[e->n].fd = fd; e->items[e->n].events = (int)events; e->items[e->n].data = data;
+            e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
+            e->items[e->n].disarmed = 0;     /* EPOLLONESHOT has not fired yet (M2016) */
+            e->items[e->n].owner = a->pid;   /* whose close() removes it (epoll_forget_fd) */
+            e->n++;
+            a->fd[fd].epwatch = 1;           /* this descriptor is worth a drain check (M2059) */
+        }
+    } else if (op == EPOLL_CTL_MOD) {
+        rc = -2;                                                               /* ENOENT: not registered */
         for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) {
             e->items[i].events = (int)events; e->items[i].data = data;
             e->items[i].last_ready = 0;   /* M1545: a changed interest set re-arms the edge, same spirit as a fresh ADD */
             e->items[i].disarmed = 0;     /* ...and re-arms EPOLLONESHOT, which is what MOD is FOR (M2016) */
             a->fd[fd].epwatch = 1;
-            return 0;
+            rc = 0;
+            break;
         }
-        return -2;                                                             /* ENOENT: not registered */
+    } else if (op == EPOLL_CTL_DEL) {
+        rc = -2;                                                               /* ENOENT */
+        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { e->items[i] = e->items[--e->n]; rc = 0; break; }
     }
-    if (op == EPOLL_CTL_DEL) {
-        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { e->items[i] = e->items[--e->n]; return 0; }
-        return -2;                                                             /* ENOENT */
-    }
-    return -22;                                                                /* EINVAL: unknown op */
+    ep_lk_give(e);
+    return rc;
 }
 /* One non-blocking pass: fill `out` with the ready members. Returns the count,
  * or -1 for a bad epfd. The SYS_epoll_wait dispatch wraps this in the poll
@@ -13615,6 +13701,7 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
     if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -1;
     struct epollobj *e = &epolls[a->fd[epfd].obj];
     int k = 0;
+    ep_lk_take(e);
     for (int i = 0; i < e->n && k < maxevents; i++) {
         /* EPOLLONESHOT: already delivered, and not re-armed. Linux keeps the
          * registration but stops reporting until EPOLL_CTL_MOD sets a new
@@ -13629,6 +13716,7 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
             if (e->items[i].events & EPOLLONESHOT) e->items[i].disarmed = 1;
         }
     }
+    ep_lk_give(e);
     return k;
 }
 
