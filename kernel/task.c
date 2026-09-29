@@ -213,6 +213,61 @@ void task_copy_fpu(task_t *dst, task_t *src) {
     memcpy(fxptr(dst), fxptr(src), g_fpu_area);
 }
 
+/* THE FP STATE A LINUX SIGNAL FRAME CARRIES (M2392).
+ *
+ * A Linux signal frame holds the interrupted thread's whole XSAVE image, and
+ * rt_sigreturn puts it back. Nothing here did either: a handler that touched
+ * an XMM register -- which is any handler that calls memcpy -- returned into
+ * code whose vector registers had silently changed. HotSpot checks for exactly
+ * that at startup (it faults on purpose with known values in YMM, then reads
+ * them back) and runs its safepoint stubs on the assumption that it holds.
+ *
+ * These work on the calling thread's OWN save area, not a per-core buffer, so
+ * a preemption in the middle cannot hand one thread's registers to another. */
+extern uint64_t fpu_xcr0(void);
+uint32_t task_fpu_area_size(void) { return g_fpu_area; }
+int      task_fpu_is_xsave(void)  { return g_use_xsave; }
+
+/* The live state, captured into the thread's own area; 0 if it has none. */
+const void *task_fpu_snapshot(void) {
+    task_t *t = task_self();
+    if (!t || !t->fxbuf) return 0;
+    fpu_store(t);
+    return fxptr(t);
+}
+
+/* Install `len` bytes of a signal frame's FP image as the live state, or the
+ * clean state when `src` is 0. The image comes from user memory, so it is
+ * sanitised first: a reserved MXCSR bit, an XSTATE_BV naming a component XCR0
+ * does not enable, or a compacted-format header all #GP the XRSTOR -- in ring
+ * 0, which is a kernel panic where Linux answers a bad frame with SIGSEGV.
+ * `fx_only` restores the legacy x87/SSE part and puts everything above it in
+ * its initial state, as Linux does for a frame without the xstate magic. */
+void task_fpu_install(const void *src, uint32_t len, int fx_only) {
+    task_t *t = task_self();
+    if (!t || !t->fxbuf) return;
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) :: "memory");   /* a switch-out would save the OLD live state over this */
+    uint8_t *d = (uint8_t *)fxptr(t);
+    const uint8_t *clean = g_use_xsave ? fpu_xtemplate : fpu_template;
+    memcpy(d, clean, g_fpu_area);
+    if (src) {
+        if (len > g_fpu_area) len = g_fpu_area;
+        memcpy(d, src, len);
+        uint32_t mask = *(const uint32_t *)(clean + 28);           /* MXCSR_MASK; 0 means the architectural 0xFFBF */
+        if (!mask) mask = 0xFFBF;
+        *(uint32_t *)(d + 24) &= mask;
+        if (g_use_xsave) {
+            uint64_t *hdr = (uint64_t *)(d + 512);                 /* the XSAVE header */
+            hdr[0] &= fpu_xcr0();                                  /* XSTATE_BV */
+            if (fx_only) hdr[0] &= 3;                              /* x87 + SSE only; the rest from init */
+            for (int i = 1; i < 8; i++) hdr[i] = 0;                /* XCOMP_BV = standard format, reserved = 0 */
+        }
+    }
+    fpu_load(t);
+    __asm__ volatile("push %0; popfq" :: "r"(fl) : "memory", "cc");
+}
+
 struct registers *task_uframe(task_t *t) { return t ? t->uframe : 0; }
 
 /* The scheduling floor, ONE PER CORE (M1531): never blocks/exits, run ONLY

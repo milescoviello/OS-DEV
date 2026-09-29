@@ -234,6 +234,7 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXS_set_robust_list 273
 #define LXS_prlimit64    302
 #define LXS_rseq         334
+#define LXS_getcpu_      309
 #define LXS_fstat          5
 #define LXS_getrandom_    318
 #define LXS_openat_      257
@@ -1624,6 +1625,7 @@ const char *lx_syscall_name(unsigned long nr) {
     case 299: return "recvmmsg";
     case 302: return "prlimit64";
     case 307: return "sendmmsg";
+    case 309: return "getcpu";
     case 318: return "getrandom";
     case 319: return "memfd_create";
     case 327: return "preadv2";
@@ -4181,6 +4183,22 @@ static void lx_dispatch_body(struct registers *r) {
         r->rax = (uint64_t)(urc == 0 ? 0 : -(long)LX_EINVAL);
         break;
     }
+    case LXS_getcpu_: {                     /* (cpu, node, tcache) */
+        /* HOTSPOT WILL NOT START WITHOUT THIS (M2392). os::Linux's init asks
+         * sched_getcpu(), and exits the VM with "getcpu(2) system call not
+         * supported by kernel" when it fails. glibc tries rseq's cpu_id first,
+         * then the vDSO; this kernel offers neither, so it lands here.
+         *
+         * The answer is an INDEX into [0, cpu count), not an APIC id: a JVM
+         * uses it to pick a per-CPU slot in an array sized by the CPU count
+         * that sched_getaffinity reported, and APIC ids need not be dense. */
+        int cpu = smp_current_cpu();
+        if (smp_cpu_count > 0 && (cpu < 0 || cpu >= smp_cpu_count)) cpu = (cpu < 0 ? 0 : cpu % smp_cpu_count);
+        if (r->rdi) { if (!vmm_user_ok(r->rdi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; } *(uint32_t *)r->rdi = (uint32_t)cpu; }
+        if (r->rsi) { if (!vmm_user_ok(r->rsi, 4)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; } *(uint32_t *)r->rsi = 0; }
+        r->rax = 0;
+        break;
+    }
     case LXS_set_robust_list:
     case LXS_rseq:
         /* Both are pure optimisations: the robust-futex list only matters if a
@@ -4611,20 +4629,49 @@ static void lx_dispatch_body(struct registers *r) {
         r->rax = (uint64_t)vn;
         break;
     }
-    case LXS_sigaltstack_:
-        /* (ss, old_ss). An alternate signal stack only matters for delivering a
-         * signal ON it -- most often SIGSEGV for stack-overflow recovery. We
-         * deliver signals on the normal stack, so there is nothing to install;
-         * refusing, though, is fatal to a runtime that treats the failure as
-         * "this kernel is broken". Report "no alternate stack installed"
-         * (ss_flags = SS_DISABLE) if asked for the old one. */
-        if (r->rsi && vmm_user_ok(r->rsi, 24)) {
+    case LXS_sigaltstack_: {                /* (ss, old_ss) */
+        /* THE ALTERNATE STACK, INSTALLED (M2392). This answered "none" and
+         * installed nothing, back when signals were always delivered on the
+         * normal stack. The Linux frame honours SA_ONSTACK, so the stack a
+         * program registers for exactly that -- a SIGSEGV handler that has to
+         * run after the normal stack overflowed -- has to be the one it gets.
+         * Linux's order: read the new one, report the old one, and refuse a
+         * change while the caller is running on it. */
+        task_t *st = task_self();
+        if (!st) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+        uint64_t usp = r->rsp;
+        int on = st->sig_alt_size && usp > st->sig_alt_base && usp <= st->sig_alt_base + st->sig_alt_size;
+        uint64_t nsp = 0, nsz = 0; int32_t nfl = 0; int have_new = 0;
+        if (r->rdi) {
+            if (!vmm_user_ok(r->rdi, 24)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            nsp = *(const uint64_t *)r->rdi;
+            nfl = *(const int32_t *)(r->rdi + 8);
+            nsz = *(const uint64_t *)(r->rdi + 16);
+            have_new = 1;
+        }
+        uint64_t osp = st->sig_alt_base, osz = st->sig_alt_size;
+        int32_t ofl = !osz ? 2 /* SS_DISABLE */ : on ? 1 /* SS_ONSTACK */ : 0;
+        if (have_new) {
+            int32_t mode = nfl & ~(int32_t)(1u << 31);   /* SS_AUTODISARM is accepted and not needed here */
+            if (on) { r->rax = (uint64_t)-(long)LX_EPERM; break; }
+            if (mode != 0 && mode != 1 && mode != 2) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            if (mode == 2) { st->sig_alt_base = 0; st->sig_alt_size = 0; }
+            else {
+                if (nsz < 2048) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }   /* MINSIGSTKSZ */
+                st->sig_alt_base = nsp; st->sig_alt_size = nsz;
+            }
+        }
+        if (r->rsi) {
+            if (!vmm_user_ok(r->rsi, 24)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             uint8_t *o = (uint8_t *)r->rsi;
-            for (int i = 0; i < 24; i++) o[i] = 0;
-            *(int32_t *)(o + 8) = 2;        /* SS_DISABLE */
+            *(uint64_t *)o = osp;
+            *(int32_t *)(o + 8) = ofl;
+            *(int32_t *)(o + 12) = 0;
+            *(uint64_t *)(o + 16) = osz;
         }
         r->rax = 0;
         break;
+    }
     case LXS_close_range_: {                /* (first, last, flags) */
         long crc = app_close_range((unsigned)a1, (unsigned)r->rsi, (int)r->rdx);
         r->rax = (uint64_t)(crc == 0 ? 0 : -(long)LX_EINVAL);

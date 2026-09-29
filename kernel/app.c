@@ -23,6 +23,7 @@
 #include "smp.h"     /* per-core fault-recursion depth (M1987) */
 #include "timer.h"
 #include "interrupts.h"   /* struct registers, for ring-3 signal delivery */
+#include "gdt.h"          /* USER_CS/USER_DS, forced on a Linux rt_sigreturn (M2392) */
 #include "vmm.h"
 #include "unixsock.h"   /* AF_UNIX sockets live in the fd table now (M1965) */
 #include "mbox.h"      /* mbox_forget_task: a freed task must not stay a stored waiter (M2053) */
@@ -318,6 +319,12 @@ struct app {
      * delivers, and consumed once. */
     uint64_t sig_fault_addr;
     int      sig_fault_code, sig_fault_valid;
+    /* 1 = a LINUX process (M2392): its signals get the Linux frame -- siginfo_t,
+     * ucontext_t, the XSAVE image -- and a fault raises the signal Linux would
+     * (SIGFPE for a divide error, SIGILL for an invalid opcode) instead of
+     * SIGSEGV for everything. Native apps keep the frame ulib.h documents. */
+    int      lxabi;
+    int      unmapped_told;              /* UNMAPPED fault reports printed for a process that catches SIGSEGV (M2392) */
     uint64_t sig_alt_base, sig_alt_size; /* sigaltstack: alternate signal-handler stack; 0 size = none (M1276) */
     uint64_t alarm_interval, alarm_next; /* SIGALRM (M1102): periodic timer; 0 interval = disarmed */
 #define APP_NPTIMER 8
@@ -8576,6 +8583,18 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
      * only says "terminating it", which cannot distinguish a wild jump from a
      * mapping we failed to create -- and those need opposite fixes. Name the
      * two neighbours so the gap is visible. (M1965) */
+    /* ...BUT NOT FORTY THOUSAND TIMES (M2392). The dump below was written for
+     * a fault that kills the process, so once. A JVM takes one of these for
+     * every null check that finds a null: 40528 of them in one LxJava run,
+     * each with a 54-line table, and the serial console turned 89 ms of work
+     * into 580 s. A process that catches its own SIGSEGV gets the first few
+     * reports and then a note saying the rest are its own business; one that
+     * cannot catch it still gets the whole report, every time. */
+    int catches = a->sig_handler[11] && a->sig_handler[11] != APP_SIG_IGN;
+    if (catches && a->unmapped_told >= 4) return 0;
+    if (catches && ++a->unmapped_told == 4)
+        kprintf("[fault] pid %d catches its own SIGSEGV: this is the last UNMAPPED report for it "
+                "(a JVM's null checks are faults exactly like these)\n", a->pid);
     {
         uint64_t below = 0, below_end = 0, above = ~0ull;
         uint64_t rfl = vma_lock(a);
@@ -8723,10 +8742,297 @@ static struct registers *sig_frame_of(task_t *t) {
     return (struct registers *)t->sig_saved;
 }
 
+/* ---- THE LINUX SIGNAL FRAME (M2392) ---------------------------------------
+ *
+ * What a Linux handler is entered with, byte for byte, because the programs
+ * that care about it READ it rather than merely receive it:
+ *
+ *   rsp -> pretcode (= sa_restorer)          struct rt_sigframe, arch/x86
+ *          ucontext_t, 304 bytes              uc_flags, uc_link, uc_stack,
+ *                                             uc_mcontext (struct sigcontext),
+ *                                             uc_sigmask
+ *          siginfo_t, 128 bytes
+ *          ... the XSAVE image, 64-aligned, that uc_mcontext.fpstate names
+ *
+ * The frame this replaces, for Linux processes, was OS-DEV's own: the
+ * interrupt frame (`struct registers`) where the ucontext belongs, and a
+ * 32-byte siginfo with si_code at +4 and si_addr at +8 where Linux has them at
+ * +8 and +16. A handler therefore read the fault address out of si_value's
+ * slot (0), gregs[REG_RIP] off our `ss` field, and the fpregs pointer from
+ * past the end of the struct -- and sigreturn restored a kernel-side copy,
+ * throwing away anything the handler had written into the context.
+ *
+ * That last one is the one that matters. "Fault on purpose and have the
+ * handler move the program counter" is not an exotic idiom: it is how HotSpot
+ * does EVERY null check (the interpreter's included), every safepoint poll,
+ * every integer division by zero, and its startup test that the kernel keeps
+ * AVX state across a signal. With the edit discarded, the faulting instruction
+ * runs again, faults again, and the thread lives in its own handler forever.
+ *
+ * Because the whole interrupted context now lives in the frame, nothing is
+ * kept kernel-side and nesting stops being special: a signal that arrives
+ * inside a handler builds a second frame below the first, as on Linux, and the
+ * thread's MASK -- not a one-handler-at-a-time flag -- decides what may
+ * interrupt a handler. siglongjmp out of a handler needs no detection either:
+ * it restores the mask itself, and there is no kernel state left to leak. */
+#define LX_SA_NODEFER            0x40000000u
+#define LX_SA_RESETHAND          0x80000000u
+#define LX_SS_ONSTACK            1
+#define LX_SS_DISABLE            2
+#define LX_UC_FP_XSTATE          0x1
+#define LX_UC_SIGCONTEXT_SS      0x2
+#define LX_UC_STRICT_RESTORE_SS  0x4
+#define LX_FP_XSTATE_MAGIC1      0x46505853u   /* "FPXS", in the FXSAVE area's software bytes */
+#define LX_FP_XSTATE_MAGIC2      0x46505845u   /* "FPXE", just past the XSAVE image */
+#define LX_USER_TOP              0x0000800000000000ull   /* first non-canonical user address */
+
+struct lx_sigcontext {                         /* uapi asm/sigcontext.h, x86-64 */
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags;
+    uint16_t cs, gs, fs, ss;
+    uint64_t err, trapno, oldmask, cr2;
+    uint64_t fpstate;                          /* user address of the FP image, or 0 */
+    uint64_t reserved1[8];
+};
+struct lx_ucontext {
+    uint64_t uc_flags, uc_link;
+    uint64_t ss_sp; int32_t ss_flags, ss_pad; uint64_t ss_size;   /* uc_stack */
+    struct lx_sigcontext mc;
+    uint64_t uc_sigmask;                       /* Linux numbering: bit n-1 is signal n */
+};
+struct lx_siginfo {
+    int32_t si_signo, si_errno, si_code, si_pad;
+    union {
+        uint64_t addr;                                              /* SIGSEGV SIGBUS SIGILL SIGFPE */
+        struct { int32_t pid; uint32_t uid; uint64_t value; } kill; /* SI_USER, SI_QUEUE */
+        struct { int32_t tid, overrun; uint64_t value; } timer;     /* SI_TIMER */
+        uint8_t raw[112];
+    } u;
+};
+struct lx_rt_sigframe { uint64_t pretcode; struct lx_ucontext uc; struct lx_siginfo info; };
+_Static_assert(sizeof(struct lx_sigcontext) == 256, "struct sigcontext is 256 bytes");
+_Static_assert(__builtin_offsetof(struct lx_sigcontext, rip) == 16 * 8, "gregs[REG_RIP]");
+_Static_assert(__builtin_offsetof(struct lx_sigcontext, err) == 19 * 8, "gregs[REG_ERR]");
+_Static_assert(__builtin_offsetof(struct lx_sigcontext, fpstate) == 23 * 8, "mcontext_t.fpregs");
+_Static_assert(__builtin_offsetof(struct lx_ucontext, mc) == 40, "uc_mcontext");
+_Static_assert(__builtin_offsetof(struct lx_ucontext, uc_sigmask) == 296, "uc_sigmask");
+_Static_assert(sizeof(struct lx_siginfo) == 128, "siginfo_t is 128 bytes");
+_Static_assert(__builtin_offsetof(struct lx_siginfo, u) == 16, "si_addr / si_pid");
+_Static_assert(__builtin_offsetof(struct lx_rt_sigframe, info) == 312, "info follows uc");
+
+/* MAKE A USER RANGE SAFE TO STORE INTO FROM RING 0. CR0.WP is clear on this
+ * kernel, so a kernel store ignores a PTE's read-only bit -- which means a
+ * frame built on a copy-on-write stack page would be written into the
+ * physical page the parent still maps. Take the write fault the program's own
+ * store would have taken (it privatises a COW page) and refuse a page that is
+ * genuinely read-only, which Linux answers the same way: no frame, SIGSEGV. */
+static int lx_user_prepare_write(uint64_t addr, uint64_t len) {
+    if (!len) return 1;
+    if (addr + len < addr || addr + len > LX_USER_TOP) return 0;
+    for (uint64_t v = addr & ~0xFFFull; v < addr + len; v += 0x1000) {
+        if (!vmm_user_ok(v, 1)) return 0;                  /* also materialises a demand-paged one */
+        uint64_t pte = vmm_pte_raw(v);
+        if (!pte) continue;                                /* a 2 MiB user page: no leaf PTE to inspect */
+        if ((pte & PTE_WRITABLE) && !(pte & PTE_COW)) continue;
+        if (!app_fault_handle(v, 7)) return 0;             /* present|write|user */
+        pte = vmm_pte_raw(v);
+        if (pte && (!(pte & PTE_WRITABLE) || (pte & PTE_COW))) return 0;
+    }
+    return 1;
+}
+
+static int lx_signal_deliver(struct app *a, task_t *th, struct registers *r, int signo) {
+    uint32_t fl = a->sig_flags[signo];
+    int fault = th->lx_fault_valid && th->lx_fault_signo == signo;
+    /* A SYNCHRONOUS FAULT THAT IS BLOCKED KILLS. Linux's force_sig_fault resets
+     * such a signal to SIG_DFL; delivering it instead would re-enter a handler
+     * that is itself faulting, for ever. */
+    if (fault && (th->sig_blocked & (1ull << signo))) { th->lx_fault_valid = 0; return 0; }
+
+    uint64_t alt_lo = th->sig_alt_base, alt_hi = th->sig_alt_base + th->sig_alt_size;
+    int on_alt = th->sig_alt_size && r->rsp > alt_lo && r->rsp <= alt_hi;
+    uint64_t sp = r->rsp - 128;                            /* the red zone belongs to the interrupted code */
+    if ((fl & APP_SA_ONSTACK) && th->sig_alt_size && !on_alt) sp = alt_hi;
+    int xs = task_fpu_is_xsave();
+    uint32_t fpimg = xs ? task_fpu_area_size() : 512;
+    uint32_t fpspan = fpimg + (xs ? 4 : 0);               /* + FP_XSTATE_MAGIC2 */
+    sp = (sp - fpspan) & ~63ull;
+    uint64_t fpaddr = sp;
+    sp -= sizeof(struct lx_rt_sigframe);
+    uint64_t frame = (sp & ~15ull) - 8;                    /* entry rsp % 16 == 8, as just after a call */
+    if (!lx_user_prepare_write(frame, fpaddr + fpspan - frame)) return 0;
+    const uint8_t *live = (const uint8_t *)task_fpu_snapshot();
+    if (!live) return 0;
+
+    uint8_t *fp = (uint8_t *)fpaddr;
+    memcpy(fp, live, fpimg);
+    memset(fp + 464, 0, 48);                               /* FXSAVE's software-available bytes */
+    if (xs) {
+        uint32_t *sw = (uint32_t *)(fp + 464);             /* struct _fpx_sw_bytes */
+        sw[0] = LX_FP_XSTATE_MAGIC1;
+        sw[1] = fpspan;                                    /* extended_size */
+        { extern uint64_t fpu_xcr0(void); *(uint64_t *)(sw + 2) = fpu_xcr0(); }   /* xfeatures */
+        sw[4] = fpimg;                                     /* xstate_size */
+        *(uint32_t *)(fp + fpimg) = LX_FP_XSTATE_MAGIC2;
+    }
+
+    struct lx_rt_sigframe *f = (struct lx_rt_sigframe *)frame;
+    memset(f, 0, sizeof *f);
+    f->pretcode = a->sig_restorer;
+    f->uc.uc_flags = LX_UC_SIGCONTEXT_SS | LX_UC_STRICT_RESTORE_SS | (xs ? LX_UC_FP_XSTATE : 0);
+    f->uc.ss_sp = th->sig_alt_base;
+    f->uc.ss_size = th->sig_alt_size;
+    f->uc.ss_flags = !th->sig_alt_size ? LX_SS_DISABLE : on_alt ? LX_SS_ONSTACK : 0;
+    struct lx_sigcontext *mc = &f->uc.mc;
+    mc->r8 = r->r8;   mc->r9 = r->r9;   mc->r10 = r->r10; mc->r11 = r->r11;
+    mc->r12 = r->r12; mc->r13 = r->r13; mc->r14 = r->r14; mc->r15 = r->r15;
+    mc->rdi = r->rdi; mc->rsi = r->rsi; mc->rbp = r->rbp; mc->rbx = r->rbx;
+    mc->rdx = r->rdx; mc->rax = r->rax; mc->rcx = r->rcx; mc->rsp = r->rsp;
+    mc->rip = r->rip; mc->eflags = r->rflags;
+    mc->cs = (uint16_t)r->cs; mc->ss = (uint16_t)r->ss;
+    if (fault) { mc->err = th->lx_fault_err; mc->trapno = th->lx_fault_trapno; mc->cr2 = th->lx_fault_cr2; }
+    /* The mask to go BACK to. Normally the one in force; inside sigsuspend it
+     * is the one sigsuspend replaced, because that is what the thread must
+     * have once the handler returns -- not the temporary one. */
+    uint64_t back = th->lx_frame_mask_set ? th->lx_frame_mask : th->sig_blocked;
+    mc->oldmask = back >> 1;
+    mc->fpstate = fpaddr;
+    f->uc.uc_sigmask = back >> 1;                          /* ours is bit n = signal n */
+
+    f->info.si_signo = signo;
+    if (fault) {
+        f->info.si_code = th->lx_fault_code;
+        f->info.u.addr = th->lx_fault_addr;
+        th->lx_fault_valid = 0;                            /* one fault, one delivery */
+    } else {
+        f->info.si_code = th->sig_q_code;
+        if (th->sig_q_code == -2 /* SI_TIMER */) f->info.u.timer.value = th->sig_q_value;
+        else f->info.u.kill.value = th->sig_q_value;
+    }
+
+    r->rsp = frame;
+    r->rip = a->sig_handler[signo];
+    r->rdi = (uint64_t)signo;                              /* h(signo, */
+    r->rsi = frame + __builtin_offsetof(struct lx_rt_sigframe, info);   /* siginfo_t *, */
+    r->rdx = frame + __builtin_offsetof(struct lx_rt_sigframe, uc);     /* ucontext_t *) */
+    r->rax = 0;
+    r->rflags &= ~((1ull << 10) | (1ull << 8) | (1ull << 16));          /* DF, TF, RF clear on entry */
+    /* The mask for the handler's duration: its sa_mask, and the signal itself
+     * unless SA_NODEFER. sigreturn puts back uc_sigmask. */
+    th->sig_blocked |= a->sig_samask[signo] | ((fl & LX_SA_NODEFER) ? 0 : (1ull << signo));
+    th->sig_blocked &= ~((1ull << 9) | (1ull << 19));
+    if (fl & LX_SA_RESETHAND) { a->sig_handler[signo] = 0; a->sig_flags[signo] &= ~APP_SA_SIGINFO; }
+    th->sig_in = 0;                                        /* the old one-handler gate is not used here */
+    return 1;
+}
+
+/* rt_sigreturn for a Linux frame: EVERYTHING comes back from user memory, so
+ * whatever the handler wrote into the ucontext is what the thread resumes
+ * with. That memory is the program's to scribble on, so nothing in it is
+ * trusted: the selectors are forced to the user ones, only the flags Linux
+ * lets a frame change are taken, and a non-canonical rip/rsp -- which would
+ * #GP on the iretq, in ring 0 -- is a bad frame. Linux kills on a bad frame. */
+static void lx_sigreturn(task_t *th, struct registers *r) {
+    struct lx_ucontext uc;
+    uint64_t ucp = r->rsp;                                 /* the handler's `ret` already popped pretcode */
+    if (!vmm_user_ok(ucp, sizeof uc)) goto bad;
+    memcpy(&uc, (const void *)ucp, sizeof uc);
+    struct lx_sigcontext *mc = &uc.mc;
+    if (mc->rip >= LX_USER_TOP || mc->rsp >= LX_USER_TOP) goto bad;
+    if (mc->fpstate && !vmm_user_ok(mc->fpstate, 512)) goto bad;
+
+    r->r8 = mc->r8;   r->r9 = mc->r9;   r->r10 = mc->r10; r->r11 = mc->r11;
+    r->r12 = mc->r12; r->r13 = mc->r13; r->r14 = mc->r14; r->r15 = mc->r15;
+    r->rdi = mc->rdi; r->rsi = mc->rsi; r->rbp = mc->rbp; r->rbx = mc->rbx;
+    r->rdx = mc->rdx; r->rax = mc->rax; r->rcx = mc->rcx; r->rsp = mc->rsp;
+    r->rip = mc->rip;
+    /* FIX_EFLAGS: AC OF DF TF SF ZF AF PF CF RF. IF and bit 1 always set. */
+    const uint64_t fix = (1ull << 18) | (1ull << 11) | (1ull << 10) | (1ull << 8) | (1ull << 7)
+                       | (1ull << 6) | (1ull << 4) | (1ull << 2) | (1ull << 0) | (1ull << 16);
+    r->rflags = (r->rflags & ~fix) | (mc->eflags & fix) | 0x202;
+    r->cs = USER_CS;
+    r->ss = USER_DS;
+    th->sig_blocked = (uc.uc_sigmask << 1) & ~((1ull << 9) | (1ull << 19));
+    th->sig_in = 0;
+
+    if (!mc->fpstate) {
+        task_fpu_install(0, 0, 0);                         /* no image: the clean state */
+    } else {
+        const uint8_t *fpu = (const uint8_t *)mc->fpstate;
+        const uint32_t *sw = (const uint32_t *)(fpu + 464);
+        uint32_t xsz = sw[4];
+        if (task_fpu_is_xsave() && sw[0] == LX_FP_XSTATE_MAGIC1 && xsz >= 576
+            && xsz <= task_fpu_area_size() && xsz <= sw[1]
+            && vmm_user_ok(mc->fpstate, (uint64_t)xsz + 4)
+            && *(const uint32_t *)(fpu + xsz) == LX_FP_XSTATE_MAGIC2)
+            task_fpu_install(fpu, xsz, 0);
+        else
+            task_fpu_install(fpu, 512, 1);                 /* legacy area only, as Linux does without the magic */
+    }
+    return;
+bad:
+    kprintf("[signal] pid %d tid %d: rt_sigreturn with an unusable frame at %lx -- killing it, as Linux would\n",
+            app_sys_getpid(), task_current_id(), (unsigned long)ucp);
+    app_sys_exit(128 + 11);
+}
+
+/* Which signal a ring-3 exception raises in a LINUX process, and what its
+ * siginfo says (M2392). Everything used to become SIGSEGV. HotSpot divides
+ * without testing for zero and relies on SIGFPE with FPE_INTDIV to throw the
+ * ArithmeticException; a SIGSEGV there is an unrecognised crash. Native apps
+ * keep SIGSEGV for everything: their handlers were written against that.
+ * Records the fault on the THREAD and returns the signal number. */
+static int lx_addr_in_vma(struct app *a, uint64_t addr) {
+    int in = 0;
+    uint64_t fl = vma_lock(a);
+    for (int i = 0; i < a->nvma && !in; i++)
+        if (addr >= a->vma[i].start && addr - a->vma[i].start < a->vma[i].len) in = 1;
+    vma_unlock(a, fl);
+    return in;
+}
+
+int app_fault_signal(struct registers *r, uint64_t cr2) {
+    struct app *a = cur();
+    task_t *th = task_self();
+    int signo = 11, code = 0x80 /* SI_KERNEL */;
+    uint64_t addr = 0;
+    switch (r->int_no) {
+    case 0:  signo = 8;  code = 1; addr = r->rip; break;  /* #DE -> SIGFPE  FPE_INTDIV */
+    case 6:  signo = 4;  code = 2; addr = r->rip; break;  /* #UD -> SIGILL  ILL_ILLOPN */
+    case 14:                                              /* SEGV_ACCERR / SEGV_MAPERR */
+        /* Linux decides by the MAPPING, not the page: inside a VMA the access
+         * was refused (ACCERR, even for a PROT_NONE page nobody ever touched,
+         * which here is simply not present); outside every VMA nothing is
+         * mapped (MAPERR). The hardware bit cannot say which: the low 1 GiB is
+         * PRESENT here, as supervisor pages shared into every address space,
+         * so a null dereference would read as ACCERR. */
+        signo = 11; code = (a && lx_addr_in_vma(a, cr2)) ? 2 : 1; addr = cr2; break;
+    case 16: case 19: signo = 8; code = 0; addr = r->rip; break;   /* x87 / SIMD floating point */
+    case 17: signo = 7;  code = 1; addr = cr2; break;     /* #AC -> SIGBUS  BUS_ADRALN */
+    case 11: case 12: signo = 7; break;                   /* #NP, #SS -> SIGBUS, as traps.c */
+    default: break;                                       /* #GP and the rest: SIGSEGV, SI_KERNEL, addr 0 */
+    }
+    if (!a || !a->lxabi) {                                /* native: the old contract, exactly */
+        if (r->int_no == 14) app_set_fault_siginfo(cr2, (r->err_code & 1) ? 2 : 1);
+        return 11;
+    }
+    if (th) {
+        th->lx_fault_addr = addr; th->lx_fault_code = code; th->lx_fault_signo = signo;
+        th->lx_fault_err = r->err_code; th->lx_fault_trapno = r->int_no;
+        th->lx_fault_cr2 = (r->int_no == 14) ? cr2 : 0;
+        th->lx_fault_valid = 1;
+    }
+    return signo;
+}
+
 int app_signal_deliver(struct registers *r, int signo) {
     struct app *a = cur();
     task_t *th = task_self();
     if (!a || !th || signo <= 0 || signo >= APP_NSIG) return 0;
+    if (a->lxabi) {
+        if (!a->sig_handler[signo] || a->sig_handler[signo] == APP_SIG_IGN || !a->sig_restorer) return 0;
+        return lx_signal_deliver(a, th, r, signo);
+    }
     /* DISPOSITIONS ARE PROCESS-WIDE, the rest is this thread's (M2075). That
      * split is not a simplification, it is what Linux does: sigaction is
      * shared by every thread, the mask, the alternate stack and the
@@ -8873,6 +9179,7 @@ int app_raise_signal_to(int pid, int signo) {
 void app_sigreturn(struct registers *r) {
     struct app *a = cur();
     task_t *th = task_self();
+    if (a && th && a->lxabi) { lx_sigreturn(th, r); return; }   /* the frame is the context (M2392) */
     if (!a || !th || !th->sig_in || !th->sig_saved) return;
     /* Restore the interrupted context kernel-side. (SA_SIGINFO hands the handler
      * a READABLE ucontext on the stack for fault inspection; resuming at a
@@ -9077,6 +9384,22 @@ long app_sigsuspend(struct registers *r, uint64_t mask) {
         if (deliverable) break;
         task_block();
         if (!a->used) return -1;    /* killed while suspended */
+    }
+    if (a->lxabi) {
+        /* A LINUX FRAME RESTORES ITS OWN MASK (M2392), so the order that is
+         * right for the native frame below is wrong here: restoring `old` now
+         * would run the handler under the original mask, and then sigreturn
+         * would install the TEMPORARY one for good. Record `old` as the
+         * frame's mask instead and leave the temporary one in force for the
+         * handler, as Linux does. The value the interrupted call returns is
+         * part of the frame too, so it must already be -EINTR -- a bare -1
+         * reads as EPERM. */
+        r->rax = (uint64_t)-4;                 /* -EINTR */
+        th->lx_frame_mask = old; th->lx_frame_mask_set = 1;
+        int entered = app_deliver_pending(r);
+        th->lx_frame_mask_set = 0;
+        if (!entered) th->sig_blocked = old;
+        return -1;
     }
     r->rax = (uint64_t)-1;
     app_deliver_pending(r);
@@ -9839,6 +10162,10 @@ void app_fault_current(struct registers *r) {
          * a fault reported SUCCESS to anything that waited on it -- which is
          * how a crashed `as` came back as "as --version -> 0". (M1956) */
         a->exit_code = 139;
+        /* ...or 128 + whichever signal the fault really raised, for a Linux
+         * process (M2392): a divide error is SIGFPE, 136. */
+        { task_t *ft = task_self();
+          if (a->lxabi && ft && ft->lx_fault_signo > 0) a->exit_code = 128 + ft->lx_fault_signo; }
         /* ...and its threads die with it (M1999). A process killed by SIGSEGV
          * has to end its siblings for exactly the reason a process that exits
          * cleanly does: app_reap is about to free the address space they are
@@ -10058,6 +10385,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
     }
     int take_linux = g_pend_linux;        /* consume before the CR3 switch, like the two above */
     g_pend_linux = 0;
+    a->lxabi = take_linux;
     char mappath[VFS_PATH_MAX];           /* likewise one-shot: copy it out before anything can re-enter */
     { int mi = 0; while (g_pend_mappath[mi] && mi < VFS_PATH_MAX - 1) { mappath[mi] = g_pend_mappath[mi]; mi++; }
       mappath[mi] = 0; g_pend_mappath[0] = 0; }
@@ -14664,7 +14992,17 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
     for (int i = 0; i < a->nvma; i++) if (a->vma[i].mfd >= 0) memfd_ref(a->vma[i].mfd);
     /* The path table the VMAs index into is GLOBAL, so a forked child inherits
      * it for free -- and cannot be handed indices into an empty one. (M1962) */
-    for (int i = 0; i < APP_NSIG; i++) a->sig_handler[i] = p->sig_handler[i];
+    /* THE WHOLE ACTION, NOT JUST THE HANDLER (M2392). fork copied sig_handler
+     * and left sig_flags and sig_samask at the child's memset zero, so a
+     * child's SA_SIGINFO handler was entered as a ONE-argument handler --
+     * siginfo and ucontext pointers never passed -- and dereferenced whatever
+     * rsi and rdx happened to hold. Linux children inherit every sigaction. */
+    for (int i = 0; i < APP_NSIG; i++) {
+        a->sig_handler[i] = p->sig_handler[i];
+        a->sig_flags[i] = p->sig_flags[i];
+        a->sig_samask[i] = p->sig_samask[i];
+    }
+    a->lxabi = p->lxabi;
     a->sig_restorer = p->sig_restorer; a->curcol = p->curcol;
     /* A CHILD'S OUTPUT BELONGS WHERE ITS PARENT'S WENT (M2004). Firefox and
      * Claude Code both fork helpers that print; without this, a helper's
@@ -15490,6 +15828,7 @@ long app_execve_linux(struct registers *r, const char *path,
     me->exec_argv = argv; me->exec_envp = envp;
     long rc = app_exec(r, path, 0);
     me->exec_img = 0; me->exec_imgsz = 0; me->exec_argv = 0; me->exec_envp = 0;
+    if (rc >= 0) me->lxabi = 1;             /* it runs a Linux image now (M2392) */
     lx_drop_interp();                       /* app_exec consumed it (or the exec failed) */
 
     /* Safe either way: app_exec copies the segments into the new address space

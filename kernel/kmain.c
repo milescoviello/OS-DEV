@@ -265,6 +265,7 @@ static volatile int g_lxtool_test;            /* -append lxtooltest: drive the B
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
+static volatile int g_lxsigctx;               /* -append lxsigctx: the signal context a JVM depends on, alone (M2392) */
 static volatile int g_lxnvdrm;                /* -append lxnvdrm: what Mesa's nvc0 asks the GT 1030's render node (M2390) */
 static volatile int g_lxdrm;                  /* -append lxdrm: does the DRM render node answer the four questions Mesa asks? (M2347) */
 static volatile int g_lxgl;                   /* -append lxgl: eight links from a GL call to the host iGPU (M2351) */
@@ -978,6 +979,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "lxport"))     { g_lxabi_test = 1; g_lxport = 1; }   /* the ephemeral port allocator race (M2324) */
+        if (cmdline_has(cl, "lxsigctx"))   { g_lxabi_test = 1; g_lxsigctx = 1; } /* siginfo/ucontext/sigreturn as HotSpot uses them (M2392) */
         /* NOT g_lxabi_test. These two run from their own site after
          * virtio_gpu_init, not from the lxabi block, so setting that flag only
          * made every boot of a GPU probe run the whole thirty-probe ABI suite
@@ -1479,6 +1481,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the PROT_NONE probe...\n");
         {   int nrc = app_run_linux_sync("/disk2/lxnone", 0, 0, 120000);
             kprintf("[lxabi] LXNONE exit -> %d\n", nrc); }
+        /* ...and whether a handler can do what a JVM's does with that fault
+         * (M2392): read it out of a real siginfo_t/ucontext_t, move the
+         * program counter, and have the thread resume THERE -- with its vector
+         * registers intact. HotSpot's null checks, safepoint polls and integer
+         * division all work that way. */
+        kprintf("[lxabi] launching the signal-context probe...\n");
+        {   int scrc = app_run_linux_sync("/disk2/lxsigctx", 0, 0, 120000);
+            kprintf("[lxabi] LXSIGCTX exit -> %d\n", scrc); }
         /* ...and whether an mprotect over a COW page keeps it copy-on-write
          * (M2178). vmm_protect replaced the PTE flags wholesale, so granting
          * write dropped the bit that makes the copy happen -- two processes
@@ -3434,6 +3444,11 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] launching the glibc getaddrinfo probe...\n");
             int gairc = app_run_linux_sync("/disk2/lxgai", 0, 0, 60000);
             kprintf("[lxabi] lxgai exit -> %d\n", gairc);
+        }
+        if (g_lxsigctx) {
+            kprintf("[lxabi] the signal context a JVM depends on, asked directly...\n");
+            int scrc = app_run_linux_sync("/disk2/lxsigctx", 0, 0, 120000);
+            kprintf("[lxabi] lxsigctx exit -> %d\n", scrc);
         }
         if (g_lxport) {
             /* THE PORT ALLOCATOR, ASKED DIRECTLY (M2324). The DNS symptom needs

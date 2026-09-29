@@ -359,8 +359,12 @@ void isr_dispatch(struct registers *r) {
             struct registers fregs = *r;
             /* SEGV_MAPERR(1) = not mapped, SEGV_ACCERR(2) = mapped and refused.
              * Bit 0 of a page-fault error code is "the page WAS present". */
-            if (r->int_no == 14) app_set_fault_siginfo(cr2, (r->err_code & 1) ? 2 : 1);
-            if (app_signal_deliver(r, 11)) {       /* SIGSEGV: a registered handler catches the fault */
+            /* WHICH SIGNAL (M2392). A Linux process gets the one Linux would
+             * raise -- SIGFPE for a divide error, SIGILL for an invalid
+             * opcode -- with the fault recorded on the THREAD; a native app
+             * still gets SIGSEGV for everything, as it always has. */
+            int fsig = app_fault_signal(r, cr2);
+            if (app_signal_deliver(r, fsig)) {     /* a registered handler catches the fault */
                 static int told;
                 if (told < 8) {
                     told++;
