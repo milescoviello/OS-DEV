@@ -2491,9 +2491,18 @@ static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
         int ihl = (buf[14] & 0x0F) * 4;
         if (ihl < 20 || 14 + ihl + 20 > len) continue;
         uint8_t *tcp = buf + 14 + ihl;
-        if (get16(tcp + 2) != port) continue;                            /* our listen port */
-        if (cport && get16(tcp + 0) != cport) continue;                  /* this connection's peer port */
-        if (cip && memcmp(buf + 26, cip, 4) != 0) continue;              /* this connection's peer IP */
+        /* SOMEONE ELSE'S SEGMENT IS PARKED, NOT DROPPED. These three tests
+         * used to `continue`, discarding a TCP frame for any other port or
+         * peer -- and this loop runs for netcon's whole uptime, inside every
+         * accept(), and on every poll() of a Linux AF_INET listener. While any
+         * of them polled, outbound connections lost their SYN-ACKs and data.
+         * Their owners look in the park ring first (tcp_recv_seg). */
+        if (get16(tcp + 2) != port ||                                    /* our listen port */
+            (cport && get16(tcp + 0) != cport) ||                        /* this connection's peer port */
+            (cip && memcmp(buf + 26, cip, 4) != 0)) {                    /* this connection's peer IP */
+            park_put(buf, len);
+            continue;
+        }
         int thl = (tcp[12] >> 4) * 4;
         if (thl < 20 || 14 + ihl + thl > len) continue;
         int iptotal = get16(buf + 16);                                   /* clamp peer-controlled length */
