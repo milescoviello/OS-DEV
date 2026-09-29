@@ -2516,10 +2516,40 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
  * no ARP/gateway. No retransmission — correct on the reliable QEMU/localhost path
  * (curl via `-netdev user,hostfwd=`). Returns request bytes read (>=0), or -1 on
  * timeout/error. Lets an in-guest httpd actually serve pages. */
+/* A connection request waiting for a listener: an IPv4 TCP SYN (no ACK) to
+ * `lport`, taken out of the park ring. See the backlog note in srv_rx. */
+static int park_take_syn(uint16_t lport, uint8_t *buf, int max) {
+    uint64_t pfl = park_take_lk();
+    uint64_t now = timer_ticks();                /* under the lock: see park_put */
+    for (int i = 0; i < PARK_N; i++) {
+        if (!g_park[i].len) continue;
+        if (now - g_park[i].at > PARK_TTL) { g_park[i].len = 0; continue; }
+        const uint8_t *f = g_park[i].buf;
+        int flen = g_park[i].len;
+        if (flen < 34 || get16(f + 12) != 0x0800 || f[14 + 9] != 6) continue;
+        int ihl = (f[14] & 0x0F) * 4;
+        if (ihl < 20 || 14 + ihl + 20 > flen) continue;
+        const uint8_t *t = f + 14 + ihl;
+        if (get16(t + 2) != lport || !(t[13] & TCP_SYN) || (t[13] & TCP_ACK)) continue;
+        int n = flen < max ? flen : max;
+        memcpy(buf, f, (size_t)n);
+        g_park[i].len = 0;
+        park_give_lk(pfl);
+        return n;
+    }
+    park_give_lk(pfl);
+    return 0;
+}
+
 static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
                   const uint8_t *cip, uint64_t deadline, uint8_t **tcp_out, int *dlen_out) {
     while (timer_ticks() < deadline) {
-        int len = rx_next(buf, max);                   /* answers ARP for us first (M2126) */
+        /* THE LISTEN BACKLOG. A listener that is not yet talking to anyone
+         * (cport == 0) takes a waiting connection request first: one that
+         * arrived while it was busy serving another client, or that another
+         * receive loop pulled off the card and parked. */
+        int len = cport ? 0 : park_take_syn(port, buf, max);
+        if (len <= 0) len = rx_next(buf, max);         /* answers ARP for us first (M2126) */
         if (len < 34) {
             /* Idle (no packet / a runt): SLEEP to the next interrupt instead of
              * tight-spinning. Interrupt-driven RX (M1858) wakes us the moment a
@@ -2544,15 +2574,23 @@ static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
          * loop runs for netcon's whole uptime, inside every accept(), and on
          * every poll() of a Linux AF_INET listener, so while any of them
          * polled, OUTBOUND connections lost their SYN-ACKs and data. Their
-         * owners look in the park ring first (tcp_recv_seg).
-         *
-         * A frame for OUR port from another peer is still dropped: this loop
-         * never reads the park ring, so a second client's SYN parked here
-         * would never be seen, whereas dropped, the client retransmits it
-         * and the next accept takes it. */
+         * owners look in the park ring first (tcp_recv_seg). */
         if (get16(tcp + 2) != port) { park_put(buf, len); continue; }    /* someone else's connection */
-        if (cport && get16(tcp + 0) != cport) continue;                  /* this connection's peer port */
-        if (cip && memcmp(buf + 26, cip, 4) != 0) continue;              /* this connection's peer IP */
+        /* ...AND ANOTHER CLIENT'S SYN IS KEPT FOR THE NEXT ACCEPT. It was
+         * dropped, on the theory that the client retransmits -- and it does,
+         * after a second, then two, then four. Under QEMU's user networking
+         * that was the whole of httpdtest's flake: the proxy accepts the host
+         * connection at once and keeps redialling the guest, so every SYN
+         * dropped while one request was being served became a connection
+         * served seconds later, after the client had given up, ahead of the
+         * live one -- and the last request of each round (the 404) timed out
+         * behind a queue of dead ones. Parked, the next accept takes it at
+         * once (the top of this loop); the park TTL expires a stale one. */
+        int other_peer = (cport && get16(tcp + 0) != cport) || (cip && memcmp(buf + 26, cip, 4) != 0);
+        if (other_peer) {
+            if ((tcp[13] & TCP_SYN) && !(tcp[13] & TCP_ACK)) park_put(buf, len);
+            continue;
+        }
         int thl = (tcp[12] >> 4) * 4;
         if (thl < 20 || 14 + ihl + thl > len) continue;
         int iptotal = get16(buf + 16);                                   /* clamp peer-controlled length */
