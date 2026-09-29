@@ -4721,6 +4721,49 @@ static void lx_dispatch_body(struct registers *r) {
                 break;
             }
         }
+        /* OPENING /proc/self/fd/N OPENS THE OBJECT N NAMES (M2395).
+         *
+         * On Linux that path is a magic link, and open(2) through it does not
+         * read a procfs file: it re-opens whatever the descriptor refers to.
+         * Firefox 156 depends on it for every READ-ONLY shared-memory handle:
+         * DupReadOnly() is open("/proc/self/fd/<memfd>", O_RDONLY), the parent
+         * sends that descriptor to each content process, and the content
+         * process checks it with F_GET_SEALS before mapping it. Here the open
+         * fell through to procfs, the handle was not a memfd at all,
+         * F_GET_SEALS answered EINVAL, and every content process died on
+         *   MOZ_CRASH "Shared memory PlatformHandle is not safe to map"
+         * (ipc/glue/SharedMemoryHandle.cpp:104) -- chrome, never a page.
+         *
+         * A memfd re-opens as a new descriptor for the SAME memfd, seals and
+         * all. A regular file re-opens by its path with the new flags. Every
+         * other kind falls through to the old behaviour. */
+        {
+            const char *tail = lx_proc_self_tail(upath);
+            if (tail && tail[0] == 'f' && tail[1] == 'd' && tail[2] == '/' && tail[3]) {
+                int pfd = 0, k = 3;
+                while (tail[k] >= '0' && tail[k] <= '9') { pfd = pfd * 10 + (tail[k] - '0'); k++; }
+                int ty = (!tail[k] && k > 3) ? app_fd_type(pfd) : -1;
+                if (ty == 3) {
+                    long rfd = app_fcntl(pfd, 0 /*F_DUPFD*/, 0);
+                    if (rfd >= 0 && ((long)r->rdx & LXO_CLOEXEC)) app_fd_set_cloexec((int)rfd, 1);
+                    r->rax = (rfd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)rfd;
+                    break;
+                }
+                if (ty == 2) {
+                    const char *fpath = app_fd_path_of(pfd);
+                    if (fpath && fpath[0]) {
+                        long rl = (long)r->rdx; int rf = 0;
+                        if (rl & (LXO_WRONLY | LXO_RDWR)) rf |= O_WRONLY;
+                        if (rl & LXO_TRUNC)  rf |= O_TRUNC;
+                        if (rl & LXO_APPEND) rf |= O_APPEND;
+                        int rfd = app_open(fpath, rf);
+                        if (rfd >= 0 && (rl & LXO_CLOEXEC)) app_fd_set_cloexec(rfd, 1);
+                        r->rax = (rfd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)rfd;
+                        break;
+                    }
+                }
+            }
+        }
         long lf = (long)r->rdx, nf = 0;
         if (lf & (LXO_WRONLY | LXO_RDWR)) nf |= O_WRONLY;   /* we have no separate RDWR */
         if (lf & LXO_CREAT)  nf |= O_CREAT;
