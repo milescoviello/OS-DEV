@@ -123,8 +123,8 @@ extern char lxs_load_site[], lxs_load_cont[], lxs_store_site[], lxs_store_cont[]
 extern char lxs_fp_site[], lxs_fp_cont[], lxs_div_site[], lxs_div_cont[];
 extern char lxs_ud_site[], lxs_ud_cont[];
 
-static int fails;
-#define CHECK(cond, ...) do { if (cond) { printf("LXSIGCTX: ok   "); printf(__VA_ARGS__); printf("\n"); } \
+static int fails, checks;
+#define CHECK(cond, ...) do { checks++; if (cond) { printf("LXSIGCTX: ok   "); printf(__VA_ARGS__); printf("\n"); } \
                               else { printf("LXSIGCTX: FAIL "); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
 
 /* ---- what the handler saw -------------------------------------------------- */
@@ -413,6 +413,8 @@ int main(void) {
               (unsigned long)nested_result);
     }
 
-    printf("LXSIGCTX: RESULT %s (%d check(s) failed)\n", fails ? "FAIL" : "PASS", fails);
+    /* THE TOTAL, NOT JUST THE FAILURES: "0 failed" does not say 0 of what, and
+     * a count read off by eye came out one short. */
+    printf("LXSIGCTX: RESULT %s (%d of %d check(s) failed)\n", fails ? "FAIL" : "PASS", fails, checks);
     return fails ? 1 : 0;
 }

@@ -36,8 +36,9 @@ import java.util.stream.*;
 import java.util.zip.CRC32;
 
 public class LxJava {
-    static int fails;
+    static int fails, checks;
     static void check(boolean ok, String what) {
+        checks++;
         System.out.println("LXJAVA: " + (ok ? "ok   " : "FAIL ") + what);
         if (!ok) fails++;
     }
@@ -186,7 +187,8 @@ public class LxJava {
         long a = System.nanoTime(); Thread.sleep(100); long el = (System.nanoTime() - a) / 1_000_000;
         check(el >= 99 && el < 1000, "Thread.sleep(100) took " + el + " ms");
 
-        System.out.println("LXJAVA: RESULT " + (fails == 0 ? "PASS" : "FAIL") + " (" + fails + " check(s) failed) in " + ms());
+        System.out.println("LXJAVA: RESULT " + (fails == 0 ? "PASS" : "FAIL") + " (" + fails + " of " + checks
+                + " check(s) failed) in " + ms());
         System.exit(fails);
     }
 }
