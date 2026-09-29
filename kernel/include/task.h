@@ -174,6 +174,8 @@ void    task_exit(void);                   /* end the current thread (no return)
 void    task_free(task_t *t);              /* free a DEAD, unlinked, off-CPU task (reaper only) */
 int     task_current_id(void);
 task_t *task_self(void);                   /* the currently running task */
+uint64_t task_cr3_borrow(uint64_t cr3);    /* run in another address space, preemption-safe; returns the token for... */
+void    task_cr3_return(uint64_t prev);    /* ...going back to this task's own space */
 /* Pin the calling task to its CURRENT core until task_unpin (M1536): for code
  * that keeps per-core global state across a call long enough to risk a
  * preemption-then-migration (the ordinary scheduler, unlike smp_parallel_for,

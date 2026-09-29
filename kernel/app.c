@@ -2567,11 +2567,9 @@ int app_reap(app_t *a) {
         {
             uint64_t flags2;
             __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags2) :: "memory");
-            uint64_t old_cr3_reap;
-            __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3_reap));
-            __asm__ volatile("mov %0, %%cr3" : : "r"(a->cr3) : "memory");
+            uint64_t old_cr3_reap = task_cr3_borrow(a->cr3);   /* msync can sleep on disk: see task_cr3_borrow */
             app_msync(0, (uint64_t)-1);
-            __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3_reap) : "memory");
+            task_cr3_return(old_cr3_reap);
             __asm__ volatile("push %0; popfq" : : "r"(flags2) : "memory", "cc");
         }
         /* Release this process's memfd mappings BEFORE the address space goes
@@ -10178,9 +10176,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
      * it (interrupts off) so the loader's writes land in the right space. */
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    uint64_t old;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(old));
-    __asm__ volatile("mov %0, %%cr3" : : "r"(a->cr3) : "memory");
+    uint64_t old = task_cr3_borrow(a->cr3);   /* the loader reads from disk: see task_cr3_borrow */
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
     if (mappath[0]) a->entry = app_load_mapped(a, mappath, elf, elfsz, g_pend_mapsize);
@@ -10496,7 +10492,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
 
     a->aslr_mmap_base = aslr_mmap_pick(); a->mmap_next = a->aslr_mmap_base;   /* ASLR: randomize the mmap region start (M1287) */
 
-    __asm__ volatile("mov %0, %%cr3" : : "r"(old) : "memory");
+    task_cr3_return(old);
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
 
     /* 256 KB kernel stack (vs the 16 KB default): a ring-3 app's syscalls run on
@@ -10519,7 +10515,7 @@ fail_in_space:
      * stack). Restore the caller's CR3 first, THEN tear down the partial address
      * space — vmm_destroy_address_space refuses to free the active space, and
      * leaving it mapped would leak the PML4/PDPT + every frame elf_load mapped. */
-    __asm__ volatile("mov %0, %%cr3" : : "r"(old) : "memory");
+    task_cr3_return(old);
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
     vmm_destroy_address_space(a->cr3);
     a->used = 0;
@@ -15234,7 +15230,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
                                                * image (not the new, not-yet-populated one) is still live */
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");   /* become the new space */
+    uint64_t exec_prev_cr3 = task_cr3_borrow(new_cr3);   /* become the new space (preemption-safe) */
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
     /* A mapped load registers VMAs as it goes, so a->nvma has to be reset
@@ -15314,7 +15310,15 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
          * page, so the new image entered ring 3 with an unmapped RSP and took
          * an immediate page fault at CR2=0x50081000. Silently entering a
          * program at a bad stack is far worse than refusing the exec. */
-        if (!rsp) { kprintf("[linuxabi] execve: could not build the initial stack\n"); goto fail; }
+        if (!rsp) {
+            /* PAST THE COMMIT POINT there is nothing to go back to: the old
+             * address space was destroyed above. `goto fail` reloaded that
+             * dead CR3 and freed the live one. The process exits instead,
+             * as Linux kills a process whose exec fails this late. */
+            kprintf("[linuxabi] execve: could not build the initial stack -- the old image is gone, exiting\n");
+            __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+            app_sys_exit(127);
+        }
         a->ustack = rsp;
     }
 
@@ -15366,7 +15370,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     return 0;                                               /* frame rewritten; iretq enters the new program */
 
 fail:
-    __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");   /* restore the old space */
+    task_cr3_return(exec_prev_cr3);                          /* restore the old space */
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
     vmm_destroy_address_space(new_cr3);
     return -1;

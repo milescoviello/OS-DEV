@@ -296,6 +296,34 @@ static inline uint64_t task_want_cr3(const task_t *t) {
     return t->cr3 ? t->cr3 : g_kernel_cr3;
 }
 
+/* WORK IN ANOTHER ADDRESS SPACE FOR A WHILE, AND SURVIVE BEING PREEMPTED THERE.
+ * spawn, exec and reap load a process's CR3 by hand to fill in or flush its
+ * pages. The scheduler restores a task's OWN cr3 when it switches back in, so
+ * a raw `mov cr3` lasted only until the first preemption -- and loading from
+ * disk re-enables interrupts -- after which the loader carried on writing
+ * user addresses on the wrong page tables. Borrowing records the space on the
+ * task itself; returning goes back to the task's real one. */
+uint64_t task_cr3_borrow(uint64_t cr3) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    task_t *t = cur[mycore()];
+    uint64_t prev = t ? t->cr3 : 0;
+    if (t) t->cr3 = cr3;
+    active_cr3 = cr3;
+    load_cr3(cr3);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return prev;
+}
+void task_cr3_return(uint64_t prev) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    task_t *t = cur[mycore()];
+    if (t) t->cr3 = prev;
+    uint64_t want = t ? task_want_cr3(t) : g_kernel_cr3;
+    if (want) { active_cr3 = want; load_cr3(want); }
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+
 /* Per-thread %fs base for TLS (M1140). The kernel never uses FS_BASE itself, so
  * we only touch the MSR on behalf of threads that set one; `loaded_fs_base`
  * tracks the live value so a system with no TLS pays nothing (stays 0 == 0).
