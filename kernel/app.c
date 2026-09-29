@@ -7763,14 +7763,14 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
          * that is already there. Looked up in the VMA table rather than from
          * the PTE, because sharedness is a property of the MAPPING -- the same
          * reason madvise(MADV_DONTNEED) consults it (M2000). */
+        int cow_in_vma = 0, shared_here = 0; uint8_t vprot = 0;
         {   struct app *ca = cur();
-            int shared_here = 0; uint8_t vprot = 0;
             if (ca) {
                 uint64_t vfl = vma_lock(ca);
                 for (int i = 0; i < ca->nvma; i++)
                     if (ca->vma[i].len && fpage >= ca->vma[i].start &&
                         fpage < ca->vma[i].start + ca->vma[i].len) {
-                        shared_here = ca->vma[i].shared; vprot = ca->vma[i].prot; break;
+                        shared_here = ca->vma[i].shared; vprot = ca->vma[i].prot; cow_in_vma = 1; break;
                     }
                 vma_unlock(ca, vfl);
             }
@@ -7795,6 +7795,15 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                 return 1;
             }
         }
+        /* A WRITE THE MAPPING DOES NOT ALLOW IS NOT A COW BREAK. The private
+         * copy below is always installed WRITABLE, so after fork a page whose
+         * VMA had been mprotect'ed read-only (vmm_protect keeps PTE_COW) was
+         * made writable by the first write to it -- a silent success where the
+         * process asked for a fault, which defeats every mprotect-based write
+         * barrier (GC card marking, guard pages, JIT W^X flips). Refuse, and
+         * the write is reported as the protection violation it is. A page
+         * with no VMA -- the main stack, the brk heap -- is private RW. */
+        if (cow_in_vma && !(vprot & VMA_PROT_WRITE)) return 0;
         /* ALWAYS COPY (M2044, and re-affirmed in M2050).
          *
          * The "refcount is 0, so I am the sole owner, so just make it writable
