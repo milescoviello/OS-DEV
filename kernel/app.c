@@ -590,6 +590,30 @@ static inline int vma_pick_slot(struct app *a) {
 }
 
 static int next_pid = 100;
+/* CLAIMING A PROCESS SLOT, the same find-then-fill as the VMA table (M1988):
+ * fork and spawn scanned apps[] for !used and only set used = 1 after a
+ * ~300 KB memset, so two cores forking at once could take the same struct
+ * app -- one address space leaked, one child running with the other's state.
+ * The memset clears `used` itself, so the claim lives beside the table:
+ * taken under a short lock, dropped once the slot says used = 1. */
+static volatile int g_app_slot_lk;
+static uint8_t g_app_slot_claimed[MAX_APPS];
+static struct app *app_slot_claim(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_app_slot_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    struct app *a = 0;
+    for (int i = 0; i < MAX_APPS; i++)
+        if (!apps[i].used && !g_app_slot_claimed[i]) { g_app_slot_claimed[i] = 1; a = &apps[i]; break; }
+    __atomic_store_n(&g_app_slot_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return a;
+}
+/* After memset + used = 1: `used` protects the slot from here on. */
+static void app_slot_publish(struct app *a) {
+    __atomic_store_n(&g_app_slot_claimed[a - apps], 0, __ATOMIC_RELEASE);
+}
+static int app_new_pid(void) { return __atomic_fetch_add(&next_pid, 1, __ATOMIC_RELAXED); }
 static int fg_pgid;             /* the controlling terminal's foreground process group (job control, M1176; 0 = none) */
 int app_oom_kill(void);         /* OOM killer (M1275): defined below, called from the sbrk exhaustion path above it */
 
@@ -2600,12 +2624,13 @@ int app_reap(app_t *a) {
  * Uses a REAL apps[] slot with no task, no threads, no VMAs, and the caller's
  * own CR3 (so the msync context switch is a no-op and nothing is destroyed). */
 int app_reap_selftest(void) {
-    int fails = 0, slot = -1;
-    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { slot = i; break; }
-    if (slot < 0) { kprintf("[reaptest] no free app slot (skipped)\n"); return 0; }
-    struct app *a = &apps[slot];
+    int fails = 0;
+    struct app *a = app_slot_claim();
+    if (!a) { kprintf("[reaptest] no free app slot (skipped)\n"); return 0; }
+    int slot = (int)(a - apps);
     memset(a, 0, sizeof *a);
     a->used = 1; a->exited = 1; a->task = 0; a->parent = 0;
+    app_slot_publish(a);
     a->pid = 0x7000 + slot;                     /* not a real pid: nothing else refers to it */
     a->nvma = 0;
     __asm__ volatile("mov %%cr3, %0" : "=r"(a->cr3));
@@ -10010,12 +10035,13 @@ static uint64_t app_load_mapped(struct app *a, const char *path, const void *hdr
 }
 
 app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
-    struct app *a = 0;
-    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { a = &apps[i]; break; }
-    if (!a || !elf) return 0;
+    if (!elf) return 0;
+    struct app *a = app_slot_claim();
+    if (!a) return 0;
 
     memset(a, 0, sizeof(*a));
     a->used = 1;
+    app_slot_publish(a);
         /* A RECYCLED apps[] SLOT MUST NOT INHERIT ITS PREDECESSOR'S CLAIMS
          * (M2327). g_fd_claimed is indexed by slot, and teardown clears it --
          * but an exit path that skips that loop would leave bits set, and
@@ -10024,7 +10050,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * later and miles away, so the invariant is re-established HERE, where
          * it cannot depend on every exit path behaving. */
         app_fd_claims_reset(a);
-    a->pid = next_pid++;
+    a->pid = app_new_pid();
     a->pgid = a->sid = a->pid;           /* a spawned app leads its own group + session (M1176) */
     /* Consume the one-shot arming from app_arm_next_spawn, BEFORE the process
      * can run a single instruction: a child that prints immediately used to
@@ -14616,12 +14642,12 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
         if (nch >= p->rlim_nproc) return -1;            /* at the limit -> EAGAIN */
     }
 
-    struct app *a = 0;
-    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { a = &apps[i]; break; }
+    struct app *a = app_slot_claim();
     if (!a) return -1;                                  /* process table full */
 
     memset(a, 0, sizeof(*a));
     a->used = 1;
+    app_slot_publish(a);
         /* A RECYCLED apps[] SLOT MUST NOT INHERIT ITS PREDECESSOR'S CLAIMS
          * (M2327). g_fd_claimed is indexed by slot, and teardown clears it --
          * but an exit path that skips that loop would leave bits set, and
@@ -14630,7 +14656,7 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
          * later and miles away, so the invariant is re-established HERE, where
          * it cannot depend on every exit path behaving. */
         app_fd_claims_reset(a);
-    a->pid = next_pid++;                                /* a FRESH pid (not the parent's) */
+    a->pid = app_new_pid();                             /* a FRESH pid (not the parent's) */
     /* title: the parent's, marked as a fork */
     int ti = 0; const char *pt = p->title ? p->title : "app";
     while (pt[ti] && ti < 16) { a->titlebuf[ti] = pt[ti]; ti++; }
@@ -14857,14 +14883,38 @@ void app_task_forget_everywhere(void *t) {
     }
 }
 
-static int app_thr_slot(struct app *a) {
-    for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) return i;
+/* Is there room for one more thread? A hint for failing early, before a task
+ * is built; the claim itself is app_thr_install. */
+static int app_thr_room(struct app *a) {
     for (int i = 0; i < APP_MAXTHREAD; i++) {
         task_t *t = a->thr[i];
-        if (!t || t->state != TASK_DEAD) continue;
+        if (!t || (t->state == TASK_DEAD && __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE))) return 1;
+    }
+    return 0;
+}
+
+/* RECORD A NEW THREAD, CLAIMING ITS SLOT WITH A COMPARE-AND-SWAP (M1988's
+ * class, in the thread table). This used to return a free index and let the
+ * caller store into it later, so two concurrent pthread_creates were handed
+ * the same slot: the overwritten thread was then invisible to
+ * app_stop_siblings and the reaper and ran on after its address space was
+ * freed, and two claimers reclaiming one dead thread both task_free'd it.
+ * Swapping the real pointer in means no half-claimed slot is ever visible,
+ * and only the winner of a reclaim frees the dead task. -1 if full. */
+static int app_thr_install(struct app *a, task_t *nt) {
+    for (int i = 0; i < APP_MAXTHREAD; i++) {
+        task_t *exp = 0;
+        if (!a->thr[i] &&
+            __atomic_compare_exchange_n(&a->thr[i], &exp, nt, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return i;
+    }
+    for (int i = 0; i < APP_MAXTHREAD; i++) {
+        task_t *t = a->thr[i];
+        if (!t || t == nt || t->state != TASK_DEAD) continue;
         if (!__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) continue;
+        if (!__atomic_compare_exchange_n(&a->thr[i], &t, nt, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;                                   /* another claimer took it first */
         app_task_forget_everywhere(t);
-        a->thr[i] = 0;
         task_free(t);
         return i;
     }
@@ -14905,7 +14955,12 @@ long app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg) {
     task_t *t = task_create_stack_suspended(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app. 256K (was 64K): a clone'd thread that calls sys_https runs the bignum/RSA TLS handshake on THIS kernel stack — the ring-3 browser's async fetch worker does exactly that, and 64K overflowed (corrupting the task ring -> task_wake_sleepers GPF). Matches the in-kernel browser worker's 256K. */
     if (!t) { kfree(f); return -1; }
     t->start_frame = f;
-    { int sl = app_thr_slot(a); if (sl >= 0) a->thr[sl] = t; }   /* track for join/reap (M1139); reclaims finished slots (M2009) */
+    if (app_thr_install(a, t) < 0) {   /* track for join/reap (M1139); reclaims finished slots (M2009) */
+        /* No slot: an untracked thread outlives its address space. Start it
+         * with no frame, so thread_trampoline ends it at once (M2014). */
+        t->start_frame = 0; kfree(f); task_cont(t);
+        return -1;
+    }
     task_cont(t);                      /* the start frame is stored: NOW it may run (M2014) */
     return t->id;
 }
@@ -14933,9 +14988,8 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
     struct app *a = cur();
     if (!a || !r || !stack) return -1;
     /* Refuse when the thread table is full rather than creating a task nothing
-     * can join or reap. */
-    int slot = app_thr_slot(a);
-    if (slot < 0) return -1;
+     * can join or reap. (A hint: the slot is claimed by app_thr_install below.) */
+    if (!app_thr_room(a)) return -1;
 
     struct registers *f = kmalloc(sizeof *f);
     if (!f) return -1;
@@ -14959,8 +15013,15 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
     /* PARENT_SETTID is written HERE, in the parent, before we return -- the
      * caller may read it the instant clone() returns, and the child may not
      * have run yet. */
+    if (app_thr_install(a, t) < 0) {
+        /* The table filled between the check above and now. Never run a
+         * thread nothing tracks: start it with no frame so it ends at once --
+         * and without a clear_child_tid, which would be written into a stack
+         * the caller frees when this clone fails. */
+        t->clear_child_tid = 0; t->start_frame = 0; kfree(f); task_cont(t);
+        return -1;
+    }
     if ((flags & LXC_PARENT_SETTID) && vmm_user_ok(ptid, 4)) *(volatile int *)ptid = t->id;
-    a->thr[slot] = t;
     task_cont(t);                      /* TLS + tid pointers are set: now it may run */
     return t->id;
 }
