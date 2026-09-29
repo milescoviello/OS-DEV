@@ -1027,8 +1027,14 @@ static void wl_flush(struct wl_client *c) {
 static void wl_flush_locked(struct wl_client *c) {
     int sent_any = 0;
     while (c->outlen > 0) {
-        long n = unix_send(c->ep, c->out, (unsigned long)c->outlen);
-        if (n <= 0) break;                       /* ring full, or the peer is gone */
+        /* NON-BLOCKING, always: this runs under g_wl_out_lock with interrupts
+         * off. The blocking unix_send task_block()s when the client's ring is
+         * full -- a client that stops reading fills it in ~1100 pointer
+         * motions -- and then the next wl_send from the WM or the compositor
+         * spun on this lock for ever with IRQs off: a hung core, a hung box on
+         * one. What does not fit stays queued for the next flush. */
+        long n = unix_send_ex(c->ep, c->out, (unsigned long)c->outlen, 1);
+        if (n <= 0) break;                       /* ring full (UNIX_EAGAIN), or the peer is gone */
         sent_any = 1;
         c->sent += (unsigned long)n;
         if (n >= c->outlen) { c->outlen = 0; break; }
@@ -1310,6 +1316,13 @@ static void wl_destroy_obj(struct wl_client *c, struct wl_object *o) {
          * clearing ptr_in/kbd_in makes the next enter() be sent for whatever
          * surface replaces it. */
         if (c->surface == id) { c->surface = 0; c->ptr_in = c->kbd_in = 0; }
+        /* ANY surface, not just the root: pointer focus follows the cursor
+         * onto subsurfaces too. Left pointing at a destroyed one, the next
+         * motion sent leave(<freed id>) after its delete_id, and libwayland
+         * treats an event for an unknown object as fatal -- the client's
+         * whole display connection died. */
+        if (c->ptr_surface == id) { c->ptr_surface = 0; c->ptr_in = 0; }
+        if (c->surf_entered == id) c->surf_entered = 0;
         if (o->mfd >= 0) { app_memfd_obj_unref(o->mfd); o->mfd = -1; }   /* the committed frame (M2087) */
         break;
     case WLK_BUFFER:
@@ -1494,6 +1507,24 @@ static void wl_fps_note(unsigned id, unsigned w, unsigned h) {
     }
 }
 
+/* A WAYLAND STRING ARGUMENT, BOUNDS-CHECKED WITHOUT WRAPAROUND. It is a
+ * 32-bit length (counting the NUL) followed by the bytes, padded to 4. The
+ * client chooses that length, and the inline arithmetic this replaced wrapped:
+ * bind cast `(slen + 3) & ~3` to int, so slen = 0x80000000 made the offset
+ * negative and the next read landed 2 GiB before the message; activate's
+ * 32-bit `4 + pad + 4` wrapped to 4 for slen = 0xFFFFFFFC and read 4 GiB past
+ * it. Either was a kernel page fault from one message. On success *next is
+ * the offset of the argument after the string; -1 if it does not fit. */
+static int wl_str_arg(int alen, int off, const uint8_t *args, uint32_t *slen, int *next) {
+    if (off < 0 || (int64_t)off + 4 > alen) return -1;
+    uint32_t n = rd32(args + off);
+    uint64_t end = (uint64_t)off + 4 + (((uint64_t)n + 3) & ~(uint64_t)3);
+    if (end > (uint64_t)alen) return -1;
+    if (slen) *slen = n;
+    if (next) *next = (int)end;
+    return 0;
+}
+
 static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
     wl_inlat_woke((int)(c - g_cl));      /* M2337: the client is awake and talking */
     uint32_t obj = rd32(m + 0);
@@ -1527,10 +1558,8 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
          * a different request on every interface, and routing by kind is the
          * only way to tell them apart. */
         uint32_t name = rd32(args + 0);
-        int p = 4;
-        if (p + 4 > alen) return;
-        uint32_t slen = rd32(args + p); p += 4;
-        p += (int)((slen + 3) & ~3u);
+        int p;
+        if (wl_str_arg(alen, 4, args, 0, &p) < 0) return;   /* the interface name; see wl_str_arg */
         uint32_t ver = (p + 4 <= alen) ? rd32(args + p) : 1;
         p += 4;                                      /* version */
         if (p + 4 > alen) return;
@@ -1771,6 +1800,25 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         bo->height = rd32(args + 12);
         bo->stride = rd32(args + 16);
         bo->format = rd32(args + 20);
+        /* VALIDATE THE GEOMETRY ONCE, HERE. commit checked only that
+         * off + stride*height fits the pool; every reader -- the WM blit, the
+         * commit sampler, the probe, the dump -- reads width*4 bytes a row, so
+         * a width wider than the stride read past the pool into kernel heap,
+         * and a 2^31 width stalled the WM in its row loop. Only the two
+         * 4-byte formats advertised on bind are drawable. A buffer that does
+         * not fit stays UNMAPPED (width 0), which every consumer skips. */
+        uint64_t need = (uint64_t)bo->off + (uint64_t)bo->stride * bo->height;
+        if (!bo->width || !bo->height || bo->width > 16384 || bo->height > 16384 ||
+            (uint64_t)bo->stride < (uint64_t)bo->width * 4 ||
+            (bo->format != WL_SHM_FORMAT_ARGB8888 && bo->format != WL_SHM_FORMAT_XRGB8888) ||
+            need > (uint64_t)bo->size) {
+            static int told;
+            if (told++ < 8)
+                kprintf("[wl] refusing shm buffer %u: %ux%u stride %u format %u at %u in a %lu-byte pool\n",
+                        bo->id, bo->width, bo->height, bo->stride, bo->format, bo->off,
+                        (unsigned long)bo->size);
+            bo->width = bo->height = bo->stride = 0;
+        }
         return;
     }
     if (o->kind == WLK_DDM && opcode == WL_DDM_CREATE_DATA_SOURCE && alen >= 4) {
@@ -1997,9 +2045,9 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         /* The surface follows the string, which is length-prefixed and padded.
          * Focus is what is being asked for, and this compositor's focus rule is
          * one window, so honour it by entering the keyboard on this client. */
-        uint32_t slen = rd32(args + 0);
-        uint32_t pad = (slen + 3u) & ~3u;
-        uint32_t sid = (4 + pad + 4 <= (uint32_t)alen) ? rd32(args + 4 + pad) : 0;
+        int after;
+        uint32_t sid = (wl_str_arg(alen, 0, args, 0, &after) == 0 && after + 4 <= alen)
+                       ? rd32(args + after) : 0;   /* the token string, then the surface */
         kprintf("[wl] xdg_activation: activate surface %u -- granting keyboard focus\n", sid);
         wl_kbd_enter(c);
         return;
@@ -2052,8 +2100,8 @@ static void wl_dispatch(struct wl_client *c, const uint8_t *m, int len) {
         return;
     }
     if (o->kind == WLK_XDG_TOPLEVEL && opcode == XDG_TOPLEVEL_SET_TITLE && alen >= 4) {
-        uint32_t slen = rd32(args + 0);
-        if (slen > 0 && 4 + slen <= (uint32_t)alen) {
+        uint32_t slen = 0;
+        if (wl_str_arg(alen, 0, args, &slen, 0) == 0 && slen > 0) {
             unsigned n = slen - 1;                        /* the length counts the NUL */
             if (n > sizeof c->title - 1) n = sizeof c->title - 1;
             for (unsigned i = 0; i < n; i++) c->title[i] = (char)args[4 + i];
@@ -3779,6 +3827,12 @@ int wl_compositor_poll(void) {
         c->pointer = c->keyboard = c->surface = 0;
         c->nptr = c->nkbd = 0;
         c->ptr_in = c->kbd_in = 0;
+        /* ...and everything else that names an OBJECT of the previous
+         * occupant. A new client that never binds wl_output (lxwl does not)
+         * was sent wl_surface.enter(<the old client's output id>) -- fatal in
+         * libwayland, as is a leave() for a stale pointer surface. */
+        c->output = 0; c->surf_entered = 0; c->ptr_surface = 0; c->ptr_ox = c->ptr_oy = 0;
+        c->sent = 0; c->nin = 0;
         c->seat_version = 0;
         for (unsigned t = 0; t < sizeof c->tl_title / sizeof c->tl_title[0]; t++)
             { c->tl_title[t].tl = 0; c->tl_title[t].s[0] = 0; }
