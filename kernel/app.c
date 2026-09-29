@@ -6027,6 +6027,30 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
 }
 /* `except` is a slot the caller has ALREADY reserved for this very range and
  * must not carve out from under itself -- see app_mmap_fixed_nl (M2329). */
+/* FREE ONLY WHAT NO CORE CAN STILL REACH (M2034's rule, for munmap). The
+ * carve used to hand each frame back to the allocator the moment its PTE was
+ * cleared, and shoot the other cores' TLBs down only at the very end -- with
+ * the result ignored. A sibling thread on another core, or a syscall still
+ * copying into the buffer there, kept writing through its stale translation
+ * into a frame already given to another process or used as a page table.
+ * So frames are batched, the batch is freed only after a shootdown every
+ * core acknowledged, and a batch whose shootdown timed out is leaked, as the
+ * COW and mremap paths already do. */
+#define CARVE_BATCH 128
+static void carve_drain(struct app *a, uint64_t *fr, int *n, uint64_t *hfr, int *nh) {
+    if (!*n && !*nh) return;
+    if (app_tlb_sync(a)) {
+        for (int k = 0; k < *n; k++) pmm_free_frame(fr[k]);
+        for (int k = 0; k < *nh; k++) pmm_free_contiguous(hfr[k], HUGE_SIZE / PAGE_SIZE);
+    } else {
+        static int told;
+        if (!told) { told = 1;
+            kprintf("[vmm] munmap LEAKED %d frame(s) + %d hugepage(s): the shootdown did not complete, "
+                    "so another core may still be using them\n", *n, *nh); }
+    }
+    *n = 0; *nh = 0;
+}
+
 static int app_vma_carve_ex(struct app *a, uint64_t addr, uint64_t len, int except) {
     if (!a || !len) return -1;
     uint64_t end = addr + len;
@@ -6074,16 +6098,25 @@ static int app_vma_carve_ex(struct app *a, uint64_t addr, uint64_t len, int exce
          * without an explicit msync() first is the common pattern (M1602). */
         if (a->vma[i].file_backed && a->vma[i].shared) app_msync(cs, ce - cs);
 
-        if (a->vma[i].huge) {
-            for (uint64_t p = cs; p < ce; p += HUGE_SIZE) {
-                uint64_t ph = vmm_translate(p);
-                if (ph) { vmm_unmap_huge(p); pmm_free_contiguous(ph & ~(HUGE_SIZE - 1), HUGE_SIZE / PAGE_SIZE); }
+        {   uint64_t fr[CARVE_BATCH], hfr[8]; int nf = 0, nh = 0;   /* see carve_drain */
+            if (a->vma[i].huge) {
+                for (uint64_t p = cs; p < ce; p += HUGE_SIZE) {
+                    uint64_t ph = vmm_translate(p);
+                    if (!ph) continue;
+                    vmm_unmap_huge(p);
+                    hfr[nh++] = ph & ~(HUGE_SIZE - 1);
+                    if (nh == 8) carve_drain(a, fr, &nf, hfr, &nh);
+                }
+            } else {
+                for (uint64_t p = cs; p < ce; p += PAGE_SIZE) {
+                    uint64_t ph = vmm_translate(p);
+                    if (!ph) continue;
+                    vmm_unmap(p);
+                    fr[nf++] = ph;
+                    if (nf == CARVE_BATCH) carve_drain(a, fr, &nf, hfr, &nh);
+                }
             }
-        } else {
-            for (uint64_t p = cs; p < ce; p += PAGE_SIZE) {
-                uint64_t ph = vmm_translate(p);
-                if (ph) { vmm_unmap(p); pmm_free_frame(ph); }
-            }
+            carve_drain(a, fr, &nf, hfr, &nh);
         }
 
         if (cs == s0 && ce == e0) {                 /* whole VMA goes */
