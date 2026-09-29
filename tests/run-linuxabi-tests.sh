@@ -326,6 +326,11 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: shared file offsets:"; grep -a "LXIO: shared" "$SLOG3" | head -2; f3=1
     fi
+    if grep -aq "LXIO: reading a directory while deleting it returned every entry" "$SLOG3"; then
+        echo "  ok: getdents64 returns every entry while the caller deletes as it reads (rm -r)"
+    else
+        echo "  FAIL: deleting while reading a directory:"; grep -a "LXIO: deleting" "$SLOG3" | head -2; f3=1
+    fi
     # Phase 3's deliverable: a REAL PIPELINE between two processes. lxbox forks,
     # re-execs ITSELF twice with different argv, wires the halves with a pipe
     # and wait4s both. The COUNT is the assertion -- "pipeline done" alone

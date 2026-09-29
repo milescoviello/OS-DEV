@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 
 int main(int argc, char **argv) {
     const char *dir  = argc > 1 ? argv[1] : "/";   /* the Linux root IS the ext2 volume (M1954) */
@@ -76,5 +77,45 @@ int main(int argc, char **argv) {
         unlink(sp);
     }
     if (shared_ok) printf("LXIO: dup'd and forked descriptors share one offset, O_APPEND appends every write\n");
-    return (lines == 200 && st.st_size == bytes && nents > 0 && shared_ok) ? 0 : 2;
+
+    /* THE rm -r SHAPE: list a directory in small getdents64 calls, deleting
+     * each entry as it is read. The listing used to be rebuilt per call and
+     * indexed by the fd's offset, so deletions shifted the rest past it and
+     * entries were skipped. A 256-byte buffer forces many calls (glibc's
+     * readdir would take all 300 in one and never reach the bug). */
+    int rmr_ok = 0;
+    {
+        const char *d = "/root/lxio-rmr";
+        char pth[128];
+        mkdir(d, 0755);
+        for (int i = 0; i < 300; i++) {
+            snprintf(pth, sizeof pth, "%s/f%03d", d, i);
+            int f = open(pth, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (f >= 0) close(f);
+        }
+        int dfd = open(d, O_RDONLY | O_DIRECTORY);
+        int removed = 0;
+        char db[256];
+        for (;;) {
+            long nb = (dfd >= 0) ? syscall(SYS_getdents64, dfd, db, sizeof db) : -1;
+            if (nb <= 0) break;
+            for (long o = 0; o < nb; ) {
+                unsigned short reclen = *(unsigned short *)(db + o + 16);
+                const char *nm = db + o + 19;
+                if (nm[0] != '.') {
+                    snprintf(pth, sizeof pth, "%s/%s", d, nm);
+                    if (unlink(pth) == 0) removed++;
+                }
+                if (!reclen) break;
+                o += reclen;
+            }
+        }
+        if (dfd >= 0) close(dfd);
+        int rmd = rmdir(d);
+        if (removed == 300 && rmd == 0) rmr_ok = 1;
+        else printf("LXIO: deleting while reading removed %d of 300 entries, rmdir %s\n",
+                    removed, rmd == 0 ? "ok" : "FAILED");
+    }
+    if (rmr_ok) printf("LXIO: reading a directory while deleting it returned every entry\n");
+    return (lines == 200 && st.st_size == bytes && nents > 0 && shared_ok && rmr_ok) ? 0 : 2;
 }
