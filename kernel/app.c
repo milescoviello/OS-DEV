@@ -11866,7 +11866,7 @@ static void eof_spin_watch(struct app *a, int fd, long n) {
                 a->pid, fd, a->fd[fd].used ? a->fd[fd].type : -1);
         if (a->fd[fd].used && a->fd[fd].type == 2)
             kprintf("[nettrace]   it is the file '%s' at offset %ld\n",
-                    a->fd[fd].path, (long)a->fd[fd].off);
+                    a->fd[fd].path, file_off(a, fd));
     }
 }
 /* RUN A BLOCKING NETWORK CALL WITH INTERRUPTS ON (M2068).
@@ -14089,7 +14089,7 @@ int app_fd_nread(int fd, long *out) {
         struct statx st;
         if (vfs_stat(a->fd[fd].path, &st) != 0) return APP_NREAD_ENOTTY;
         if ((st.stx_mode & 0xF000) == 0x4000) return APP_NREAD_ENOTTY;   /* a DIRECTORY is not a byte stream */
-        long sz = (long)st.stx_size, off = a->fd[fd].off;
+        long sz = (long)st.stx_size, off = file_off(a, fd);   /* the OPENING's cursor (g_ofd) */
         n = sz > off ? sz - off : 0;
         break;
     }
@@ -14418,7 +14418,7 @@ void app_fd_print(int fd) {
                 obj, a->fd[fd].write_end ? "write" : "read", ro, wo, q, hw, nb, cx);
         break;
     }
-    case 2: kprintf("file '%s' off=%ld nonblock=%d cloexec=%d", a->fd[fd].path, a->fd[fd].off, nb, cx); break;
+    case 2: kprintf("file '%s' off=%ld nonblock=%d cloexec=%d", a->fd[fd].path, file_off(a, fd), nb, cx); break;
     case 3: kprintf("memfd obj %d off=%ld nonblock=%d cloexec=%d", obj, a->fd[fd].off, nb, cx); break;
     case 12: kprintf("AF_UNIX ep %d rx_queued=%ld readable=%d TX_queued=%ld tx_room=%d "
                      "peer_reader_waiting=%d nonblock=%d cloexec=%d",
