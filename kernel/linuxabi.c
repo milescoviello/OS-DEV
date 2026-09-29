@@ -2366,7 +2366,13 @@ static void lx_dispatch_body(struct registers *r) {
              * wait4's options and openat's dirfd -- a request accepted and not
              * actually honourable. */
             if (port == 0) { r->rax = (uint64_t)-(long)LX_ECONNREFUSED; break; }
+            /* sti around the network call: it waits on tick deadlines (ARP, SYN, an
+             * accept with nothing pending), and ticks advance only in the BSP's
+             * timer interrupt. With the syscall's IF=0 the deadline never came on
+             * the BSP -- that core spun forever and froze the clock machine-wide. */
+            __asm__ volatile("sti");
             int crc = app_connect((int)a1, ip, port);
+            __asm__ volatile("cli");
             /* ALWAYS, not only under a trace flag (M2004). An outbound
              * connection is a rare, structural event, and "which address did it
              * actually try, and did it get there" is the first question when a
@@ -2411,7 +2417,9 @@ static void lx_dispatch_body(struct registers *r) {
     case LXS_accept4_: {                    /* (fd, sockaddr *, addrlen *[, flags]) */
         int is4 = (r->rax == LXS_accept4_);          /* rax still holds the syscall number here */
         if (app_fd_type((int)a1) == 15) {            /* AF_INET listener (M2020) */
+            __asm__ volatile("sti");                 /* waits on tick deadlines: see connect */
             int af = app_inet_accept((int)a1);
+            __asm__ volatile("cli");
             if (af < 0) { r->rax = (uint64_t)lx_fd_err(af); break; }
             if (is4) app_fd_set_nonblock(af, (r->r10 & 0x800) ? 1 : 0);
             if (r->rsi && vmm_user_ok(r->rsi, 16)) {   /* fill in a plausible peer address */
@@ -2577,7 +2585,9 @@ static void lx_dispatch_body(struct registers *r) {
         if (*(const uint16_t *)sa != 2 /*AF_INET*/) { r->rax = (uint64_t)-(long)LX_EAFNOSUPPORT; break; }
         uint16_t dport = (uint16_t)((sa[2] << 8) | sa[3]);       /* big-endian in the struct */
         uint8_t dip[4] = { sa[4], sa[5], sa[6], sa[7] };
+        __asm__ volatile("sti");                     /* ARP resolution waits on ticks: see connect */
         long sn = app_sendto((int)a1, dip, dport, (const void *)r->rsi, (int)slen);
+        __asm__ volatile("cli");
         if (g_lx_systrace)
             kprintf("[sock] sendto(fd %ld, %u.%u.%u.%u:%u, %ld) -> %ld\n",
                     a1, dip[0], dip[1], dip[2], dip[3], dport, slen, sn);
