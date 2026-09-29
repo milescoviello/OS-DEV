@@ -45,14 +45,36 @@
  * core lock (a plain `cli` only ever protected against a LOCAL interrupt
  * reentering, never against another core concurrently walking/mutating the
  * same ring). `current`/`active_cr3` are kept as macros so the large existing
- * body of this file (every `current->x`, `current = t`, etc.) keeps working
- * unchanged — each reference now transparently resolves to THIS core's own
- * slot instead of silently being a single-core assumption. */
+ * body of this file (every `current->x`) keeps working unchanged — each
+ * reference now transparently resolves to THIS core's own slot instead of
+ * silently being a single-core assumption. */
 #define MAX_SCHED_CPUS 16
 static task_t   *cur[MAX_SCHED_CPUS];
 static uint64_t  active_cr3_arr[MAX_SCHED_CPUS];
 static inline int mycore(void) { return smp_current_cpu() & (MAX_SCHED_CPUS - 1); }
-#define current    (cur[mycore()])
+/* READING `current` IS TWO LOADS, AND THEY MUST NOT BE SPLIT BY A MIGRATION.
+ *
+ * cur[mycore()] reads the LAPIC ID, then indexes cur[]. With interrupts on, a
+ * timer tick between the two can switch this task out and resume it on
+ * another core -- which then loads the ORIGINAL core's slot, i.e. some other
+ * task. That is the rip=0x3 panic: thread_trampoline enabled interrupts and
+ * then called current->entry, got an idle AP's task (entry == NULL) and
+ * called address 0, where SeaBIOS's IVT (53 FF 00 F0) decodes to push rbx /
+ * inc [rax] / #UD at offset 3. Every task_self() -- so every cur() app lookup
+ * in a syscall that has done its sti -- had the same window. Masking
+ * interrupts across the pair makes it one observation of one core.
+ *
+ * The scheduler's own writes (`CUR_SLOT = next`) already run with interrupts
+ * off under the run-queue lock, so they index the slot directly. */
+static inline task_t *cur_self(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    task_t *t = cur[mycore()];
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return t;
+}
+#define current    (cur_self())
+#define CUR_SLOT   (cur[mycore()])
 
 /* HOW CLOSE DID ANYTHING ACTUALLY GET? (M2212)
  *
@@ -468,8 +490,9 @@ void task_finish_switch(void) {
 /* Where a freshly created thread begins. `current` is already this thread. */
 static void thread_trampoline(void) {
     task_finish_switch();             /* complete whoever we just preempted (M1531) */
+    void (*entry)(void) = current->entry;   /* BEFORE interrupts: see cur_self */
     interrupts_enable();        /* new threads start with interrupts on */
-    current->entry();
+    entry();
     task_exit();                /* if the entry function returns, end cleanly */
 }
 
@@ -538,7 +561,7 @@ void sched_init(void) {
      * page faults/GPFs right as the desktop launched) before adding this. */
     t->pin_core = mycore();
     t->affinity = ~0u;           /* pin_core already governs task 0; affinity is just the default (M1557) */
-    current = t;
+    CUR_SLOT = t;
     task_t *idle = task_create(idle_loop, read_cr3(), 0);   /* the BSP's always-runnable floor (heap is up: kheap_init precedes sched_init); task_create already defaults its affinity to ~0u */
     idle->pin_core = mycore();                              /* never let another core pick this up (M1531) */
     idle->is_floor = 1;
@@ -855,7 +878,7 @@ static void switch_to_next(void) {
         next->rq_wait_ms += now - next->ready_since;
         next->ready_since = 0;
     }
-    current = next;
+    CUR_SLOT = next;
     g_nr_switches++;                              /* a real switch happened (next != prev guaranteed above) — /proc/stat ctxt (M1253) */
 
     next->last_in = now;                          /* stamp switch-in (prev was already charged above) */
@@ -1576,7 +1599,7 @@ void task_exit(void) {
     if (!next) next = floor_task[mycore()];
 
     next->state = TASK_RUNNING;
-    current = next;
+    CUR_SLOT = next;
     next->last_in = timer_ms();   /* stamp switch-in so its CPU time isn't over-counted from a stale last_in */
     next->nswitch++;
     rq_lock_give();
