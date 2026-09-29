@@ -95,9 +95,11 @@ uint64_t nic_fw_out_drops(void) { return g_fw_out_drops; }
  * TX and RX get separate locks: the rings are independent, so one lock would be
  * pure false contention, and neither is ever taken while holding the other --
  * the ARP answer in net.c's rx_next sends AFTER nic_receive has returned. Plain
- * spinlocks, per pci.c's reasoning: no interrupt handler calls either function
- * (e1000's ISR drains the hardware ring into the software queue directly, and
- * only ever advances the head this side does not touch). */
+ * spinlocks, per pci.c's reasoning: no interrupt handler calls either function.
+ * e1000's ISR drains the hardware ring into its software queue directly; that
+ * drain and e1000_receive's are serialised by the driver's own lock (taken
+ * inside this one, never the other way round), because -- contrary to what
+ * this comment used to say -- both advance the same indices. */
 static volatile int rx_lock, tx_lock;
 static inline void take(volatile int *l) {
     while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
