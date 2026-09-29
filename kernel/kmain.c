@@ -155,11 +155,19 @@ static int cmdline_has(const char *hay, const char *needle) {
  * SGDT/SIDT/SLDT/STR/SMSW #GP, closing those kernel-address info leaks), each
  * gated on CPUID.7:0 support. SMAP (CR4 bit 21) is deliberately NOT set: the
  * kernel reads/writes user buffers directly (syscall args) without stac/clac,
- * which SMAP would fault on. BSP only — ring-3 code runs on the BSP. */
-static void cpu_harden(void) {
+ * which SMAP would fault on.
+ *
+ * CR4 IS PER CORE, so this runs on every core (cpu_harden_ap from ap_main).
+ * It used to run on the BSP only, under a comment that ring-3 code runs on the
+ * BSP -- which stopped being true when M1531 made every core schedule ring-3
+ * tasks, so SMEP and UMIP were simply off on all the APs. */
+static void cpu_harden_core(int announce);
+static void cpu_harden(void) { cpu_harden_core(1); }
+void cpu_harden_ap(void) { cpu_harden_core(0); }
+static void cpu_harden_core(int announce) {
     uint32_t a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u), "c"(0u));
-    if (a < 7) { kprintf("[cpu] CPUID leaf 7 unavailable; no SMEP/UMIP\n"); return; }
+    if (a < 7) { if (announce) kprintf("[cpu] CPUID leaf 7 unavailable; no SMEP/UMIP\n"); return; }
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7u), "c"(0u));
     int have_smep = (b >> 7) & 1;    /* CPUID.(EAX=7,ECX=0).EBX[7] */
     int have_umip = (c >> 2) & 1;    /* CPUID.(EAX=7,ECX=0).ECX[2] */
@@ -168,8 +176,9 @@ static void cpu_harden(void) {
     if (have_umip) cr4 |= (1ull << 11);
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
     uint64_t now; __asm__ volatile("mov %%cr4, %0" : "=r"(now));
-    kprintf("[ ok ] CPU hardening: SMEP=%d UMIP=%d (CR4=%lx)\n",
-            (int)((now >> 20) & 1), (int)((now >> 11) & 1), (unsigned long)now);
+    if (announce)
+        kprintf("[ ok ] CPU hardening: SMEP=%d UMIP=%d (CR4=%lx)\n",
+                (int)((now >> 20) & 1), (int)((now >> 11) & 1), (unsigned long)now);
 }
 
 /* Multiboot2 -> Multiboot1 shim (M1293, bare-metal graphics). GRUB booted via

@@ -374,6 +374,7 @@ void ap_main(void) {
     idt_load();                          /* kernel IDT: the wake/tick IPIs + exceptions */
     extern void fpu_init_ap(void);        /* CR0/CR4 are per-core: enable FXSAVE/FXRSTOR HERE too (M1531) */
     fpu_init_ap();
+    { extern void cpu_harden_ap(void); cpu_harden_ap(); }   /* SMEP/UMIP are per-core CR4 bits too */
     { extern void fpu_xsave_arm(void); fpu_xsave_arm(); }   /* CR4.OSXSAVE/XCR0 are PER-CORE too (M1942) */
     lapic_timer_start_this_cpu();        /* this core's own real preemption source (M1532) */
     __atomic_add_fetch(&smp_cpu_count, 1, __ATOMIC_SEQ_CST);
