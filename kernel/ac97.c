@@ -78,10 +78,22 @@ int ac97_init(void) {
     outb(nabm + PO_CR, CR_RR);                       /* reset the PCM-out engine */
     for (int i = 0; i < 100000 && (inb(nabm + PO_CR) & CR_RR); i++) { }
 
+    /* THROUGH THE HHDM, NOT THE IDENTITY MAP. These were dereferenced as
+     * (pointer)physical, which is valid only on the kernel's own page tables
+     * (the low identity map is not in a process's address space since M1969).
+     * SYS_pcm and SYS_pcm_stream run on the CALLER's CR3, and ac97_pump runs
+     * from the timer IRQ on whatever CR3 is loaded -- so playing audio could
+     * page-fault the kernel, or write PCM samples over a process's own memory
+     * at that address. The BDL holds 32-bit addresses, so a frame above 4 GiB
+     * cannot be used at all: refuse it rather than DMA to a truncated one. */
     bdl_phys = pmm_alloc_frame();
-    bdl = (bdl_entry_t *)(uintptr_t)bdl_phys;
+    if (!bdl_phys || bdl_phys >= 0x100000000ull) { kprintf("[ac97] no DMA frame below 4 GiB for the BDL\n"); return -1; }
+    bdl = (bdl_entry_t *)hhdm(bdl_phys);
     memset(bdl, 0, NUM_BUF * sizeof(bdl_entry_t));
-    for (int i = 0; i < NUM_BUF; i++) buf_phys[i] = pmm_alloc_frame();   /* 128 KiB pool */
+    for (int i = 0; i < NUM_BUF; i++) {                     /* 128 KiB pool */
+        buf_phys[i] = pmm_alloc_frame();
+        if (!buf_phys[i] || buf_phys[i] >= 0x100000000ull) { kprintf("[ac97] no DMA frame below 4 GiB for a buffer\n"); return -1; }
+    }
     outl(nabm + PO_BDBAR, (uint32_t)bdl_phys);
 
     inited = 1;
@@ -100,7 +112,7 @@ void ac97_play(const int16_t *frames, int nframes) {
         for (; n < NUM_BUF && pos < total; n++) {
             int chunk = total - pos;
             if (chunk > (int)BUF_FRAMES) chunk = BUF_FRAMES;
-            memcpy((int16_t *)(uintptr_t)buf_phys[n], frames + (size_t)pos * 2, (size_t)chunk * 4);
+            memcpy((int16_t *)hhdm(buf_phys[n]), frames + (size_t)pos * 2, (size_t)chunk * 4);
             bdl[n].addr    = (uint32_t)buf_phys[n];
             bdl[n].samples = (uint16_t)(chunk * 2);   /* 2 samples per stereo frame */
             bdl[n].ctrl    = 0;
@@ -271,7 +283,7 @@ void ac97_pump(void) {
 
     int civ = inb(nabm + PO_CIV);
     while (last_civ != civ) {                           /* buffers the device finished */
-        int16_t *dst = (int16_t *)(uintptr_t)buf_phys[last_civ];
+        int16_t *dst = (int16_t *)hhdm(buf_phys[last_civ]);   /* IRQ context: any CR3 may be loaded */
         for (int f = 0; f < (int)BUF_FRAMES; f++) {
             if (s_tail != s_head) {
                 dst[f * 2]     = sbuf[s_tail * 2];
