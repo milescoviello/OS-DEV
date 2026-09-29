@@ -80,6 +80,12 @@ MKE2FS    := $(shell command -v mke2fs 2>/dev/null)
 CLAUDE_BIN ?= $(shell readlink -f "$$(command -v claude 2>/dev/null)" 2>/dev/null)
 # Firefox's install directory. Staged whole -- see the rule below for why.
 FIREFOX_DIR ?= $(firstword $(wildcard /usr/lib64/firefox /usr/lib/firefox))
+# THE JVM (M2393). Minecraft Java Edition 26.x requires Java 25, so that is
+# the JDK staged -- Gentoo's openjdk-bin (a Temurin build) or Debian's.
+JDK_DIR ?= $(firstword $(wildcard /opt/openjdk-bin-25 /usr/lib/jvm/java-25-openjdk-amd64 /usr/lib/jvm/java-25-openjdk))
+# Its OWN javac, never $$JAVAC: Gentoo's java-config exports JAVAC (and
+# JAVA_HOME) for the system VM, a JDK 21 that refuses --release 25.
+LXJAVAC := $(JDK_DIR)/bin/javac
 EXT2SIZE := 4600M   # 512M -> 1500M -> 2200M -> 3200M -> 3900M -> 4600M (M2305/M2307/M2371: gp108 firmware + headroom; the 500 MB-free guard fired at 443 MB).
 # AND NOT ONE BYTE OVER 4 GiB UNTIL THE 32-BIT OFFSET BUG IS FIXED (M2307).
 # 5200M was tried and it CORRUPTED THE FILESYSTEM: inode-table errors went
@@ -720,6 +726,27 @@ $(LXROOT)/Makefile.guest: tools/lx/Makefile.guest
 # been run by hand. A prerequisite that exists only in a shell history is not
 # a prerequisite. Ordered by the stamp dependency, so our Mesa is written last
 # and wins no matter what the closure drags in.
+# The JDK, whole, at /opt/jdk. The launcher finds its own home from
+# /proc/self/exe and libjli through RPATH $$ORIGIN/../lib, so it must be run by
+# that path, never through a copy in /usr/bin. What is left out is only for
+# COMPILING Java (headers, ct.sym) or for flags nothing here passes (the
+# compact-object-header CDS archives); ~200 MB instead of 246. cacerts is a
+# symlink out of the JDK into /etc/ssl, hence --copy-unsafe-links.
+$(LXROOT)/.jdk-staged:
+	@if [ -d "$(JDK_DIR)" ]; then \
+	    mkdir -p $(LXROOT)/opt/jdk && \
+	    rsync -a --delete --copy-unsafe-links --exclude=/include --exclude=/man --exclude=/lib/ct.sym \
+	          --exclude='/lib/server/classes*_coh.jsa' "$(JDK_DIR)/" $(LXROOT)/opt/jdk/ && \
+	    echo "  STAGE   jdk <- $(JDK_DIR) ($$(du -sh $(LXROOT)/opt/jdk | cut -f1))"; \
+	 else echo "  SKIP    jdk (no JDK 25 found; set JDK_DIR=)"; fi
+	@touch $@
+
+$(LXROOT)/opt/lxjava/LxJava.class: tools/lx/LxJava.java
+	@mkdir -p $(dir $@)
+	@if [ -x "$(LXJAVAC)" ]; then $(LXJAVAC) --release 25 -d $(dir $@) $< && \
+	    echo "  JAVAC   $@ (a JVM doing on purpose what Minecraft makes it do)"; \
+	 else echo "  SKIP    LxJava (no javac; set JDK_DIR=)"; fi
+
 $(LXROOT)/.mesa-staged: tools/build-mesa-virgl.sh $(LXROOT)/.tools-staged
 	@tools/build-mesa-virgl.sh >/dev/null || { echo "  MESA    FAILED -- see tools/build-mesa-virgl.sh"; exit 1; }
 	@echo "  MESA    $(LXROOT)/usr/lib64 (virgl + nouveau nvc0, no LLVM) staged AFTER the tool closure"
@@ -904,7 +931,7 @@ $(LXROOT)/.fw-staged: $(LXROOT)/.tools-staged
 # mirrors it onto TrueNAS as a per-file delta (a source edit moves kilobytes),
 # and each Proxmox host builds its own image on local disk from that mirror
 # with the SAME flags -- MKE2FS_FLAGS is the single definition both use.
-EXT2_DEPS := $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged $(LXROOT)/.fw-staged
+EXT2_DEPS := $(EXT2_CREDS) $(FFURL_DST) $(LXBINS) $(LXROOT)/.tools-staged $(LXROOT)/.mesa-staged $(LXROOT)/hello.s $(LXROOT)/hello.c $(LXROOT)/Makefile.guest $(LXROOT)/big.s $(LXROOT)/ffpage.html $(LXROOT)/ffinput.html $(LXROOT)/ffnav.html $(LXROOT)/ffnav2.html $(LXROOT)/.src-staged $(LXROOT)/.fw-staged $(LXROOT)/.jdk-staged $(LXROOT)/opt/lxjava/LxJava.class
 MKE2FS_FLAGS := -F -q -b 4096 -O ^resize_inode,^dir_index,^ext_attr,^has_journal,^extent
 
 .PHONY: lxroot-ready

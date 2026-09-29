@@ -266,6 +266,7 @@ static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- 
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
 static volatile int g_lxsigctx;               /* -append lxsigctx: the signal context a JVM depends on, alone (M2392) */
+static volatile int g_lxjava;                 /* -append lxjava: a real HotSpot JVM, then a Java program that faults on purpose (M2393) */
 static volatile int g_lxnvdrm;                /* -append lxnvdrm: what Mesa's nvc0 asks the GT 1030's render node (M2390) */
 static volatile int g_lxdrm;                  /* -append lxdrm: does the DRM render node answer the four questions Mesa asks? (M2347) */
 static volatile int g_lxgl;                   /* -append lxgl: eight links from a GL call to the host iGPU (M2351) */
@@ -980,6 +981,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "lxport"))     { g_lxabi_test = 1; g_lxport = 1; }   /* the ephemeral port allocator race (M2324) */
         if (cmdline_has(cl, "lxsigctx"))   { g_lxabi_test = 1; g_lxsigctx = 1; } /* siginfo/ucontext/sigreturn as HotSpot uses them (M2392) */
+        if (cmdline_has(cl, "lxjava"))     { g_lxabi_test = 1; g_lxjava = 1; }   /* the JVM itself (M2393) */
         /* NOT g_lxabi_test. These two run from their own site after
          * virtio_gpu_init, not from the lxabi block, so setting that flag only
          * made every boot of a GPU probe run the whole thirty-probe ABI suite
@@ -3449,6 +3451,33 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] the signal context a JVM depends on, asked directly...\n");
             int scrc = app_run_linux_sync("/disk2/lxsigctx", 0, 0, 120000);
             kprintf("[lxabi] lxsigctx exit -> %d\n", scrc);
+        }
+        if (g_lxjava) {
+            /* A REAL JVM (M2393). Minecraft Java Edition is a HotSpot program,
+             * so this is the first link of that chain: the VM starts, reports
+             * its version, and then runs LxJava, which does on purpose the
+             * things a JVM does through signals -- implicit null checks,
+             * division by zero, stack overflow, safepoints under a JIT and a
+             * collector -- and says which of them held. Serial GC first
+             * because it asks the kernel for the least; then the default.
+             * -Xshare:auto is the default: the CDS archive is mapped if it
+             * can be and silently skipped if not. */
+            static const char *jv_ver[] = { "-XX:-UsePerfData", "-version" };
+            static const char *jv_ser[] = { "-XX:-UsePerfData", "--enable-native-access=ALL-UNNAMED", "-XX:+UseSerialGC",
+                                            "-Xmx512m", "-cp", "/opt/lxjava", "LxJava" };
+            static const char *jv_def[] = { "-XX:-UsePerfData", "--enable-native-access=ALL-UNNAMED",
+                                            "-Xmx512m", "-cp", "/opt/lxjava", "LxJava" };
+            const char *java = "/disk2/opt/jdk/bin/java";
+            kprintf("[lxjava] java -version...\n");
+            int j1 = app_run_linux_sync(java, jv_ver, 2, 300000);
+            kprintf("[lxjava] java -version exit -> %d\n", j1);
+            kprintf("[lxjava] LxJava under the Serial collector...\n");
+            int j2 = app_run_linux_sync(java, jv_ser, 7, 600000);
+            kprintf("[lxjava] LxJava (SerialGC) exit -> %d\n", j2);
+            kprintf("[lxjava] LxJava under the default collector...\n");
+            int j3 = app_run_linux_sync(java, jv_def, 6, 600000);
+            kprintf("[lxjava] LxJava (default GC) exit -> %d\n", j3);
+            kprintf("[lxjava] DONE: version %d, serial %d, default %d\n", j1, j2, j3);
         }
         if (g_lxport) {
             /* THE PORT ALLOCATOR, ASKED DIRECTLY (M2324). The DNS symptom needs
