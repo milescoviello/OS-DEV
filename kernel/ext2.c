@@ -1559,9 +1559,44 @@ static int free_block(ext2_t *v, uint32_t blk) {
     return wr_sb(v, sb);
 }
 
+/* A FAST SYMLINK KEEPS ITS TARGET TEXT IN i_block ITSELF (mode S_IFLNK and no
+ * data blocks, apart from an xattr block if it has one). Those 60 bytes are
+ * characters, not block numbers, and nothing may treat them as pointers:
+ * free_inode_blocks did, so `rm` of a link to "libz.so.1" freed block 49 -- an
+ * inode-table block the next allocation handed to file data. */
+static int e2_fast_symlink(const ext2_t *v, const uint8_t *inode) {
+    if ((e_rd16(inode + 0) & 0xF000) != 0xA000) return 0;
+    uint32_t sectors = e_rd32(inode + 28);                 /* i_blocks, in 512-byte units */
+    if (e_rd32(inode + 104)) {                             /* i_file_acl: an xattr block counts too */
+        uint32_t per = v->block_size / 512;
+        sectors = sectors > per ? sectors - per : 0;
+    }
+    return sectors == 0;
+}
+
+/* Where a WRITE through the symlink `inode`, found as a name in directory
+ * `parent`, should land: open(O_WRONLY) follows a link, and a dangling one
+ * creates its target. An absolute target is volume-relative, as walk_d reads
+ * it. -1 for a slow symlink (walk_d does not follow those either) or a path
+ * that does not fit. */
+static int e2_link_write_path(const uint8_t *inode, const char *parent, char *out, int max) {
+    uint32_t sz = e_rd32(inode + 4);
+    if (sz == 0 || sz > 60) return -1;
+    const char *t = (const char *)inode + 40;
+    int o = 0;
+    if (t[0] != '/') {
+        for (int i = 0; parent[i]; i++) { if (o >= max - 1) return -1; out[o++] = parent[i]; }
+        if (o) { if (o >= max - 1) return -1; out[o++] = '/'; }
+    }
+    for (uint32_t i = 0; i < sz; i++) { if (o >= max - 1) return -1; out[o++] = t[i]; }
+    out[o] = 0;
+    return 0;
+}
+
 /* Free every data block an inode references — direct (0-11), single-indirect
  * (12) and double-indirect (13), plus the indirect metablocks themselves. */
 static void free_inode_blocks(ext2_t *v, const uint8_t *inode) {
+    if (e2_fast_symlink(v, inode)) return;                 /* its i_block is text: see above */
     const uint8_t *ib = inode + 40;
     uint32_t ppb = v->block_size / 4;
     uint8_t buf[4096], buf2[4096];
@@ -2056,21 +2091,27 @@ long ext2_rename_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
 
-    uint8_t sin[256]; int sdir = 0;
-    uint32_t src_ino = walk(&v, oldpath, sin, &sdir);
-    if (!src_ino) return -1;                               /* source must exist */
-    uint8_t ftype = sdir ? 2 : (((e_rd16(sin) & 0xF000) == 0xA000) ? 7 : 1);
-
     char op[256], ob[256], np[256], nb[256];
     path_split(oldpath, op, ob);
     path_split(newpath, np, nb);
     if (ob[0] == 0 || nb[0] == 0) return -1;
     if (nb[0] == '.' && (nb[1] == 0 || (nb[1] == '.' && nb[2] == 0))) return -1;   /* refuse "." / ".." */
+    if (ob[0] == '.' && (ob[1] == 0 || (ob[1] == '.' && ob[2] == 0))) return -1;
 
     uint8_t opin[256], npin[256]; int od = 0, nd = 0;
     uint32_t oldp = walk(&v, op, opin, &od);
     uint32_t newp = walk(&v, np, npin, &nd);
     if (!oldp || !od || !newp || !nd) return -1;           /* both parents must be dirs */
+
+    /* THE SOURCE IS THE NAME, NOT WHAT IT POINTS AT. walk() follows a final
+     * symlink, so `mv link link2` used to move the link's TARGET under the
+     * new name -- with no link-count bump -- and orphan the symlink inode;
+     * the next rm of either name freed an inode that was still named. Look
+     * the entry up in its parent without following, as unlink does. */
+    uint8_t sin[256]; int sdir = 0;
+    uint32_t src_ino = dir_lookup(&v, opin, ob, &sdir);
+    if (!src_ino || read_inode(&v, src_ino, sin) < 0) return -1;   /* source must exist */
+    uint8_t ftype = sdir ? 2 : (((e_rd16(sin) & 0xF000) == 0xA000) ? 7 : 1);
 
     if (sdir && is_ancestor(&v, src_ino, newp)) return -1; /* can't move a dir into itself/subtree */
 
@@ -2134,10 +2175,6 @@ long ext2_rename2_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
 
-    uint8_t sin[256]; int sdir = 0;
-    uint32_t src_ino = walk(&v, oldpath, sin, &sdir);
-    if (!src_ino) return -1;                               /* source must exist */
-
     char op[256], ob[256], np[256], nb[256];
     path_split(oldpath, op, ob);
     path_split(newpath, np, nb);
@@ -2147,6 +2184,10 @@ long ext2_rename2_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
     uint32_t oldp = walk(&v, op, opin, &od);
     uint32_t newp = walk(&v, np, npin, &nd);
     if (!oldp || !od || !newp || !nd) return -1;           /* both parents must be dirs */
+
+    uint8_t sin[256]; int sdir = 0;                        /* the name itself, unfollowed: see rename */
+    uint32_t src_ino = dir_lookup(&v, opin, ob, &sdir);
+    if (!src_ino || read_inode(&v, src_ino, sin) < 0) return -1;   /* source must exist */
 
     int td = 0;
     uint32_t tgt = dir_lookup(&v, npin, nb, &td);
@@ -2441,8 +2482,16 @@ static int extent_to_indirect(ext2_t *v, uint8_t *inode, uint32_t *charged) {
  * from the volume root. Measured per-syscall thread time: pwrite64 cost about
  * 13.8 SECONDS in every 15 seconds of wall clock -- one thread inside write()
  * 92% of the time, ~37 ms for a single write -- and none of it was the write. */
+static long ext2_pwrite_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                               const char *path, uint64_t off, const void *buf, unsigned long len,
+                               int depth);
 long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, uint64_t off, const void *buf, unsigned long len) {
+    return ext2_pwrite_path_d(read, write, ctx, start_lba, path, off, buf, len, 0);
+}
+static long ext2_pwrite_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                               const char *path, uint64_t off, const void *buf, unsigned long len,
+                               int depth) {
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -2464,6 +2513,15 @@ long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
     int cd = 0;
     uint32_t existing = dir_lookup(&v, pin, base, &cd);
     if (existing && cd) return -1;                         /* it's a directory */
+    if (existing) {                                        /* a symlink: write its TARGET (see ext2_write_path) */
+        uint8_t lin[256];
+        if (read_inode(&v, existing, lin) < 0) return -1;
+        if ((e_rd16(lin + 0) & 0xF000) == 0xA000) {
+            char tp[256];
+            if (depth >= EXT2_SYMLINK_MAX || e2_link_write_path(lin, parent, tp, sizeof tp) < 0) return -1;
+            return ext2_pwrite_path_d(read, write, ctx, start_lba, tp, off, buf, len, depth + 1);
+        }
+    }
     /* Creating a name DOES change the namespace: a negative entry for this
      * path would now be a lie. Overwriting an existing one changes nothing the
      * cache holds -- see the note above this function. (M2140) */
@@ -2531,8 +2589,14 @@ fail:
     return -1;
 }
 
+static long ext2_write_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                              const char *path, const void *buf, unsigned long len, int depth);
 long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, const void *buf, unsigned long len) {
+    return ext2_write_path_d(read, write, ctx, start_lba, path, buf, len, 0);
+}
+static long ext2_write_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                              const char *path, const void *buf, unsigned long len, int depth) {
     ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
@@ -2553,6 +2617,15 @@ long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
     int cd = 0;
     uint32_t existing = dir_lookup(&v, pin, base, &cd);
     if (existing && cd) return -1;                         /* a directory already owns that name */
+    if (existing) {                                        /* a symlink: write its TARGET, as open() does */
+        uint8_t lin[256];
+        if (read_inode(&v, existing, lin) < 0) return -1;
+        if ((e_rd16(lin + 0) & 0xF000) == 0xA000) {
+            char tp[256];
+            if (depth >= EXT2_SYMLINK_MAX || e2_link_write_path(lin, parent, tp, sizeof tp) < 0) return -1;
+            return ext2_write_path_d(read, write, ctx, start_lba, tp, buf, len, depth + 1);
+        }
+    }
 
     uint32_t ppb = v.block_size / 4;
     uint32_t nblocks = (uint32_t)((len + v.block_size - 1) / v.block_size);
