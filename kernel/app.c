@@ -15425,6 +15425,38 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
         
     }
 
+    /* EXEC ENDS EVERY OTHER THREAD FIRST, as on Linux. The old address space
+     * is destroyed just below, and the siblings were never stopped: they
+     * went on running on its freed page tables. Stop them, wait (bounded)
+     * until none is still executing on a core, and release them as the
+     * reaper would. If a non-main thread is the one exec'ing, it becomes the
+     * main task -- the old main is just another sibling now. */
+    {   task_t *me = task_self();
+        for (int i = 0; i < APP_MAXTHREAD; i++) {
+            task_t *t = a->thr[i];
+            if (t && t != me) { app_futex_forget(t); task_stop(t); }
+        }
+        if (a->task && a->task != me) { app_futex_forget(a->task); task_stop(a->task); }
+        for (int spin = 0; spin < 2000; spin++) {
+            int on = (a->task && a->task != me && task_is_on_cpu(a->task));
+            for (int i = 0; i < APP_MAXTHREAD && !on; i++)
+                if (a->thr[i] && a->thr[i] != me && task_is_on_cpu(a->thr[i])) on = 1;
+            if (!on) break;
+            task_sleep_ms(1);
+        }
+        if (a->task != me) {                         /* adopt: the exec'ing thread is the process now */
+            for (int i = 0; i < APP_MAXTHREAD; i++)
+                if (a->thr[i] == me) { a->thr[i] = a->task; break; }
+            a->task = me;
+        }
+        for (int i = 0; i < APP_MAXTHREAD; i++) {
+            task_t *t = a->thr[i];
+            if (!t || t == me || !app_task_reapable(t)) continue;
+            app_task_forget_everywhere(t);
+            app_task_release(t);
+            a->thr[i] = 0;
+        }
+    }
     /* committed: we are now the new program. Free the OLD space (non-active now). */
     /* A vfork CHILD's old address space is its PARENT's -- destroying it here
      * would take the parent down with it. exec is also the moment the parent
