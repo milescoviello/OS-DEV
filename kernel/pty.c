@@ -59,6 +59,7 @@ static int pr_get(struct ptyring *r, unsigned char *d, int n) {
 struct pty {
     int used, owner;                 /* owner pid (for cleanup) */
     int m_open, s_open;              /* which ends are still open */
+    int m_refs, s_refs;              /* descriptors (and native ids) holding each end: see pty_ref */
     unsigned lflag;                  /* ICANON | ECHO | ISIG */
     unsigned char cc[4];             /* VINTR, VEOF, VERASE, VKILL */
     int fg_pgid;                     /* INTR signal target (pty_ctl cmd 1) */
@@ -162,6 +163,7 @@ int pty_open(void) {
         struct pty *p = &ptys[i];
         for (unsigned k = 0; k < sizeof *p; k++) ((unsigned char *)p)[k] = 0;
         p->used = 1; p->m_open = 1; p->s_open = 1;
+        p->m_refs = 1; p->s_refs = 0;                        /* the opener holds the master */
         p->owner = app_sys_getpid();
         p->fg_pgid = p->owner;                               /* INTR targets the opener by default */
         p->lflag = ICANON | ECHO | ISIG;                     /* cooked, like a real new tty */
@@ -242,15 +244,39 @@ long pty_read(int id, void *buf, unsigned long max) {
     return pr_get(r, (unsigned char *)buf, (int)max);
 }
 
+/* AN END IS A REFERENCE, NOT A FLAG (M2002's lesson for AF_UNIX, here for
+ * ptys). The first close() of ANY copy of an end used to close it for every
+ * holder: a forked child closing the master it inherited made the shell's
+ * reads return EOF, and a parent closing its copy of the slave freed a pty
+ * its child was still using. Each descriptor now holds a reference; an end
+ * hangs up when its LAST reference goes, and the slot is freed when neither
+ * end has any. A slave never opened yet has no references and does not look
+ * hung up -- master reads block, as on Linux. */
+int pty_ref(int id) {
+    int slave; struct pty *p = resolve(id, &slave); if (!p) return -1;
+    uint64_t fl = pty_irq_save();
+    if (slave) { p->s_refs++; p->s_open = 1; } else p->m_refs++;
+    pty_irq_restore(fl);
+    return 0;
+}
+
 int pty_close(int id) {
     int slave; struct pty *p = resolve(id, &slave); if (!p) return -1;
     uint64_t fl = pty_irq_save();
-    if (slave) p->s_open = 0; else p->m_open = 0;
+    if (slave) { if (p->s_refs > 0) p->s_refs--; if (p->s_refs == 0) p->s_open = 0; }
+    else       { if (p->m_refs > 0) p->m_refs--; if (p->m_refs == 0) p->m_open = 0; }
     if (p->in_waiter)  { task_wake(p->in_waiter);  p->in_waiter = 0; }   /* let blocked reads see EOF */
     if (p->out_waiter) { task_wake(p->out_waiter); p->out_waiter = 0; }
-    if (!p->m_open && !p->s_open) p->used = 0;               /* both ends gone -> free the slot */
+    if (p->m_refs == 0 && p->s_refs == 0) p->used = 0;       /* nobody holds either end -> free the slot */
     pty_irq_restore(fl);
     return 0;
+}
+
+/* A master held through a DESCRIPTOR is released when the descriptor is, so
+ * the pid-based cleanup below must not also drop it. */
+void pty_disown(int id) {
+    int slave; struct pty *p = resolve(id, &slave); if (!p) return;
+    p->owner = 0;
 }
 
 int pty_ctl(int id, int cmd, int arg) {
@@ -305,13 +331,13 @@ long pty_nread(int id) {
     return (long)pr_cnt(slave ? &p->in : &p->out);
 }
 
+/* A native app that opened a pty by id (not through a descriptor) has died:
+ * drop the master reference it held. The slot survives while a slave is
+ * still open elsewhere, which now sees the hangup instead of a freed pty. */
 void pty_release_pid(int pid) {
     for (int i = 0; i < NPTY; i++)
         if (ptys[i].used && ptys[i].owner == pid) {
-            uint64_t fl = pty_irq_save();
-            if (ptys[i].in_waiter)  { task_wake(ptys[i].in_waiter);  ptys[i].in_waiter = 0; }
-            if (ptys[i].out_waiter) { task_wake(ptys[i].out_waiter); ptys[i].out_waiter = 0; }
-            ptys[i].used = 0;
-            pty_irq_restore(fl);
+            ptys[i].owner = 0;
+            pty_close(i << 1);
         }
 }

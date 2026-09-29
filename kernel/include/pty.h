@@ -14,7 +14,9 @@
 int  pty_open(void);                                       /* -> master id (slave id = master|1), or -1 */
 long pty_read(int id, void *buf, unsigned long max);       /* bytes; 0 at EOF; -1 bad id (blocks if empty) */
 long pty_write(int id, const void *buf, unsigned long len);/* bytes; -1 bad id */
-int  pty_close(int id);                                    /* close one end (wakes the peer); 0/-1 */
+int  pty_close(int id);                                    /* drop one reference to an end (wakes the peer); 0/-1 */
+int  pty_ref(int id);                                      /* one more descriptor holds this end (dup/fork/SCM, slave open) */
+void pty_disown(int id);                                   /* the master is held by a descriptor, not by its pid */
 int  pty_ctl(int id, int cmd, int arg);                    /* 0=set lflag (ICANON|ECHO|ISIG); 1=set fg pgid; 2=set winsize (rows<<16|cols); 3=get winsize; 4=get lflag (M2211) */
 int  pty_ready(int id);                                    /* fswait peek: would pty_read NOT block? */
 int  pty_writable(int id);                                 /* would a WRITE come up short? for poll POLLOUT (M2206) */

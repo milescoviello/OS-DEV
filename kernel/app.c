@@ -1469,6 +1469,7 @@ int app_scm_send(int ep, int fd) {
     case 8:  inotify_ref(g_scmpool[e].fe.obj); break;
     case 10: net_tcp_sock_ref(g_scmpool[e].fe.obj); break;
     case 12: if (g_scmpool[e].fe.obj >= 0) unix_ref(g_scmpool[e].fe.obj); break;
+    case 11: pty_ref(g_scmpool[e].fe.obj); break;   /* a pty end is a reference too (pty_ref) */
     default: break;                      /* files and console aliases carry no count */
     }
     /* FIFO append, because the protocol matches descriptors to messages by
@@ -1571,6 +1572,7 @@ void app_scm_drop_conn(int ci) {
         case 8:  inotify_free(doomed[i].obj); break;
         case 10: net_tcp_sock_close(doomed[i].obj); break;
         case 12: if (doomed[i].obj >= 0) unix_close(doomed[i].obj); break;
+        case 11: pty_close(doomed[i].obj); break;
         default: break;
         }
     }
@@ -12377,6 +12379,7 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].used && a->fd[newfd].type == 8) inotify_free(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 10) net_tcp_sock_close(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
+    else if (a->fd[newfd].used && a->fd[newfd].type == 11) pty_close(a->fd[newfd].obj);   /* pty ends are references (pty_ref) */
     /* CLAIM newfd BEFORE WRITING IT, NOT AFTER (M2329). dup2 installs a
      * descriptor without ever going through app_fd_claim, so between the
      * struct copy starting and the claim bit being set, an allocator on
@@ -12416,6 +12419,7 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].type == 8) inotify_ref(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].type == 10) net_tcp_sock_ref(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_ref(a->fd[newfd].obj); /* AF_UNIX: a descriptor is a reference (M2002) */
+    else if (a->fd[newfd].type == 11) pty_ref(a->fd[newfd].obj);   /* and so is a pty end: a dup'd copy must not close it for everyone */
     return newfd;
 }
 /* mkfifo(path): create a named pipe (M1188). 0/-1. */
@@ -12530,10 +12534,12 @@ int app_open(const char *path, int flags) {
             if (*q) return -1;                                   /* trailing junk */
             if (!pty_pts_valid(n)) return -1;                    /* no such live pty */
             id = (n << 1) | 1;                                   /* slave id */
+            if (pty_ref(id) < 0) return -1;                      /* this descriptor holds the slave */
         }
         int fd = -1;
         fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
-        if (fd < 0) { if (!(id & 1)) pty_close(id); return -1; } /* no fd slot: undo the master open */
+        if (fd < 0) { pty_close(id); return -1; }               /* no fd slot: undo the open (either end) */
+        if (!(id & 1)) pty_disown(id);                           /* released with the descriptor, not the pid */
         a->fd[fd] = (struct fdent){ 1, 11, 1, id, {0}, 0 };      /* used, type=11 pty, write_end=1 (bidirectional) */
         int j = 0; while (path[j] && j < (int)sizeof a->fd[fd].path - 1) { a->fd[fd].path[j] = path[j]; j++; }
         a->fd[fd].path[j] = 0;
@@ -14655,6 +14661,7 @@ static void app_fd_fork(struct app *child, struct app *parent) {
          * how Firefox's display connection died right after it had bound every
          * global and taken its keymap. */
         else if (parent->fd[i].used && parent->fd[i].type == 12) unix_ref(parent->fd[i].obj);   /* AF_UNIX endpoint inherited (M2002) */
+        else if (parent->fd[i].used && parent->fd[i].type == 11) pty_ref(parent->fd[i].obj);    /* pty end inherited: the child's close must not hang it up */
     }
 }
 /* exit/reap: close every fd the process still held. Must mirror app_fd_close's
@@ -14662,9 +14669,9 @@ static void app_fd_fork(struct app *child, struct app *parent) {
  * exited without itself calling close() on a memfd/epoll/inotify/TCP-socket
  * fd leaked that global table's slot permanently (TCPSOCK_N is just 2, so
  * two such exits exhausted socket() for the whole OS until reboot). Type 11
- * (pty) is deliberately NOT here: it's already released by pid, not by fd,
- * via pty_release_pid() a few lines up in app_reap -- adding it here would
- * double-close it. */
+ * (pty) is here now that each descriptor holds a reference to its end
+ * (pty_ref): a master opened through /dev/ptmx is disowned from the pid-based
+ * pty_release_pid, which only drops the id a NATIVE app holds. */
 static void app_fd_release(struct app *a) {
     for (int i = 0; i < APP_NFD; i++) if (a->fd[i].used) {
         if (a->fd[i].type == 1) pipe_close_end(a->fd[i].obj, a->fd[i].write_end);
@@ -14679,6 +14686,7 @@ static void app_fd_release(struct app *a) {
          * compositor's client table fills with the dead. */
         else if (a->fd[i].type == 12) { if (a->fd[i].obj >= 0) unix_close(a->fd[i].obj); }
         else if (a->fd[i].type == 13) unix_unlisten(a->fd[i].obj);
+        else if (a->fd[i].type == 11) pty_close(a->fd[i].obj);
         a->fd[i].used = 0;
         app_fd_mark(a, i, 0);
         app_fd_unclaim_mark(a, i);
