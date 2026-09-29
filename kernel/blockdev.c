@@ -460,19 +460,6 @@ void blockdev_drop_cache(int i, uint64_t lba, uint32_t count) {
  * rather than copied, so the two cannot drift apart again. */
 #define BLOCKDEV_MAX_BATCH ((uint32_t)ata_dma_max_sectors())
 
-/* Read one sector (dev i, lba) into dst, via the cache. The per-device lock spans
- * lookup->read->install so a concurrent write's invalidation can't race between
- * the raw_read and the install and strand a stale sector in the cache (M1885). */
-static int bread(int i, uint64_t lba, uint8_t *dst) {
-    if (is_ata_backed(i)) return raw_read(i, lba, 1, dst) < 0 ? -1 : 0;   /* ATA: driver caches coherently */
-    blk_lock_take(i);
-    if (bcache_lookup(BCACHE_OWNER_BLK(i), lba, dst)) { blk_lock_give(i); return 0; }  /* hit */
-    int r = raw_read(i, lba, 1, dst);                               /* miss */
-    if (r >= 0) bcache_install(BCACHE_OWNER_BLK(i), lba, dst);
-    blk_lock_give(i);
-    return r < 0 ? -1 : 0;
-}
-
 /* Raised with the cache in M2154-M2155, for the same reason ATA's was: at 128
  * entries one big read had to bypass the cache to avoid flushing it, and
  * against tens of thousands of entries a 128-sector read is a fraction of a
@@ -670,7 +657,7 @@ int blockdev_write(int i, uint64_t lba, uint32_t count, const void *buf) {
     }
     if (is_ata_backed(i)) {
         /* ATA path: ata_write_drive already invalidates the ATA-owner cache under
-         * ata_lock (and we keep no BLK-owner copy for ATA — see bread), so no
+         * ata_lock (and we keep no BLK-owner copy for ATA — see is_ata_backed), so no
          * blockdev-level cache work is needed and it stays coherent (M1885). */
         r = raw_write(i, lba, count, buf);
     } else {
@@ -1111,12 +1098,21 @@ long blockdev_mount_pread(int i, const char *path, void *buf, unsigned long max,
  * shape ata.c's lock uses (M1911), because this is held across real disk I/O
  * and a pure spinner on the holder's own core starves the task it waits for. */
 static volatile int fsw_lock;
+static unsigned long fsw_epoch0;      /* the path-cache epoch when the current writer began */
 static void fsw_take(void) {
     uint32_t spins = 0;
     while (__atomic_exchange_n(&fsw_lock, 1, __ATOMIC_ACQUIRE))
         if (++spins >= 1000) { spins = 0; task_yield(); }
+    fsw_epoch0 = ext2_path_cache_epoch();
 }
-static void fsw_give(void) { __atomic_store_n(&fsw_lock, 0, __ATOMIC_RELEASE); }
+/* A writer that changed the namespace flushed the ext2 path cache on entry;
+ * flush it AGAIN as it leaves, or a reader whose walk overlapped the write can
+ * cache the pre-write answer (see g_e2pc_epoch in ext2.c). An in-place
+ * overwrite never flushed (M2140) and still does not. */
+static void fsw_give(void) {
+    if (ext2_path_cache_epoch() != fsw_epoch0) ext2_path_cache_flush();
+    __atomic_store_n(&fsw_lock, 0, __ATOMIC_RELEASE);
+}
 
 static long blockdev_mount_write_locked(int i, const char *path, const void *buf, unsigned long len) {
     blockdev_mount_scan();
@@ -1202,6 +1198,14 @@ long blockdev_mount_symlink(int i, const char *path, const char *target) {
 
 
 /* Read a symlink's target on mount `i` (ext2 only), not followed. bytes/-1. M1594. */
+int blockdev_mount_link_stat(int i, const char *path, uint32_t *out_size, uint32_t *out_ino,
+                             uint32_t *out_mtime, uint32_t *out_nlink, uint32_t *out_mode) {
+    blockdev_mount_scan();
+    if (i < 0 || i >= g_nmount || g_mount[i].fstype != FS_EXT2) return -1;   /* only ext2 has symlinks */
+    return ext2_link_stat_path(mount_rfn(i), mount_ctx(i), g_mount[i].start, path ? path : "",
+                               out_size, out_ino, out_mtime, out_nlink, out_mode);
+}
+
 long blockdev_mount_readlink(int i, const char *path, void *buf, unsigned long max) {
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
@@ -1237,12 +1241,18 @@ long blockdev_mount_rename(int i, const char *oldpath, const char *newpath) {
     return r;
 }
 
+/* Under fsw_lock like every other mutating mount op: renameat2 was the one
+ * that skipped it, reopening the read-modify-write race (M2308) on directory
+ * blocks, inodes and bitmaps for every RENAME_NOREPLACE/EXCHANGE. */
 long blockdev_mount_rename2(int i, const char *oldpath, const char *newpath, int flags) {  /* renameat2 (ext2 only); 0/-1 (M1232) */
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
-    return ext2_rename2_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
-                             oldpath ? oldpath : "", newpath ? newpath : "", flags);
+    fsw_take();
+    long r = ext2_rename2_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
+                               oldpath ? oldpath : "", newpath ? newpath : "", flags);
+    fsw_give();
+    return r;
 }
 static long blockdev_mount_truncate_locked(int i, const char *path, uint64_t newlen) {   /* resize (ext2 only); 0/-1 (M1228) */
     blockdev_mount_scan();

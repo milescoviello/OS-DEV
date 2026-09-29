@@ -221,9 +221,22 @@ static volatile uint32_t g_swrx_head, g_swrx_tail;    /* empty when head == tail
 static volatile uint64_t g_swrx_dropped;              /* queue full: the honest count */
 uint64_t e1000_rx_dropped(void) { return g_swrx_dropped; }
 
-/* Move every ready descriptor into the software queue. Safe from the ISR: no
- * allocation, no locks taken by anyone else, and it only advances indices this
- * function and e1000_receive own. */
+/* ONE LOCK FOR THE RECEIVE PATH. The drain runs from the ISR and from every
+ * poller (e1000_receive), and they used to share only an assumption: that the
+ * ISR "only ever advances the head the other side does not touch". It advances
+ * rx_cur and g_swrx_head exactly as the poller does, and e1000_receive's cli
+ * masks only its OWN core -- the IRQ lands on another. Two drains could both
+ * read rx_cur = 5; one finished 5 and 6, then the other wrote back a stale
+ * g_swrx_head (frame 6 lost), RDT = 5 and rx_cur = 6, leaving descriptor 6
+ * cleared but no longer the card's: the drain stopped there, and receive was
+ * dead for good. Two pollers also raced on g_swrx_tail. Held with interrupts
+ * off, for a few frame copies at most. */
+static volatile int g_rx_lk;
+static inline void rx_lock(void)   { while (__atomic_exchange_n(&g_rx_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause"); }
+static inline void rx_unlock(void) { __atomic_store_n(&g_rx_lk, 0, __ATOMIC_RELEASE); }
+
+/* Move every ready descriptor into the software queue. Called with g_rx_lk
+ * held and interrupts off (the ISR, or e1000_receive). */
 static void e1000_drain_ring(void) {
     for (;;) {
         uint32_t i = rx_cur;
@@ -284,7 +297,9 @@ static void e1000_isr(struct registers *r) {
     uint32_t cause = reg_read(REG_ICR);              /* read = ack/clear the causes (no storm) */
     if (!cause) return;                               /* 0 => not our (shared) IRQ */
     g_e1000_irqs++;
+    rx_lock();                                        /* interrupts are already off in the ISR */
     e1000_drain_ring();                               /* the ring must never be the buffer (M2021) */
+    rx_unlock();
 }
 
 /* Intel Gigabit controllers this driver supports. 0x100E is the classic 82540EM
@@ -430,6 +445,7 @@ int e1000_receive(void *out, uint16_t max) {
      * the interrupt is being delivered -- a missed or masked IRQ must never
      * mean a missed packet, only a later one. (M2021) */
     uint64_t fl; __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl));
+    rx_lock();                                        /* against the ISR on another core, and other pollers */
     e1000_drain_ring();
     uint16_t len = 0;
     if (g_swrx_tail != g_swrx_head) {
@@ -438,6 +454,7 @@ int e1000_receive(void *out, uint16_t max) {
         memcpy(out, g_swrx[g_swrx_tail].buf, len);
         g_swrx_tail = (g_swrx_tail + 1) % SWRX_N;
     }
+    rx_unlock();
     __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
     return len;
 }

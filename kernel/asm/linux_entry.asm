@@ -79,3 +79,6 @@ linux_syscall_entry:
     add rsp, 16                     ; discard int_no + err_code
     iretq                           ; rip/cs/rflags/rsp/ss -- honours any frame
                                     ; edit the dispatcher made (signals, exec)
+
+; No executable stack (the linker otherwise assumes one for this object).
+section .note.GNU-stack noalloc noexec nowrite progbits

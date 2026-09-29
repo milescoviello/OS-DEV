@@ -33,7 +33,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: node test ($QEMU not found)"
 
 SLOG=$(mktemp /tmp/osdev_node.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting and running real Node.js in-guest (minutes: V8 under TCG)..."

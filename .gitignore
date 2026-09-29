@@ -3,6 +3,8 @@
 
 # Editor / OS cruft
 *.o
+# a bare `gcc foo.c` at the repo root (one was committed by accident at M1961)
+/a.out
 *.swp
 *~
 .DS_Store

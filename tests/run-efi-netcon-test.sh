@@ -22,7 +22,7 @@ HPORT=12325
 TMP=$(mktemp -d /tmp/osdev_efinc.XXXXXX)
 SLOG=$TMP/serial.log
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 for t in "$QEMU" grub-mkstandalone python3; do

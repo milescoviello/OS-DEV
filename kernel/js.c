@@ -1182,7 +1182,7 @@ static char *num_to_str(double d){
     double sc = js_floor(t * 1e14 + 0.5);                                /* t in [1,10) -> a 15-digit integer */
     if (sc >= 1e15) { sc *= 0.1; e++; }                                  /* rounded up to 10.x -> renormalize */
     int64_t iv = (int64_t)sc;
-    { char tmp[20]; int tn=0; int64_t z=iv; if(z==0) tmp[tn++]='0'; while(z){ tmp[tn++]=(char)('0'+(int)(z%10)); z/=10; } while(tn<15) tmp[tn++]='0'; for(int i=tn-1;i>=0;i--) dig[nd++]=tmp[i]; }
+    { int64_t z=iv; for(int i=14;i>=0;i--){ dig[i]=(char)('0'+(int)(z%10)); z/=10; } nd=15; }   /* iv is in [1e14,1e15): exactly 15 digits */
     while (nd>1 && dig[nd-1]=='0') nd--;                                 /* trim trailing zeros */
     if (e< -6 || e>=21){                                                 /* exponential notation */
         buf[p++]=dig[0];

@@ -229,6 +229,41 @@ int main(int argc, char **argv) {
                 if (sl2 != 4 || memcmp(tiny, "/SYM", 4) != 0) { fprintf(stderr, "readlink truncation wrong (n=%ld)\n", sl2); return 1; }
                 printf("readlink: real on-disk (ext2) symlink target read back exact, non-symlink refused, small buffer truncates safely\n");
             }
+            /* A FAST SYMLINK'S i_block IS TEXT, NOT BLOCK POINTERS. Removing one must
+             * free no data block: "libz.so.1" padded to 4-byte words ends in the
+             * word 49 ('1'), and free_inode_blocks used to free block 49. Then a
+             * rename must move the LINK (walk() follows, so it moved the target),
+             * and a write through a dangling relative link must create its target
+             * (open(O_WRONLY) follows links). The final image is e2fsck'd below,
+             * which is what would catch a link count left wrong. */
+            {
+                #define SB_FREE_BLOCKS() ((uint32_t)g_img[1024 + 12] | (uint32_t)g_img[1024 + 13] << 8 | \
+                                          (uint32_t)g_img[1024 + 14] << 16 | (uint32_t)g_img[1024 + 15] << 24)
+                if (ext2_symlink_path(bd_read, bd_write, 0, 0, "/LZ.LNK", "libz.so.1") != 0) { fprintf(stderr, "fast-symlink setup failed\n"); return 1; }
+                uint32_t before = SB_FREE_BLOCKS();
+                if (ext2_unlink_path(bd_read, bd_write, 0, 0, "/LZ.LNK") != 0) { fprintf(stderr, "unlink of a symlink failed\n"); return 1; }
+                uint32_t after = SB_FREE_BLOCKS();
+                if (after != before) { fprintf(stderr, "removing a fast symlink freed %d block(s): its target text was read as block pointers\n", (int)(after - before)); return 1; }
+                static uint8_t lr2[1000];
+                if (ext2_read_path(bd_read, 0, 0, "/HL2.TXT", lr2, sizeof lr2) != 1000) { fprintf(stderr, "a file broke after removing a symlink\n"); return 1; }
+
+                if (ext2_symlink_path(bd_read, bd_write, 0, 0, "/SYMR.LNK", "/HL2.TXT") != 0) { fprintf(stderr, "rename-symlink setup failed\n"); return 1; }
+                if (ext2_rename_path(bd_read, bd_write, 0, 0, "/SYMR.LNK", "/SYMR2.LNK") != 0) { fprintf(stderr, "rename of a symlink failed\n"); return 1; }
+                char rb[64];
+                long rl = ext2_readlink_path(bd_read, 0, 0, "/SYMR2.LNK", rb, sizeof rb);
+                if (rl != 8 || memcmp(rb, "/HL2.TXT", 8) != 0) { fprintf(stderr, "rename moved the symlink's TARGET, not the link (readlink n=%ld)\n", rl); return 1; }
+                if (ext2_readlink_path(bd_read, 0, 0, "/SYMR.LNK", rb, sizeof rb) != -1) { fprintf(stderr, "the old symlink name survived its rename\n"); return 1; }
+                if (ext2_read_path(bd_read, 0, 0, "/HL2.TXT", lr2, sizeof lr2) != 1000) { fprintf(stderr, "a symlink rename disturbed its target\n"); return 1; }
+
+                if (ext2_symlink_path(bd_read, bd_write, 0, 0, "/SYMW.LNK", "SYMW.TXT") != 0) { fprintf(stderr, "write-through setup failed\n"); return 1; }
+                if (ext2_write_path(bd_read, bd_write, 0, 0, "/SYMW.LNK", "hello", 5) != 5) { fprintf(stderr, "write through a symlink failed\n"); return 1; }
+                char wb[16];
+                if (ext2_read_path(bd_read, 0, 0, "/SYMW.TXT", wb, sizeof wb) != 5 || memcmp(wb, "hello", 5) != 0) { fprintf(stderr, "write through a dangling symlink did not create its target\n"); return 1; }
+                long wl = ext2_readlink_path(bd_read, 0, 0, "/SYMW.LNK", rb, sizeof rb);
+                if (wl != 8 || memcmp(rb, "SYMW.TXT", 8) != 0) { fprintf(stderr, "a write through a symlink overwrote the link itself\n"); return 1; }
+                #undef SB_FREE_BLOCKS
+                printf("fast symlinks: rm frees no blocks, rename moves the link, a write goes through to the (created) target\n");
+            }
             /* rename (M1213): relocate a directory entry, preserving the inode.
              * (a) same-dir file rename, (b) cross-dir file move, (c) directory move
              * across parents (fixes ".." + both parents' link counts), (d) a move

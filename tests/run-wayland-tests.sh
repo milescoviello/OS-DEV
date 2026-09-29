@@ -35,7 +35,7 @@ SOCK=$TMP/mon.sock
 QSOCK=$TMP/qmp.sock
 PPM=$TMP/screen.ppm
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -rf "$TMP"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and running a real libwayland client against our compositor..."
@@ -303,6 +303,6 @@ else
     echo "  SKIP: input check (an earlier check already failed)"
 fi
 
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 [ $f -eq 0 ] || { echo "FAIL: Wayland compositor"; exit 1; }
 echo "PASS: PHASE 8 -- a real libwayland client's surface is DRAWN IN AN OS-DEV WINDOW, and it takes INPUT"

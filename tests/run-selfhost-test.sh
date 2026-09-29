@@ -33,7 +33,7 @@ command -v debugfs   >/dev/null 2>&1 || { echo "SKIP: self-host test (debugfs no
 SLOG=$(mktemp /tmp/osdev_selfhost.XXXXXX.log)
 BLOG=$(mktemp /tmp/osdev_selfboot.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG" "$BLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG" "$BLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "stage 1/2: building OS-DEV's own kernel INSIDE OS-DEV (this takes ~15 min under TCG)..."
@@ -48,7 +48,7 @@ while [ $i -lt 5400 ]; do
     grep -aqE "lxbuild\] make -> |KERNEL PANIC" "$SLOG" 2>/dev/null && break
     sleep 0.5; i=$((i+1))
 done
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 f=0
 if grep -aq "\[lxbuild\] make -> 0" "$SLOG"; then

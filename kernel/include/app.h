@@ -313,7 +313,7 @@ uint64_t app_mmap_drm(int fd, uint64_t len, uint64_t off);   /* mmap a DRM rende
 int  app_fd_obj(int fd);                                       /* the object index behind an fd (pipe no., memfd idx), or -1 (M2004) */
 int  app_fd_type(int fd);
 long app_memfd_size(int fd);                                   /* a memfd's size, or -1 if fd is not one (M2000) */
-void app_memfd_selftest(void);                                 /* boot-time: a MAPPED memfd can grow, and its old buffer is retired (M2082) */
+void app_memfd_selftest(void);                                 /* boot-time: a MAPPED memfd grows without moving, and teardown frees its pages (M2082) */
 uint64_t app_mmap_hint(uint64_t addr, uint64_t len);           /* mmap's addr WITHOUT MAP_FIXED: place there only if free, else 0 (M2000) */
 void app_set_next_env(const char *e);                          /* one extra env var for the NEXT Linux spawn only (M1999) */
 void app_set_next_cwd(const char *p);                          /* working directory for the NEXT Linux spawn only (M2056) */
@@ -339,12 +339,15 @@ int  app_memfd_create(const char *name, int flags);        /* anonymous sealable
 long app_memfd_seal(int fd, unsigned add);                 /* add F_SEAL_* (one-way); new seal set/-1 (M1212) */
 long app_ftruncate(int fd, long len);                      /* resize a memfd (seal-checked); 0/-1 (M1212) */
 uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off);  /* MAP_SHARED a memfd: the wl_shm primitive; VA/0 (M1977) */
+uint64_t app_mmap_memfd_ex(int fd, uint64_t len, uint64_t off, int prot, int priv);  /* ...with PROT_* bits and MAP_PRIVATE (copy-on-write) */
 long app_fsync(int fd);                                     /* fsync/fdatasync: 0 for a real file fd (write-through already durable), -1 otherwise (M1566) */
 long app_sync_file_range(int fd, uint64_t offset, uint64_t nbytes, unsigned flags);  /* same as app_fsync; range/flags unused (M1566) */
 void app_sync(void);                                        /* whole-system flush, no fd, never fails (M1588) */
 int  app_timerfd_create(void);                             /* a pollable one-shot timer fd (>=3); -1 (M1217) */
 long app_timerfd_settime(int fd, long delay_ms, long interval_ms);
 long app_timerfd_remaining_ms(int fd);                     /* ms until it fires, 0 = disarmed/expired, -1 = not a timerfd (M2073) */
+void app_timerfd_set_realtime(int fd, int on);             /* its TFD_TIMER_ABSTIME deadlines are epoch times (CLOCK_REALTIME) */
+int  app_timerfd_is_realtime(int fd);
 long app_timerfd_interval_ms(int fd);                      /* its periodic interval in ms, 0 = one-shot (M2073) */  /* arm a timerfd: initial delay + periodic interval (ms; interval 0 = one-shot, delay <=0 disarms); 0/-1 (M1217, periodic M1302) */
 long app_fcntl(int fd, int cmd, long arg);                 /* F_GETFD/SETFD/DUPFD/DUPFD_CLOEXEC (M1218) */
 int  app_dup3(int oldfd, int newfd, int flags);            /* dup w/ O_CLOEXEC; -1 if old==new (M1218) */
@@ -405,6 +408,8 @@ void   app_setcolor(int idx);           /* set the calling app's text colour (pa
 void   app_sys_exit(int code);          /* records the exit status; does not return */
 long   app_waitpid(int pid, int *status);   /* block until a child (pid, or -1=any) exits; returns its pid + *status (M1117) */
 long   app_wait4(int pid, int *status, int nohang);   /* wait4, honouring WNOHANG (M2025) */
+long   app_wait4_sig(int pid, int *status, int *killsig, int nohang);   /* ...and the signal that killed it (0 = exited) */
+void   app_note_kill_sig(int sig);                    /* the caller exits BY this signal (wait: WIFSIGNALED) */
 void   app_fault_current(struct registers *r);  /* a ring-3 task faulted: dump a core, kill it, keep the kernel alive; no return */
 void   app_core_dump(struct registers *r);      /* write an ET_CORE ELF of the faulting app to /tmp/core (M1104) */
 

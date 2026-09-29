@@ -47,6 +47,9 @@ int ata_write(uint32_t lba, uint8_t count, const void *buf) {
 void ata_cache_flush(void) { }                       /* journal flush hook (M1866) — mock disk is write-through */
 void kprintf(const char *fmt, ...) { (void)fmt; }    /* fat32_journal_selftest logs via kprintf (unused here) */
 void vfs_register(struct vfs_ops *ops) { (void)ops; }
+/* fat32.c's writer lock and journal owner ask which task is running: one here. */
+struct task; struct task *task_self(void) { return 0; }
+void task_yield(void) { }
 /* fat32.c now routes metadata writes through the write-ahead journal; pull in the
  * real journal.c so the same code links here (JRNL_HOST -> host <string.h>). If the
  * mock disk has no reserved tail the journal just stays off and the direct path is

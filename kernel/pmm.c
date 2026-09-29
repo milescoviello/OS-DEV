@@ -17,6 +17,7 @@
 #include "pmm.h"
 #include "multiboot.h"
 #include "string.h"
+#include "console.h"       /* kprintf: the one-time saturation notice in pmm_addref */
 
 /* End of the kernel image in memory, provided by the linker script. */
 #include "vmm.h"           /* kvirt_to_phys: linker symbols are higher-half addresses now (M1968) */
@@ -55,6 +56,7 @@ static uint64_t  next_hint;       /* where to start the next allocation scan */
  * naming nothing. (M1961) */
 #define PMM_MAXREFS (1u << 22)    /* covers up to 16 GiB of RAM (4 MiB array) */
 static uint8_t  pmm_refs[PMM_MAXREFS];
+#define PMM_REF_SAT 255u          /* a count this high is pinned: see pmm_addref */
 
 /* The bitmap is shared mutable state, and the allocator runs from more than one
  * thread: kmalloc/sbrk on whatever task needs memory, and pmm_free_frame from
@@ -197,7 +199,7 @@ void pmm_free_frame(uint64_t phys) {
     uint64_t frame = phys / PAGE_SIZE;
     uint64_t fl = irq_save();
     if (frame < PMM_MAXREFS && pmm_refs[frame]) {   /* a shared frame: drop one reference, keep it allocated */
-        pmm_refs[frame]--;
+        if (pmm_refs[frame] != PMM_REF_SAT) pmm_refs[frame]--;   /* saturated: see pmm_addref */
         irq_restore(fl);
         return;
     }
@@ -245,8 +247,17 @@ void pmm_addref(uint64_t phys) {
     uint64_t frame = phys / PAGE_SIZE;
     if (frame >= PMM_MAXREFS) return;               /* >1 GiB: unref-counted (won't be double-mapped) */
     uint64_t fl = irq_save();
-    pmm_refs[frame]++;
+    /* SATURATE, DO NOT WRAP. The count is 8 bits; one more reference than it
+     * holds used to wrap it to zero, and the next pmm_free_frame then freed a
+     * frame that 255 mappings still used. Pinned at the ceiling instead, the
+     * frame is simply never freed: a leak, which is the safe way to be wrong. */
+    int pinned = (pmm_refs[frame] == PMM_REF_SAT);
+    if (!pinned) pmm_refs[frame]++;
     irq_restore(fl);
+    static int told;                                /* outside the allocator's lock: kprintf may not */
+    if (pinned && !told) { told = 1;                /* re-enter the PMM while it is held */
+        kprintf("[pmm] frame %lx has %u+ sharers: its count is pinned and it will not be freed\n",
+                (unsigned long)phys, (unsigned)PMM_REF_SAT); }
 }
 
 /* The extra-reference count of a frame: 0 means single-owner (a normal

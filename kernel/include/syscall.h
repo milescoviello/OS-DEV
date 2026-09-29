@@ -412,6 +412,7 @@ struct timeval { long tv_sec; long tv_usec; };
  * reporting a specific reason, so using the real numbers means ported code
  * checking `errno == ECONNREFUSED` after a getsockopt(SO_ERROR) just works. */
 #define ENETUNREACH   101
+#define ENOBUFS       105    /* no per-connection reliability state left for a new connection */
 #define ETIMEDOUT     110
 #define ECONNREFUSED  111
 #define SA_ONSTACK 0x08000000  /* sigaction flag: run this handler on the sigaltstack() stack (M1276) */

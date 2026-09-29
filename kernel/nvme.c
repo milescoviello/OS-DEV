@@ -197,27 +197,41 @@ static uint16_t nvme_submit(struct nvme_queue *q, struct nvme_sqe *cmd) {
     __asm__ volatile("" ::: "memory");
     *q->sq_db = q->sq_tail;
 
-    /* Poll the CQ head slot until its phase bit flips to the phase we expect. */
-    volatile struct nvme_cqe *cqe = (volatile struct nvme_cqe *)&q->cq[q->cq_head];
+    /* Poll the CQ head slot until its phase bit flips to the phase we expect,
+     * and the entry is OURS.
+     *
+     * THE COMMAND ID IS CHECKED. A command that timed out left its completion
+     * to arrive later, at the head this loop reads next -- so the NEXT
+     * command took that stale entry as its own, returned before its own
+     * transfer had happened, and a read handed back the bounce buffer's
+     * contents from the wrong command. An entry for another cid is consumed
+     * and the wait goes on. */
     uint16_t status = 0xFFFF;
     for (uint64_t i = 0; i < 200000000ull; i++) {
+        volatile struct nvme_cqe *cqe = (volatile struct nvme_cqe *)&q->cq[q->cq_head];
         uint16_t s = cqe->status;
         if ((s & 1) == q->phase) {
-            status = (uint16_t)(s >> 1);     /* the 15-bit status field */
-            break;
+            int mine = (cqe->cid == cmd->cid);
+            if (mine) status = (uint16_t)(s >> 1);     /* the 15-bit status field */
+            /* Advance the CQ head; the phase bit toggles each time the ring wraps. */
+            q->cq_head = (uint16_t)((q->cq_head + 1) % q->depth);
+            if (q->cq_head == 0)
+                q->phase ^= 1;
+            __asm__ volatile("" ::: "memory");
+            *q->cq_db = q->cq_head;
+            if (mine) break;
+            continue;                        /* a late completion of an earlier command */
         }
         __asm__ volatile("pause");
     }
-    if (status == 0xFFFF)
-        return 0xFFFF;                       /* timeout: never saw our completion */
-
-    /* Advance the CQ head; the phase bit toggles each time the ring wraps. */
-    q->cq_head = (uint16_t)((q->cq_head + 1) % q->depth);
-    if (q->cq_head == 0)
-        q->phase ^= 1;
-    __asm__ volatile("" ::: "memory");
-    *q->cq_db = q->cq_head;
-
+    if (status == 0xFFFF) {
+        /* Never saw ours. The command may still complete, into the one bounce
+         * buffer every later command shares, so this controller is not used
+         * again this boot rather than trusted to be in step. */
+        kprintf("[nvme] command %u timed out -- taking the controller offline\n", (unsigned)cmd->cid);
+        nv.present = 0;
+        return 0xFFFF;
+    }
     return status;
 }
 

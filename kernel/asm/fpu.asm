@@ -17,6 +17,10 @@
 ; FP-using programs (e.g. DOOM and Quake) can run at once without corrupting each
 ; other's XMM/x87 registers.
 
+; Absolute addressing is what this file has always assembled to; say so, since
+; NASM deprecates leaving 64-bit code's addressing mode implicit.
+default abs
+
 section .text
 global fpu_init
 fpu_init:

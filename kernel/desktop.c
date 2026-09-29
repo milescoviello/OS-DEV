@@ -2835,32 +2835,52 @@ void desktop_run(void) {
                 app_set_mouse((app_t *)fw->app, rx, ry, btn);
                 app_add_mouse_rel((app_t *)fw->app, rdx, rdy);
             }
-            /* A focused Wayland window gets the pointer, in SURFACE-relative
-             * coordinates -- the client knows nothing about where its window
-             * sits on our desktop, and sending screen coordinates would put
-             * every click in the wrong place. Motion is only forwarded when it
-             * CHANGES: a Wayland client redraws on motion, and re-sending the
-             * same position every frame would keep it busy forever. (M1983) */
-            if (!fw->minimized && fw->kind == KIND_WAYLAND) {
-                /* Name the client this window belongs to, so the compositor
-                 * delivers to it rather than to whichever surface happens to
-                 * be largest (M2275). */
+            /* The focused Wayland window gets the KEYBOARD (M2275). Its
+             * pointer is decided below, by where the cursor is. */
+            if (!fw->minimized && fw->kind == KIND_WAYLAND)
                 wl_set_focus_client((int)(long)fw->app - 1);
-                int sw3 = fw->w - 14, sh3 = fw->h - TITLEBAR_H - 14;
-                int rx = mx - (fw->x + 6), ry = my - (fw->y + TITLEBAR_H + 6);
-                /* HIT-TEST against the surface, not just the window: pointer
-                 * focus in Wayland follows the cursor, so a client outside
-                 * whose bounds the cursor sits must get a leave() and no
-                 * motion. Forwarding out-of-bounds coordinates is worse than
-                 * useless -- the client happily acts on a click it should
-                 * never have seen. */
+        }
+
+        /* THE POINTER GOES TO THE WAYLAND WINDOW UNDER THE CURSOR, focused or
+         * not -- Wayland's rule, and what makes hovering work. This used to
+         * run only for the focused window, so an unfocused client never saw
+         * the cursor until it was clicked. Coordinates are SURFACE-relative:
+         * the client knows nothing about where its window sits on our
+         * desktop. Motion is only forwarded when it CHANGES, because a
+         * Wayland client redraws on motion and re-sending one position every
+         * frame would keep it busy forever. (M1983) Outside every Wayland
+         * surface the client that had the pointer gets a leave(), since
+         * pointer focus follows the cursor and a click it should never have
+         * seen is worse than none. */
+        {
+            static int ptr_ci = -1;                 /* the client the pointer is in, -1 = none */
+            window_t *hw = 0;
+            for (int i = win_count - 1; i >= 0; i--) {
+                window_t *w = &windows[i];
+                if (w->minimized || !in_rect(mx, my, w->x, w->y, w->w, w->h)) continue;
+                hw = w; break;                      /* only the topmost window counts */
+            }
+            int over = 0;
+            if (hw && hw->kind == KIND_WAYLAND && !menu_open && !help_open) {
+                int sw3 = hw->w - 14, sh3 = hw->h - TITLEBAR_H - 14;
+                int rx = mx - (hw->x + 6), ry = my - (hw->y + TITLEBAR_H + 6);
                 if (rx >= 0 && ry >= 0 && rx < sw3 && ry < sh3) {
+                    int ci = (int)(long)hw->app - 1;
+                    over = 1;
+                    if (ci != ptr_ci) {             /* crossed from one client's surface to another's */
+                        if (ptr_ci >= 0) wl_post_pointer_leave();
+                        wl_set_pointer_client(ci);
+                        ptr_ci = ci;
+                    }
                     if (mx != prev_x || my != prev_y) { g_dk_mot++; wl_post_motion(rx, ry); }
                     if ((btn & 1) != (prev_btn & 1)) { g_dk_btn++; wl_post_button(rx, ry, 0x110, btn & 1); }   /* BTN_LEFT */
                     if ((btn & 2) != (prev_btn & 2)) wl_post_button(rx, ry, 0x111, (btn & 2) ? 1 : 0);  /* BTN_RIGHT */
-                } else if (mx != prev_x || my != prev_y) {
-                    wl_post_pointer_leave();
                 }
+            }
+            if (!over && ptr_ci >= 0) {
+                wl_post_pointer_leave();
+                wl_set_pointer_client(-1);
+                ptr_ci = -1;
             }
         }
 

@@ -225,6 +225,13 @@ static int ext2_open(blk_read_fn read, void *ctx, uint64_t start, ext2_t *v) {
     v->feat_incompat    = (rev >= 1) ? e_rd32(sb + 96) : 0;   /* `extent`=0x40, for extent writes (M1189) */
     if (!v->blocks_per_group || v->blocks_count <= v->first_data_block) {
         v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }
+    /* A group's block and inode bitmaps are ONE block each, so neither count
+     * can exceed 8 bits per byte of it. alloc_block, alloc_inode and
+     * free_block index a 4 KiB stack buffer by bit>>3: an image claiming
+     * more (losetup accepts any file) wrote past that buffer on the kernel
+     * stack. ext2 itself never makes one; refuse it. */
+    if (v->blocks_per_group > 8u * v->block_size || v->inodes_per_group > 8u * v->block_size) {
+        v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }
     v->groups = (v->blocks_count - v->first_data_block + v->blocks_per_group - 1) / v->blocks_per_group;
     return 0;
 }
@@ -588,7 +595,11 @@ static uint32_t walk_d(ext2_t *v, uint32_t startino, const char *path,
 /* `gen` is a seqlock: ODD = published and whole, EVEN = free or mid-write. It
  * replaces the old `used` flag because a flag cannot express "being rewritten",
  * and that is the state a reader has to detect. See walk_cached. */
+/* Keyed by VOLUME as well as path: with two ext2 volumes mounted (/disk2 and
+ * a losetup image, say) "etc/passwd" on one used to answer with the other's
+ * inode number -- the wrong file, or a false ENOENT. */
 static struct { char path[128]; uint32_t ino; uint8_t isdir, negative;
+                blk_read_fn vread; void *vctx; uint64_t vstart;
                 volatile unsigned gen; volatile int claim; } g_e2pc[E2PC_N];
 static unsigned g_e2pc_clk;
 static uint8_t  g_e2pc_lru[E2PC_N];
@@ -625,7 +636,18 @@ static int e2pc_eq(const char *a, const char *b) {
 }
 /* Any write to this volume drops the whole cache. Called from every mutating
  * entry point in this file. */
+/* THE FLUSH EPOCH. A reader that was already walking when a writer flushed
+ * would insert what it saw BEFORE the write -- say "P is absent" just as P was
+ * created -- and nothing would ever retract it: app_open then took O_CREAT's
+ * create-or-overwrite path and TRUNCATED THE EXISTING FILE (a stale positive
+ * after an unlink read a freed inode instead). Every flush bumps the epoch
+ * first; a reader snapshots it before walking and retracts its own insert if
+ * it moved. Writers flush again when they finish (blockdev's fsw_give), so a
+ * walk overlapping a write always meets a later bump. */
+static volatile unsigned long g_e2pc_epoch;
+unsigned long ext2_path_cache_epoch(void) { return __atomic_load_n(&g_e2pc_epoch, __ATOMIC_ACQUIRE); }
 void ext2_path_cache_flush(void) {
+    __atomic_fetch_add(&g_e2pc_epoch, 1, __ATOMIC_ACQ_REL);   /* BEFORE the entries: see above */
     for (int i = 0; i < E2PC_N; i++) {
         unsigned g = __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE);
         if (g & 1u) __atomic_store_n(&g_e2pc[i].gen, g + 1, __ATOMIC_RELEASE);
@@ -668,6 +690,7 @@ int g_e2_read_runs  = 1;
 
 static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int *is_dir) {
     if (!g_e2_path_cache) return walk(v, path, inode_out, is_dir);
+    unsigned long epoch0 = __atomic_load_n(&g_e2pc_epoch, __ATOMIC_ACQUIRE);   /* see g_e2pc_epoch */
     int plen = 0; while (path[plen]) plen++;
     int cacheable = (plen > 0 && plen < (int)sizeof g_e2pc[0].path);
     int slot = -1;
@@ -689,6 +712,8 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
             unsigned g1 = __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE);
             if (!(g1 & 1u)) continue;                  /* free, or being written */
             if (!e2pc_eq(g_e2pc[i].path, path)) continue;
+            if (g_e2pc[i].vread != v->read || g_e2pc[i].vctx != v->ctx ||
+                g_e2pc[i].vstart != v->start) continue;       /* another volume's answer (validated by the gen re-read) */
             uint32_t cino = g_e2pc[i].ino;
             uint8_t  cdir = g_e2pc[i].isdir, cneg = g_e2pc[i].negative;
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -746,6 +771,7 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
             g_e2pc[slot].ino = ino;
             g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
             g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
+            g_e2pc[slot].vread = v->read; g_e2pc[slot].vctx = v->ctx; g_e2pc[slot].vstart = v->start;
             g_e2pc[slot].gen |= 1u;                  /* "published", with no ordering at all */
             g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
         } else if (v2 >= 0 && !__atomic_exchange_n(&g_e2pc[v2].claim, 1, __ATOMIC_ACQUIRE)) {
@@ -759,10 +785,15 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
             g_e2pc[slot].ino = ino;
             g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
             g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
+            g_e2pc[slot].vread = v->read; g_e2pc[slot].vctx = v->ctx; g_e2pc[slot].vstart = v->start;
             __atomic_thread_fence(__ATOMIC_RELEASE);
-            __atomic_store_n(&g_e2pc[slot].gen,
-                             (__atomic_load_n(&g_e2pc[slot].gen, __ATOMIC_RELAXED) | 1u) + 2u,
-                             __ATOMIC_RELEASE);          /* publish: odd, and different */
+            unsigned pub = (__atomic_load_n(&g_e2pc[slot].gen, __ATOMIC_RELAXED) | 1u) + 2u;
+            __atomic_store_n(&g_e2pc[slot].gen, pub, __ATOMIC_RELEASE);   /* publish: odd, and different */
+            /* A flush during our walk means what we saw may predate a write:
+             * take it back (unless a flush already retired it). */
+            if (__atomic_load_n(&g_e2pc_epoch, __ATOMIC_ACQUIRE) != epoch0)
+                __atomic_compare_exchange_n(&g_e2pc[slot].gen, &pub, pub + 1, 0,
+                                            __ATOMIC_RELEASE, __ATOMIC_RELAXED);
             g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
             __atomic_store_n(&g_e2pc[v2].claim, 0, __ATOMIC_RELEASE);
         } else if (v2 >= 0) {
@@ -1458,12 +1489,20 @@ static int bslot_set(ext2_t *v, uint8_t *inode, bslot_t s, uint32_t phys) {
 /* Physical block backing logical block `fblk`, allocating it (and any indirect
  * level above it) if absent. Updates i_block[] in the caller's in-memory
  * `inode`, so the caller must write_inode() to commit. 0 on failure. */
+static uint32_t bmap_alloc_f(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged, int *fresh);
 static uint32_t bmap_alloc(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged) {
+    return bmap_alloc_f(v, inode, fblk, charged, 0);
+}
+/* As bmap_alloc; *fresh says whether the block was allocated just now, i.e.
+ * holds a previous owner's bytes rather than this file's. */
+static uint32_t bmap_alloc_f(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged, int *fresh) {
     bslot_t s;
+    if (fresh) *fresh = 0;
     if (!bmap_slot(v, inode, fblk, &s, charged)) return 0;
     uint32_t b = bslot_get(v, inode, s);
     if (b) return b;                                       /* already mapped */
     if (!(b = alloc_block(v))) return 0;
+    if (fresh) *fresh = 1;
     if (charged) (*charged)++;
     if (bslot_set(v, inode, s, b) < 0) { free_block(v, b); return 0; }
     return b;
@@ -1559,9 +1598,44 @@ static int free_block(ext2_t *v, uint32_t blk) {
     return wr_sb(v, sb);
 }
 
+/* A FAST SYMLINK KEEPS ITS TARGET TEXT IN i_block ITSELF (mode S_IFLNK and no
+ * data blocks, apart from an xattr block if it has one). Those 60 bytes are
+ * characters, not block numbers, and nothing may treat them as pointers:
+ * free_inode_blocks did, so `rm` of a link to "libz.so.1" freed block 49 -- an
+ * inode-table block the next allocation handed to file data. */
+static int e2_fast_symlink(const ext2_t *v, const uint8_t *inode) {
+    if ((e_rd16(inode + 0) & 0xF000) != 0xA000) return 0;
+    uint32_t sectors = e_rd32(inode + 28);                 /* i_blocks, in 512-byte units */
+    if (e_rd32(inode + 104)) {                             /* i_file_acl: an xattr block counts too */
+        uint32_t per = v->block_size / 512;
+        sectors = sectors > per ? sectors - per : 0;
+    }
+    return sectors == 0;
+}
+
+/* Where a WRITE through the symlink `inode`, found as a name in directory
+ * `parent`, should land: open(O_WRONLY) follows a link, and a dangling one
+ * creates its target. An absolute target is volume-relative, as walk_d reads
+ * it. -1 for a slow symlink (walk_d does not follow those either) or a path
+ * that does not fit. */
+static int e2_link_write_path(const uint8_t *inode, const char *parent, char *out, int max) {
+    uint32_t sz = e_rd32(inode + 4);
+    if (sz == 0 || sz > 60) return -1;
+    const char *t = (const char *)inode + 40;
+    int o = 0;
+    if (t[0] != '/') {
+        for (int i = 0; parent[i]; i++) { if (o >= max - 1) return -1; out[o++] = parent[i]; }
+        if (o) { if (o >= max - 1) return -1; out[o++] = '/'; }
+    }
+    for (uint32_t i = 0; i < sz; i++) { if (o >= max - 1) return -1; out[o++] = t[i]; }
+    out[o] = 0;
+    return 0;
+}
+
 /* Free every data block an inode references — direct (0-11), single-indirect
  * (12) and double-indirect (13), plus the indirect metablocks themselves. */
 static void free_inode_blocks(ext2_t *v, const uint8_t *inode) {
+    if (e2_fast_symlink(v, inode)) return;                 /* its i_block is text: see above */
     const uint8_t *ib = inode + 40;
     uint32_t ppb = v->block_size / 4;
     uint8_t buf[4096], buf2[4096];
@@ -1911,6 +1985,38 @@ long ext2_symlink_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
  * target -- this just returns that decoded target instead of following it.
  * Slow symlinks (target too long to fit inline) are unsupported, matching
  * walk_d's own existing limit for auto-following. */
+/* lstat's half (the name, NOT what it points at): if the final component of
+ * `path` is a symlink, report the LINK's own inode -- number, size (target
+ * length), mode, times, links -- and return 0. -1 if the name is absent or is
+ * not a symlink; the caller then answers with an ordinary stat, which is what
+ * lstat means for everything else. */
+int ext2_link_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
+                        uint32_t *out_size, uint32_t *out_ino, uint32_t *out_mtime,
+                        uint32_t *out_nlink, uint32_t *out_mode) {
+    ext2_t v;
+    if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
+    char parent[256], base[256];
+    int last = -1, n = 0;
+    for (int i = 0; path[i]; i++) { if (path[i] == '/') last = i; n = i + 1; }
+    if (last < 0) parent[0] = 0;
+    else { int j = 0; for (; j < last && j < 255; j++) parent[j] = path[j]; parent[j] = 0; }
+    { int j = 0, s = last + 1; for (; s < n && j < 255; s++, j++) base[j] = path[s]; base[j] = 0; }
+    if (base[0] == 0) return -1;
+    uint8_t pin[256]; int pdir = 0;
+    if (!walk(&v, parent, pin, &pdir) || !pdir) return -1;
+    int cd = 0;
+    uint32_t ino = dir_lookup(&v, pin, base, &cd);
+    uint8_t inode[256];
+    if (!ino || read_inode(&v, ino, inode) < 0) return -1;
+    if ((e_rd16(inode + 0) & 0xF000) != 0xA000) return -1;   /* not a link: plain stat answers */
+    if (out_size)  *out_size  = e_rd32(inode + 4);
+    if (out_ino)   *out_ino   = ino;
+    if (out_mtime) *out_mtime = e_rd32(inode + 16);
+    if (out_nlink) *out_nlink = e_rd16(inode + 26);
+    if (out_mode)  *out_mode  = e_rd16(inode + 0);
+    return 0;
+}
+
 long ext2_readlink_path(blk_read_fn read, void *ctx, uint64_t start_lba,
                         const char *path, void *buf, unsigned long max) {
     ext2_t v;
@@ -2056,21 +2162,27 @@ long ext2_rename_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
 
-    uint8_t sin[256]; int sdir = 0;
-    uint32_t src_ino = walk(&v, oldpath, sin, &sdir);
-    if (!src_ino) return -1;                               /* source must exist */
-    uint8_t ftype = sdir ? 2 : (((e_rd16(sin) & 0xF000) == 0xA000) ? 7 : 1);
-
     char op[256], ob[256], np[256], nb[256];
     path_split(oldpath, op, ob);
     path_split(newpath, np, nb);
     if (ob[0] == 0 || nb[0] == 0) return -1;
     if (nb[0] == '.' && (nb[1] == 0 || (nb[1] == '.' && nb[2] == 0))) return -1;   /* refuse "." / ".." */
+    if (ob[0] == '.' && (ob[1] == 0 || (ob[1] == '.' && ob[2] == 0))) return -1;
 
     uint8_t opin[256], npin[256]; int od = 0, nd = 0;
     uint32_t oldp = walk(&v, op, opin, &od);
     uint32_t newp = walk(&v, np, npin, &nd);
     if (!oldp || !od || !newp || !nd) return -1;           /* both parents must be dirs */
+
+    /* THE SOURCE IS THE NAME, NOT WHAT IT POINTS AT. walk() follows a final
+     * symlink, so `mv link link2` used to move the link's TARGET under the
+     * new name -- with no link-count bump -- and orphan the symlink inode;
+     * the next rm of either name freed an inode that was still named. Look
+     * the entry up in its parent without following, as unlink does. */
+    uint8_t sin[256]; int sdir = 0;
+    uint32_t src_ino = dir_lookup(&v, opin, ob, &sdir);
+    if (!src_ino || read_inode(&v, src_ino, sin) < 0) return -1;   /* source must exist */
+    uint8_t ftype = sdir ? 2 : (((e_rd16(sin) & 0xF000) == 0xA000) ? 7 : 1);
 
     if (sdir && is_ancestor(&v, src_ino, newp)) return -1; /* can't move a dir into itself/subtree */
 
@@ -2134,10 +2246,6 @@ long ext2_rename2_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
 
-    uint8_t sin[256]; int sdir = 0;
-    uint32_t src_ino = walk(&v, oldpath, sin, &sdir);
-    if (!src_ino) return -1;                               /* source must exist */
-
     char op[256], ob[256], np[256], nb[256];
     path_split(oldpath, op, ob);
     path_split(newpath, np, nb);
@@ -2147,6 +2255,10 @@ long ext2_rename2_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
     uint32_t oldp = walk(&v, op, opin, &od);
     uint32_t newp = walk(&v, np, npin, &nd);
     if (!oldp || !od || !newp || !nd) return -1;           /* both parents must be dirs */
+
+    uint8_t sin[256]; int sdir = 0;                        /* the name itself, unfollowed: see rename */
+    uint32_t src_ino = dir_lookup(&v, opin, ob, &sdir);
+    if (!src_ino || read_inode(&v, src_ino, sin) < 0) return -1;   /* source must exist */
 
     int td = 0;
     uint32_t tgt = dir_lookup(&v, npin, nb, &td);
@@ -2261,6 +2373,10 @@ long ext2_truncate_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
+    /* i_size is 32 bits here, as in ext2_pwrite_path. `(uint32_t)newlen` used
+     * to wrap instead: ftruncate(fd, 4 GiB) became a truncate to 0 that freed
+     * the whole file, 5 GiB became 1 GiB. Refuse what cannot be represented. */
+    if (newlen > 0xFFFFFFFFull) return -1;
     uint8_t inode[256]; int isdir = 0;
     uint32_t ino = walk(&v, path, inode, &isdir);
     if (!ino || isdir) return -1;                          /* regular files only */
@@ -2441,8 +2557,16 @@ static int extent_to_indirect(ext2_t *v, uint8_t *inode, uint32_t *charged) {
  * from the volume root. Measured per-syscall thread time: pwrite64 cost about
  * 13.8 SECONDS in every 15 seconds of wall clock -- one thread inside write()
  * 92% of the time, ~37 ms for a single write -- and none of it was the write. */
+static long ext2_pwrite_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                               const char *path, uint64_t off, const void *buf, unsigned long len,
+                               int depth);
 long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                       const char *path, uint64_t off, const void *buf, unsigned long len) {
+    return ext2_pwrite_path_d(read, write, ctx, start_lba, path, off, buf, len, 0);
+}
+static long ext2_pwrite_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                               const char *path, uint64_t off, const void *buf, unsigned long len,
+                               int depth) {
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
@@ -2464,6 +2588,15 @@ long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
     int cd = 0;
     uint32_t existing = dir_lookup(&v, pin, base, &cd);
     if (existing && cd) return -1;                         /* it's a directory */
+    if (existing) {                                        /* a symlink: write its TARGET (see ext2_write_path) */
+        uint8_t lin[256];
+        if (read_inode(&v, existing, lin) < 0) return -1;
+        if ((e_rd16(lin + 0) & 0xF000) == 0xA000) {
+            char tp[256];
+            if (depth >= EXT2_SYMLINK_MAX || e2_link_write_path(lin, parent, tp, sizeof tp) < 0) return -1;
+            return ext2_pwrite_path_d(read, write, ctx, start_lba, tp, off, buf, len, depth + 1);
+        }
+    }
     /* Creating a name DOES change the namespace: a negative entry for this
      * path would now be a lie. Overwriting an existing one changes nothing the
      * cache holds -- see the note above this function. (M2140) */
@@ -2491,7 +2624,8 @@ long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
         uint32_t lo = (off > bstart) ? (uint32_t)(off - bstart) : 0;
         uint32_t hi = ((off + len) < (uint64_t)bstart + v.block_size)
                         ? (uint32_t)(off + len - bstart) : v.block_size;
-        uint32_t db = bmap_alloc(&v, inode, fb, &charged);
+        int fresh = 0;
+        uint32_t db = bmap_alloc_f(&v, inode, fb, &charged, &fresh);
         if (!db) goto fail;
 
         if (lo == 0 && hi == v.block_size) {               /* full block: no read needed */
@@ -2499,8 +2633,10 @@ long ext2_pwrite_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
         } else {                                           /* partial: read-modify-write */
             /* A block inside the old file must be preserved around the edit;
              * one past EOF (or a hole) has no contents to preserve and must
-             * read as zeroes, not as whatever the recycled block held. */
-            if (bstart < size) { if (rdblk(&v, db, blk) < 0) goto fail; }
+             * read as zeroes, not as whatever the recycled block held. A hole
+             * INSIDE the file is also just-allocated: testing only bstart <
+             * size read a deleted file's bytes back into it. */
+            if (bstart < size && !fresh) { if (rdblk(&v, db, blk) < 0) goto fail; }
             else               { memset(blk, 0, v.block_size); }
             const uint8_t *src = (const uint8_t *)buf + (bstart + lo - off);
             memcpy(blk + lo, src, hi - lo);
@@ -2531,8 +2667,14 @@ fail:
     return -1;
 }
 
+static long ext2_write_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                              const char *path, const void *buf, unsigned long len, int depth);
 long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                      const char *path, const void *buf, unsigned long len) {
+    return ext2_write_path_d(read, write, ctx, start_lba, path, buf, len, 0);
+}
+static long ext2_write_path_d(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
+                              const char *path, const void *buf, unsigned long len, int depth) {
     ext2_path_cache_flush();   /* wholesale: see the note at ext2_unlink_path (M2103) */
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
@@ -2553,6 +2695,15 @@ long ext2_write_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
     int cd = 0;
     uint32_t existing = dir_lookup(&v, pin, base, &cd);
     if (existing && cd) return -1;                         /* a directory already owns that name */
+    if (existing) {                                        /* a symlink: write its TARGET, as open() does */
+        uint8_t lin[256];
+        if (read_inode(&v, existing, lin) < 0) return -1;
+        if ((e_rd16(lin + 0) & 0xF000) == 0xA000) {
+            char tp[256];
+            if (depth >= EXT2_SYMLINK_MAX || e2_link_write_path(lin, parent, tp, sizeof tp) < 0) return -1;
+            return ext2_write_path_d(read, write, ctx, start_lba, tp, buf, len, depth + 1);
+        }
+    }
 
     uint32_t ppb = v.block_size / 4;
     uint32_t nblocks = (uint32_t)((len + v.block_size - 1) / v.block_size);

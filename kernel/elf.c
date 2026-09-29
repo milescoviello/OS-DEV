@@ -243,7 +243,11 @@ static uint64_t elf_load_dyn_base(const void *image, uint64_t maxsz, uint64_t wa
             else if (d->d_tag == DT_RELA)   rela   = d->d_val;
             else if (d->d_tag == DT_RELASZ) relasz = d->d_val;
         }
+        /* The TABLE must lie inside the image, not just its start: relasz
+         * came straight from the file, and an oversized one walked this loop
+         * past the loaded span into whatever the kernel had mapped beyond it. */
         if (rela && rela < span) {
+            if (relasz > span - rela) relasz = span - rela;
             for (uint64_t o = 0; o + sizeof(Elf64_Rela) <= relasz; o += sizeof(Elf64_Rela)) {
                 const Elf64_Rela *r = (const Elf64_Rela *)(base + rela + o);
                 if ((uint32_t)r->r_info == R_X86_64_RELATIVE &&

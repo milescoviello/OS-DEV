@@ -45,14 +45,40 @@
  * core lock (a plain `cli` only ever protected against a LOCAL interrupt
  * reentering, never against another core concurrently walking/mutating the
  * same ring). `current`/`active_cr3` are kept as macros so the large existing
- * body of this file (every `current->x`, `current = t`, etc.) keeps working
- * unchanged — each reference now transparently resolves to THIS core's own
- * slot instead of silently being a single-core assumption. */
+ * body of this file (every `current->x`) keeps working unchanged — each
+ * reference now transparently resolves to THIS core's own slot instead of
+ * silently being a single-core assumption. */
 #define MAX_SCHED_CPUS 16
 static task_t   *cur[MAX_SCHED_CPUS];
 static uint64_t  active_cr3_arr[MAX_SCHED_CPUS];
+/* The kernel's own address space (task 0's, set in sched_init). A task with
+ * cr3 == 0 -- a kernel thread -- runs on THIS, not on whatever CR3 the previous
+ * task left loaded: see task_want_cr3. */
+static uint64_t  g_kernel_cr3;
 static inline int mycore(void) { return smp_current_cpu() & (MAX_SCHED_CPUS - 1); }
-#define current    (cur[mycore()])
+/* READING `current` IS TWO LOADS, AND THEY MUST NOT BE SPLIT BY A MIGRATION.
+ *
+ * cur[mycore()] reads the LAPIC ID, then indexes cur[]. With interrupts on, a
+ * timer tick between the two can switch this task out and resume it on
+ * another core -- which then loads the ORIGINAL core's slot, i.e. some other
+ * task. That is the rip=0x3 panic: thread_trampoline enabled interrupts and
+ * then called current->entry, got an idle AP's task (entry == NULL) and
+ * called address 0, where SeaBIOS's IVT (53 FF 00 F0) decodes to push rbx /
+ * inc [rax] / #UD at offset 3. Every task_self() -- so every cur() app lookup
+ * in a syscall that has done its sti -- had the same window. Masking
+ * interrupts across the pair makes it one observation of one core.
+ *
+ * The scheduler's own writes (`CUR_SLOT = next`) already run with interrupts
+ * off under the run-queue lock, so they index the slot directly. */
+static inline task_t *cur_self(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    task_t *t = cur[mycore()];
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return t;
+}
+#define current    (cur_self())
+#define CUR_SLOT   (cur[mycore()])
 
 /* HOW CLOSE DID ANYTHING ACTUALLY GET? (M2212)
  *
@@ -313,6 +339,45 @@ static inline uint64_t read_cr3(void) {
 static inline void load_cr3(uint64_t v) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(v) : "memory");
 }
+/* A KERNEL THREAD MUST NOT BORROW A PROCESS'S PAGE TABLES. cr3 == 0 used to
+ * mean "keep whatever is loaded", which after an app's last thread exits on
+ * this core is THAT app's CR3. The WM then reaps the app on another core and
+ * vmm_destroy_address_space frees those tables -- checking only the reaper's
+ * own CR3 -- while net_rx_service, netcon or wl_server runs on them here,
+ * and the MMU goes on writing accessed/dirty bits into recycled frames. The
+ * kernel half is mapped in every address space, so the kernel's own CR3 is
+ * always a valid place for a kernel thread to be. */
+static inline uint64_t task_want_cr3(const task_t *t) {
+    return t->cr3 ? t->cr3 : g_kernel_cr3;
+}
+
+/* WORK IN ANOTHER ADDRESS SPACE FOR A WHILE, AND SURVIVE BEING PREEMPTED THERE.
+ * spawn, exec and reap load a process's CR3 by hand to fill in or flush its
+ * pages. The scheduler restores a task's OWN cr3 when it switches back in, so
+ * a raw `mov cr3` lasted only until the first preemption -- and loading from
+ * disk re-enables interrupts -- after which the loader carried on writing
+ * user addresses on the wrong page tables. Borrowing records the space on the
+ * task itself; returning goes back to the task's real one. */
+uint64_t task_cr3_borrow(uint64_t cr3) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    task_t *t = cur[mycore()];
+    uint64_t prev = t ? t->cr3 : 0;
+    if (t) t->cr3 = cr3;
+    active_cr3 = cr3;
+    load_cr3(cr3);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return prev;
+}
+void task_cr3_return(uint64_t prev) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    task_t *t = cur[mycore()];
+    if (t) t->cr3 = prev;
+    uint64_t want = t ? task_want_cr3(t) : g_kernel_cr3;
+    if (want) { active_cr3 = want; load_cr3(want); }
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
 
 /* Per-thread %fs base for TLS (M1140). The kernel never uses FS_BASE itself, so
  * we only touch the MSR on behalf of threads that set one; `loaded_fs_base`
@@ -513,8 +578,14 @@ void task_finish_switch(void) {
     core_prev[c] = 0;
     uint64_t f = irq_save();
     rq_lock_take();
-    p->state = TASK_READY;
-    p->ready_since = timer_ms();
+    /* ONLY RUNNING -> READY. Between switch_to_next recording `p` here and
+     * this line, p still reads RUNNING, and a task_stop from another core's
+     * exit_group or SIGSTOP can set it STOPPED. Overwriting that with READY
+     * lost the stop, and the thread kept running after exit_group. */
+    if (p->state == TASK_RUNNING) {
+        p->state = TASK_READY;
+        p->ready_since = timer_ms();
+    }
     p->nivcsw++;
     rq_lock_give();
     irq_restore(f);
@@ -523,8 +594,9 @@ void task_finish_switch(void) {
 /* Where a freshly created thread begins. `current` is already this thread. */
 static void thread_trampoline(void) {
     task_finish_switch();             /* complete whoever we just preempted (M1531) */
+    void (*entry)(void) = current->entry;   /* BEFORE interrupts: see cur_self */
     interrupts_enable();        /* new threads start with interrupts on */
-    current->entry();
+    entry();
     task_exit();                /* if the entry function returns, end cleanly */
 }
 
@@ -577,12 +649,13 @@ static void idle_loop(void) {
 
 void sched_init(void) {
     task_t *t = kzalloc(sizeof(task_t));
-    t->id = next_id++;
+    t->id = __atomic_fetch_add(&next_id, 1, __ATOMIC_RELAXED);
     t->state = TASK_RUNNING;
     t->next = t;                /* a ring of one */
     t->weight = NICE0_WEIGHT;   /* CFS: task 0 at nice 0 (M1171) — never leave weight 0 (div-by-zero in the charge) */
     t->cr3 = read_cr3();        /* task 0 runs in the kernel's address space */
     active_cr3 = t->cr3;
+    g_kernel_cr3 = t->cr3;
     fx_alloc(t);
     t->last_in = timer_ms();    /* start CPU-time accounting for task 0 */
     /* task 0 becomes the WM/desktop main loop (kmain -> desktop_run(), never
@@ -593,7 +666,7 @@ void sched_init(void) {
      * page faults/GPFs right as the desktop launched) before adding this. */
     t->pin_core = mycore();
     t->affinity = ~0u;           /* pin_core already governs task 0; affinity is just the default (M1557) */
-    current = t;
+    CUR_SLOT = t;
     task_t *idle = task_create(idle_loop, read_cr3(), 0);   /* the BSP's always-runnable floor (heap is up: kheap_init precedes sched_init); task_create already defaults its affinity to ~0u */
     idle->pin_core = mycore();                              /* never let another core pick this up (M1531) */
     idle->is_floor = 1;
@@ -610,7 +683,7 @@ void task_register_ap_core(void) {
     while (!__atomic_load_n(&g_sched_ready, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
     int c = mycore();
     task_t *self = kzalloc(sizeof(task_t));
-    self->id = next_id++;
+    self->id = __atomic_fetch_add(&next_id, 1, __ATOMIC_RELAXED);
     self->state = TASK_RUNNING;
     self->weight = NICE0_WEIGHT;
     self->vruntime = g_min_vruntime;
@@ -624,7 +697,7 @@ void task_register_ap_core(void) {
     self->last_in = timer_ms();
 
     task_t *idle = kzalloc(sizeof(task_t));
-    idle->id = next_id++;
+    idle->id = __atomic_fetch_add(&next_id, 1, __ATOMIC_RELAXED);
     idle->state = TASK_READY;
     idle->entry = idle_loop;
     idle->weight = NICE0_WEIGHT;
@@ -687,25 +760,30 @@ task_t *task_create(void (*entry)(void), uint64_t cr3, void *proc) {
  * vfork parent-suspension made the child's first instants far more likely to
  * win, which is how it finally became reproducible. Create it stopped, finish
  * the context, then task_cont it. */
+/* STOPPED FROM BIRTH. This used to create the task READY -- linked into the
+ * ring -- and flip it to STOPPED in a second critical section, so a core
+ * already in switch_to_next could pick it in between, and it usually won:
+ * it starts at the minimum vruntime. The thread child then died at its
+ * trampoline with no start frame, and a fork child ran with %fs = 0 -- the
+ * M2099 %fs:0x28 fault signature. The state is now set before the ring
+ * insert, so there is no window to win. */
+static task_t *task_create_stack_as(void (*entry)(void), uint64_t cr3, void *proc, int stack_size,
+                                    int state);
 task_t *task_create_stack_suspended(void (*entry)(void), uint64_t cr3, void *proc, int stack_size) {
-    task_t *t = task_create_stack(entry, cr3, proc, stack_size);
-    if (!t) return 0;
-    uint64_t f = irq_save();
-    rq_lock_take();
-    /* Only if it has not already been picked up -- and if it has, the caller's
-     * copies are racing anyway, so say nothing and let task_cont be a no-op. */
-    if (t->state == TASK_READY) t->state = TASK_STOPPED;
-    rq_lock_give();
-    irq_restore(f);
-    return t;
+    return task_create_stack_as(entry, cr3, proc, stack_size, TASK_STOPPED);
 }
 
 task_t *task_create_stack(void (*entry)(void), uint64_t cr3, void *proc, int stack_size) {
+    return task_create_stack_as(entry, cr3, proc, stack_size, TASK_READY);
+}
+
+static task_t *task_create_stack_as(void (*entry)(void), uint64_t cr3, void *proc, int stack_size,
+                                    int state) {
     task_t *t = kzalloc(sizeof(task_t));
     if (!t) return 0;                        /* OOM: fail cleanly rather than deref NULL */
-    t->id = next_id++;
+    t->id = __atomic_fetch_add(&next_id, 1, __ATOMIC_RELAXED);   /* every core creates tasks */
     t->entry = entry;
-    t->state = TASK_READY;
+    t->state = state;                        /* before the ring insert: see above */
     t->weight = NICE0_WEIGHT;   /* CFS: born at nice 0 (M1171) — must be non-zero before any vruntime charge */
     t->vruntime = g_min_vruntime;  /* start at the floor: don't dominate (vruntime 0) or starve */
     t->cr3 = cr3;             /* set BEFORE the ring insert: no startup race */
@@ -910,7 +988,7 @@ static void switch_to_next(void) {
         next->rq_wait_ms += now - next->ready_since;
         next->ready_since = 0;
     }
-    current = next;
+    CUR_SLOT = next;
     g_nr_switches++;                              /* a real switch happened (next != prev guaranteed above) — /proc/stat ctxt (M1253) */
 
     next->last_in = now;                          /* stamp switch-in (prev was already charged above) */
@@ -921,9 +999,8 @@ static void switch_to_next(void) {
     /* switch address space if the next task lives in a different one. Safe to
      * do here: kernel code, this stack (heap), and the GDT/IDT/TSS are mapped
      * in every address space, so execution continues seamlessly. */
-    if (next->cr3 && next->cr3 != active_cr3) {
-        active_cr3 = next->cr3;
-        load_cr3(next->cr3);
+    {   uint64_t want = task_want_cr3(next);
+        if (want && want != active_cr3) { active_cr3 = want; load_cr3(want); }
     }
     if (next->kstack_top)
         tss_set_rsp0(next->kstack_top);     /* traps from ring 3 land here */
@@ -1054,6 +1131,16 @@ static int task_on_a_cpu(task_t *t) {
     return 0;
 }
 
+/* For a reaper: is `t` still executing (or mid-switch) on some core? */
+int task_is_on_cpu(task_t *t) {
+    uint64_t f = irq_save();
+    rq_lock_take();
+    int on = t ? task_on_a_cpu(t) : 0;
+    rq_lock_give();
+    irq_restore(f);
+    return on;
+}
+
 void task_wake(task_t *t) {
     uint64_t f = irq_save();
     rq_lock_take();
@@ -1174,6 +1261,18 @@ void task_sleep_ms(uint64_t ms) {
         return;
     }
     uint64_t f = irq_save();
+    /* Under the run-queue lock, like task_block_timeout. Setting BLOCKED
+     * without it raced the scheduler's own state changes, and a deferred stop
+     * (stop_pending, M2094) was never honoured: poll, epoll_wait and
+     * nanosleep all sleep through here, so a thread parked in one of them kept
+     * running after exit_group. */
+    rq_lock_take();
+    if (current->stop_pending) {
+        current->stop_pending = 0;
+        rq_lock_give();
+        irq_restore(f);
+        task_exit();
+    }
     current->wchan = (uint64_t)__builtin_return_address(0);   /* the sleep's caller, for WCHAN (M1166) */
     /* NANOSECONDS, NOT MILLISECONDS (M2341).
      *
@@ -1192,6 +1291,7 @@ void task_sleep_ms(uint64_t ms) {
     current->wake_at = timer_ns() + ms * 1000000ull;   /* 0 ms still parks until the next scan */
     task_sleep_hint_ns(current->wake_at);              /* M2342 */
     current->state = TASK_BLOCKED;
+    rq_lock_give();
     switch_to_next();                             /* yields; woken by the timer scan */
     irq_restore(f);
 }
@@ -1217,8 +1317,15 @@ void task_sleep_ms(uint64_t ms) {
 static volatile uint64_t g_next_wake_ns;
 
 void task_sleep_hint_ns(uint64_t when) {
+    /* A compare-and-swap minimum: a load and a separate store let two
+     * sleepers both pass the test and the LATER deadline land last, so the
+     * earlier sleeper overslept. Every caller also holds the run-queue lock,
+     * as the rebuild in task_wake_sleepers does, so the rebuild cannot
+     * overwrite a hint set concurrently either. */
     uint64_t cur_hint = __atomic_load_n(&g_next_wake_ns, __ATOMIC_RELAXED);
-    if (!cur_hint || when < cur_hint) __atomic_store_n(&g_next_wake_ns, when, __ATOMIC_RELAXED);
+    while (!cur_hint || when < cur_hint)
+        if (__atomic_compare_exchange_n(&g_next_wake_ns, &cur_hint, when, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
 }
 
 void task_wake_sleepers(void) {
@@ -1268,15 +1375,22 @@ static uint64_t load_next_ms;     /* next 5 s sample boundary */
 
 /* Tasks that want the CPU right now: RUNNING or READY, idle floor excluded.
  * Walks the (tiny) ready ring; safe from the IRQ as task_wake_sleepers does. */
+/* The run-queue lock is taken with interrupts OFF, always: a timer tick on
+ * this core while it is held would enter switch_to_next and spin on a lock
+ * its own core owns. These three counters ran with interrupts on (the system
+ * monitor calls task_count from task 0), which is a BSP deadlock. */
 int task_runnable_count(void) {
-    if (!current) return 0;
+    task_t *me = current;
+    if (!me) return 0;
+    uint64_t f = irq_save();
     rq_lock_take();
-    int n = 0; task_t *t = current;
+    int n = 0; task_t *t = me;
     do {
         if (!t->is_floor && (t->state == TASK_RUNNING || t->state == TASK_READY)) n++;
         t = t->next;
-    } while (t != current);
+    } while (t != me);
     rq_lock_give();
+    irq_restore(f);
     return n;
 }
 
@@ -1593,9 +1707,22 @@ void task_report_why_idle(task_t *t) {
 void task_cont(task_t *t) {
     uint64_t f = irq_save();
     rq_lock_take();
-    if (t && t->state == TASK_STOPPED) {
+    if (t && t->state == TASK_STOPPED && !task_on_a_cpu(t)) {
         t->state = TASK_READY;
         sched_place_wake(t);            /* a long-stopped task rejoins at the floor, not dominating (M1171) */
+    } else if (t && t->state == TASK_STOPPED) {
+        /* STOPPED, but its core has not switched it out yet -- a SIGCONT
+         * that arrived right behind the SIGSTOP. Making it READY now lets
+         * another core resume its saved rsp while it is still running on
+         * that stack: two cores, one stack. The same case task_wake meets
+         * (M1995), and the same answer: hand it to the sleeper scan, which
+         * skips tasks still on a core and makes it READY the moment this
+         * one is off. A timed wake with nothing pending, so a later
+         * task_block is not cut short. */
+        t->state = TASK_BLOCKED;
+        t->wake_at = timer_ns();
+        if (!t->wake_at) t->wake_at = 1;           /* 0 means "not a timed sleep" */
+        task_sleep_hint_ns(t->wake_at);
     }
     rq_lock_give();
     irq_restore(f);
@@ -1631,7 +1758,7 @@ void task_exit(void) {
     if (!next) next = floor_task[mycore()];
 
     next->state = TASK_RUNNING;
-    current = next;
+    CUR_SLOT = next;
     next->last_in = timer_ms();   /* stamp switch-in so its CPU time isn't over-counted from a stale last_in */
     next->nswitch++;
     rq_lock_give();
@@ -1641,9 +1768,8 @@ void task_exit(void) {
      * which is unsafe the moment that CR3 is reclaimed (vmm_destroy on an app
      * exit) — `next` would be running on freed page tables. With this, an app's
      * CR3 is never the active one by the time the WM reaps it. */
-    if (next->cr3 && next->cr3 != active_cr3) {
-        active_cr3 = next->cr3;
-        load_cr3(next->cr3);
+    {   uint64_t want = task_want_cr3(next);   /* a cr3-0 kthread gets the kernel's, not the dead app's */
+        if (want && want != active_cr3) { active_cr3 = want; load_cr3(want); }
     }
     if (next->kstack_top)
         tss_set_rsp0(next->kstack_top);
@@ -1734,12 +1860,15 @@ void sched_selftest(void) {
 }
 
 int task_count(void) {
-    if (!current) return 0;                  /* ring not built yet */
+    task_t *me = current;
+    if (!me) return 0;                       /* ring not built yet */
+    uint64_t f = irq_save();                 /* see task_runnable_count */
     rq_lock_take();
     int n = 0;
-    task_t *t = current;
-    do { if (t->state != TASK_DEAD) n++; t = t->next; } while (t != current);
+    task_t *t = me;
+    do { if (t->state != TASK_DEAD) n++; t = t->next; } while (t != me);
     rq_lock_give();
+    irq_restore(f);
     return n;
 }
 
@@ -1826,12 +1955,15 @@ void task_percore_times(int core, uint64_t *user_ms, uint64_t *sys_ms, uint64_t 
  * The runnable count is the existing task_runnable_count() (M1148). */
 int task_blocked_count(void) {
     int b = 0;
-    if (current) {
+    task_t *me = current;
+    if (me) {
+        uint64_t f = irq_save();             /* see task_runnable_count */
         rq_lock_take();
-        task_t *t = current;
+        task_t *t = me;
         do { if (!t->is_floor && t->state == TASK_BLOCKED) b++;
-             t = t->next; } while (t != current);
+             t = t->next; } while (t != me);
         rq_lock_give();
+        irq_restore(f);
     }
     return b;
 }

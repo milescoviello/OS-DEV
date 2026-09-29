@@ -373,6 +373,9 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXO_APPEND 02000
 #define LXO_NONBLOCK 04000        /* Linux O_NONBLOCK (M2009) */
 #define LXO_CLOEXEC 02000000      /* Linux O_CLOEXEC */
+#define LXO_EXCL       0200
+#define LXO_DIRECTORY  0200000
+#define LXO_NOFOLLOW   0400000
 
 /* Linux's x86-64 `struct stat` -- 144 bytes, and the field OFFSETS are the ABI.
  * Writing our own struct layout here would compile fine and hand glibc
@@ -548,16 +551,23 @@ static const char *lx_fd_prefix_rewrite(const char *p, char *out, int max) {
  * different files. */
 static unsigned long g_path_trunc;
 unsigned long lx_path_truncations(void) { return g_path_trunc; }
-static void lx_path_truncated(const char *want, const char *got, int max) {
+/* What a translation that did not fit resolves to: a name under /proc, which
+ * procfs owns and which nothing can create, write, rename or delete. So the
+ * call FAILS instead of acting on whatever the cut-off prefix names -- the
+ * diagnostic below used to be all there was, and the open, unlink or rename
+ * went ahead on a different file. */
+static const char g_lx_toolong[] = "/proc/.path-too-long";
+static const char *lx_path_truncated(const char *want, const char *got, int max) {
     g_path_trunc++;
-    if (g_path_trunc > 8) return;
+    if (g_path_trunc > 8) return g_lx_toolong;
     int n = 0; while (want && want[n]) n++;
     app_t *a = app_current();
     kprintf("[linuxabi] path TRUNCATED #%lu by pid %d: %d chars asked for, %d is the limit "
-            "(+%d for the mount prefix) -- this NAMES A DIFFERENT FILE.\n"
-            "           wanted \"%s\"\n           opened \"%s\"\n",
+            "(+%d for the mount prefix) -- REFUSED, since the cut-off name is a different file.\n"
+            "           wanted \"%s\"\n           cut to \"%s\"\n",
             g_path_trunc, a ? app_pid_of(a) : -1, n, max - 1, LX_ROOT_LEN,
             want ? want : "(null)", got ? got : "(null)");
+    return g_lx_toolong;
 }
 
 static const char *lx_xlate(const char *p, char *out, int max) {
@@ -612,7 +622,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
          * chain against a 16 KB kernel stack -- so it is its own milestone.
          * Until then, say so: a wrong answer that announces itself can be
          * found, and this one could not. */
-        if (p[pi]) lx_path_truncated(p, out, max);
+        if (p[pi]) return lx_path_truncated(p, out, max);
         /* A TRAILING SLASH IS NOT A CHARACTER THE PATH WALKER FORGIVES, and
          * "/" is the path a program is most likely to hand us: the root itself
          * became "/disk2/", which resolved to nothing. Claude Code checks its
@@ -643,7 +653,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
     if (n && out[n - 1] != '/' && n < max - 1) out[n++] = '/';
     int ri; for (ri = 0; p[ri] && n < max - 1; ri++) out[n++] = p[ri];
     out[n] = 0;
-    if (cwd[ci] || p[ri]) lx_path_truncated(p, out, max);   /* M2197: this branch had no diagnostic */
+    if (cwd[ci] || p[ri]) return lx_path_truncated(p, out, max);   /* M2197: this branch had no diagnostic */
     while (n > 1 && out[n - 1] == '/') out[--n] = 0;      /* same rule for a relative path */
     return out;
 }
@@ -673,6 +683,67 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * old cwd-relative behaviour. The stored fd path is ALREADY kernel-side
  * (/disk2/...), so it must not be translated a second time. */
 #define LX_AT_FDCWD (-100)
+#define LX_AT_SYMLINK_NOFOLLOW 0x100   /* fstatat/statx: stat the name, not a symlink's target */
+#define LX_AT_EMPTY_PATH 0x1000      /* the dirfd itself: how glibc's fstat() and Rust's metadata() ask */
+/* A STRING ARGUMENT IS VALIDATED TO ITS TERMINATOR, NOT ITS FIRST BYTE. Paths,
+ * socket names and argv/envp were checked with vmm_user_ok(p, 1) and then read
+ * until NUL, so a string running into an unmapped page faulted IN RING 0 --
+ * which panics the machine -- where Linux returns EFAULT. vmm_user_str_ok
+ * checks page by page up to the NUL (faulting demand pages in, so a valid
+ * string in not-yet-touched memory is still accepted). */
+#define LX_STRMAX     4096u          /* PATH_MAX */
+
+/* A DIRECTORY READ IS A SNAPSHOT (getdents64). The descriptor's offset used
+ * to be an index into a listing rebuilt on every call, so when a caller
+ * deleted what it had just read -- `rm -r`, `git clean` -- the remaining
+ * entries shifted down past the index and were never returned: files were
+ * left behind and the final rmdir failed. The listing taken at offset 0 is
+ * kept, per (pid, fd, path), until the read reaches its end. */
+#define LX_DSNAP_N 8
+static struct { int pid, fd; char path[128]; vfs_dirent *ents; int n; unsigned long used; } g_dsnap[LX_DSNAP_N];
+static volatile int g_dsnap_lk;
+static unsigned long g_dsnap_clk;
+static uint64_t dsnap_lock(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_dsnap_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static void dsnap_unlock(uint64_t f) {
+    __atomic_store_n(&g_dsnap_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+static int dsnap_key(int i, int pid, int fd, const char *path) {
+    if (!g_dsnap[i].ents || g_dsnap[i].pid != pid || g_dsnap[i].fd != fd) return 0;
+    int k = 0; while (path[k] && g_dsnap[i].path[k] == path[k]) k++;
+    return path[k] == 0 && g_dsnap[i].path[k] == 0;
+}
+/* Detach (pid, fd)'s snapshot, if any; the caller frees what comes back. */
+static vfs_dirent *dsnap_take(int pid, int fd, const char *path, int *n) {
+    uint64_t f = dsnap_lock();
+    vfs_dirent *e = 0;
+    for (int i = 0; i < LX_DSNAP_N; i++)
+        if (dsnap_key(i, pid, fd, path)) { e = g_dsnap[i].ents; *n = g_dsnap[i].n; g_dsnap[i].ents = 0; break; }
+    dsnap_unlock(f);
+    return e;
+}
+/* Keep `e` for (pid, fd); returns whatever it displaced, for the caller to free. */
+static vfs_dirent *dsnap_put(int pid, int fd, const char *path, vfs_dirent *e, int n) {
+    int pl = 0; while (path[pl]) pl++;
+    if (pl >= (int)sizeof g_dsnap[0].path) return e;          /* cannot key it: do not keep it */
+    uint64_t f = dsnap_lock();
+    int slot = -1; unsigned long oldest = ~0ul;
+    for (int i = 0; i < LX_DSNAP_N; i++) {
+        if (!g_dsnap[i].ents) { slot = i; break; }
+        if (g_dsnap[i].used < oldest) { oldest = g_dsnap[i].used; slot = i; }
+    }
+    vfs_dirent *old = g_dsnap[slot].ents;
+    g_dsnap[slot].ents = e; g_dsnap[slot].n = n; g_dsnap[slot].pid = pid; g_dsnap[slot].fd = fd;
+    for (int k = 0; k <= pl; k++) g_dsnap[slot].path[k] = path[k];
+    g_dsnap[slot].used = ++g_dsnap_clk;
+    dsnap_unlock(f);
+    return old;
+}
+#define LX_ARGSTRMAX  131072u        /* MAX_ARG_STRLEN: one argv/envp string */
 /* WHICH RESOLVER FILES DID GLIBC ACTUALLY LOOK AT (M2128).
  *
  * `getaddrinfo` fails inside OS-DEV while `lxinet`, which builds its own DNS
@@ -723,7 +794,7 @@ static const char *lx_xlate_at(long dirfd, const char *up, char *out, int max) {
     while (u[0] == '.' && u[1] == '/') u += 2;
     int k; for (k = 0; u[k] && p < max - 1; k++) out[p++] = u[k];
     out[p] = 0;
-    if (btrunc || u[k]) lx_path_truncated(up, out, max);    /* M2197: this join had no diagnostic */
+    if (btrunc || u[k]) return lx_path_truncated(up, out, max);    /* M2197: this join had no diagnostic */
     return out;
 }
 
@@ -1682,6 +1753,159 @@ void linux_syscall_dispatch(struct registers *r) {
     if (sc_nr < 512) g_syscycles[sc_nr] += dd;
     task_kernel_leave();               /* may not return: see task_t::in_kernel */
 }
+/* fstat(fd) into a struct stat buffer (kernel or already-validated user
+ * memory). 0 or a negative Linux errno. Shared by fstat, by fstatat and statx
+ * with AT_EMPTY_PATH -- which is how glibc 2.33+ implements fstat() and how
+ * Rust's File::metadata() asks -- so one descriptor gets one answer. */
+static long lx_fstat_fill(long a1, uint8_t *st) {
+    for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
+    /* stdio calls this on its own fds to decide buffering. Reporting a
+     * CHARACTER DEVICE is both true (they are the console) and what makes
+     * glibc pick line buffering instead of a full 4 KiB buffer -- with a
+     * regular-file answer, output would not appear until an explicit
+     * fflush or exit. */
+    if (a1 >= 0 && a1 <= 2) {
+        *(uint32_t *)(st + LXST_O_MODE) = LX_S_IFCHR | 0620;
+        *(uint64_t *)(st + LXST_O_RDEV) = 0x0501;          /* a tty-ish rdev */
+        *(uint64_t *)(st + LXST_O_NLINK) = 1;
+        *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
+        return 0;
+    } else {
+        /* A REAL fd. opendir() fstat()s the fd it just opened to confirm it
+         * is a directory before it will call getdents64 -- so returning
+         * EBADF here made every opendir() fail silently, with the directory
+         * fd already successfully created. The fd table remembers each
+         * FILE fd's path, so stat that. */
+        const char *fp = app_fd_path((int)a1);
+        struct statx sx;
+        if (!fp) {
+            /* A non-FILE fd -- a pipe, socket, eventfd and so on. Report a
+             * FIFO rather than EBADF: stdio calls fstat() on its own fds to
+             * pick a buffering mode, and an error there leaves it guessing.
+             * S_IFIFO is also the truthful answer for the pipe case, which
+             * is the one a shell pipeline depends on. */
+            if (!app_fd_is_open((int)a1)) { return -(long)LX_EBADF; }
+            /* EXCEPT A MEMFD, which is a REGULAR FILE -- an unlinked tmpfs
+             * one -- and every Wayland client depends on that being said.
+             * glibc's posix_fallocate fstat()s first and returns ESPIPE for
+             * a FIFO without attempting anything, so the shared-memory pool
+             * libwayland-cursor sizes that way was never sized at all, the
+             * mmap after it failed, and GDK reported the entire chain as
+             * one warning: "Failed to load cursor theme Adwaita". (M2000) */
+            long mfsz = app_memfd_size((int)a1);
+            if (mfsz >= 0) {
+                *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFREG | 0600u;
+                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)mfsz;
+                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                *(int64_t  *)(st + LXST_O_BLOCKS)  = (mfsz + 511) / 512;
+                *(uint64_t *)(st + LXST_O_INO)     = 0x2000ull + (uint64_t)a1;
+                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+                return 0;
+            }
+            /* AND A PTY IS A CHARACTER DEVICE, which is not a detail:
+             * glibc's grantpt() does
+             *
+             *     if (__fstat64 (fd, &st) < 0) return -1;
+             *     if (! S_ISCHR (st.st_mode)) { __set_errno (EINVAL); ... }
+             *
+             * so a pty master reported as a FIFO makes openpty() fail with
+             * EINVAL before it has even asked for the slave number -- which
+             * is exactly what happened after M2206 added TIOCGPTN and
+             * TIOCSPTLCK: `LXPTY: openpty failed: Invalid argument`. Two
+             * missing ioctls were not the whole reason a Linux binary could
+             * not get a pty; this was the third. ptsname_r checks the same
+             * thing. (M2211)
+             *
+             * rdev carries the real /dev/pts index in the minor, because
+             * ttyname() and a few TUI programs read it to find their own
+             * terminal: major 5 minor 2 is /dev/ptmx, major 136 is a pts
+             * slave, which is what Linux reports. */
+            /* AND A DRM RENDER NODE IS A CHARACTER DEVICE TOO (M2351),
+             * for exactly the same kind of reason as the pty above, in a
+             * library that is even stricter about it. libdrm's
+             * drmGetDevice2 -- which Mesa calls before it will load any
+             * driver -- starts with
+             *
+             *     if (fstat(fd, &sbuf)) return -errno;
+             *     maj = major(sbuf.st_rdev); min = minor(sbuf.st_rdev);
+             *     if (!drmNodeIsDRM(maj, min) || !S_ISCHR(sbuf.st_mode))
+             *             return -EINVAL;
+             *
+             * so a render node reported as a regular file is rejected
+             * before anything else is looked at, and the only symptom
+             * upstream is eglInitialize returning EGL_NOT_INITIALIZED with
+             * no explanation -- which is exactly what the first lxgl run
+             * got. Linux numbers DRM major 226, with render nodes from
+             * minor 128; this is renderD128. */
+            if (app_fd_type((int)a1) == 17) {
+                *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFCHR | 0666u;
+                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                *(uint64_t *)(st + LXST_O_RDEV)    = (226ull << 8) | 128ull;
+                *(int64_t  *)(st + LXST_O_SIZE)    = 0;
+                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                *(int64_t  *)(st + LXST_O_BLOCKS)  = 0;
+                *(uint64_t *)(st + LXST_O_INO)     = 0x3000ull;
+                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+                return 0;
+            }
+            {   long ptsn = app_pts_number((int)a1);
+                int is_pty = app_fd_type((int)a1) == 11;
+                if (is_pty) {
+                    *(uint32_t *)(st + LXST_O_MODE)  = LX_S_IFCHR | 0620u;
+                    *(uint64_t *)(st + LXST_O_NLINK) = 1;
+                    *(uint64_t *)(st + LXST_O_RDEV)  = (ptsn >= 0)
+                                                       ? ((5ull << 8) | 2ull)      /* the master: /dev/ptmx */
+                                                       : ((136ull << 8) | 0ull);   /* a slave: /dev/pts/N */
+                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
+                    *(uint64_t *)(st + LXST_O_INO)   = 0x3000ull + (uint64_t)a1;
+                    *(uint64_t *)(st + LXST_O_DEV)   = LX_FAKE_DEV;
+                    return 0;
+                }
+            }
+            *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
+            *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+            *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+            /* Per-fd, so two different pipes are not reported as the
+             * same file. The 0x1000 bias keeps these clear of the
+             * path-hash inodes vfs_stat hands out for real files. */
+            *(uint64_t *)(st + LXST_O_INO)     = 0x1000ull + (uint64_t)a1;
+            *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+            return 0;
+        }
+        if (vfs_stat(fp, &sx) != 0) { return -(long)LX_EBADF; }
+        int isdir = (sx.stx_mode & 0170000u) == 0040000u;
+        /* The REAL mode when the filesystem reported one -- ext2 does. An
+         * executable bit that is not reported is an executable that cannot be
+         * run, and a mode of 0644 on every file makes chmod look broken.
+         * (M1999) */
+        *(uint32_t *)(st + LXST_O_MODE)    = (sx.stx_mode & 07777u)
+                                             ? sx.stx_mode
+                                             : (isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u));
+        /* The REAL link count, not a constant 1 (M1998). A directory
+         * always has at least two links ("." and its entry in its parent);
+         * find(1) subtracts 2 from st_nlink to decide how many
+         * subdirectories are left to visit and walks a negative number of
+         * them. A hardlinked file reported 1 too, so nothing could tell
+         * that two names were the same file. */
+        *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);
+        *(int64_t  *)(st + LXST_O_ATIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_MTIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_CTIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
+        *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+        *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
+        /* A REAL inode, not a constant. ld.so decides "is this object
+         * already loaded?" by comparing (st_dev, st_ino) -- reporting 1
+         * for everything made it map libbfd and then skip libz, libzstd
+         * and libc as duplicates of it, and the only symptom was
+         * `undefined symbol: free, version GLIBC_2.2.5`. (M1955) */
+        *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;
+        *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+        return 0;
+    }
+}
+
 static void lx_dispatch_body(struct registers *r) {
     /* WHICH RING SLOT THIS CALL OWNS -- a LOCAL, not a shared cursor (M2003).
      *
@@ -1743,7 +1967,7 @@ static void lx_dispatch_body(struct registers *r) {
         int pa = lx_path_arg(re->nr);
         if (pa) {
             uint64_t up = (pa == 1) ? r->rdi : r->rsi;
-            if (up && vmm_user_ok(up, 1)) {
+            if (up && vmm_user_str_ok(up, LX_STRMAX)) {
                 const char *sp = (const char *)up;
                 int ci = 0;
                 while (ci < (int)sizeof re->path - 1 && sp[ci]) { re->path[ci] = sp[ci]; ci++; }
@@ -1930,7 +2154,7 @@ static void lx_dispatch_body(struct registers *r) {
         /* shm_unlink(3) is unlink("/dev/shm/NAME"). Firefox creates its segment
          * with O_EXCL and unlinks it immediately, so without this the next
          * process to want that name collides with a ghost. (M2008) */
-        if (r->rdi && vmm_user_ok(r->rdi, 1)) {
+        if (r->rdi && vmm_user_str_ok(r->rdi, LX_STRMAX)) {
             const char *up_ = (const char *)r->rdi;
             const char *t_ = "/dev/shm/";
             int k_ = 0; while (t_[k_] && up_[k_] == t_[k_]) k_++;
@@ -1940,25 +2164,43 @@ static void lx_dispatch_body(struct registers *r) {
                 break;
             }
         }
+        __attribute__((fallthrough));
     case LXS_unlinkat_: {                   /* (dirfd, path, flags) */
-        /* unlinkat shifts its arguments one right, exactly like faccessat. */
-        uint64_t up = (r->rax == LXS_unlink_) ? r->rdi : r->rsi;
+        /* unlinkat shifts its arguments one right, exactly like faccessat --
+         * and plain unlink has NO dirfd: it used to pass rdi, the path
+         * pointer itself, as one, so a relative unlink resolved against a
+         * garbage descriptor. */
+        int is_at = (r->rax == LXS_unlinkat_);
+        uint64_t up = is_at ? r->rsi : r->rdi;
         const char *upath = (const char *)up;
-        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX];
+        const char *path = lx_xlate_at(is_at ? (long)r->rdi : LX_AT_FDCWD, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        /* AT_REMOVEDIR (0x200) is rmdir; without it a directory is EISDIR.
+         * And say WHY a removal failed: everything used to be ENOENT, so
+         * `rm -r` could not tell a non-empty directory from a missing one. */
+        struct statx rsx;
+        if (vfs_lstat(path, &rsx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        int isdir = (rsx.stx_mode & 0170000u) == 0040000u;
+        int rmdir = is_at && (r->rdx & 0x200);
+        if (isdir && !rmdir) { r->rax = (uint64_t)-(long)LX_EISDIR; break; }
+        if (!isdir && rmdir) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
         /* gcc writes its intermediate .s to a mkstemp'd name and unlinks it
          * when done; without this the driver reported
          * "gcc: error: ./ccXXXXXX.s: Function not implemented" and stopped
          * before it ever ran the assembler. (M1960) */
-        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
+        if (vfs_remove(path) == 0) { r->rax = 0; break; }
+        r->rax = (uint64_t)-(long)(isdir ? LX_ENOTEMPTY : LX_EIO);   /* it exists, so not ENOENT */
         break;
     }
     case LXS_mkdir_:                        /* (path, mode) */
     case LXS_mkdirat_: {                    /* (dirfd, path, mode) */
-        uint64_t up = (r->rax == LXS_mkdir_) ? r->rdi : r->rsi;   /* mkdirat shifts right */
+        int mk_at = (r->rax == LXS_mkdirat_);
+        uint64_t up = mk_at ? r->rsi : r->rdi;   /* mkdirat shifts right */
         const char *upath = (const char *)up;
-        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        char xp[VFS_PATH_MAX];
+        const char *path = lx_xlate_at(mk_at ? (long)r->rdi : LX_AT_FDCWD, upath, xp, sizeof xp);   /* dirfd (M2032); mkdir has none */
         /* A TRAILING SLASH is legal in mkdir(2) -- `mkdir -p o/kernel/` passes
          * one straight through -- and our VFS path walker treats it as an
          * extra empty component and fails. Strip it here rather than in
@@ -2032,10 +2274,13 @@ static void lx_dispatch_body(struct registers *r) {
          * copy-and-rename or gives up. (M1999) */
         uint64_t uo = (r->rax == LXS_link_) ? r->rdi : r->rsi;
         uint64_t un = (r->rax == LXS_link_) ? r->rsi : r->r10;
-        if (!uo || !un || !vmm_user_ok(uo, 1) || !vmm_user_ok(un, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!uo || !un || !vmm_user_str_ok(uo, LX_STRMAX) || !vmm_user_str_ok(un, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xo[VFS_PATH_MAX], xn[VFS_PATH_MAX];
-        const char *op = lx_xlate((const char *)uo, xo, sizeof xo);
-        const char *np = lx_xlate((const char *)un, xn, sizeof xn);
+        /* Each name relative to its own dirfd, as linkat defines. */
+        long odir = (r->rax == LXS_link_) ? LX_AT_FDCWD : (long)r->rdi;
+        long ndir = (r->rax == LXS_link_) ? LX_AT_FDCWD : (long)r->rdx;
+        const char *op = lx_xlate_at(odir, (const char *)uo, xo, sizeof xo);
+        const char *np = lx_xlate_at(ndir, (const char *)un, xn, sizeof xn);
         r->rax = (uint64_t)(vfs_link(op, np) == 0 ? 0 : -(long)LX_EPERM);
         break;
     }
@@ -2049,9 +2294,10 @@ static void lx_dispatch_body(struct registers *r) {
          * Getting it backwards produces links that point at themselves. */
         uint64_t ut = r->rdi;
         uint64_t ul = (r->rax == LXS_symlink_) ? r->rsi : r->rdx;
-        if (!ut || !ul || !vmm_user_ok(ut, 1) || !vmm_user_ok(ul, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!ut || !ul || !vmm_user_str_ok(ut, LX_STRMAX) || !vmm_user_str_ok(ul, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xl[VFS_PATH_MAX];
-        const char *lp = lx_xlate((const char *)ul, xl, sizeof xl);
+        long ldir = (r->rax == LXS_symlink_) ? LX_AT_FDCWD : (long)r->rsi;   /* symlinkat's newdirfd */
+        const char *lp = lx_xlate_at(ldir, (const char *)ul, xl, sizeof xl);
         /* The TARGET is not translated: it is the link's contents, a string
          * interpreted later in the process's own view of the filesystem, and
          * rewriting it into /disk2/... would bake our mount point into a file
@@ -2069,17 +2315,44 @@ static void lx_dispatch_body(struct registers *r) {
          * UTIME_NOW is 0x3fffffff and UTIME_OMIT is 0x3ffffffe, in the
          * NANOSECONDS field -- a value that is not a time at all, which is why
          * they have to be recognised before the seconds are used. */
-        if (!r->rsi || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* A NULL PATH IS THE DESCRIPTOR ITSELF: that is futimens(), which
+         * glibc implements as utimensat(fd, NULL, times, 0) and which cp -p,
+         * tar and rsync use on the file they just wrote. It was EFAULT. The
+         * dirfd was ignored too, so a relative name resolved against the
+         * working directory instead of the directory it was given. */
+        if (r->r10 & ~(uint64_t)(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         char xu[VFS_PATH_MAX];
-        const char *up2 = lx_xlate((const char *)r->rsi, xu, sizeof xu);
+        const char *up2 = 0;
+        int of_fd = !r->rsi;
+        if (!of_fd) {
+            if (!vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            if (!((const char *)r->rsi)[0]) {
+                if (!(r->r10 & LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+                of_fd = 1;
+            }
+        }
+        if (of_fd) {
+            if ((long)a1 == LX_AT_FDCWD) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }   /* Linux: no file named */
+            if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            up2 = app_fd_path((int)a1);
+        } else {
+            up2 = lx_xlate_at((long)a1, (const char *)r->rsi, xu, sizeof xu);
+        }
+        /* "Now" is the clock clock_gettime reports, not a fresh RTC read that
+         * can differ from it by up to a second -- make compares the two. */
         long at = -1, mt = -1;                       /* -1 = leave alone */
-        if (!r->rdx) { at = (long)(rtc_unix()); mt = at; }
+        long now = (long)lx_realtime_sec();
+        if (!r->rdx) { at = now; mt = now; }
         else if (vmm_user_ok(r->rdx, 32)) {
             const int64_t *ts = (const int64_t *)r->rdx;
-            long now = (long)rtc_unix();
+            int bad = 0;
+            for (int k = 1; k <= 3; k += 2)
+                if (ts[k] != 0x3fffffff && ts[k] != 0x3ffffffe && (ts[k] < 0 || ts[k] >= 1000000000)) bad = 1;
+            if (bad) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
             at = (ts[1] == 0x3fffffff) ? now : (ts[1] == 0x3ffffffe ? -1 : (long)ts[0]);
             mt = (ts[3] == 0x3fffffff) ? now : (ts[3] == 0x3ffffffe ? -1 : (long)ts[2]);
         } else { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up2) { r->rax = 0; break; }             /* a pipe or socket: no file time to keep */
         r->rax = (uint64_t)(vfs_utimes(up2, at, mt) == 0 ? 0 : -(long)LX_ENOENT);
         break;
     }
@@ -2093,9 +2366,14 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_rmdir_: {                      /* (path) */
         const char *upath = (const char *)r->rdi;
-        if (!upath || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
-        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
+        /* The real reason, as unlinkat does: a non-empty directory is
+         * ENOTEMPTY (what rm -r and git clean act on), not ENOENT. */
+        struct statx dsx;
+        if (vfs_lstat(path, &dsx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        if ((dsx.stx_mode & 0170000u) != 0040000u) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOTEMPTY);
         break;
     }
     case LXS_fchdir_: {                     /* (fd) */
@@ -2114,7 +2392,7 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_chdir_: {                      /* (path) */
         const char *up = (const char *)r->rdi;
-        if (!up || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
         if (vfs_chdir(path) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
         app_chdir_track(path);              /* keep getcwd's answer in step */
@@ -2173,6 +2451,7 @@ static void lx_dispatch_body(struct registers *r) {
             lx_fatal_record(app_sys_getpid(), sig);
             lx_trace_dump(sig == 6 ? "abort()" : "the fatal signal");
             lx_user_backtrace(r);
+            app_note_kill_sig(sig);             /* a signal death, for the parent's wait status */
             app_sys_exit(128 + sig);
             break;
         }
@@ -2212,11 +2491,33 @@ static void lx_dispatch_body(struct registers *r) {
          * unlike struct stat. Node stats constantly, and an ENOSYS here makes
          * libuv fall back -- but reporting the size correctly is cheap. */
         const char *up = (const char *)r->rsi;
-        if (!up || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
         struct statx sx;
-        if (vfs_stat(path, &sx) != 0) {
+        int st_rc = -1;
+        if (!up[0]) {                       /* AN EMPTY PATH: see LXS_newfstatat */
+            if (!(r->rdx & LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+            if ((long)r->rdi != LX_AT_FDCWD) {
+                /* The descriptor itself, answered exactly as fstat answers it
+                 * -- a pipe is a FIFO, a memfd a regular file, a pty or DRM
+                 * node a character device -- then carried over field by field. */
+                uint8_t tst[LXST_SIZE];
+                long frc = lx_fstat_fill((long)r->rdi, tst);
+                if (frc < 0) { r->rax = (uint64_t)frc; break; }
+                for (unsigned i = 0; i < sizeof sx; i++) ((char *)&sx)[i] = 0;
+                sx.stx_mode  = *(uint32_t *)(tst + LXST_O_MODE);
+                sx.stx_nlink = (unsigned)*(uint64_t *)(tst + LXST_O_NLINK);
+                sx.stx_size  = (unsigned long)*(int64_t *)(tst + LXST_O_SIZE);
+                sx.stx_ino   = (unsigned)*(uint64_t *)(tst + LXST_O_INO);
+                sx.stx_mtime = (unsigned long)*(int64_t *)(tst + LXST_O_MTIME);
+                sx.stx_rdev  = *(uint64_t *)(tst + LXST_O_RDEV);
+                st_rc = 0;
+            } else up = ".";                /* AT_FDCWD: the working directory itself */
+        }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
+        if (st_rc != 0)
+            st_rc = (r->rdx & LX_AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &sx) : vfs_stat(path, &sx);   /* see LXS_lstat_ */
+        if (st_rc != 0) {
             /* Name BOTH spellings. A stat that fails on a path the program
              * believes in is nearly always a TRANSLATION problem, and the
              * translated form is the only place that shows. (M1992) */
@@ -2357,7 +2658,13 @@ static void lx_dispatch_body(struct registers *r) {
              * wait4's options and openat's dirfd -- a request accepted and not
              * actually honourable. */
             if (port == 0) { r->rax = (uint64_t)-(long)LX_ECONNREFUSED; break; }
+            /* sti around the network call: it waits on tick deadlines (ARP, SYN, an
+             * accept with nothing pending), and ticks advance only in the BSP's
+             * timer interrupt. With the syscall's IF=0 the deadline never came on
+             * the BSP -- that core spun forever and froze the clock machine-wide. */
+            __asm__ volatile("sti");
             int crc = app_connect((int)a1, ip, port);
+            __asm__ volatile("cli");
             /* ALWAYS, not only under a trace flag (M2004). An outbound
              * connection is a rare, structural event, and "which address did it
              * actually try, and did it get there" is the first question when a
@@ -2402,9 +2709,14 @@ static void lx_dispatch_body(struct registers *r) {
     case LXS_accept4_: {                    /* (fd, sockaddr *, addrlen *[, flags]) */
         int is4 = (r->rax == LXS_accept4_);          /* rax still holds the syscall number here */
         if (app_fd_type((int)a1) == 15) {            /* AF_INET listener (M2020) */
+            __asm__ volatile("sti");                 /* waits on tick deadlines: see connect */
             int af = app_inet_accept((int)a1);
+            __asm__ volatile("cli");
             if (af < 0) { r->rax = (uint64_t)lx_fd_err(af); break; }
-            if (is4) app_fd_set_nonblock(af, (r->r10 & 0x800) ? 1 : 0);
+            /* SOCK_NONBLOCK / SOCK_CLOEXEC for accept4; plain accept inherits
+             * NEITHER from the listener on Linux (the new fd is blocking). */
+            app_fd_set_nonblock(af, (is4 && (r->r10 & 0x800)) ? 1 : 0);
+            if (is4 && (r->r10 & LXO_CLOEXEC)) app_fd_set_cloexec(af, 1);
             if (r->rsi && vmm_user_ok(r->rsi, 16)) {   /* fill in a plausible peer address */
                 uint8_t *o = (uint8_t *)r->rsi;
                 for (int i = 0; i < 16; i++) o[i] = 0;
@@ -2423,7 +2735,8 @@ static void lx_dispatch_body(struct registers *r) {
          * a loop that retries on EAGAIN would spin on it forever. */
         if (nf < 0) { r->rax = (uint64_t)lx_fd_err(nf); break; }
         /* accept4's SOCK_NONBLOCK applies to the ACCEPTED fd, not the listener. */
-        if (is4) app_fd_set_nonblock(nf, (r->r10 & 0x800) ? 1 : 0);
+        app_fd_set_nonblock(nf, (is4 && (r->r10 & 0x800)) ? 1 : 0);   /* see the AF_INET branch */
+        if (is4 && (r->r10 & LXO_CLOEXEC)) app_fd_set_cloexec(nf, 1);
         if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 2;   /* addrlen: just the family */
         r->rax = (uint64_t)nf;
         break;
@@ -2568,7 +2881,9 @@ static void lx_dispatch_body(struct registers *r) {
         if (*(const uint16_t *)sa != 2 /*AF_INET*/) { r->rax = (uint64_t)-(long)LX_EAFNOSUPPORT; break; }
         uint16_t dport = (uint16_t)((sa[2] << 8) | sa[3]);       /* big-endian in the struct */
         uint8_t dip[4] = { sa[4], sa[5], sa[6], sa[7] };
+        __asm__ volatile("sti");                     /* ARP resolution waits on ticks: see connect */
         long sn = app_sendto((int)a1, dip, dport, (const void *)r->rsi, (int)slen);
+        __asm__ volatile("cli");
         if (g_lx_systrace)
             kprintf("[sock] sendto(fd %ld, %u.%u.%u.%u:%u, %ld) -> %ld\n",
                     a1, dip[0], dip[1], dip[2], dip[3], dport, slen, sn);
@@ -2642,11 +2957,19 @@ static void lx_dispatch_body(struct registers *r) {
             if (!vmm_user_ok(upoff, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             off = *(long *)upoff;
         }
-        static char sfbuf[4096];            /* the syscall path is serialized; see lx_emit */
+        /* A buffer PER CALL. This was one static 4 KiB buffer, commented as
+         * safe because "the syscall path is serialized" -- it is not: every
+         * core runs syscalls, and app_fd_write to a full pipe BLOCKS mid-copy
+         * with the buffer still in use, so even on one core a second process's
+         * sendfile refilled it. busybox cat uses sendfile by default, and
+         * `cat big | cat > out` came out corrupted. */
+        enum { SFBUF = 4096 };
+        char *sfbuf = (char *)kmalloc(SFBUF);
+        if (!sfbuf) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
         long total = 0;
         while ((unsigned long)total < count) {
             unsigned long want = count - (unsigned long)total;
-            if (want > sizeof sfbuf) want = sizeof sfbuf;
+            if (want > SFBUF) want = SFBUF;
             long got = (off >= 0) ? app_pread(ifd, sfbuf, want, off + total)
                                   : app_fd_read(ifd, sfbuf, want);
             if (got <= 0) { if (total == 0 && got < 0) total = got; break; }
@@ -2655,7 +2978,11 @@ static void lx_dispatch_body(struct registers *r) {
             total += put;
             if (put < got) break;           /* short write: stop, report what landed */
         }
+        kfree(sfbuf);
         if (total >= 0 && off >= 0) *(long *)upoff = off + total;
+        /* A native -1 is not an errno: returned raw it read as EPERM. */
+        if (total < 0)
+            total = -(long)((app_fd_is_open(ifd) && app_fd_is_open(ofd)) ? LX_EIO : LX_EBADF);
         r->rax = (uint64_t)total;
         break;
     }
@@ -2682,7 +3009,7 @@ static void lx_dispatch_body(struct registers *r) {
          * app_memfd_create has existed since M1212; it simply had no Linux
          * number. (M1977) */
         const char *nm = (const char *)r->rdi;
-        if (nm && !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (nm && !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         int mf = app_memfd_create(nm ? nm : "memfd", 0);
         if (mf < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
         if (r->rsi & 1) app_fd_set_cloexec(mf, 1);      /* MFD_CLOEXEC */
@@ -3244,7 +3571,7 @@ static void lx_dispatch_body(struct registers *r) {
          * "which thread" is the whole question, and every one of them announces
          * its own answer -- "IPC I/O Parent", "Compositor", "JS Helper". Keep
          * it and print it in the thread dump. PR_SET_VMA really is advisory. */
-        if (a1 == 15 /*PR_SET_NAME*/ && r->rsi && vmm_user_ok(r->rsi, 1))
+        if (a1 == 15 /*PR_SET_NAME*/ && r->rsi && vmm_user_str_ok(r->rsi, LX_STRMAX))
             task_set_name((const char *)r->rsi);
         r->rax = 0;
         break;
@@ -3300,8 +3627,17 @@ static void lx_dispatch_body(struct registers *r) {
      * matters: reading an absolute deadline as a relative one is the same
      * mistake M2010 fixed in FUTEX_WAIT_BITSET. */
     case LXS_timerfd_create_: {             /* (clockid, flags) */
+        /* REALTIME(0), MONOTONIC(1), BOOTTIME(7) and their _ALARM forms
+         * (8, 9) are what Linux accepts; anything else, and any flag but
+         * NONBLOCK|CLOEXEC, is EINVAL. The clock matters for TFD_TIMER_ABSTIME:
+         * a REALTIME deadline is an epoch time, and measuring it against
+         * uptime put it decades away. */
+        if (!(a1 == 0 || a1 == 1 || a1 == 7 || a1 == 8 || a1 == 9) || (r->rsi & ~(uint64_t)0x80800)) {
+            r->rax = (uint64_t)-(long)LX_EINVAL; break;
+        }
         int tfd = app_timerfd_create();
         if (tfd < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        app_timerfd_set_realtime(tfd, a1 == 0 || a1 == 8);
         if (r->rsi & 0x800)   app_fd_set_nonblock(tfd, 1);   /* TFD_NONBLOCK */
         if (r->rsi & 0x80000) app_fd_set_cloexec(tfd, 1);    /* TFD_CLOEXEC  */
         r->rax = (uint64_t)tfd;
@@ -3311,14 +3647,26 @@ static void lx_dispatch_body(struct registers *r) {
         if (!r->rdx) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(r->rdx, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         const int64_t *it = (const int64_t *)r->rdx;      /* {interval.sec,nsec, value.sec,nsec} */
+        /* What Linux refuses, refused: a negative time or a nanosecond field
+         * outside [0, 1e9). And seconds are capped (~31 years) so the
+         * conversion below cannot overflow into a negative delay, which would
+         * read as "disarm". */
+        if (it[0] < 0 || it[2] < 0 || it[1] < 0 || it[1] >= 1000000000 || it[3] < 0 || it[3] >= 1000000000) {
+            r->rax = (uint64_t)-(long)LX_EINVAL; break;
+        }
+        if ((r->rsi & ~(uint64_t)3) != 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }   /* ABSTIME | CANCEL_ON_SET only */
+        int64_t isec = it[0] > 1000000000ll ? 1000000000ll : it[0];
+        int64_t vsec = it[2] > 1000000000ll ? 1000000000ll : it[2];
         /* Round the nanoseconds UP, for the same reason the futex path does:
          * a sub-millisecond timer must not become a zero-millisecond one,
          * which reads as "disarm" and stops the loop it was driving. */
-        int64_t ival = it[0] * 1000 + (it[1] + 999999) / 1000000;
-        int64_t want = it[2] * 1000 + (it[3] + 999999) / 1000000;
+        int64_t ival = isec * 1000 + (it[1] + 999999) / 1000000;
+        int64_t want = vsec * 1000 + (it[3] + 999999) / 1000000;
         int64_t delay = want;
         if ((it[2] || it[3]) && (r->rsi & 1)) {           /* TFD_TIMER_ABSTIME */
-            int64_t now = (int64_t)timer_ms();
+            int64_t now = app_timerfd_is_realtime((int)a1)   /* the clock the deadline was read from */
+                ? (int64_t)lx_realtime_sec() * 1000 + (int64_t)(timer_ms() % 1000)
+                : (int64_t)timer_ms();
             delay = want - now;
             if (delay <= 0) delay = 1;                    /* already due: fire at once, not never */
         }
@@ -3353,6 +3701,7 @@ static void lx_dispatch_body(struct registers *r) {
         break;
     case LXS_epoll_create1_: {              /* (flags) */
         int efd = app_epoll_create();
+        if (efd >= 0 && (a1 & LXO_CLOEXEC)) app_fd_set_cloexec(efd, 1);   /* EPOLL_CLOEXEC: it was dropped */
         r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;
         break;
     }
@@ -3997,7 +4346,7 @@ static void lx_dispatch_body(struct registers *r) {
             uint64_t base = app_heap_base();
             if (lo < base) lo = base;
             app_set_break(lo);
-            r->rax = lo;
+            r->rax = app_sbrk(0);            /* the break actually set (page-rounded, >= lo) */
         }
         break;
     }
@@ -4025,6 +4374,14 @@ static void lx_dispatch_body(struct registers *r) {
             /* A DRM render-node object, addressed by the offset VIRTGPU_MAP
              * handed out. Like a memfd it has no path, so the file-backed
              * route below cannot serve it. (M2350) */
+            /* MAP_FIXED IS REFUSED FOR THESE, NOT IGNORED. Both paths pick
+             * their own address, so a caller that asked for a particular one
+             * used to get another -- the failure this handler's own rule
+             * above says must be an error. (MAP_FIXED_NOREPLACE is 0x100000.) */
+            int ty = (fd >= 0) ? app_fd_type(fd) : -1;
+            if ((ty == 17 || ty == 3) && (flags & (LX_MAP_FIXED | 0x100000))) {
+                r->rax = (uint64_t)-(long)LX_EINVAL; break;
+            }
             if (fd >= 0 && app_fd_type(fd) == 17) {
                 uint64_t db = app_mmap_drm(fd, (uint64_t)len, (uint64_t)r->r9);
                 if (g_lx_systrace)
@@ -4034,7 +4391,11 @@ static void lx_dispatch_body(struct registers *r) {
                 r->rax = db; break;
             }
             if (fd >= 0 && app_fd_type(fd) == 3) {
-                uint64_t mb = app_mmap_memfd(fd, (uint64_t)len, (uint64_t)r->r9);
+                int priv = !(flags & LX_MAP_SHARED);
+                /* A write-sealed object cannot be mapped shared and writable:
+                 * F_SEAL_WRITE (8) is the promise a receiver relies on. */
+                if (!priv && (prot & 2) && (app_memfd_seal(fd, 0) & 8)) { r->rax = (uint64_t)-(long)LX_EPERM; break; }
+                uint64_t mb = app_mmap_memfd_ex(fd, (uint64_t)len, (uint64_t)r->r9, (int)prot, priv);
                 if (g_lx_systrace)
                     kprintf("[lxmmap] memfd fd=%d len=%lx off=%lx -> %lx\n",
                             fd, (unsigned long)len, (unsigned long)r->r9, (unsigned long)mb);
@@ -4247,8 +4608,8 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_statfs_: case LXS_fstatfs_: {
         /* struct statfs is 120 bytes: f_type, f_bsize, f_blocks, f_bfree,
-         * f_bavail, f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags,
-         * f_spare[4] -- all 8-byte except the fsid pair. glib uses it to decide
+         * f_bavail, f_files, f_ffree, f_fsid (int[2], 8 bytes), f_namelen,
+         * f_frsize, f_flags, f_spare[4] -- fifteen 8-byte slots. glib uses it to decide
          * whether a directory is on a remote filesystem before it will watch
          * it; ENOSYS made every path look unwatchable. The numbers are the
          * ext2 volume's shape, rounded: honest enough for that decision and
@@ -4264,8 +4625,11 @@ static void lx_dispatch_body(struct registers *r) {
         f[4] = 280000;                       /* f_bavail */
         f[5] = 65536;                        /* f_files */
         f[6] = 60000;                        /* f_ffree */
-        f[9] = 255;                          /* f_namelen */
-        f[10] = 4096;                        /* f_frsize */
+        /* f[7] is f_fsid: fsid_t is int[2], ONE 8-byte slot, not two. This
+         * wrote f_namelen into f_frsize's slot and f_frsize into f_flags, so
+         * df scaled every size by 255 and pathconf(_PC_NAME_MAX) said 0. */
+        f[8] = 255;                          /* f_namelen */
+        f[9] = 4096;                         /* f_frsize */
         r->rax = 0;
         break;
     }
@@ -4302,7 +4666,7 @@ static void lx_dispatch_body(struct registers *r) {
          * (add_watch, add_watch, ppoll) burning a core with its window never
          * opening, and the ring is what showed it. The native watch mechanism
          * has existed since M1266; only the ABI spelling was missing. */
-        if (!r->rsi || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!r->rsi || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate((const char *)r->rsi, xp, sizeof xp);
         int wd = app_inotify_add((int)a1, path, (unsigned)r->rdx);
         r->rax = (wd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)wd;
@@ -4313,8 +4677,14 @@ static void lx_dispatch_body(struct registers *r) {
         break;
     case LXS_inotify_init1_:
         /* inotify EXISTS here (M1266) -- only the flags-taking entry point was
-         * missing, which is the only one glib uses. */
-        { int ifd = app_inotify_init(); r->rax = ifd < 0 ? (uint64_t)-(long)LX_EMFILE : (uint64_t)ifd; }
+         * missing, which is the only one glib uses.
+         * IN_NONBLOCK (= O_NONBLOCK) and IN_CLOEXEC (= O_CLOEXEC) were then
+         * dropped: libuv drains inotify until EAGAIN, so without IN_NONBLOCK
+         * Node's fs.watch thread parked in the read instead of its loop. */
+        { int ifd = app_inotify_init();
+          if (ifd >= 0 && (a1 & LXO_NONBLOCK)) app_fd_set_nonblock(ifd, 1);
+          if (ifd >= 0 && (a1 & LXO_CLOEXEC))  app_fd_set_cloexec(ifd, 1);
+          r->rax = ifd < 0 ? (uint64_t)-(long)LX_EMFILE : (uint64_t)ifd; }
         break;
     case LXS_prlimit64:
         /* (pid, resource, new, old). Report "unlimited" for a get and accept a
@@ -4388,157 +4758,7 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_fstat: {                       /* (fd, struct stat*) */
         if (!vmm_user_ok(r->rsi, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        uint8_t *st = (uint8_t *)r->rsi;
-        for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
-        /* stdio calls this on its own fds to decide buffering. Reporting a
-         * CHARACTER DEVICE is both true (they are the console) and what makes
-         * glibc pick line buffering instead of a full 4 KiB buffer -- with a
-         * regular-file answer, output would not appear until an explicit
-         * fflush or exit. */
-        if (a1 >= 0 && a1 <= 2) {
-            *(uint32_t *)(st + LXST_O_MODE) = LX_S_IFCHR | 0620;
-            *(uint64_t *)(st + LXST_O_RDEV) = 0x0501;          /* a tty-ish rdev */
-            *(uint64_t *)(st + LXST_O_NLINK) = 1;
-            *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
-            r->rax = 0;
-        } else {
-            /* A REAL fd. opendir() fstat()s the fd it just opened to confirm it
-             * is a directory before it will call getdents64 -- so returning
-             * EBADF here made every opendir() fail silently, with the directory
-             * fd already successfully created. The fd table remembers each
-             * FILE fd's path, so stat that. */
-            const char *fp = app_fd_path((int)a1);
-            struct statx sx;
-            if (!fp) {
-                /* A non-FILE fd -- a pipe, socket, eventfd and so on. Report a
-                 * FIFO rather than EBADF: stdio calls fstat() on its own fds to
-                 * pick a buffering mode, and an error there leaves it guessing.
-                 * S_IFIFO is also the truthful answer for the pipe case, which
-                 * is the one a shell pipeline depends on. */
-                if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
-                /* EXCEPT A MEMFD, which is a REGULAR FILE -- an unlinked tmpfs
-                 * one -- and every Wayland client depends on that being said.
-                 * glibc's posix_fallocate fstat()s first and returns ESPIPE for
-                 * a FIFO without attempting anything, so the shared-memory pool
-                 * libwayland-cursor sizes that way was never sized at all, the
-                 * mmap after it failed, and GDK reported the entire chain as
-                 * one warning: "Failed to load cursor theme Adwaita". (M2000) */
-                long mfsz = app_memfd_size((int)a1);
-                if (mfsz >= 0) {
-                    *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFREG | 0600u;
-                    *(uint64_t *)(st + LXST_O_NLINK)   = 1;
-                    *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)mfsz;
-                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                    *(int64_t  *)(st + LXST_O_BLOCKS)  = (mfsz + 511) / 512;
-                    *(uint64_t *)(st + LXST_O_INO)     = 0x2000ull + (uint64_t)a1;
-                    *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-                    r->rax = 0;
-                    break;
-                }
-                /* AND A PTY IS A CHARACTER DEVICE, which is not a detail:
-                 * glibc's grantpt() does
-                 *
-                 *     if (__fstat64 (fd, &st) < 0) return -1;
-                 *     if (! S_ISCHR (st.st_mode)) { __set_errno (EINVAL); ... }
-                 *
-                 * so a pty master reported as a FIFO makes openpty() fail with
-                 * EINVAL before it has even asked for the slave number -- which
-                 * is exactly what happened after M2206 added TIOCGPTN and
-                 * TIOCSPTLCK: `LXPTY: openpty failed: Invalid argument`. Two
-                 * missing ioctls were not the whole reason a Linux binary could
-                 * not get a pty; this was the third. ptsname_r checks the same
-                 * thing. (M2211)
-                 *
-                 * rdev carries the real /dev/pts index in the minor, because
-                 * ttyname() and a few TUI programs read it to find their own
-                 * terminal: major 5 minor 2 is /dev/ptmx, major 136 is a pts
-                 * slave, which is what Linux reports. */
-                /* AND A DRM RENDER NODE IS A CHARACTER DEVICE TOO (M2351),
-                 * for exactly the same kind of reason as the pty above, in a
-                 * library that is even stricter about it. libdrm's
-                 * drmGetDevice2 -- which Mesa calls before it will load any
-                 * driver -- starts with
-                 *
-                 *     if (fstat(fd, &sbuf)) return -errno;
-                 *     maj = major(sbuf.st_rdev); min = minor(sbuf.st_rdev);
-                 *     if (!drmNodeIsDRM(maj, min) || !S_ISCHR(sbuf.st_mode))
-                 *             return -EINVAL;
-                 *
-                 * so a render node reported as a regular file is rejected
-                 * before anything else is looked at, and the only symptom
-                 * upstream is eglInitialize returning EGL_NOT_INITIALIZED with
-                 * no explanation -- which is exactly what the first lxgl run
-                 * got. Linux numbers DRM major 226, with render nodes from
-                 * minor 128; this is renderD128. */
-                if (app_fd_type((int)a1) == 17) {
-                    *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFCHR | 0666u;
-                    *(uint64_t *)(st + LXST_O_NLINK)   = 1;
-                    *(uint64_t *)(st + LXST_O_RDEV)    = (226ull << 8) | 128ull;
-                    *(int64_t  *)(st + LXST_O_SIZE)    = 0;
-                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                    *(int64_t  *)(st + LXST_O_BLOCKS)  = 0;
-                    *(uint64_t *)(st + LXST_O_INO)     = 0x3000ull;
-                    *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-                    r->rax = 0;
-                    break;
-                }
-                {   long ptsn = app_pts_number((int)a1);
-                    int is_pty = app_fd_type((int)a1) == 11;
-                    if (is_pty) {
-                        *(uint32_t *)(st + LXST_O_MODE)  = LX_S_IFCHR | 0620u;
-                        *(uint64_t *)(st + LXST_O_NLINK) = 1;
-                        *(uint64_t *)(st + LXST_O_RDEV)  = (ptsn >= 0)
-                                                           ? ((5ull << 8) | 2ull)      /* the master: /dev/ptmx */
-                                                           : ((136ull << 8) | 0ull);   /* a slave: /dev/pts/N */
-                        *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
-                        *(uint64_t *)(st + LXST_O_INO)   = 0x3000ull + (uint64_t)a1;
-                        *(uint64_t *)(st + LXST_O_DEV)   = LX_FAKE_DEV;
-                        r->rax = 0;
-                        break;
-                    }
-                }
-                *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
-                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
-                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                /* Per-fd, so two different pipes are not reported as the
-                 * same file. The 0x1000 bias keeps these clear of the
-                 * path-hash inodes vfs_stat hands out for real files. */
-                *(uint64_t *)(st + LXST_O_INO)     = 0x1000ull + (uint64_t)a1;
-                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-                r->rax = 0;
-                break;
-            }
-            if (vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
-            int isdir = (sx.stx_mode & 0170000u) == 0040000u;
-            /* The REAL mode when the filesystem reported one -- ext2 does. An
-             * executable bit that is not reported is an executable that cannot be
-             * run, and a mode of 0644 on every file makes chmod look broken.
-             * (M1999) */
-            *(uint32_t *)(st + LXST_O_MODE)    = (sx.stx_mode & 07777u)
-                                                 ? sx.stx_mode
-                                                 : (isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u));
-            /* The REAL link count, not a constant 1 (M1998). A directory
-             * always has at least two links ("." and its entry in its parent);
-             * find(1) subtracts 2 from st_nlink to decide how many
-             * subdirectories are left to visit and walks a negative number of
-             * them. A hardlinked file reported 1 too, so nothing could tell
-             * that two names were the same file. */
-            *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);
-            *(int64_t  *)(st + LXST_O_ATIME)   = (int64_t)sx.stx_mtime;
-            *(int64_t  *)(st + LXST_O_MTIME)   = (int64_t)sx.stx_mtime;
-            *(int64_t  *)(st + LXST_O_CTIME)   = (int64_t)sx.stx_mtime;
-            *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
-            *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-            *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
-            /* A REAL inode, not a constant. ld.so decides "is this object
-             * already loaded?" by comparing (st_dev, st_ino) -- reporting 1
-             * for everything made it map libbfd and then skip libz, libzstd
-             * and libc as duplicates of it, and the only symptom was
-             * `undefined symbol: free, version GLIBC_2.2.5`. (M1955) */
-            *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;
-            *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-            r->rax = 0;
-        }
+        r->rax = (uint64_t)lx_fstat_fill(a1, (uint8_t *)r->rsi);
         break;
     }
     case LXS_readlinkat:
@@ -4573,7 +4793,7 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t ub  = (r->rax == LXS_readlinkat) ? r->rdx : r->rsi;
         uint64_t usz = (r->rax == LXS_readlinkat) ? r->r10 : r->rdx;
         const char *upath = (const char *)up;
-        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
 
         const char *vis = 0;                 /* the answer, in the process's own view */
         char lbuf[VFS_PATH_MAX];             /* ...when it has to be read off disk */
@@ -4610,7 +4830,15 @@ static void lx_dispatch_body(struct registers *r) {
             const char *xp = lx_xlate(upath, lbuf, (int)sizeof lbuf);
             char tgt[VFS_PATH_MAX];
             long tn = vfs_readlink(xp, tgt, sizeof tgt - 1);
-            if (tn < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            if (tn < 0) {
+                /* EINVAL means "it exists and is not a symlink". For a name
+                 * that does not exist at all it is ENOENT: glibc's realpath()
+                 * reads EINVAL as "a real file, keep going", so it used to
+                 * succeed on paths that were not there. */
+                struct statx lsx;
+                r->rax = (uint64_t)-(long)(vfs_lstat(xp, &lsx) == 0 ? LX_EINVAL : LX_ENOENT);
+                break;
+            }
             if (tn > (long)sizeof tgt - 1) tn = (long)sizeof tgt - 1;
             tgt[tn] = 0;
             for (long k = 0; k <= tn; k++) lbuf[k] = tgt[k];
@@ -4689,7 +4917,7 @@ static void lx_dispatch_body(struct registers *r) {
             r->rsi = p_; r->rdx = f_;
         }
         const char *upath = (const char *)r->rsi;
-        if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* honour dirfd (M2032) */
         /* /dev/tty IS THE CONTROLLING TERMINAL (M2004), and we had no such
          * file at all. A TUI does not settle for stdin: Ink -- which is what
@@ -4765,12 +4993,31 @@ static void lx_dispatch_body(struct registers *r) {
             }
         }
         long lf = (long)r->rdx, nf = 0;
+        /* THE FLAGS THAT CHANGE THE ANSWER, which only write/create/trunc/
+         * append used to survive. O_CREAT|O_EXCL on an existing name succeeded,
+         * so a lock file (git's index.lock) excluded nobody; O_DIRECTORY and
+         * O_NOFOLLOW were no-ops; O_CLOEXEC and O_NONBLOCK were lost, so every
+         * file leaked into exec'd children. Checked against the name itself
+         * (lstat), as Linux does: a symlink "exists" for O_EXCL. */
+        {   struct statx osx;
+            int ex = (vfs_lstat(path, &osx) == 0);
+            int islnk = ex && (osx.stx_mode & 0170000u) == 0120000u;
+            if (ex && (lf & LXO_CREAT) && (lf & LXO_EXCL)) { r->rax = (uint64_t)-(long)LX_EEXIST; break; }
+            if (islnk && (lf & LXO_NOFOLLOW)) { r->rax = (uint64_t)-(long)LX_ELOOP; break; }
+            if (lf & LXO_DIRECTORY) {
+                struct statx dsx;
+                if (vfs_stat(path, &dsx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+                if ((dsx.stx_mode & 0170000u) != 0040000u) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+            }
+        }
         if (lf & (LXO_WRONLY | LXO_RDWR)) nf |= O_WRONLY;   /* we have no separate RDWR */
         if (lf & LXO_CREAT)  nf |= O_CREAT;
         if (lf & LXO_TRUNC)  nf |= O_TRUNC;
         if (lf & LXO_APPEND) nf |= O_APPEND;
         int fd = app_open(path, (int)nf);
         if (fd >= 0) {
+            if (lf & LXO_CLOEXEC)  app_fd_set_cloexec(fd, 1);
+            if (lf & LXO_NONBLOCK) app_fd_set_nonblock(fd, 1);
             /* DID THE BROWSER EVER ASK FOR THE PAGE? (M2107)
              *
              * Only FAILED opens are logged here, which is right for a dynamic
@@ -4886,18 +5133,35 @@ static void lx_dispatch_body(struct registers *r) {
          * (path, statbuf) rather than (dirfd, path, statbuf, flags). glibc on
          * x86-64 still emits them, and a program that gets ENOSYS for stat
          * cannot look at a file at all -- Claude Code issued twelve in a row
-         * before giving up. We have no symlinks to follow differently, so
-         * lstat is the same answer. (M1992) */
+         * before giving up. (M1992)
+         *
+         * lstat, and fstatat with AT_SYMLINK_NOFOLLOW, stat the NAME: a
+         * symlink reports itself. They used to follow it, because this was
+         * written before ext2 had symlinks -- so `rm -r` saw a link to a
+         * directory as a directory, descended through it and deleted the
+         * target's contents, and cp -a / tar copied targets. */
         int by_path = (r->rax == LXS_stat_ || r->rax == LXS_lstat_);
+        int nofollow = (r->rax == LXS_lstat_) ||
+                       (r->rax == LXS_newfstatat && (r->r10 & LX_AT_SYMLINK_NOFOLLOW));
         uint64_t upath_u = by_path ? r->rdi : r->rsi;
         uint64_t ubuf_u  = by_path ? r->rsi : r->rdx;
         const char *upath = (const char *)upath_u;
-        if (!upath || !vmm_user_ok(upath_u, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        if (!upath || !vmm_user_str_ok(upath_u, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(ubuf_u, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* AN EMPTY PATH. With AT_EMPTY_PATH it means the descriptor itself --
+         * this is how glibc 2.33+ implements fstat() -- and it used to be
+         * joined onto the descriptor's path or, for a pipe or socket, resolved
+         * as the current directory, so fstat() of a pipe said "directory".
+         * Without the flag it is ENOENT, as on Linux. */
+        if (!upath[0]) {
+            if (by_path || !(r->r10 & LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+            if ((long)r->rdi != LX_AT_FDCWD) { r->rax = (uint64_t)lx_fstat_fill((long)r->rdi, (uint8_t *)ubuf_u); break; }
+            upath = ".";                    /* AT_FDCWD: the working directory itself */
+        }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         r->rdx = ubuf_u;                    /* the writes below all go through rdx */
         struct statx sx;
-        if (vfs_stat(path, &sx) != 0) {
+        if ((nofollow ? vfs_lstat(path, &sx) : vfs_stat(path, &sx)) != 0) {
             /* Name BOTH spellings. A stat that fails on a path the program
              * believes in is nearly always a TRANSLATION problem, and the
              * translated form is the only place it shows. (M1992) */
@@ -4944,7 +5208,7 @@ static void lx_dispatch_body(struct registers *r) {
         r->rax = app_fd_is_open((int)a1) ? 0 : (uint64_t)-(long)LX_EBADF;
         break;
     case LXS_rename_: {                     /* (oldpath, newpath) */
-        if (!vmm_user_ok(r->rdi, 1) || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!vmm_user_str_ok(r->rdi, LX_STRMAX) || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char op[VFS_PATH_MAX], np[VFS_PATH_MAX];
         char ox[VFS_PATH_MAX], nx[VFS_PATH_MAX];
         const char *o = lx_xlate((const char *)r->rdi, ox, sizeof ox);
@@ -4967,7 +5231,7 @@ static void lx_dispatch_body(struct registers *r) {
         /* 64 -> 1024, and from the HEAP rather than a shared static (M1962).
          *
          * A directory listing that stops at 64 entries is a silent wrong
-         * answer, not an error: GNU make's $(wildcard kernel/*.c) saw only the
+         * answer, not an error: GNU make's wildcard over kernel's *.c files saw only the
          * first 64 of OS-DEV's 136 kernel sources, so the build linked a
          * PARTIAL object list and came back as pages of "undefined reference
          * to kmalloc / pci_find / wav_parse" -- every one of them a file
@@ -4985,18 +5249,27 @@ static void lx_dispatch_body(struct registers *r) {
          * call has to find. Fall back to 256 rather than fail the readdir
          * outright when the heap cannot spare it; a truncated listing is
          * reported below, which is more than a lost directory would be. */
-        int ecap = 1024;                    /* NB: `cap` is already the user buffer size */
-        vfs_dirent *ents = kmalloc((unsigned long)ecap * sizeof *ents);
-        if (!ents) { ecap = 256; ents = kmalloc((unsigned long)ecap * sizeof *ents); }
-        if (!ents) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
-        int n = vfs_list_path(dp, ents, ecap);
-        if (n < 0) { kfree(ents); r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
-        if (n == ecap)
-            kprintf("[linuxabi] getdents64(%s): at least %d entries -- listing TRUNCATED\n", dp, ecap);
         /* The offset is carried in the fd's own cursor, so a second call
          * returns 0 and readdir() terminates instead of looping forever. */
         long start = app_lseek((int)a1, 0, 1 /*SEEK_CUR*/);
         if (start < 0) start = 0;
+        int dpid = app_current_pid(), n = 0;
+        vfs_dirent *ents = (start > 0) ? dsnap_take(dpid, (int)a1, dp, &n) : 0;   /* a read already under way: see g_dsnap */
+        if (!ents) {
+            int ecap = 1024;                /* NB: `cap` is already the user buffer size */
+            vfs_dirent *tmp = kmalloc((unsigned long)ecap * sizeof *tmp);
+            if (!tmp) { ecap = 256; tmp = kmalloc((unsigned long)ecap * sizeof *tmp); }
+            if (!tmp) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+            n = vfs_list_path(dp, tmp, ecap);
+            if (n < 0) { kfree(tmp); r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+            if (n == ecap)
+                kprintf("[linuxabi] getdents64(%s): at least %d entries -- listing TRUNCATED\n", dp, ecap);
+            /* Keep an exact-size copy as the snapshot (the scratch array is
+             * 1024 x 264 bytes); if even that fails, serve from the scratch. */
+            ents = n ? kmalloc((unsigned long)n * sizeof *ents) : 0;
+            if (ents) { for (int i = 0; i < n; i++) ents[i] = tmp[i]; kfree(tmp); }
+            else ents = tmp;
+        }
         uint8_t *out = (uint8_t *)r->rsi;
         long used = 0; int emitted = 0;
         for (int i = (int)start; i < n; i++) {
@@ -5016,7 +5289,10 @@ static void lx_dispatch_body(struct registers *r) {
             used += rec; emitted++;
         }
         app_lseek((int)a1, start + emitted, 0 /*SEEK_SET*/);
-        kfree(ents);
+        if (emitted && start + emitted < n) {           /* more to come: keep the snapshot */
+            vfs_dirent *old = dsnap_put(dpid, (int)a1, dp, ents, n);
+            if (old) kfree(old);
+        } else if (ents) kfree(ents);                   /* the end: nothing to keep */
         r->rax = (uint64_t)used;            /* 0 = end of directory */
         break;
     }
@@ -5162,7 +5438,7 @@ static void lx_dispatch_body(struct registers *r) {
         break;
     case LXS_execve_: {                     /* (path, argv[], envp[]) */
         const char *path = (const char *)r->rdi;
-        if (!path || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!path || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         /* Copy argv/envp into KERNEL memory before exec'ing. The vectors live
          * in the OLD address space, which app_execve_linux tears down partway
          * through -- reading them afterwards would be a use-after-free of an
@@ -5234,7 +5510,7 @@ static void lx_dispatch_body(struct registers *r) {
             unsigned long ao = 0; int atoobig = 0;
             for (; na < LX_EXEC_ARGS && uav[na]; na++) {
                 const char *sp = uav[na];
-                if (!vmm_user_ok((uint64_t)sp, 1)) break;
+                if (!vmm_user_str_ok((uint64_t)sp, LX_ARGSTRMAX)) break;
                 unsigned long len = 0;
                 while (sp[len] && ao + len + 1 < LX_EXEC_POOL) len++;
                 if (sp[len]) { atoobig = 1; break; }     /* pool exhausted, not a short arg */
@@ -5294,7 +5570,7 @@ static void lx_dispatch_body(struct registers *r) {
             unsigned long eo = 0; int etoobig = 0;
             for (; ne < LX_EXEC_ARGS && uev[ne]; ne++) {
                 const char *sp = uev[ne];
-                if (!vmm_user_ok((uint64_t)sp, 1)) break;
+                if (!vmm_user_str_ok((uint64_t)sp, LX_ARGSTRMAX)) break;
                 unsigned long len = 0;
                 while (sp[len] && eo + len + 1 < LX_EXEC_POOL) len++;
                 if (sp[len]) { etoobig = 1; break; }
@@ -5353,8 +5629,8 @@ static void lx_dispatch_body(struct registers *r) {
              * the path, was the one thing never written down. Six children in a
              * row died this way and the log named none of them. */
             kprintf("[linuxabi] execve(\"%s\") -> ENOENT (raw=\"%s\" ptr=%lx readable=%d argv0=\"%s\" na=%d) (child exits 127)\n",
-                    pbuf, (path && vmm_user_ok(r->rdi, 1)) ? path : "<unreadable>",
-                    (unsigned long)r->rdi, (path && vmm_user_ok(r->rdi, 1)) ? 1 : 0,
+                    pbuf, (path && vmm_user_str_ok(r->rdi, LX_STRMAX)) ? path : "<unreadable>",
+                    (unsigned long)r->rdi, (path && vmm_user_str_ok(r->rdi, LX_STRMAX)) ? 1 : 0,
                     a0buf, na);
             r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
         }
@@ -5367,7 +5643,8 @@ static void lx_dispatch_body(struct registers *r) {
          * (M2012) and eventfd2's (M2017). WNOHANG means "look, do not block",
          * and an event loop that polls its children with it was instead parked
          * forever on the first call. */
-        long got = app_wait4((int)a1, &st, ((int)a3 & LX_WNOHANG) != 0);
+        int ks = 0;
+        long got = app_wait4_sig((int)a1, &st, &ks, ((int)a3 & LX_WNOHANG) != 0);
         if (got < 0) { r->rax = (uint64_t)-(long)LX_ECHILD; break; }
         if (got == 0) { r->rax = 0; break; }   /* WNOHANG: children exist, none ready */
         if (r->rsi) {
@@ -5376,8 +5653,15 @@ static void lx_dispatch_body(struct registers *r) {
              * for the terminating signal, which is what WEXITSTATUS/WIFEXITED
              * decode. Handing back the raw code would make WIFEXITED false and
              * WEXITSTATUS read as 0 -- a silently wrong status, not an error. */
-            *(int *)r->rsi = (st & 0xFF) << 8;
+            /* ...and a child KILLED by a signal has just that signal in the
+             * low 7 bits (WIFSIGNALED / WTERMSIG); reporting 128+sig as an
+             * exit code made every such death look like a normal exit. */
+            *(int *)r->rsi = ks ? (ks & 0x7F) : ((st & 0xFF) << 8);
         }
+        /* struct rusage (144 bytes): not tracked per child, so report zeros
+         * rather than leave the caller's uninitialised stack in it. */
+        if (r->r10 && vmm_user_ok(r->r10, 144))
+            for (int i = 0; i < 144; i++) ((uint8_t *)r->r10)[i] = 0;
         r->rax = (uint64_t)got;
         break;
     }
@@ -5421,7 +5705,7 @@ static void lx_dispatch_body(struct registers *r) {
             if (si.si_pid) {
                 *(int *)(o + 0)  = 17;            /* si_signo = SIGCHLD */
                 *(int *)(o + 4)  = 0;             /* si_errno */
-                *(int *)(o + 8)  = 1;             /* si_code = CLD_EXITED */
+                *(int *)(o + 8)  = si.si_code;    /* CLD_EXITED, or CLD_KILLED with si_status = the signal */
                 *(int *)(o + 16) = si.si_pid;     /* si_pid */
                 *(int *)(o + 20) = 0;             /* si_uid */
                 *(int *)(o + 24) = si.si_status;  /* si_status */
@@ -5761,8 +6045,11 @@ static void lx_dispatch_body(struct registers *r) {
     case LXS_faccessat_: {                  /* (path, mode) / (dirfd, path, mode, flags) */
         uint64_t pa = (r->rax == LXS_access_) ? r->rdi : r->rsi;
         const char *up = (const char *)pa;
-        if (!up || !vmm_user_ok(pa, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
+        if (!up || !vmm_user_str_ok(pa, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* faccessat's name is relative to ITS dirfd, not the cwd (M2032's
+         * rule, which this handler predated). */
+        long adir = (r->rax == LXS_access_) ? LX_AT_FDCWD : (long)r->rdi;
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at(adir, up, xp, sizeof xp);
         struct statx sx;
         /* Existence only. Everything runs as root here and there are no mode
          * bits on the boot volume, so reporting a permission failure would be
@@ -5816,6 +6103,13 @@ static void lx_dispatch_body(struct registers *r) {
          * manager's schedule, while POSIX requires the fds to close at EXIT. */
         app_sys_exit((int)a1);
         break;
+    /* 312 IS kcmp ON x86-64; 179 IS quotactl. M2193 implemented kcmp under
+     * 179 because that was the number Firefox's ENOSYS log showed -- those
+     * were quotactl calls, and real kcmp callers (Mesa's fd-sharing check)
+     * still got ENOSYS. Both land here now: kcmp is answered for real, and a
+     * quotactl, whose arguments can never name two equal pids, gets EPERM --
+     * the refusal it has been getting, and a plausible one without quotas. */
+    case 312:
     case 179: {   /* kcmp(pid1, pid2, type, idx1, idx2) -- M2193 */
         /* THE ONLY UNIMPLEMENTED SYSCALL FIREFOX STILL MAKES.
          *

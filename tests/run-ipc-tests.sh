@@ -24,7 +24,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: ipc test ($QEMU not found)";
 
 SLOG=$(mktemp /tmp/osdev_ipc.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting kernel headless and running the POSIX IPC self-test (COM1 capture)..."
@@ -42,7 +42,7 @@ while [ $i -lt 160 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 if ! grep -q "memfd self-test:" "$SLOG" 2>/dev/null; then
     echo "FAIL: the memfd self-test never ran (boot problem, not a memfd regression)"
@@ -132,24 +132,23 @@ require "FS_BASE: reloading the SAME base after the register was zeroed behind u
 # A MAPPED memfd MUST BE ABLE TO GROW (M2082). Resizing an already-mapped
 # shared-memory pool is what every wl_shm client does -- libwayland-cursor's
 # shm_pool_resize and Firefox's WaylandShmPool::Resize are posix_fallocate /
-# ftruncate on a mapped fd -- and it was refused outright, because growing means
-# reallocating and the old buffer's pages are aliased into the process. Firefox's
-# startup made that call 107 times and got ENOSPC every time; wayland.c's own
-# M2058 comment records that the compositor then has to answer the follow-up
-# wl_shm_pool.resize with a FATAL protocol error.
+# ftruncate on a mapped fd -- and it was refused outright, because growing meant
+# reallocating a kmalloc'd buffer whose pages were aliased into the process.
 #
-# Two separate things can regress, so both are asserted. Put the
-# `if (m->mapped) return -1` guard back and the first one fails. Remove it
-# WITHOUT retiring the outgoing buffer -- the obvious fix -- and the second one
-# fails instead, which is the important one: the kernel heap hands that block
-# straight back out while a process still has its pages mapped, and nothing
-# anywhere else in the tree would notice.
+# The object is page-backed now and a grow maps frames at the end of a fixed
+# window, so the properties are: it succeeds, keeps the bytes, does NOT move
+# (the compositor holds raw pointers into it), keeps the same frames under the
+# pages that existed (a live mapping still shares them), zeroes what it adds,
+# and teardown gives every frame back. Put the kmalloc-and-copy grow back and
+# the "did not move" and "same frame" lines fail.
 require "growing a MAPPED memfd past its capacity SUCCEEDS"                 "a mapped wl_shm pool can be resized at all"
-require "with nothing actually aliasing it, the outgoing buffer is FREED, not retired (M2226)" "an un-aliased outgoing buffer is freed, not leaked into the retired array"
-require "and the freed buffer really did go back to the heap (churn reclaimed it)" "the freed buffer is genuinely back on the heap free list"
 require "the bytes written before the grow survived it"                     "a resize preserves the pool's contents"
-require "a further resize within the new capacity moves nothing at all"     "a grown mapped object has headroom, so the next resize does not move it"
-require "teardown released the object and every buffer it outgrew"          "retired buffers are freed with the object, not leaked"
+require "the object did not move, so every pointer into it is still valid"  "a grow never moves the object"
+require "its first page is still the same frame, so a live mapping still shares it" "a grow keeps the frames a mapping shares"
+require "the pages the grow added read as zeros"                            "a grow never exposes stale bytes"
+require "a further grow moves nothing either"                               "repeated grows keep the object in place"
+require "a dead object's slot is held until its frames are reclaimed"       "a dead object's frames are not reused before the TLB shootdown"
+require "teardown unmapped and freed every page the object owned"           "teardown frees every page, not leaked"
 if grep -qE "memfd self-test: [0-9]+ passed, 0 failed" "$SLOG"; then
     n=$(grep -oE "memfd self-test: [0-9]+ passed" "$SLOG" | grep -oE "[0-9]+" | head -1)
     echo "  ok: all $n memfd-growth assertions passed in-guest"

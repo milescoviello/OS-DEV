@@ -117,7 +117,9 @@ long blockdev_mount_pwrite(int i, const char *path, const void *buf, unsigned lo
 long blockdev_mount_remove(int i, const char *path);   /* delete a file (ext2 only); 0/-1 (M1135) */
 long blockdev_mount_mkdir(int i, const char *path);    /* create a directory (ext2 only); 0/-1 (M1137) */
 long blockdev_mount_symlink(int i, const char *path, const char *target);  /* create a symlink (ext2 only); 0/-1 (M1146) */
-long blockdev_mount_readlink(int i, const char *path, void *buf, unsigned long max);  /* read a symlink's target (ext2 only), not followed; bytes/-1 (M1594) */
+long blockdev_mount_readlink(int i, const char *path, void *buf, unsigned long max);
+int  blockdev_mount_link_stat(int i, const char *path, uint32_t *out_size, uint32_t *out_ino,
+                              uint32_t *out_mtime, uint32_t *out_nlink, uint32_t *out_mode);   /* lstat of an ext2 symlink name; 0/-1 */  /* read a symlink's target (ext2 only), not followed; bytes/-1 (M1594) */
 long blockdev_mount_link(int i, const char *oldpath, const char *newpath); /* hard link (ext2 only); 0/-1 (M1207) */
 long blockdev_mount_rename(int i, const char *oldpath, const char *newpath); /* rename/move (ext2 only); 0/-1 (M1213) */
 long blockdev_mount_rename2(int i, const char *oldpath, const char *newpath, int flags); /* renameat2 NOREPLACE/EXCHANGE (M1232) */

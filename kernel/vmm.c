@@ -1143,6 +1143,17 @@ uint64_t vmm_translate(uint64_t virt) {
  * list) and re-walk from the top, since that call may have just built the
  * intermediate tables too. A present-but-!USER entry at any level is a real
  * violation (kernel memory) and is never retried.
+ *
+ * A COPY-ON-WRITE LEAF IS BROKEN HERE TOO. CR0.WP is clear, so a supervisor
+ * write ignores the read-only bit fork put on a shared page: after fork, a
+ * read() into a buffer the child had not written yet wrote into the frame the
+ * PARENT still maps, and the parent's memory changed under it. A validated
+ * syscall buffer is about to be the kernel's to write, so give this process
+ * its own copy now -- exactly what its first ring-3 write would have done. A
+ * buffer that is only read pays a page copy it did not strictly need, and
+ * only between a fork and the child's exec. (Setting CR0.WP would catch the
+ * write itself, but a read-only buffer handed to read() would then fault in
+ * ring 0 with no fixup to turn it into EFAULT, which here is a panic.)
  */
 static int user_page_present(uint64_t v) {
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -1164,6 +1175,10 @@ static int user_page_present(uint64_t v) {
         e = pt[PT_IDX(v)];
         if (!(e & PTE_PRESENT)) { if (attempt == 0 && app_fault_handle(v, 0)) continue; return 0; }
         if (!(e & PTE_USER)) return 0;
+        if ((e & PTE_COW) && !(e & PTE_WRITABLE) && attempt == 0) {
+            /* err = present | write | user: the fault ring 3 would have taken */
+            if (app_fault_handle(v, 0x7)) continue;
+        }
         return 1;
     }
     return 0;

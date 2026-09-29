@@ -26,7 +26,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: lxinet test ($QEMU not found
 
 SLOG=$(mktemp /tmp/osdev_lxinet.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and running AF_INET sockets (DNS over UDP + HTTP over TCP, poll-driven)..."
@@ -44,7 +44,7 @@ while [ $i -lt 600 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 if grep -aq "KERNEL PANIC" "$SLOG"; then
     echo "FAIL: KERNEL PANIC during the AF_INET test:"

@@ -21,14 +21,15 @@
 int  drm_is_node_path(const char *path);   /* 1 for /dev/dri/renderD128 (and card0) */
 long drm_ioctl(int fd, unsigned long req, void *uarg);
 int  drm_open_node(void);                  /* returns a node id, or -1 */
-void drm_close_node(int id);
+void drm_close_node(int id);             /* drops one descriptor's reference; the last one frees the node */
+void drm_node_ref(int id);               /* one more descriptor (dup/fork/SCM) holds the node */
 
 /* For app.c's mmap of a render-node descriptor: which physical frame backs
  * page `page` of the object named by VIRTGPU_MAP offset `off`, and how large
  * that object is. The handle namespace has exactly one owner (drm.c) and this
  * is how the mapping code asks it questions. (M2349) */
-uint64_t drm_map_frame(uint64_t off, uint64_t page);
-uint64_t drm_map_size(uint64_t off);
+uint64_t drm_map_frame_ref(int node, uint64_t off, uint64_t page);  /* that page's frame, WITH a reference for the caller's mapping; 0 if none */
+uint64_t drm_map_size(int node, uint64_t off);                      /* bytes of node's object at map offset off, 0 if none */
 
 /* PRIME: name a DRM buffer object with a descriptor and get it back (M2362).
  * Implemented in app.c because it needs the process fd table. */

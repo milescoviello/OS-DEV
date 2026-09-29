@@ -25,7 +25,7 @@ DISK=build/fat.img
 BIG=$(mktemp /tmp/osdev_lba48.XXXXXX.img)
 LOG=$(mktemp /tmp/osdev_lba48.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$LOG" "$BIG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$LOG" "$BIG"; exit "$rc"; }
 trap cleanup EXIT
 
 if ! command -v "$QEMU" >/dev/null 2>&1; then
@@ -48,7 +48,7 @@ while [ $i -lt 70 ]; do
     sleep 0.5; i=$((i+1))
 done
 sleep 0.3
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 
 fail=0
 require() {
@@ -57,6 +57,7 @@ require() {
 }
 require "ATA LBA48: drive"                            "a >128 GiB ATA disk was detected (LBA48 candidate)"
 require "wrote + read back, data matches (LBA48 OK)"  "high-LBA write+read-back past the 128 GiB boundary (LBA48 works)"
+require "original restored"                           "the sector's original contents were put back (the test destroys nothing)"
 require "mounted FAT32 volume"                        "boot FAT32 still mounted on the LBA28 path (boot intact)"
 require "launching the desktop environment"           "reached desktop launch (no fault on the ATA path)"
 

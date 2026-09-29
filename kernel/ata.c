@@ -635,7 +635,20 @@ static int ata_write_drive_impl(int drive, uint32_t lba, uint32_t count, const v
         return ata_write_drive_impl_lba48(drive, lba, count, buf);
     if (g_ata_dma_writes && count <= ATA_DMA_BOUNCE_SECTORS && ata_dma_setup()) {
         int dr = ata_dma_xfer_impl(drive, lba, count, (void *)buf, 1);
-        if (dr >= 0) { io_dma_cmds++; return 0; }
+        if (dr >= 0) {
+            io_dma_cmds++;
+            /* THE SAME FLUSH THE PIO LOOP DOES. DMA is the default write path,
+             * and it returned before ever reaching the FLUSH CACHE below, so
+             * almost no write was flushed -- while the journal's crash
+             * consistency is argued on writes reaching the medium, and the
+             * diskbench "no flush" arm was measuring nothing. */
+            if (g_ata_write_flush) {
+                uint16_t fio = ATA_DRIVES[drive].io;
+                outb(fio + REG_COMMAND, CMD_FLUSH);
+                wait_busy_clear(fio);
+            }
+            return 0;
+        }
         /* Fall through to PIO: a controller that misbehaves costs speed, not
          * correctness -- the same rule the read path states. */
     }
@@ -1693,12 +1706,27 @@ void ata_lba48_selftest(void) {
 
     uint64_t hi = (1ull << 28) + 100000;             /* ~49 MiB past the 128 GiB boundary -> needs LBA48 */
     if (hi >= info->sectors) hi = info->sectors - 1;
+    /* SAVE AND RESTORE THE SECTOR. This ran by default on any non-boot ATA
+     * disk over 128 GiB and overwrote a sector of it with a test pattern --
+     * harmless on the harness's blank scratch disk, one sector of somebody's
+     * data on real hardware. Every other disk self-test puts the original
+     * back; this one does too now, and does not write at all unless it could
+     * read the original first. */
+    static uint8_t saved[SECTOR_SIZE];
+    if (ata_read_drive(big, (uint32_t)hi, 1, saved) != 0) {
+        kprintf("[ !! ] ATA LBA48: could not read sector %lu to save it; not writing\n\n", hi);
+        return;
+    }
     for (int i = 0; i < SECTOR_SIZE; i++) dma_scratch[i] = (uint8_t)(i * 3 + 0x2D);
     memset(dma_readback, 0, sizeof(dma_readback));
     int ok = (ata_write_drive(big, (uint32_t)hi, 1, dma_scratch) == 0);
     ok = ok && (ata_read_drive(big, (uint32_t)hi, 1, dma_readback) == 0);
     ok = ok && (memcmp(dma_readback, dma_scratch, SECTOR_SIZE) == 0);
+    int restored = (ata_write_drive(big, (uint32_t)hi, 1, saved) == 0) &&
+                   (ata_read_drive(big, (uint32_t)hi, 1, dma_readback) == 0) &&
+                   (memcmp(dma_readback, saved, SECTOR_SIZE) == 0);
     kprintf("[ %s ] ATA LBA48 high-LBA round-trip at sector %lu (past the 128 GiB "
-            "boundary): %s\n\n", ok ? "ok" : "!!", hi,
-            ok ? "wrote + read back, data matches (LBA48 OK)" : "MISMATCH/FAIL");
+            "boundary): %s; original %s\n\n", ok && restored ? "ok" : "!!", hi,
+            ok ? "wrote + read back, data matches (LBA48 OK)" : "MISMATCH/FAIL",
+            restored ? "restored" : "NOT RESTORED");
 }

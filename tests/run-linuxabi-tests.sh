@@ -24,7 +24,7 @@ command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: linuxabi test ($QEMU not fou
 
 SLOG=$(mktemp /tmp/osdev_lxabi.XXXXXX.log)
 QPID=""
-cleanup() { rc=$?; [ -n "$QPID" ] && { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
+cleanup() { rc=$?; [ -n "$QPID" ] && { pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }; rm -f "$SLOG"; exit "$rc"; }
 trap cleanup EXIT
 
 echo "booting headless and running a host-built static-PIE Linux binary..."
@@ -82,10 +82,10 @@ echo "PASS: Linux ABI — a real static-PIE Linux binary runs under OS-DEV"
 # killed), and QEMU takes a WRITE LOCK on a raw drive image -- so a second
 # instance opening the same ext2 volume silently fails to start and produces an
 # empty log. Reap it first.
-kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
+pkill -KILL -P "$QPID" 2>/dev/null || true; kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; QPID=""
 SLOG2=$(mktemp /tmp/osdev_lxfault.XXXXXX.log)
 QPID2=""
-cleanup2() { [ -n "$QPID2" ] && { kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; }; rm -f "$SLOG2"; }
+cleanup2() { [ -n "$QPID2" ] && { pkill -KILL -P "$QPID2" 2>/dev/null || true; kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; }; rm -f "$SLOG2"; }
 trap 'rc=$?; cleanup2; exit $rc' EXIT
 
 echo "booting with a deliberately-faulting Linux binary (console-lock deadlock regression)..."
@@ -127,7 +127,14 @@ else
     # "wedged", and the one time it fired the boot had merely been slow.
     echo "  FAIL: the boot did not reach its end marker within the budget ($(wc -l < "$SLOG2") log lines; a full boot is ~306)"; f2=1
 fi
-[ $f2 -eq 0 ] || { echo "FAIL: console-lock/fault-reporting regression"; exit 1; }
+if [ $f2 -ne 0 ]; then
+    # KEEP THE EVIDENCE. This boot's log was deleted with the rest, so the one
+    # time it overran its budget there was nothing to say what it was doing.
+    cp "$SLOG2" /tmp/osdev-linuxabi-FAULT-FAIL.log 2>/dev/null && {
+        echo "  (the failing boot's serial log is at /tmp/osdev-linuxabi-FAULT-FAIL.log; its tail:)"
+        tail -15 "$SLOG2" | sed 's/^/      /'; }
+    echo "FAIL: console-lock/fault-reporting regression"; exit 1
+fi
 echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console"
 
 # --- M1942: AVX via XSAVE ---------------------------------------------------
@@ -140,9 +147,9 @@ echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console
 # proving nothing about the code it was added for.
 if qemu-system-x86_64 -cpu help 2>/dev/null | grep -q '^  max'; then
     SLOG3=$(mktemp /tmp/osdev_lxavx.XXXXXX.log)
-    kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; QPID2=""
+    pkill -KILL -P "$QPID2" 2>/dev/null || true; kill -9 "$QPID2" 2>/dev/null || true; wait "$QPID2" 2>/dev/null || true; QPID2=""
     QPID3=""
-    cleanup3() { [ -n "$QPID3" ] && { kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; }; rm -f "$SLOG3"; }
+    cleanup3() { [ -n "$QPID3" ] && { pkill -KILL -P "$QPID3" 2>/dev/null || true; kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; }; rm -f "$SLOG3"; }
     trap 'rc=$?; cleanup3; exit $rc' EXIT
 
     echo "booting with -cpu max to exercise the XSAVE/AVX path..."
@@ -320,6 +327,16 @@ LXWAIT: reaped 40/40 children
         echo "  ok: glibc stdio wrote+re-read a 200-line file on ext2 AND listed the directory"
     else
         echo "  FAIL: glibc file I/O wrong:"; grep -a "LXIO:" "$SLOG3" | head -1; f3=1
+    fi
+    if grep -aq "LXIO: dup'd and forked descriptors share one offset" "$SLOG3"; then
+        echo "  ok: dup'd and forked descriptors share one file offset, and O_APPEND appends every write"
+    else
+        echo "  FAIL: shared file offsets:"; grep -a "LXIO: shared" "$SLOG3" | head -2; f3=1
+    fi
+    if grep -aq "LXIO: reading a directory while deleting it returned every entry" "$SLOG3"; then
+        echo "  ok: getdents64 returns every entry while the caller deletes as it reads (rm -r)"
+    else
+        echo "  FAIL: deleting while reading a directory:"; grep -a "LXIO: deleting" "$SLOG3" | head -2; f3=1
     fi
     # Phase 3's deliverable: a REAL PIPELINE between two processes. lxbox forks,
     # re-execs ITSELF twice with different argv, wires the halves with a pipe
@@ -682,6 +699,11 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: symlinks:"; grep -a "LXCWD: .*symlink\|LXCWD: cursor" "$SLOG3" | head -4; f3=1
     fi
+    if grep -aq "LXCWD: lstat reports the link itself" "$SLOG3"; then
+        echo "  ok: lstat/fstatat/statx NOFOLLOW report a symlink as S_IFLNK; stat follows it"
+    else
+        echo "  FAIL: lstat of a symlink:"; grep -a "LXCWD: lstat" "$SLOG3" | head -3; f3=1
+    fi
     if grep -aq "LXCWD: hard link shares the inode" "$SLOG3"; then
         echo "  ok: link(2) makes a hard link, and both names report the same inode ($(grep -ao 'shares the inode ([0-9]*)' "$SLOG3" | head -1))"
     else
@@ -879,6 +901,14 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: munmap of a memfd mapping freed kernel-heap pages:"; grep -a "LXMEMFD" "$SLOG3" | head -3; f3=1
     fi
+    if grep -aq "LXMEMFD-OK: a write through a MAP_PRIVATE memfd mapping stays private" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: a write-sealed memfd refuses a shared writable mapping with EPERM" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: ...and still maps read-only" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: MAP_FIXED on a memfd lands exactly where it was asked, or fails" "$SLOG3"; then
+        echo "  ok: a memfd maps as asked -- MAP_PRIVATE is private, a write seal holds, MAP_FIXED never lands elsewhere"
+    else
+        echo "  FAIL: a memfd mapping ignored its prot or flags:"; grep -a "LXMEMFD-FAIL" "$SLOG3" | head -4; f3=1
+    fi
     if grep -aq "LXMEMFD-OK: the mapping OUTLIVED the last close" "$SLOG3"; then
         echo "  ok: ...and a mapping outlives the last close() of the memfd, which is how every toolkit uses one"
     else
@@ -999,9 +1029,9 @@ LXWAIT: reaped 40/40 children
     # process) and because bundling it into lxfulltest would make one failure
     # indistinguishable from the other.
     SLOG4=$(mktemp /tmp/osdev_lxtool.XXXXXX.log)
-    kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; QPID3=""
+    pkill -KILL -P "$QPID3" 2>/dev/null || true; kill -9 "$QPID3" 2>/dev/null || true; wait "$QPID3" 2>/dev/null || true; QPID3=""
     QPID4=""
-    cleanup4() { [ -n "$QPID4" ] && { kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; }; rm -f "$SLOG4"; }
+    cleanup4() { [ -n "$QPID4" ] && { pkill -KILL -P "$QPID4" 2>/dev/null || true; kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; }; rm -f "$SLOG4"; }
     trap 'rc=$?; cleanup4; exit $rc' EXIT
 
     echo "booting to assemble+link a program with the borrowed host toolchain..."
@@ -1108,9 +1138,9 @@ LXWAIT: reaped 40/40 children
     # programs; bundling them made a WORKING compile fail for want of
     # wall-clock, and made one failure indistinguishable from the other.
     SLOG5=$(mktemp /tmp/osdev_lxgcc.XXXXXX.log)
-    kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; QPID4=""
+    pkill -KILL -P "$QPID4" 2>/dev/null || true; kill -9 "$QPID4" 2>/dev/null || true; wait "$QPID4" 2>/dev/null || true; QPID4=""
     QPID5=""
-    cleanup5() { [ -n "$QPID5" ] && { kill -9 "$QPID5" 2>/dev/null || true; wait "$QPID5" 2>/dev/null || true; }; rm -f "$SLOG5"; }
+    cleanup5() { [ -n "$QPID5" ] && { pkill -KILL -P "$QPID5" 2>/dev/null || true; kill -9 "$QPID5" 2>/dev/null || true; wait "$QPID5" 2>/dev/null || true; }; rm -f "$SLOG5"; }
     trap 'rc=$?; cleanup5; exit $rc' EXIT
 
     echo "booting to compile OS-DEV's OWN kernel/elf.c with the in-guest gcc..."

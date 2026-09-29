@@ -407,7 +407,22 @@ static int virtio_blk_xfer_locked(uint64_t lba, uint32_t count, void *buf, int w
         if (vb.used->idx != vb.used_seen) { done = 1; break; }
         __asm__ volatile("pause");
     }
-    if (!done) { vblk_why("the device never completed the request (timeout)", lba, count, write); return -1; }
+    if (!done) {
+        /* A TIMED-OUT REQUEST IS STILL THE DEVICE'S. Returning -1 left the
+         * chain in flight: the next request reused descriptors 0-2, and its
+         * poll could take THIS request's late completion as its own and hand
+         * back data that had not arrived -- while the late completion DMAed
+         * into a buffer the caller had already given up on. Nothing here can
+         * resynchronise the rings, so stop the device: a reset is the one
+         * thing the virtio spec guarantees ends its use of them. The disk is
+         * then gone for this boot, which is an honest failure; a corrupted
+         * read was not. */
+        vblk_why("the device never completed the request (timeout) -- resetting it and taking it offline",
+                 lba, count, write);
+        vcfg_w8(VIRTIO_PCI_STATUS, 0);
+        vb.present = 0;
+        return -1;
+    }
 
     if (bounced && !write)
         for (uint32_t k = 0; k < bytes; k++) ((uint8_t *)buf)[k] = bounce[k];

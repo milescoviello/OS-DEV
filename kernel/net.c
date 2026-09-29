@@ -434,6 +434,11 @@ static struct { uint8_t buf[ORING_MAX]; int len; uint64_t at; } g_oring[ORING_N]
     }
 RXQ_LOCK(udpq)
 RXQ_LOCK(oring)
+/* ...and the TCP park ring, which every core and net_rx_service use as well
+ * and which had no lock: two park_puts could claim one slot (a lost segment,
+ * or one frame's header over another's payload) and an eviction could
+ * overwrite a slot while park_take was copying it out. */
+RXQ_LOCK(park)
 
 static void oring_put_u(const uint8_t *f, int len) {
     if (len <= 0 || len > ORING_MAX) return;
@@ -517,6 +522,30 @@ static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
  * kernel was also listening. This is the "no cross-connection RX demux" the
  * stack's own comments describe, and TCP got its park ring for exactly this in
  * M2017; UDP never got the equivalent. Now it has one. */
+static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport);
+/* A DATAGRAM ALREADY FILED FOR US, rebuilt as the frame it arrived in.
+ *
+ * The kernel's own UDP clients -- the DNS resolver, the DHCP client, TFTP --
+ * wait for their reply here, and this loop only ever read the card. But every
+ * other consumer that pulls a frame off the card files a UDP datagram into the
+ * UDP queue by destination port (tcp_recv_seg does, the socket pumps do), so a
+ * reply that happened to arrive while a TCP read or a poll() was running was
+ * put where these callers never looked, and the lookup timed out with its
+ * answer sitting in the queue. The callers parse Ethernet/IPv4/UDP headers, so
+ * the payload is handed back inside a well-formed frame: source address and
+ * port from the queue entry, destination ours. */
+static int udpq_take_frame(uint16_t port, uint8_t *buf, int max) {
+    if (max < 42 + 1) return 0;
+    uint8_t sip[4]; uint16_t sp = 0;
+    int n = udpq_take(port, buf + 42, max - 42, sip, &sp);
+    if (n <= 0) return 0;
+    for (int i = 0; i < 42; i++) buf[i] = 0;
+    put16(buf + 12, 0x0800);                        /* IPv4 */
+    buf[14] = 0x45; put16(buf + 16, (uint16_t)(20 + 8 + n)); buf[14 + 8] = 64; buf[14 + 9] = 17;
+    memcpy(buf + 26, sip, 4); memcpy(buf + 30, OUR_IP, 4);
+    put16(buf + 34, sp); put16(buf + 36, port); put16(buf + 38, (uint16_t)(8 + n));
+    return 42 + n;
+}
 static int recv_timeout(uint8_t *buf, int max, uint64_t ticks, int my_udp_port) {
     uint64_t deadline = timer_ticks() + ticks;
     /* A TICK DEADLINE IS NOT A BOUND WITH INTERRUPTS OFF (M2068).
@@ -559,6 +588,10 @@ static int recv_timeout(uint8_t *buf, int max, uint64_t ticks, int my_udp_port) 
     int once = (ticks == 0);
     while (once || (no_irq ? (--budget > 0) : (timer_ticks() <= deadline))) {
         if (once) once = 0, budget = 1;           /* this iteration, then out */
+        if (my_udp_port > 0) {                         /* our reply, filed by another consumer */
+            int u = udpq_take_frame((uint16_t)my_udp_port, buf, max);
+            if (u > 0) return u;
+        }
         int l = oring_take(buf, max);                  /* frames another consumer filed for us (M2018) */
         if (l > 0) {
             if (arp_maybe_reply(buf, l)) continue;
@@ -2215,8 +2248,13 @@ static int park_matches(const uint8_t *f, int len, const uint8_t *dip,
 uint64_t g_park_evicted;                  /* frames thrown away because the ring was full (M2022) */
 static void park_put(const uint8_t *f, int len) {
     if (len <= 0 || len > PARK_MAX) return;
+    uint64_t pfl = park_take_lk();
+    /* The clock is read UNDER the lock: every parked frame's `at` was set
+     * under it too, so at <= now always. Read before, another core's newer
+     * frame made `now - at` wrap, and the freshest segment expired at once
+     * (the M2124 bug class). */
     uint64_t now = timer_ticks();
-    int slot = -1;
+    int slot = -1, evicted = 0;
     for (int i = 0; i < PARK_N; i++) {
         if (g_park[i].len && now - g_park[i].at > PARK_TTL) g_park[i].len = 0;  /* expire */
         if (!g_park[i].len && slot < 0) slot = i;
@@ -2226,6 +2264,7 @@ static void park_put(const uint8_t *f, int len) {
                                            * lost TCP segment, which is the most
                                            * expensive kind of quiet. (M2022) */
         g_park_evicted++;
+        evicted = 1;
         /* SAY SO WHERE SOMEONE WILL SEE IT (M2336). M2022 wrote "a silent
          * eviction here is a silently lost TCP segment, which is the most
          * expensive kind of quiet" -- and then incremented a counter that
@@ -2238,12 +2277,7 @@ static void park_put(const uint8_t *f, int len) {
          * card, a new connection's handshake reply can be thrown away before
          * tcp_connect's park_take reaches it -- so connect() times out and a
          * tab opened after startup can never load anything. */
-        if (g_park_evicted == 1 || g_park_evicted == 10 ||
-            g_park_evicted == 100 || g_park_evicted == 1000 ||
-            (g_park_evicted % 5000) == 0)
-            kprintf("[park] ** the TCP park ring is FULL: %lu segment(s) evicted "
-                    "(%d slots). An evicted SYN-ACK is a connection that cannot "
-                    "be opened. **\n", (unsigned long)g_park_evicted, PARK_N);
+        /* (printed below, once the lock is released) */
         /* EVICT SOMETHING RE-SENDABLE. A data segment that goes missing is
          * retransmitted by the peer; a SYN-ACK that goes missing costs the
          * whole connection, because tcp_connect gives up after four SYNs. So
@@ -2272,13 +2306,20 @@ static void park_put(const uint8_t *f, int len) {
     memcpy(g_park[slot].buf, f, (size_t)len);
     g_park[slot].len = len;
     g_park[slot].at  = now;
+    uint64_t ev = g_park_evicted;
+    park_give_lk(pfl);
+    if (evicted && (ev == 1 || ev == 10 || ev == 100 || ev == 1000 || (ev % 5000) == 0))
+        kprintf("[park] ** the TCP park ring is FULL: %lu segment(s) evicted "
+                "(%d slots). An evicted SYN-ACK is a connection that cannot "
+                "be opened. **\n", (unsigned long)ev, PARK_N);
 }
 
 /* Take a parked frame for this connection, if one is waiting. Returns its length
  * (copied into `buf`) or 0. */
 static int park_take(uint8_t *buf, int max, const uint8_t *dip,
                      uint16_t sport, uint16_t dport) {
-    uint64_t now = timer_ticks();
+    uint64_t pfl = park_take_lk();
+    uint64_t now = timer_ticks();                /* under the lock: see park_put */
     for (int i = 0; i < PARK_N; i++) {
         if (!g_park[i].len) continue;
         if (now - g_park[i].at > PARK_TTL) { g_park[i].len = 0; continue; }
@@ -2286,9 +2327,11 @@ static int park_take(uint8_t *buf, int max, const uint8_t *dip,
         int n = g_park[i].len; if (n > max) n = max;
         memcpy(buf, g_park[i].buf, (size_t)n);
         g_park[i].len = 0;
+        park_give_lk(pfl);
         synack_trace(SA_TAKE, buf, n);
         return n;
     }
+    park_give_lk(pfl);
     return 0;
 }
 
@@ -2349,6 +2392,7 @@ static int tcp_recv_seg(uint8_t *buf, int max, const uint8_t *dip,
 /* ---------------- reusable TCP stream (for HTTP and, later, TLS) ----------- */
 
 static int ooo_claim(void);       /* claim a fresh reassembly+FIN slot (defined below, M1606) */
+static int ooo_slots(void);       /* how many there are, for the refusal message */
 static void tcp_snd_open(int idx, uint32_t isn, uint32_t peer_wnd);  /* arm the reliable-send state on connect (M1886) */
 
 /* Open a connection to ip:port (routed via the gateway). 0 on success, -1 on
@@ -2410,9 +2454,28 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
             if ((fl & TCP_SYN) && (fl & TCP_ACK) && get32(tcp + 8) == c->myseq + 1) {
                 c->theirseq = get32(tcp + 4) + 1;
                 c->myseq += 1;
+                c->ooo_idx = ooo_claim();     /* fresh reassembly + FIN state for this conn, now that we know we need it (M1606) */
+                /* NO RELIABILITY STATE, NO CONNECTION. The slot holds the
+                 * retransmit queue, the reassembly buffer and the FIN, so a
+                 * connection made without one -- the old "graceful degrade"
+                 * when OOO_N ran out -- sent every byte exactly once with no
+                 * retransmission, dropped anything out of order, and never
+                 * saw the peer's FIN, so its reader waited for ever. A
+                 * browser holding dozens of connections can run the table
+                 * out. Refuse instead: reset the half-open connection the
+                 * peer thinks it has, and fail with ENOBUFS. */
+                if (c->ooo_idx < 0) {
+                    tcp_send_seg(c->gw, c->ip, c->sport, port, c->myseq, c->theirseq, TCP_RST | TCP_ACK, 0, 0);
+                    static int told;
+                    if (told++ < 4)
+                        kprintf("[tcp] connect %u.%u.%u.%u:%u REFUSED locally: all %d connection slots "
+                                "are in use, and a connection without one would not be reliable\n",
+                                c->ip[0], c->ip[1], c->ip[2], c->ip[3], port, ooo_slots());
+                    c->errno_hint = ENOBUFS;
+                    return -1;
+                }
                 tcp_send_seg(c->gw, c->ip, c->sport, port, c->myseq, c->theirseq, TCP_ACK, 0, 0);
                 c->up = 1;
-                c->ooo_idx = ooo_claim();     /* fresh reassembly + FIN state for this conn, now that we know we need it (M1606) */
                 tcp_snd_open(c->ooo_idx, c->myseq, get16(tcp + 14));  /* arm reliable send: ISN + peer's advertised window (M1886) */
                 return 0;
             }
@@ -2453,10 +2516,40 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
  * no ARP/gateway. No retransmission — correct on the reliable QEMU/localhost path
  * (curl via `-netdev user,hostfwd=`). Returns request bytes read (>=0), or -1 on
  * timeout/error. Lets an in-guest httpd actually serve pages. */
+/* A connection request waiting for a listener: an IPv4 TCP SYN (no ACK) to
+ * `lport`, taken out of the park ring. See the backlog note in srv_rx. */
+static int park_take_syn(uint16_t lport, uint8_t *buf, int max) {
+    uint64_t pfl = park_take_lk();
+    uint64_t now = timer_ticks();                /* under the lock: see park_put */
+    for (int i = 0; i < PARK_N; i++) {
+        if (!g_park[i].len) continue;
+        if (now - g_park[i].at > PARK_TTL) { g_park[i].len = 0; continue; }
+        const uint8_t *f = g_park[i].buf;
+        int flen = g_park[i].len;
+        if (flen < 34 || get16(f + 12) != 0x0800 || f[14 + 9] != 6) continue;
+        int ihl = (f[14] & 0x0F) * 4;
+        if (ihl < 20 || 14 + ihl + 20 > flen) continue;
+        const uint8_t *t = f + 14 + ihl;
+        if (get16(t + 2) != lport || !(t[13] & TCP_SYN) || (t[13] & TCP_ACK)) continue;
+        int n = flen < max ? flen : max;
+        memcpy(buf, f, (size_t)n);
+        g_park[i].len = 0;
+        park_give_lk(pfl);
+        return n;
+    }
+    park_give_lk(pfl);
+    return 0;
+}
+
 static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
                   const uint8_t *cip, uint64_t deadline, uint8_t **tcp_out, int *dlen_out) {
     while (timer_ticks() < deadline) {
-        int len = rx_next(buf, max);                   /* answers ARP for us first (M2126) */
+        /* THE LISTEN BACKLOG. A listener that is not yet talking to anyone
+         * (cport == 0) takes a waiting connection request first: one that
+         * arrived while it was busy serving another client, or that another
+         * receive loop pulled off the card and parked. */
+        int len = cport ? 0 : park_take_syn(port, buf, max);
+        if (len <= 0) len = rx_next(buf, max);         /* answers ARP for us first (M2126) */
         if (len < 34) {
             /* Idle (no packet / a runt): SLEEP to the next interrupt instead of
              * tight-spinning. Interrupt-driven RX (M1858) wakes us the moment a
@@ -2476,9 +2569,28 @@ static int srv_rx(uint8_t *buf, int max, uint16_t port, uint16_t cport,
         int ihl = (buf[14] & 0x0F) * 4;
         if (ihl < 20 || 14 + ihl + 20 > len) continue;
         uint8_t *tcp = buf + 14 + ihl;
-        if (get16(tcp + 2) != port) continue;                            /* our listen port */
-        if (cport && get16(tcp + 0) != cport) continue;                  /* this connection's peer port */
-        if (cip && memcmp(buf + 26, cip, 4) != 0) continue;              /* this connection's peer IP */
+        /* ANOTHER PORT'S SEGMENT IS PARKED, NOT DROPPED. This test used to
+         * `continue`, discarding every TCP frame for another port -- and this
+         * loop runs for netcon's whole uptime, inside every accept(), and on
+         * every poll() of a Linux AF_INET listener, so while any of them
+         * polled, OUTBOUND connections lost their SYN-ACKs and data. Their
+         * owners look in the park ring first (tcp_recv_seg). */
+        if (get16(tcp + 2) != port) { park_put(buf, len); continue; }    /* someone else's connection */
+        /* ...AND ANOTHER CLIENT'S SYN IS KEPT FOR THE NEXT ACCEPT. It was
+         * dropped, on the theory that the client retransmits -- and it does,
+         * after a second, then two, then four. Under QEMU's user networking
+         * that was the whole of httpdtest's flake: the proxy accepts the host
+         * connection at once and keeps redialling the guest, so every SYN
+         * dropped while one request was being served became a connection
+         * served seconds later, after the client had given up, ahead of the
+         * live one -- and the last request of each round (the 404) timed out
+         * behind a queue of dead ones. Parked, the next accept takes it at
+         * once (the top of this loop); the park TTL expires a stale one. */
+        int other_peer = (cport && get16(tcp + 0) != cport) || (cip && memcmp(buf + 26, cip, 4) != 0);
+        if (other_peer) {
+            if ((tcp[13] & TCP_SYN) && !(tcp[13] & TCP_ACK)) park_put(buf, len);
+            continue;
+        }
         int thl = (tcp[12] >> 4) * 4;
         if (thl < 20 || 14 + ihl + thl > len) continue;
         int iptotal = get16(buf + 16);                                   /* clamp peer-controlled length */
@@ -2926,6 +3038,7 @@ struct ooo_state {
     int      in_fastrec;      /* 1 while in fast recovery (inflated cwnd until a new ACK) */
 };
 static struct ooo_state ooo_tab[OOO_N];
+static int ooo_slots(void) { return OOO_N; }
 static volatile int ooo_lock;
 static inline uint64_t ooo_irq_save(void) {
     uint64_t fl;

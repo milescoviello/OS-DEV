@@ -451,6 +451,7 @@ struct app {
                                             * 0 = none. Deliberately NOT inherited on fork/exec, matching real Linux
                                             * (a child must opt in for itself each time) (M1562) */
     int      exit_code;                  /* exit status, captured at SYS_exit */
+    int      kill_sig;                   /* terminated BY this signal (0 = exited): wait reports WIFSIGNALED */
     int      zombie;                     /* exited + resources freed, slot retained until a parent collects it */
     volatile int waiting;                /* this process is blocked in waitpid() */
     int      ns_id;                      /* mount-namespace id (0 = the shared/global namespace); unshare() detaches (M1122) */
@@ -530,7 +531,11 @@ unsigned long g_readahead_pages;   /* pages filled by readahead rather than by a
 int g_net_trace;
 static unsigned long g_net_calls;   /* socket reads+writes, to notice a connection going quiet (M2016) */
 static struct app apps[MAX_APPS];
+static long file_off(struct app *a, int fd);   /* a file fd's cursor, shared by dup/fork (see g_ofd) */
+static void ofd_ref(int h);                    /* one more descriptor for a file opening */
+static void ofd_unref(int h);
 void app_cow_quarantine_flush(struct app *a);   /* drain the batched COW frees (M2102) */
+static int app_msync_of(struct app *a, uint64_t addr, uint64_t len);   /* write back a's dirty MAP_SHARED pages */
 
 /* SELF-AUDIT (-append vmaaudit, M1988). Two VMAs must never describe the same
  * address: that is the invariant every "no VMA" fault suggests is broken, and
@@ -544,10 +549,12 @@ int g_vma_audit;
  * is opt-in and effectively never on. This asks it for ONE slot -- the one just
  * published -- which is O(n) and cheap enough to leave on always. It exists
  * because an overlap is the signature of the find-then-fill race that M2329
- * fixed in the MAP_FIXED path and that six `vma_find_gap` sites still have:
- * two threads are handed the same address, the later carve removes one of the
- * twins, and the survivor can be a PROT_NONE reservation that the victim then
- * faults on -- which is precisely how Firefox died on its own thread stack.
+ * fixed in the MAP_FIXED path: two threads are handed the same address, the
+ * later carve removes one of the twins, and the survivor can be a PROT_NONE
+ * reservation that the victim then faults on -- which is precisely how Firefox
+ * died on its own thread stack. Every gap search now goes through
+ * vma_reserve, which searches and claims under one lock, so this should stay
+ * silent; it is kept because it is cheap and names the racing pair if not.
  *
  * Silent when correct. Fires only on the defect, and names both slots and the
  * line that created each, so the report identifies the racing pair rather than
@@ -595,6 +602,30 @@ static inline int vma_pick_slot(struct app *a) {
 }
 
 static int next_pid = 100;
+/* CLAIMING A PROCESS SLOT, the same find-then-fill as the VMA table (M1988):
+ * fork and spawn scanned apps[] for !used and only set used = 1 after a
+ * ~300 KB memset, so two cores forking at once could take the same struct
+ * app -- one address space leaked, one child running with the other's state.
+ * The memset clears `used` itself, so the claim lives beside the table:
+ * taken under a short lock, dropped once the slot says used = 1. */
+static volatile int g_app_slot_lk;
+static uint8_t g_app_slot_claimed[MAX_APPS];
+static struct app *app_slot_claim(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_app_slot_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    struct app *a = 0;
+    for (int i = 0; i < MAX_APPS; i++)
+        if (!apps[i].used && !g_app_slot_claimed[i]) { g_app_slot_claimed[i] = 1; a = &apps[i]; break; }
+    __atomic_store_n(&g_app_slot_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return a;
+}
+/* After memset + used = 1: `used` protects the slot from here on. */
+static void app_slot_publish(struct app *a) {
+    __atomic_store_n(&g_app_slot_claimed[a - apps], 0, __ATOMIC_RELEASE);
+}
+static int app_new_pid(void) { return __atomic_fetch_add(&next_pid, 1, __ATOMIC_RELAXED); }
 static int fg_pgid;             /* the controlling terminal's foreground process group (job control, M1176; 0 = none) */
 int app_oom_kill(void);         /* OOM killer (M1275): defined below, called from the sbrk exhaustion path above it */
 
@@ -1212,7 +1243,7 @@ int app_format_fds(app_t *a, char *b, int max) {
             p = maps_str(b, p, max, "file ");
             p = maps_str(b, p, max, a->fd[i].path);
             p = maps_str(b, p, max, " @");
-            p = maps_dec(b, p, max, (uint64_t)a->fd[i].off);
+            p = maps_dec(b, p, max, (uint64_t)file_off(a, i));
         } else {
             p = maps_str(b, p, max, "?");
         }
@@ -1449,6 +1480,9 @@ int app_scm_send(int ep, int fd) {
     case 8:  inotify_ref(g_scmpool[e].fe.obj); break;
     case 10: net_tcp_sock_ref(g_scmpool[e].fe.obj); break;
     case 12: if (g_scmpool[e].fe.obj >= 0) unix_ref(g_scmpool[e].fe.obj); break;
+    case 11: pty_ref(g_scmpool[e].fe.obj); break;   /* a pty end is a reference too (pty_ref) */
+    case 17: drm_node_ref(g_scmpool[e].fe.obj); break;   /* and a render node (drm_node_ref) */
+    case 2:  ofd_ref(g_scmpool[e].fe.obj); break;        /* a passed file shares its opening */
     default: break;                      /* files and console aliases carry no count */
     }
     /* FIFO append, because the protocol matches descriptors to messages by
@@ -1551,6 +1585,9 @@ void app_scm_drop_conn(int ci) {
         case 8:  inotify_free(doomed[i].obj); break;
         case 10: net_tcp_sock_close(doomed[i].obj); break;
         case 12: if (doomed[i].obj >= 0) unix_close(doomed[i].obj); break;
+        case 11: pty_close(doomed[i].obj); break;
+        case 17: drm_close_node(doomed[i].obj); break;
+        case 2:  ofd_unref(doomed[i].obj); break;
         default: break;
         }
     }
@@ -2308,7 +2345,14 @@ static int app_reap_children_of(struct app *me) {
  * exist but none is ready, which is what Linux does and what an event loop
  * polling its subprocesses depends on -- see the LXS_wait4_ case, which until
  * M2025 discarded the options argument and so blocked forever on WNOHANG. */
-long app_wait4(int pid, int *status, int nohang) {
+/* The caller is about to exit because of `sig` (a fatal self-signal). */
+void app_note_kill_sig(int sig) { struct app *a = cur(); if (a) a->kill_sig = sig; }
+
+long app_wait4_sig(int pid, int *status, int *killsig, int nohang);
+long app_wait4(int pid, int *status, int nohang) { return app_wait4_sig(pid, status, 0, nohang); }
+/* As app_wait4, and also reports the signal that killed the child (0 if it
+ * exited), which the Linux wait status encodes separately (WIFSIGNALED). */
+long app_wait4_sig(int pid, int *status, int *killsig, int nohang) {
     struct app *me = cur();
     if (!me) return -1;
     for (;;) {
@@ -2329,10 +2373,11 @@ long app_wait4(int pid, int *status, int nohang) {
             if (c->exited) finishing = 1;
         }
         if (z) {
-            int code = z->exit_code, cpid = z->pid;
+            int code = z->exit_code, cpid = z->pid, ks = z->kill_sig;
             z->used = 0; z->zombie = 0;            /* collect the zombie slot */
             irq_restore(f);
             if (status) *status = code;
+            if (killsig) *killsig = ks;
             return cpid;
         }
         if (!have) { irq_restore(f); return -1; }  /* no matching children to wait for */
@@ -2369,7 +2414,7 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
             if (c->zombie) { z = c; break; }
         }
         if (z) {
-            int code = z->exit_code, cpid = z->pid;
+            int code = z->exit_code, cpid = z->pid, ks = z->kill_sig;
             /* WNOWAIT MEANS LOOK, DO NOT TAKE (M2106).
              *
              * Chromium's process watcher -- which is Firefox's -- peeks at a
@@ -2385,8 +2430,8 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
              * about. */
             if (!(options & WNOWAIT)) { z->used = 0; z->zombie = 0; }   /* collect the zombie slot */
             irq_restore(f);
-            if (si) { si->si_signo = SIGCHLD; si->si_errno = 0; si->si_code = CLD_EXITED;
-                      si->si_pid = cpid; si->si_uid = 0; si->si_status = code; }
+            if (si) { si->si_signo = SIGCHLD; si->si_errno = 0; si->si_code = ks ? CLD_KILLED : CLD_EXITED;
+                      si->si_pid = cpid; si->si_uid = 0; si->si_status = ks ? ks : code; }
             return 0;
         }
         if (!have) { irq_restore(f); return -1; }  /* no matching children */
@@ -2455,6 +2500,22 @@ int app_reap(app_t *a) {
      * process stayed un-reaped and un-zombified for ever and its parent hung in
      * wait4(). See task_off_stack for why STOPPED needs its own proof. */
     if (a->used && a->exited && (!a->task || app_task_reapable(a->task))) {
+        /* EVERY THREAD OFF ITS CORE BEFORE ANYTHING IT USES IS FREED. The
+         * teardown below stopped a live thread and destroyed the address
+         * space a few lines later -- but a task_stop only takes effect at that
+         * thread's next switch, up to a tick away on another core, so it went
+         * on running user code and syscalls on freed page tables. Stop them
+         * all first, and if any is still on a core, report "not reaped yet":
+         * every caller retries. A thread blocked off-CPU does not hold this up. */
+        {   int on_core = 0;
+            for (int i = 0; i < APP_MAXTHREAD; i++) {
+                task_t *t = a->thr[i];
+                if (!t || app_task_reapable(t)) continue;
+                task_stop(t);
+                if (task_is_on_cpu(t)) on_core = 1;
+            }
+            if (on_core) return 0;
+        }
         /* ONE REAPER, ATOMICALLY (M2072).
          *
          * This function frees the address space, every memfd mapping, the
@@ -2539,11 +2600,9 @@ int app_reap(app_t *a) {
         {
             uint64_t flags2;
             __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags2) :: "memory");
-            uint64_t old_cr3_reap;
-            __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3_reap));
-            __asm__ volatile("mov %0, %%cr3" : : "r"(a->cr3) : "memory");
-            app_msync(0, (uint64_t)-1);
-            __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3_reap) : "memory");
+            uint64_t old_cr3_reap = task_cr3_borrow(a->cr3);   /* msync can sleep on disk: see task_cr3_borrow */
+            app_msync_of(a, 0, (uint64_t)-1);                  /* THIS process's mappings, not the reaper's */
+            task_cr3_return(old_cr3_reap);
             __asm__ volatile("push %0; popfq" : : "r"(flags2) : "memory", "cc");
         }
         /* Release this process's memfd mappings BEFORE the address space goes
@@ -2605,12 +2664,13 @@ int app_reap(app_t *a) {
  * Uses a REAL apps[] slot with no task, no threads, no VMAs, and the caller's
  * own CR3 (so the msync context switch is a no-op and nothing is destroyed). */
 int app_reap_selftest(void) {
-    int fails = 0, slot = -1;
-    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { slot = i; break; }
-    if (slot < 0) { kprintf("[reaptest] no free app slot (skipped)\n"); return 0; }
-    struct app *a = &apps[slot];
+    int fails = 0;
+    struct app *a = app_slot_claim();
+    if (!a) { kprintf("[reaptest] no free app slot (skipped)\n"); return 0; }
+    int slot = (int)(a - apps);
     memset(a, 0, sizeof *a);
     a->used = 1; a->exited = 1; a->task = 0; a->parent = 0;
+    app_slot_publish(a);
     a->pid = 0x7000 + slot;                     /* not a real pid: nothing else refers to it */
     a->nvma = 0;
     __asm__ volatile("mov %%cr3, %0" : "=r"(a->cr3));
@@ -4957,12 +5017,39 @@ int app_sys_read(char *buf, unsigned max) {
  * LXS_brk case for what looping on that costs. The pages stay mapped; only the
  * bookkeeping moves, which is all the caller can observe. */
 uint64_t app_heap_base(void) { return UHEAP_BASE; }
+static int app_tlb_sync(struct app *a);
+/* LOWERING THE BREAK FREES WHAT IT UNCOVERS. This only moved heap_end, so the
+ * pages above the new break stayed mapped; the next grow mapped fresh frames
+ * over them and the old ones were orphaned for good (glibc's malloc trim does
+ * exactly this, repeatedly). It also broke the brk contract glibc's calloc
+ * relies on -- memory newly obtained from brk is zero -- whenever a grow
+ * re-exposed a page that was still mapped. The break is kept page-aligned
+ * (brk returns the break actually set, which may round up), and the freed
+ * pages go back only after a shootdown every core acknowledged, as munmap's
+ * do. Only ever lowers, never grows. */
 void app_set_break(uint64_t addr) {
     struct app *a = cur();
     if (!a) return;
     if (!a->heap_end) a->heap_end = UHEAP_BASE;
     if (addr < UHEAP_BASE) addr = UHEAP_BASE;
-    if (addr <= a->heap_end) a->heap_end = addr;      /* only ever lowers, never grows */
+    addr = (addr + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (addr >= a->heap_end) return;
+    uint64_t top = (a->heap_end + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    a->heap_end = addr;
+    uint64_t fr[64]; int n = 0, leaked = 0;
+    for (uint64_t v = addr; v < top; v += PAGE_SIZE) {
+        uint64_t ph = vmm_translate(v);
+        if (!ph) continue;
+        vmm_unmap(v);
+        fr[n++] = ph & ~(uint64_t)(PAGE_SIZE - 1);
+        if (n == 64 || v + PAGE_SIZE >= top) {
+            if (app_tlb_sync(a)) { for (int k = 0; k < n; k++) pmm_free_frame(fr[k]); }
+            else leaked += n;
+            n = 0;
+        }
+    }
+    if (n) { if (app_tlb_sync(a)) { for (int k = 0; k < n; k++) pmm_free_frame(fr[k]); } else leaked += n; }
+    if (leaked) kprintf("[app] brk shrink leaked %d frame(s): the shootdown did not complete\n", leaked);
 }
 
 uint64_t app_sbrk(long inc) {
@@ -5130,7 +5217,8 @@ static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align);
  * Returns the claimed slot, with start/len already set, and writes the address
  * to *out. -1 if there is no gap or no slot. The caller fills in the rest of
  * the entry; `len` is already non-zero, so no other allocator can take it. */
-static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *out) {
+#define vma_reserve(a, len, align, out) vma_reserve_line((a), (len), (align), (out), __LINE__)
+static int vma_reserve_line(struct app *a, uint64_t len, uint64_t align, uint64_t *out, unsigned line) {
     uint64_t f = vma_alloc_lock(a);
     uint64_t addr = vma_find_gap(a, len, align);
     int slot = -1;
@@ -5138,6 +5226,7 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
         slot = vma_pick_slot(a);
         if (slot >= 0) {
             for (unsigned b = 0; b < sizeof a->vma[0]; b++) ((char *)&a->vma[slot])[b] = 0;
+            a->vma[slot].oline = (unsigned short)line;   /* WHO MADE THIS MAPPING, as VMA_NEW records it (M2207) */
             a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
             a->vma[slot].prot = VMA_PROT_READ | VMA_PROT_WRITE;
             a->vma[slot].start = addr;
@@ -5148,6 +5237,57 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
     vma_alloc_unlock(a, f);
     if (slot >= 0) vma_published(a, slot);   /* M2333 */
     if (slot >= 0 && out) *out = addr;
+    return slot;
+}
+
+/* GIVE A RESERVATION BACK, for a caller that fails after vma_reserve or
+ * VMA_NEW. The same tombstone app_munmap writes, in the same order: every
+ * field but len first, len LAST, because len == 0 is what hands the slot to
+ * the next allocator -- clear it earlier and that allocator's fields can be
+ * overwritten by ours. Under the claim lock so vma_pick_slot cannot see the
+ * slot half-released. */
+static void vma_release(struct app *a, int slot) {
+    uint64_t f = vma_alloc_lock(a);
+    a->vma[slot].start = 0;
+    a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
+    a->vma[slot].file_backed = 0; a->vma[slot].shared = 0;
+    a->vma[slot].huge = 0; a->vma[slot].sealed = 0; a->vma[slot].uffd = 0;
+    a->vma[slot].locked = 0; a->vma[slot].prot = 0;
+    a->vma[slot].len = 0;                         /* LAST: this frees the slot */
+    vma_alloc_unlock(a, f);
+}
+
+/* RESERVE A RANGE THE CALLER CHOSE (M2329's shape, shared). Publishes
+ * [addr, addr+len) as a live anonymous RW VMA under the claim lock, so from
+ * that instant every other allocator's search and carve sees it. With
+ * `refuse_overlap` the overlap test happens inside the same critical section
+ * (an mmap hint must never land on an existing mapping); without it the caller
+ * carves the old mappings out afterwards with app_vma_carve_ex(.., slot).
+ * Returns the slot, or -1 (no slot, or an overlap was refused). */
+#define vma_reserve_at(a, addr, len, refuse) vma_reserve_at_line((a), (addr), (len), (refuse), __LINE__)
+static int vma_reserve_at_line(struct app *a, uint64_t addr, uint64_t len, int refuse_overlap,
+                               unsigned line) {
+    uint64_t f = vma_alloc_lock(a);
+    int slot = -1;
+    int clash = 0;
+    if (refuse_overlap)
+        for (int i = 0; i < a->nvma; i++) {
+            if (!a->vma[i].len) continue;
+            uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
+            if (addr < e && s < addr + len) { clash = 1; break; }
+        }
+    if (!clash) slot = vma_pick_slot(a);
+    if (slot >= 0) {
+        for (unsigned b = 0; b < sizeof a->vma[0]; b++) ((char *)&a->vma[slot])[b] = 0;
+        a->vma[slot].oline = (unsigned short)line;
+        a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
+        a->vma[slot].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        a->vma[slot].start = addr;
+        a->vma[slot].len   = len;             /* THE RESERVATION: a range, not a slot */
+        if (slot >= a->nvma) a->nvma = slot + 1;
+    }
+    vma_alloc_unlock(a, f);
+    if (slot >= 0) vma_published(a, slot);
     return slot;
 }
 
@@ -5218,13 +5358,14 @@ static int gap_is_clear(uint64_t addr, uint64_t len) {
     for (uint64_t p = addr; p < end; p += HUGE_SIZE) {
         if (vmm_pte_raw(p) & PTE_PRESENT) {
             g_gap_collisions++;
-            if (g_gap_collisions <= 8)
+            if (g_gap_collisions <= 8) {
                 kprintf("[vma] ** the gap chosen at %lx+%lx is NOT EMPTY: %lx is already mapped "
                         "(pte %lx) with no VMA covering it. Two allocations would have shared "
                         "pages. Refusing this range. **\n",
                         (unsigned long)addr, (unsigned long)len, (unsigned long)p,
                         (unsigned long)vmm_pte_raw(p));
-                { struct app *ca = cur(); if (ca) gap_report_neighbours(ca, p); }
+                struct app *ca = cur(); if (ca) gap_report_neighbours(ca, p);
+            }
             return 0;
         }
     }
@@ -5353,26 +5494,10 @@ static uint64_t app_mmap_fixed_nl(uint64_t addr, uint64_t len) {
      * Ninth instance of this session's one bug class -- find, then fill, with
      * the table unlocked in between.
      */
-    int vs0 = -1;
-    {   uint64_t rf = vma_alloc_lock(a);
-        vs0 = vma_pick_slot(a);
-        if (vs0 >= 0) {
-            for (unsigned _b = 0; _b < sizeof a->vma[0]; _b++) ((char *)&a->vma[vs0])[_b] = 0;
-            a->vma[vs0].oline = (unsigned short)__LINE__;
-            a->vma[vs0].fidx = -1; a->vma[vs0].mfd = -1;
-            a->vma[vs0].prot = VMA_PROT_READ | VMA_PROT_WRITE;
-            a->vma[vs0].start = addr;
-            a->vma[vs0].len   = len;          /* THE RESERVATION: a range, not a slot */
-            if (vs0 >= a->nvma) a->nvma = vs0 + 1;
-        }
-        vma_alloc_unlock(a, rf);
-    }
+    int vs0 = vma_reserve_at(a, addr, len, 0);
     if (vs0 < 0) return 0;
     if (app_vma_carve_ex(a, addr, len, vs0) != 0) {
-        uint64_t rf = vma_alloc_lock(a);      /* give the reservation back */
-        a->vma[vs0].start = 0; a->vma[vs0].len = 0;
-        a->vma[vs0].fidx = -1; a->vma[vs0].mfd = -1; a->vma[vs0].prot = 0;
-        vma_alloc_unlock(a, rf);
+        vma_release(a, vs0);                  /* give the reservation back */
         return 0;
     }
     a->vma[vs0].sealed = 0;
@@ -5408,22 +5533,12 @@ static uint64_t app_mmap_hint_nl(uint64_t addr, uint64_t len) {
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-    for (int i = 0; i < a->nvma; i++) {
-        if (!a->vma[i].len) continue;
-        uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
-        if (addr < e && s < addr + len) return 0;      /* occupied: the caller chooses instead */
-    }
-    int vs0; VMA_NEW(a, vs0);
-    a->vma[vs0].start = addr;
-    a->vma[vs0].len   = len;
-    a->vma[vs0].sealed = 0;
-    a->vma[vs0].uffd  = 0;
-    a->vma[vs0].file_backed = 0;
+    /* The overlap test and the claim are one critical section: tested and then
+     * recorded separately, two threads hinting the same free address both
+     * passed the test and both got it. Occupied -> 0, the caller picks. */
+    int vs0 = vma_reserve_at(a, addr, len, 1);
+    if (vs0 < 0) return 0;
     a->vma[vs0].locked = a->mlock_future;
-    a->vma[vs0].huge = 0;
-    a->vma[vs0].shared = 0;
-    a->vma[vs0].foff = 0;
-    a->vma[vs0].fidx = -1;
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
@@ -5473,7 +5588,7 @@ static uint64_t app_mmap_nl(uint64_t len) {
     uint64_t addr = 0;
     int vs1 = vma_reserve(a, len, len >= HUGE_SIZE ? HUGE_SIZE : 0, &addr);
     if (vs1 < 0) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) { a->vma[vs1].start = 0; a->vma[vs1].len = 0; return 0; }
+    if (addr + len > MMAP_TOP || addr + len < addr) { vma_release(a, vs1); return 0; }
     a->vma[vs1].locked = a->mlock_future;       /* MCL_FUTURE: born locked if mlockall(MCL_FUTURE) is in effect (M1283) */
     
     a->mmap_next = addr + len + PAGE_SIZE;          /* leave an unmapped guard gap */
@@ -5499,17 +5614,13 @@ static uint64_t app_mmap_huge_nl(uint64_t len) {
     len = (len + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);          /* whole 2 MiB pages */
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    uint64_t addr = vma_find_gap(a, len, HUGE_SIZE);   /* 2 MiB-aligned base */
-    if (!addr) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    int vs2; VMA_NEW(a, vs2);
-    a->vma[vs2].start = addr;
-    a->vma[vs2].len   = len;
-    vma_published(a, vs2);   /* M2333 */
-    a->vma[vs2].sealed = 0;
-    a->vma[vs2].uffd  = 0;
-    a->vma[vs2].file_backed = 0;
-    a->vma[vs2].locked = 0;
+    /* Search and claim in ONE critical section, as app_mmap does (M1988):
+     * finding the gap and recording it as two acts let two threads be handed
+     * the same range. */
+    uint64_t addr = 0;
+    int vs2 = vma_reserve(a, len, HUGE_SIZE, &addr);   /* 2 MiB-aligned base */
+    if (vs2 < 0) return 0;
+    if (addr + len > MMAP_TOP || addr + len < addr) { vma_release(a, vs2); return 0; }
     a->vma[vs2].huge = 1;
     
     a->mmap_next = addr + len + HUGE_SIZE;          /* guard gap, preserving 2 MiB alignment */
@@ -5561,15 +5672,18 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
         vs3 = vma_reserve(a, len, 0, &addr);
         if (vs3 < 0) return 0;
         if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) {
-            a->vma[vs3].start = 0; a->vma[vs3].len = 0; return 0;
+            vma_release(a, vs3); return 0;
         }
     } else {
-        if (app_vma_carve(a, addr, len) != 0) return 0;     /* MAP_FIXED: replace what is there */
+        /* MAP_FIXED: replace what is there. Reserve the range FIRST and carve
+         * around the reservation, as app_mmap_fixed does (M2329): carving and
+         * then recording left the range unclaimed in between, so another
+         * thread's mmap could be handed it -- in the path ld.so maps every
+         * library through. */
         if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-        if (vma_full(a)) return 0;               /* re-check: the carve may have split */
-        VMA_NEW(a, vs3);
-        a->vma[vs3].start = addr;
-        a->vma[vs3].len   = len;
+        vs3 = vma_reserve_at(a, addr, len, 0);
+        if (vs3 < 0) return 0;
+        if (app_vma_carve_ex(a, addr, len, vs3) != 0) { vma_release(a, vs3); return 0; }
     }
     a->vma[vs3].sealed = 0;
     a->vma[vs3].uffd  = 0;
@@ -5586,7 +5700,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[vs3].fidx < 0) { a->vma[vs3].start = 0; a->vma[vs3].len = 0; return 0; }   /* release the slot */
+    if (a->vma[vs3].fidx < 0) { vma_release(a, vs3); return 0; }   /* release the slot */
     
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -5598,18 +5712,11 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    uint64_t addr = vma_find_gap(a, len, 0);
-    if (!addr) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    int vs4; VMA_NEW(a, vs4);
-    a->vma[vs4].start = addr;
-    a->vma[vs4].len   = len;
-    vma_published(a, vs4);   /* M2333 */
-    a->vma[vs4].sealed = 0;
-    a->vma[vs4].uffd  = 0;
+    uint64_t addr = 0;
+    int vs4 = vma_reserve(a, len, 0, &addr);         /* search + claim atomically (M1988) */
+    if (vs4 < 0) return 0;
+    if (addr + len > MMAP_TOP || addr + len < addr) { vma_release(a, vs4); return 0; }
     a->vma[vs4].file_backed = 1;
-    a->vma[vs4].locked = 0;
-    a->vma[vs4].huge = 0;
     a->vma[vs4].shared = shared ? 1 : 0;
     a->vma[vs4].foff = 0;
     a->vma[vs4].fidx = vma_intern_path(path);
@@ -5620,7 +5727,7 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[vs4].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
+    if (a->vma[vs4].fidx < 0) { vma_release(a, vs4); return 0; }   /* the slot IS claimed: give it back */
     
     a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -5639,10 +5746,32 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
  * fd write (M1195) -- read the whole file via vfs_read, patch the dirty
  * page(s) in memory, write it back via vfs_write. One RMW per VMA (not per
  * page), and skipped entirely when nothing in range is actually dirty. */
-int app_msync(uint64_t addr, uint64_t len) {
-    struct app *a = cur();
-    if (!a) return -1;
+/* WHAT CHANGED, AND WHY (the M1544 design above, three corrections).
+ *
+ *  - THE DIRTY BIT WAS CLEARED ON ONE CORE. A core that already caches the
+ *    page's translation with D=1 never writes the PTE again, so after a local
+ *    invlpg its writes left the page looking clean and the NEXT msync skipped
+ *    them. Now the bit is cleared, every core is made to drop the translation,
+ *    and only THEN is the page copied: a write after that either landed before
+ *    the copy (and is in it) or re-dirties the page for the next sync.
+ *  - THE WHOLE FILE WAS REWRITTEN, AND GROWN. It was read, patched and written
+ *    back at max(size, the mapping's page-rounded span), so msync of a mapped
+ *    100-byte file made it 4096 bytes, and any write() another process made
+ *    between the read and the write-back was undone. Each dirty page is now
+ *    written in place with vfs_pwrite, clipped at end-of-file (Linux does not
+ *    extend a file from a mapping either). The read-patch-write path remains
+ *    only for a filesystem with no positioned write, still clipped.
+ *  - THE PAGE WAS READ THROUGH ITS USER ADDRESS, which needed the process's
+ *    address space loaded and was not protected from a munmap on another core.
+ *    It is read through the HHDM from a frame this function holds a reference
+ *    on, so it works for any process -- which reap needs: it runs in the window
+ *    manager's context, and app_msync used to walk cur()'s VMAs there, which
+ *    are not the dying process's. */
+#define MSYNC_BATCH 64
+static int app_msync_of(struct app *a, uint64_t addr, uint64_t len) {
+    if (!a || !a->cr3) return -1;
     uint64_t end = addr + len;
+    if (end < addr) end = ~(uint64_t)0;
     for (int i = 0; i < a->nvma; i++) {
         if (!a->vma[i].file_backed || !a->vma[i].shared) continue;
         uint64_t vstart = a->vma[i].start, vend = vstart + a->vma[i].len;
@@ -5654,64 +5783,68 @@ int app_msync(uint64_t addr, uint64_t len) {
             if (vmm_pte_in(a->cr3, page) & PTE_DIRTY) { any_dirty = 1; break; }
         if (!any_dirty) continue;
 
-        /* SNAPSHOT THE MAPPING BEFORE BLOCKING ON THE DISK (M2161).
-         *
-         * THE PANIC THIS FIXES. `vfs_read` below goes to the disk and this
-         * function deliberately holds no VMA lock across it (see the comment on
-         * vma_lock). It then went back to `a->vma[i]` for `foff` -- after
-         * another thread could have carved, moved or replaced that entry. A
-         * larger `foff` makes `fileoff` exceed `need`, and then
-         *
-         *     uint64_t n = PAGE_SIZE; if (fileoff + n > need) n = need - fileoff;
-         *
-         * UNDERFLOWS: `need - fileoff` is unsigned, so `n` becomes ~2^64 and
-         * the copy runs off the end of both the heap buffer and the mapped
-         * page. That is a supervisor READ of an absent page with no handler:
-         *
-         *     *** KERNEL PANIC *** Page Fault err=0x0 rip=app_msync
-         *
-         * reachable by any process that calls msync() while another of its
-         * threads touches the same address space -- which is Firefox with
-         * SQLite on eight cores, every run.
-         *
-         * Three fixes, because each is independently necessary: take the
-         * fields ONCE, before the I/O; clamp with a comparison that cannot
-         * underflow; and do the page copy under the VMA lock, which is safe
-         * here precisely because the copy does no I/O -- the reads and writes
-         * are outside it. */
-        uint64_t v_foff = a->vma[i].foff, v_len = a->vma[i].len, v_start = a->vma[i].start;
+        /* SNAPSHOT THE MAPPING BEFORE BLOCKING ON THE DISK (M2161): another
+         * thread can carve, move or replace this entry while the writes below
+         * sleep, so its fields are taken once, here. */
+        uint64_t v_foff = a->vma[i].foff, v_start = a->vma[i].start;
         char vpath[VFS_PATH_MAX];
         {   const char *sp = vma_path(a, i); unsigned k = 0;
             for (; sp && sp[k] && k < sizeof(vpath) - 1; k++) vpath[k] = sp[k];
             vpath[k] = 0; }
-        struct statx st; long sz = (vfs_stat(vpath, &st) == 0) ? (long)st.stx_size : 0;
-        uint64_t need = v_foff + v_len;                      /* the mapping's own span sets the ceiling */
-        if ((uint64_t)sz > need) need = (uint64_t)sz;        /* preserve any bytes past the mapping */
-        if (need == 0 || need > (16u << 20)) continue;       /* refuse to RMW something absurd (16 MiB cap) */
-        char *tmp = kmalloc((size_t)need);
-        if (!tmp) continue;
-        long got = vfs_read(vpath, tmp, need);
-        if (got < 0) got = 0;
-        for (long b = got; b < (long)need; b++) tmp[b] = 0;  /* zero-fill any gap, mirrors app_fd_write */
+        struct statx st;
+        if (vfs_stat(vpath, &st) != 0) continue;
+        uint64_t fsz = (uint64_t)st.stx_size;
 
-        uint64_t mfl = vma_lock(a);
-        for (uint64_t page = lo & ~(uint64_t)(PAGE_SIZE - 1); page < hi; page += PAGE_SIZE) {
-            uint64_t pte = vmm_pte_in(a->cr3, page);
-            if (!(pte & PTE_PRESENT) || !(pte & PTE_DIRTY)) continue;
-            if (page < v_start) continue;
-            uint64_t fileoff = v_foff + (page - v_start);
-            if (fileoff >= need) continue;                   /* never underflow the clamp */
-            uint64_t n = need - fileoff; if (n > PAGE_SIZE) n = PAGE_SIZE;
-            for (uint64_t b = 0; b < n; b++) tmp[fileoff + b] = ((const char *)page)[b];
-            vmm_set_pte_in(a->cr3, page, pte & ~PTE_DIRTY);
-            __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+        uint64_t page = lo & ~(uint64_t)(PAGE_SIZE - 1);
+        while (page < hi) {
+            struct { uint64_t off, phys; uint32_t n; } w[MSYNC_BATCH];
+            int nw = 0;
+            uint64_t mfl = vma_lock(a);
+            for (; page < hi && nw < MSYNC_BATCH; page += PAGE_SIZE) {
+                uint64_t pte = vmm_pte_in(a->cr3, page);
+                if (!(pte & PTE_PRESENT) || !(pte & PTE_DIRTY)) continue;
+                if (page < v_start) continue;
+                uint64_t fileoff = v_foff + (page - v_start);
+                uint64_t phys = pte & PTE_ADDR_MASK;
+                if (fileoff < fsz && !pmm_refcountable(phys)) continue;   /* cannot hold it: leave it dirty */
+                vmm_set_pte_in(a->cr3, page, pte & ~PTE_DIRTY);
+                __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+                if (fileoff >= fsz) continue;          /* past end-of-file: Linux drops it too */
+                pmm_addref(phys);                      /* the copy below reads THIS frame, whatever munmap does */
+                uint64_t n = fsz - fileoff; if (n > PAGE_SIZE) n = PAGE_SIZE;
+                w[nw].off = fileoff; w[nw].phys = phys; w[nw].n = (uint32_t)n; nw++;
+            }
+            vma_unlock(a, mfl);
+            if (!nw) continue;
+            app_tlb_sync(a);                           /* no core keeps a D=1 translation past here */
+            int unsupported = 0;
+            for (int k = 0; k < nw; k++) {
+                long wr = unsupported ? VFS_PWRITE_UNSUPPORTED
+                                      : vfs_pwrite(vpath, hhdm(w[k].phys), w[k].n, w[k].off);
+                if (wr == VFS_PWRITE_UNSUPPORTED) unsupported = 1;
+            }
+            if (unsupported && fsz && fsz <= (16u << 20)) {
+                /* No positioned write here (tmpfs, FAT): patch the file as a
+                 * whole, as before -- but never past its end. */
+                char *tmp = kmalloc((size_t)fsz);
+                if (tmp) {
+                    long got = vfs_read(vpath, tmp, fsz);
+                    if (got < 0) got = 0;
+                    for (uint64_t b = (uint64_t)got; b < fsz; b++) tmp[b] = 0;
+                    for (int k = 0; k < nw; k++) {
+                        const char *src = (const char *)hhdm(w[k].phys);
+                        for (uint32_t b = 0; b < w[k].n; b++) tmp[w[k].off + b] = src[b];
+                    }
+                    vfs_write(vpath, tmp, fsz);
+                    kfree(tmp);
+                }
+            }
+            for (int k = 0; k < nw; k++) pmm_free_frame(w[k].phys);   /* our hold, not the mapping's */
         }
-        vma_unlock(a, mfl);
-        vfs_write(vpath, tmp, need);
-        kfree(tmp);
     }
     return 0;
 }
+int app_msync(uint64_t addr, uint64_t len) { return app_msync_of(cur(), addr, len); }
 
 /* Split the VMA containing `addr` so that `addr` becomes a boundary. No-op if
  * nothing contains it, or if it is already a start/end. Returns 0, or -1 if
@@ -5907,6 +6040,11 @@ void app_cow_quarantine_flush(struct app *a) {
 }
 
 unsigned long g_tlb_sync_fail;   /* shootdowns that did NOT get every ack (M2107) */
+/* `a` must be the CURRENT process, or one with no thread on any core: the
+ * "no worker threads, so this core's invlpg was enough" shortcut below is only
+ * true when the one thread is running HERE. Rewriting another live process's
+ * page tables and syncing it through this is wrong -- its main task can be on
+ * another core -- which is one of the reasons memfd growth stopped doing so. */
 static int app_tlb_sync(struct app *a) {
     if (!a) return 1;
     for (int i = 0; i < APP_MAXTHREAD; i++)
@@ -5955,6 +6093,30 @@ static int app_vma_carve(struct app *a, uint64_t addr, uint64_t len) {
 }
 /* `except` is a slot the caller has ALREADY reserved for this very range and
  * must not carve out from under itself -- see app_mmap_fixed_nl (M2329). */
+/* FREE ONLY WHAT NO CORE CAN STILL REACH (M2034's rule, for munmap). The
+ * carve used to hand each frame back to the allocator the moment its PTE was
+ * cleared, and shoot the other cores' TLBs down only at the very end -- with
+ * the result ignored. A sibling thread on another core, or a syscall still
+ * copying into the buffer there, kept writing through its stale translation
+ * into a frame already given to another process or used as a page table.
+ * So frames are batched, the batch is freed only after a shootdown every
+ * core acknowledged, and a batch whose shootdown timed out is leaked, as the
+ * COW and mremap paths already do. */
+#define CARVE_BATCH 128
+static void carve_drain(struct app *a, uint64_t *fr, int *n, uint64_t *hfr, int *nh) {
+    if (!*n && !*nh) return;
+    if (app_tlb_sync(a)) {
+        for (int k = 0; k < *n; k++) pmm_free_frame(fr[k]);
+        for (int k = 0; k < *nh; k++) pmm_free_contiguous(hfr[k], HUGE_SIZE / PAGE_SIZE);
+    } else {
+        static int told;
+        if (!told) { told = 1;
+            kprintf("[vmm] munmap LEAKED %d frame(s) + %d hugepage(s): the shootdown did not complete, "
+                    "so another core may still be using them\n", *n, *nh); }
+    }
+    *n = 0; *nh = 0;
+}
+
 static int app_vma_carve_ex(struct app *a, uint64_t addr, uint64_t len, int except) {
     if (!a || !len) return -1;
     uint64_t end = addr + len;
@@ -6002,16 +6164,25 @@ static int app_vma_carve_ex(struct app *a, uint64_t addr, uint64_t len, int exce
          * without an explicit msync() first is the common pattern (M1602). */
         if (a->vma[i].file_backed && a->vma[i].shared) app_msync(cs, ce - cs);
 
-        if (a->vma[i].huge) {
-            for (uint64_t p = cs; p < ce; p += HUGE_SIZE) {
-                uint64_t ph = vmm_translate(p);
-                if (ph) { vmm_unmap_huge(p); pmm_free_contiguous(ph & ~(HUGE_SIZE - 1), HUGE_SIZE / PAGE_SIZE); }
+        {   uint64_t fr[CARVE_BATCH], hfr[8]; int nf = 0, nh = 0;   /* see carve_drain */
+            if (a->vma[i].huge) {
+                for (uint64_t p = cs; p < ce; p += HUGE_SIZE) {
+                    uint64_t ph = vmm_translate(p);
+                    if (!ph) continue;
+                    vmm_unmap_huge(p);
+                    hfr[nh++] = ph & ~(HUGE_SIZE - 1);
+                    if (nh == 8) carve_drain(a, fr, &nf, hfr, &nh);
+                }
+            } else {
+                for (uint64_t p = cs; p < ce; p += PAGE_SIZE) {
+                    uint64_t ph = vmm_translate(p);
+                    if (!ph) continue;
+                    vmm_unmap(p);
+                    fr[nf++] = ph;
+                    if (nf == CARVE_BATCH) carve_drain(a, fr, &nf, hfr, &nh);
+                }
             }
-        } else {
-            for (uint64_t p = cs; p < ce; p += PAGE_SIZE) {
-                uint64_t ph = vmm_translate(p);
-                if (ph) { vmm_unmap(p); pmm_free_frame(ph); }
-            }
+            carve_drain(a, fr, &nf, hfr, &nh);
         }
 
         if (cs == s0 && ce == e0) {                 /* whole VMA goes */
@@ -6161,25 +6332,34 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
     /* GROW: extend in place if the tail [old_end,new_end) is free + in-window */
     uint64_t old_end = old_addr + old_len, new_end = old_addr + new_len;
     if (new_end <= MMAP_TOP && new_end > old_addr) {
+        if (a->rlim_as && app_vma_total(a) - old_len + new_len > a->rlim_as) return (uint64_t)-1;
+        /* The check and the extension are ONE claim, under the same lock
+         * vma_reserve searches under: checked and then written separately,
+         * another thread's mmap could be handed the tail in between (M1988's
+         * find-then-fill race, in the one path that grows a range rather than
+         * finding one). */
         int overlap = 0;
+        uint64_t gf = vma_alloc_lock(a);
         for (int i = 0; i < a->nvma; i++) if (i != vi) {
             uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
             if (old_end < e && new_end > s) { overlap = 1; break; }
         }
-        if (!overlap) {
-            if (a->rlim_as && app_vma_total(a) - old_len + new_len > a->rlim_as) return (uint64_t)-1;
-            a->vma[vi].len = new_len;                     /* new pages demand-fault in lazily */
-            return old_addr;
-        }
+        if (!overlap) a->vma[vi].len = new_len;           /* new pages demand-fault in lazily */
+        vma_alloc_unlock(a, gf);
+        if (!overlap) return old_addr;
     }
     if (!(flags & MREMAP_MAYMOVE)) return (uint64_t)-1;   /* blocked, and not allowed to move */
 
     /* MOVE: reserve a fresh region (bump allocator, like app_mmap), copy, free old */
     if (vma_full(a)) return (uint64_t)-1;
-    uint64_t nbase = vma_find_gap(a, new_len, 0);
-    if (!nbase) return (uint64_t)-1;
-    if (nbase + new_len > MMAP_TOP || nbase + new_len < nbase) return (uint64_t)-1;
     if (a->rlim_as && app_vma_total(a) + new_len > a->rlim_as) return (uint64_t)-1;
+    /* Claim the destination BEFORE copying into it: pages are mapped there
+     * below, and an unclaimed range can be handed to another thread's mmap
+     * while that happens (M1988). */
+    uint64_t nbase = 0;
+    int vs5 = vma_reserve(a, new_len, 0, &nbase);
+    if (vs5 < 0) return (uint64_t)-1;
+    if (nbase + new_len > MMAP_TOP || nbase + new_len < nbase) { vma_release(a, vs5); return (uint64_t)-1; }
     uint64_t copy_len = old_len < new_len ? old_len : new_len;
     for (uint64_t off = 0; off < copy_len; off += PAGE_SIZE) {
         uint64_t ph = vmm_translate(old_addr + off);
@@ -6187,17 +6367,13 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
         uint64_t nf = pmm_alloc_frame();
         if (!nf) {                                         /* OOM mid-move: undo the new pages, bail (old untouched) */
             for (uint64_t u = 0; u < off; u += PAGE_SIZE) { uint64_t q = vmm_translate(nbase + u); if (q) { vmm_unmap(nbase + u); pmm_free_frame(q); } }
+            vma_release(a, vs5);
             return (uint64_t)-1;
         }
         uint8_t *s = (uint8_t *)hhdm(ph), *d = (uint8_t *)hhdm(nf);
         memcpy(d, s, PAGE_SIZE);   /* word-at-a-time (M2094) */
         vmm_map(nbase + off, nf, PTE_WRITABLE | PTE_USER | PTE_NX);
     }
-    int vs5; VMA_NEW(a, vs5);
-    a->vma[vs5].start = nbase; a->vma[vs5].len = new_len;
-    vma_published(a, vs5);   /* M2333 */
-    a->vma[vs5].sealed = a->vma[vs5].uffd = a->vma[vs5].file_backed = a->vma[vs5].locked = a->vma[vs5].huge = 0;
-    
     a->mmap_next = nbase + new_len + PAGE_SIZE;
     app_munmap_nl(old_addr, old_len);                     /* free the old region's frames + VMA (the lock is already held) */
     return nbase;
@@ -7012,9 +7188,10 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
     uint64_t total = len * 2;
     if (total < len) return 0;                       /* overflow */
     if (vma_full(a)) return 0;
-    uint64_t base = vma_find_gap(a, total, 0);
-    if (!base) return 0;
-    if (base + total > MMAP_TOP || base + total < base) return 0;
+    uint64_t base = 0;
+    int vs6 = vma_reserve(a, total, 0, &base);       /* claim before mapping into it (M1988) */
+    if (vs6 < 0) return 0;
+    if (base + total > MMAP_TOP || base + total < base) { vma_release(a, vs6); return 0; }
     uint64_t mapped = 0;
     for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
         uint64_t frame = pmm_alloc_frame();
@@ -7024,6 +7201,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
                 vmm_unmap(base + len + u); vmm_unmap(base + u);
                 if (ph) pmm_free_frame(ph);          /* drops the addref, then frees */
             }
+            vma_release(a, vs6);
             return 0;
         }
         uint8_t *z = (uint8_t *)hhdm(frame);
@@ -7038,6 +7216,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
                 vmm_unmap(base + len + u); vmm_unmap(base + u);
                 if (ph) pmm_free_frame(ph);
             }
+            vma_release(a, vs6);
             return 0;
         }
         vmm_map(base + off, frame, PTE_WRITABLE | PTE_USER | PTE_NX);          /* primary */
@@ -7047,16 +7226,6 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
         __asm__ volatile("invlpg (%0)" : : "r"(base + len + off) : "memory");
         mapped += PAGE_SIZE;
     }
-    int vs6; VMA_NEW(a, vs6);
-    a->vma[vs6].start = base;
-    a->vma[vs6].len   = total;
-    vma_published(a, vs6);   /* M2333 */
-    a->vma[vs6].sealed = 0;
-    a->vma[vs6].uffd  = 0;
-    a->vma[vs6].file_backed = 0;
-    a->vma[vs6].locked = 0;
-    a->vma[vs6].huge = 0;
-    
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -7081,21 +7250,20 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
     if (shm_get(name, size, &frames, &np) < 0) return 0;
     if (vma_full(a)) return 0;
     uint64_t total = (uint64_t)np * PAGE_SIZE;
-    uint64_t base = vma_find_gap(a, total, 0);
-    if (!base) return 0;
-    if (base + total > MMAP_TOP || base + total < base) return 0;
+    uint64_t base = 0;
+    int vs7 = vma_reserve(a, total, 0, &base);       /* claim before mapping into it (M1988) */
+    if (vs7 < 0) return 0;
+    if (base + total > MMAP_TOP || base + total < base) { vma_release(a, vs7); return 0; }
     /* Above PMM_MAXREFS pmm_addref SILENTLY DOES NOTHING, so the mapping below
      * would not hold the reference it claims to and the first unmap would free
      * a frame the SHM object still owns. Refuse instead: an honest failure to
      * share beats a mapping that outlives its own memory. (M1985) */
-    for (int p = 0; p < np; p++) if (!pmm_refcountable(frames[p])) return 0;
+    for (int p = 0; p < np; p++) if (!pmm_refcountable(frames[p])) { vma_release(a, vs7); return 0; }
     for (int p = 0; p < np; p++) {
         vmm_map(base + (uint64_t)p * PAGE_SIZE, frames[p], PTE_WRITABLE | PTE_USER | PTE_NX);
         pmm_addref(frames[p]);                       /* this mapping holds a ref on the shared frame */
         __asm__ volatile("invlpg (%0)" : : "r"(base + (uint64_t)p * PAGE_SIZE) : "memory");
     }
-    int vs7; VMA_NEW(a, vs7);
-    a->vma[vs7].start = base; a->vma[vs7].len = total; vma_published(a, vs7); a->vma[vs7].sealed = 0; a->vma[vs7].uffd = 0; a->vma[vs7].file_backed = 0; a->vma[vs7].locked = 0; a->vma[vs7].huge = 0; 
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -7717,14 +7885,14 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
          * that is already there. Looked up in the VMA table rather than from
          * the PTE, because sharedness is a property of the MAPPING -- the same
          * reason madvise(MADV_DONTNEED) consults it (M2000). */
+        int cow_in_vma = 0, shared_here = 0; uint8_t vprot = 0;
         {   struct app *ca = cur();
-            int shared_here = 0; uint8_t vprot = 0;
             if (ca) {
                 uint64_t vfl = vma_lock(ca);
                 for (int i = 0; i < ca->nvma; i++)
                     if (ca->vma[i].len && fpage >= ca->vma[i].start &&
                         fpage < ca->vma[i].start + ca->vma[i].len) {
-                        shared_here = ca->vma[i].shared; vprot = ca->vma[i].prot; break;
+                        shared_here = ca->vma[i].shared; vprot = ca->vma[i].prot; cow_in_vma = 1; break;
                     }
                 vma_unlock(ca, vfl);
             }
@@ -7749,6 +7917,15 @@ static int app_fault_handle_inner(uint64_t cr2, uint64_t err) {
                 return 1;
             }
         }
+        /* A WRITE THE MAPPING DOES NOT ALLOW IS NOT A COW BREAK. The private
+         * copy below is always installed WRITABLE, so after fork a page whose
+         * VMA had been mprotect'ed read-only (vmm_protect keeps PTE_COW) was
+         * made writable by the first write to it -- a silent success where the
+         * process asked for a fault, which defeats every mprotect-based write
+         * barrier (GC card marking, guard pages, JIT W^X flips). Refuse, and
+         * the write is reported as the protection violation it is. A page
+         * with no VMA -- the main stack, the brk heap -- is private RW. */
+        if (cow_in_vma && !(vprot & VMA_PROT_WRITE)) return 0;
         /* ALWAYS COPY (M2044, and re-affirmed in M2050).
          *
          * The "refcount is 0, so I am the sole owner, so just make it writable
@@ -9154,11 +9331,37 @@ int app_signal_deliver(struct registers *r, int signo) {
  * Kept in app.c because the decision needs struct app: whether a handler is
  * installed, whether it is SIG_IGN, and what the default action is. The ABI
  * layer should not be reaching into any of that. */
+static int app_raise_one(struct app *me, struct app *t, int signo);
+/* kill(2)'s pid argument names a TARGET SET, not just a process: > 0 is that
+ * process, 0 the caller's process group, -1 every process but init and the
+ * caller, < -1 the group -pid. This used to map every pid <= 0 to the caller,
+ * so a supervisor that signalled its child's group -- `kill(-pgid, SIGTERM)`,
+ * which is how make, timeout and every job-control shell stop a pipeline --
+ * signalled ITSELF, and the group was never touched. For a set: 1 if the
+ * caller was a member and must now terminate, else 0; -1 if nothing matched. */
 int app_raise_signal_to(int pid, int signo) {
     struct app *me = cur();
     if (signo <= 0 || signo >= APP_NSIG) return -1;
-    struct app *t = (pid <= 0 || (me && pid == me->pid)) ? me : app_by_pid(pid);
-    if (!t) return -1;
+    if (pid > 0) {
+        struct app *t = (me && pid == me->pid) ? me : app_by_pid(pid);
+        return t ? app_raise_one(me, t, signo) : -1;
+    }
+    int grp = pid == 0 ? (me ? me->pgid : 0) : -pid;
+    int found = 0, self_dies = 0;
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app *t = &apps[i];
+        if (!t->used || t->exited || t->zombie) continue;
+        if (pid == -1) { if (t == me || t->pid == 1) continue; }
+        else if (t->pgid != grp) continue;
+        found = 1;
+        if (t == me) continue;                               /* the caller last: it may have to die */
+        app_raise_one(me, t, signo);
+    }
+    if (me && !me->exited && pid != -1 && me->pgid == grp)
+        self_dies = (app_raise_one(me, me, signo) == 1);
+    return found ? self_dies : -1;
+}
+static int app_raise_one(struct app *me, struct app *t, int signo) {
     if (t->sig_handler[signo] == APP_SIG_IGN) return 0;      /* explicitly ignored: discard */
     if (t->sig_handler[signo]) { app_request_signal((app_t *)t, signo); return 0; }
     /* SIG_DFL. The signals whose default action is to terminate -- everything
@@ -9168,7 +9371,13 @@ int app_raise_signal_to(int pid, int signo) {
     case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
     case 9: case 11: case 13: case 14: case 15: case 24: case 25: case 31:
         if (t == me) return 1;
-        t->kill = 1;                                         /* cooperative terminate, as the OOM killer does */
+        /* kill_sig makes this a SIGNAL death: app_deliver_pending ends the
+         * process on its next return to ring 3. `kill` alone is only read by
+         * the native syscalls' cooperative checks, so a Linux process -- a
+         * hung Firefox, a child a parent timed out -- got 0 back from kill
+         * and kept running. */
+        t->kill_sig = signo;
+        t->kill = 1;
         if (t->task) task_wake((task_t *)t->task);
         return 2;
     default:
@@ -9235,7 +9444,7 @@ void app_request_signal(app_t *a, int signo) {
      * the timer for SIGALRM) is routinely a different process on a different
      * core than the one about to block. */
     uint64_t f = irq_save();
-    ap->pending_sigs |= (1ull << signo);       /* OR into the bitset, so a 2nd async signal isn't dropped */
+    __atomic_fetch_or(&ap->pending_sigs, (1ull << signo), __ATOMIC_ACQ_REL);       /* OR into the bitset, so a 2nd async signal isn't dropped */
     /* WAKE EVERY THREAD THAT COULD TAKE IT, not just the main one (M2075).
      * A process-directed signal is delivered by whichever thread does not
      * block it, and the main thread is routinely the one parked longest -- in
@@ -9284,7 +9493,7 @@ int app_raise_signal_to_thread(int pid, int tid, int signo) {
     if (t->sig_handler[signo] == APP_SIG_IGN) return 0;  /* explicitly ignored: discard */
     if (t->sig_handler[signo]) {
         uint64_t f = irq_save();
-        th->sig_pending |= (1ull << signo);
+        __atomic_fetch_or(&th->sig_pending, (1ull << signo), __ATOMIC_ACQ_REL);
         task_wake(th);
         irq_restore(f);
         return 0;
@@ -9295,6 +9504,7 @@ int app_raise_signal_to_thread(int pid, int tid, int signo) {
     case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
     case 9: case 11: case 13: case 14: case 15: case 24: case 25: case 31:
         if (th == task_self()) return 1;
+        t->kill_sig = signo;                             /* see app_raise_one */
         t->kill = 1;
         if (t->task) task_wake((task_t *)t->task);
         return 2;
@@ -9460,7 +9670,7 @@ static int app_sigqueue_to(struct app *t, int signo, uint64_t value, int code) {
         t->sigq[t->sigq_n].value = value;
         t->sigq_n++;
     }
-    t->pending_sigs |= (1ull << signo);                     /* mark pending; the queue holds the multiplicity */
+    __atomic_fetch_or(&t->pending_sigs, (1ull << signo), __ATOMIC_ACQ_REL);                     /* mark pending; the queue holds the multiplicity */
     task_wake(t->task);
     return 0;
 }
@@ -9662,6 +9872,16 @@ int app_deliver_pending(struct registers *r) {
                                               * sched_init (current==NULL) and on kernel tasks -> guard */
     if (!t || !t->proc) return 0;
     struct app *a = (struct app *)t->proc;
+    /* KILLED BY A SIGNAL: die here, on the way back to user code. This runs
+     * on every interrupt and syscall return, so it catches a process spinning
+     * in ring 3 as well as one woken from a blocking call. Only for a signal
+     * kill: the WM's close request (kill without kill_sig) stays cooperative. */
+    if (a->kill && a->kill_sig && (r->cs & 3) == 3) {
+        if (!a->exit_code) a->exit_code = 128 + a->kill_sig;
+        a->exited = 1;
+        app_stop_siblings(a);
+        task_exit();
+    }
     task_t *th = task_self();
     uint64_t thp = th ? th->sig_pending : 0;
     uint64_t thb = th ? th->sig_blocked : 0;
@@ -9669,6 +9889,10 @@ int app_deliver_pending(struct registers *r) {
     if ((r->cs & 3) != 3) return 0;          /* resuming kernel code (mid-syscall) -> defer */
     /* deliver the lowest pending signal that has a handler (one per return, like
      * Linux); handler-less signals stay pending for signalfd to drain. */
+    /* The pending sets are set by senders on other cores and cleared here,
+     * so every update is one atomic operation: a plain `&= ~bit` could store
+     * back a value read before another signal's bit arrived, and that signal
+     * was lost -- a lost GC-suspend signal hangs JavaScriptCore's collector. */
     for (int sig = 1; sig < APP_NSIG; sig++) {
         /* THIS THREAD'S first, then the process-wide set: a thread-directed
          * signal names its target and a process-directed one does not. (M2075) */
@@ -9676,8 +9900,8 @@ int app_deliver_pending(struct registers *r) {
         if (!mine && !(a->pending_sigs & (1ull << sig))) continue;
         /* SIG_IGN: DISCARD it, do not leave it pending for ever (M2063). */
         if (a->sig_handler[sig] == APP_SIG_IGN) {
-            a->pending_sigs &= ~(1ull << sig);
-            if (th) th->sig_pending &= ~(1ull << sig);
+            __atomic_fetch_and(&a->pending_sigs, ~(1ull << sig), __ATOMIC_ACQ_REL);
+            if (th) __atomic_fetch_and(&th->sig_pending, ~(1ull << sig), __ATOMIC_ACQ_REL);
             continue;
         }
         if (!a->sig_handler[sig]) continue;
@@ -9690,8 +9914,8 @@ int app_deliver_pending(struct registers *r) {
         if (app_signal_deliver(r, sig)) {
             if (qi >= 0) sigq_drop(a, qi);            /* consumed one queued instance */
             if (sigq_peek(a, sig) < 0) {   /* clear only when none remain -> the next queued instance delivers on the next return to ring 3 (RT queuing) */
-                a->pending_sigs &= ~(1ull << sig);
-                if (th) th->sig_pending &= ~(1ull << sig);
+                __atomic_fetch_and(&a->pending_sigs, ~(1ull << sig), __ATOMIC_ACQ_REL);
+                if (th) __atomic_fetch_and(&th->sig_pending, ~(1ull << sig), __ATOMIC_ACQ_REL);
             }
             return 1;
         }
@@ -9719,17 +9943,20 @@ static int sigfd_pick(struct app *a) {       /* lowest pending signal routed to 
 int app_sigfd_ready(app_t *a) { return a && sigfd_pick((struct app *)a) != 0; }   /* fswait peek */
 long app_sigfd_read(app_t *a, char *buf, int max) {
     struct app *ap = (struct app *)a;
-    if (!ap || max < 3) return -1;
+    if (!ap || max < 4) return -1;            /* up to "63\n" plus its NUL: max 3 wrote one byte past */
     int s;
     for (;;) {                                /* block until a sigfd signal is pending (woken by app_request_signal) */
         uint64_t f = irq_save();              /* pairs with app_request_signal's own lock (M1612) */
         s = sigfd_pick(ap);
+        /* Consumed under the same lock senders OR bits in under: a plain
+         * read-modify-write outside it could erase a signal raised in
+         * between. */
+        if (s != 0) __atomic_fetch_and(&ap->pending_sigs, ~(1ull << s), __ATOMIC_ACQ_REL);
         irq_restore(f);
         if (s != 0) break;
         task_block();
         if (!ap->used) return -1;             /* killed while parked */
     }
-    ap->pending_sigs &= ~(1ull << s);           /* consume it */
     int p = 0; char t[6]; int n = 0; int v = s;
     if (!v) t[n++] = '0'; while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
     while (n) buf[p++] = t[--n];
@@ -10162,10 +10389,15 @@ void app_fault_current(struct registers *r) {
          * a fault reported SUCCESS to anything that waited on it -- which is
          * how a crashed `as` came back as "as --version -> 0". (M1956) */
         a->exit_code = 139;
+        a->kill_sig = 11;                    /* and wait says so: WIFSIGNALED, WTERMSIG == SIGSEGV */
         /* ...or 128 + whichever signal the fault really raised, for a Linux
-         * process (M2392): a divide error is SIGFPE, 136. */
+         * process (M2392): a divide error is SIGFPE, 136 -- and wait reports
+         * THAT signal, not SIGSEGV. */
         { task_t *ft = task_self();
-          if (a->lxabi && ft && ft->lx_fault_signo > 0) a->exit_code = 128 + ft->lx_fault_signo; }
+          if (a->lxabi && ft && ft->lx_fault_signo > 0) {
+              a->exit_code = 128 + ft->lx_fault_signo;
+              a->kill_sig  = ft->lx_fault_signo;
+          } }
         /* ...and its threads die with it (M1999). A process killed by SIGSEGV
          * has to end its siblings for exactly the reason a process that exits
          * cleanly does: app_reap is about to free the address space they are
@@ -10202,7 +10434,8 @@ int app_oom_kill(void) {
         if (s > best) { best = s; victim = a; }
     }
     if (!victim) return -1;
-    victim->kill = 1;                                     /* cooperative terminate */
+    victim->kill_sig = 9;                                 /* a SIGKILL death: ends even a Linux process (see app_raise_one) */
+    victim->kill = 1;
     if (victim->task) task_wake((task_t *)victim->task);  /* unblock it so it notices + exits */
     kprintf("[oom] reclaiming memory: killed pid %d (score %ld pages)\n", victim->pid, best);
     return victim->pid;
@@ -10318,12 +10551,13 @@ static uint64_t app_load_mapped(struct app *a, const char *path, const void *hdr
 }
 
 app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
-    struct app *a = 0;
-    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { a = &apps[i]; break; }
-    if (!a || !elf) return 0;
+    if (!elf) return 0;
+    struct app *a = app_slot_claim();
+    if (!a) return 0;
 
     memset(a, 0, sizeof(*a));
     a->used = 1;
+    app_slot_publish(a);
         /* A RECYCLED apps[] SLOT MUST NOT INHERIT ITS PREDECESSOR'S CLAIMS
          * (M2327). g_fd_claimed is indexed by slot, and teardown clears it --
          * but an exit path that skips that loop would leave bits set, and
@@ -10332,7 +10566,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
          * later and miles away, so the invariant is re-established HERE, where
          * it cannot depend on every exit path behaving. */
         app_fd_claims_reset(a);
-    a->pid = next_pid++;
+    a->pid = app_new_pid();
     a->pgid = a->sid = a->pid;           /* a spawned app leads its own group + session (M1176) */
     /* Consume the one-shot arming from app_arm_next_spawn, BEFORE the process
      * can run a single instruction: a child that prints immediately used to
@@ -10398,9 +10632,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
      * it (interrupts off) so the loader's writes land in the right space. */
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    uint64_t old;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(old));
-    __asm__ volatile("mov %0, %%cr3" : : "r"(a->cr3) : "memory");
+    uint64_t old = task_cr3_borrow(a->cr3);   /* the loader reads from disk: see task_cr3_borrow */
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
     if (mappath[0]) a->entry = app_load_mapped(a, mappath, elf, elfsz, g_pend_mapsize);
@@ -10716,7 +10948,7 @@ app_t *app_spawn(const void *elf, const char *title, uint64_t elfsz) {
 
     a->aslr_mmap_base = aslr_mmap_pick(); a->mmap_next = a->aslr_mmap_base;   /* ASLR: randomize the mmap region start (M1287) */
 
-    __asm__ volatile("mov %0, %%cr3" : : "r"(old) : "memory");
+    task_cr3_return(old);
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
 
     /* 256 KB kernel stack (vs the 16 KB default): a ring-3 app's syscalls run on
@@ -10739,7 +10971,7 @@ fail_in_space:
      * stack). Restore the caller's CR3 first, THEN tear down the partial address
      * space — vmm_destroy_address_space refuses to free the active space, and
      * leaving it mapped would leak the PML4/PDPT + every frame elf_load mapped. */
-    __asm__ volatile("mov %0, %%cr3" : : "r"(old) : "memory");
+    task_cr3_return(old);
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
     vmm_destroy_address_space(a->cr3);
     a->used = 0;
@@ -10790,59 +11022,79 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
 }
 
 /* ---- memfd: anonymous, sealable memory-backed file objects (M1212) ------------
- * A small global table of growable kheap-backed buffers, referenced by the fd
+ * A small global table of growable page-backed objects, referenced by the fd
  * table as type 3 (obj = memfd index). Distinct from mseal (M1153, which seals
  * virtual-ADDRESS ranges): these are FILE objects carrying one-way F_SEAL_* flags
  * (WRITE/SHRINK/GROW/SEAL). Refcounted across fork/dup2 exactly like a pipe. */
 #define NMEMFD 256      /* Firefox wants one /dev/shm object per content process, plus GTK's pools (M2008) */
-#define MEMFD_MAX (16ul * 1024 * 1024)   /* 16 MiB per object (kheap-bounded) */
-/* `raw` is the allocation; `buf` is the PAGE-ALIGNED view inside it, and the
- * capacity is a whole number of pages. Both are needed to mmap a memfd
- * (M1977): mapping it into a process means aliasing its pages, which requires
- * the region to start on a page boundary AND to own every page it spans --
- * otherwise the last page could be shared with an unrelated kernel allocation
- * and get handed to userspace along with it.
+#define MEMFD_MAX (16ul * 1024 * 1024)   /* 16 MiB per object: the stride of its window, below */
+/* A MEMFD NEVER MOVES.
  *
- * `mapped` freezes the size once a process has mapped it. Growing would
- * kmalloc a new buffer and copy, leaving every existing mapping pointing at
- * freed memory. wl_shm sizes a pool once and then maps it, so refusing is
- * both correct and sufficient. */
-unsigned long g_memfd_remapped;   /* pages re-pointed after a mapped memfd grew (M2200) */
-unsigned long g_memfd_unretired;  /* retired buffers freed again because nothing aliased them (M2226) */
+ * Every object owns a fixed 16 MiB slot of kernel virtual address space, and
+ * its contents are whole PMM frames mapped into the front of that slot, one
+ * page per frame. Growing maps more frames at the end, and nothing that
+ * already exists changes: not the address, not a single frame.
+ *
+ * It used to be one kmalloc'd buffer, and every property of the object
+ * followed from that choice, badly. A grow had to allocate a bigger buffer and
+ * copy, and every pointer into the old one then had to be chased down:
+ *
+ *  - a process's mmap aliased the old pages, so the old buffer was RETIRED
+ *    rather than freed (M2082), then each mapping was RE-POINTED at the new
+ *    buffer (M2200), then the retired buffer was freed once all were moved
+ *    (M2226). The re-pointing rewrote OTHER processes' page tables, under no
+ *    lock that their munmap, exec or exit takes, so it could map a frame into
+ *    an address space being destroyed, or back into a range just unmapped.
+ *    Its TLB sync also skipped processes with no worker threads, so their
+ *    main thread kept writing the retired buffer from another core.
+ *  - the COMPOSITOR keeps plain pointers into the object (a wl_shm pool, each
+ *    buffer cut from it, each surface's committed frame). A grow of an object
+ *    no process had mapped -- or the M2226 free -- handed that memory back to
+ *    the heap while the window manager was still blitting from it.
+ *  - two concurrent grows each copied, each retired or freed `raw`: a double
+ *    kfree.
+ *
+ * With a fixed address all three are impossible by construction. The frames
+ * come from the PMM, so they are refcounted the same way every other user page
+ * is, and a mapping takes one reference per page as before (M1985).
+ *
+ * `cap` is npg whole pages. `size` is the file length and never exceeds it.
+ * `buf` is the slot's address once it has a page, and 0 before, which is what
+ * "the object has no buffer" has always meant to the callers that test it. */
+#define MEMFD_WIN_BASE 0xFFFF903000000000ull   /* 4 GiB in the shared PML4[288], between the kheap and kstack windows */
+#define MEMFD_WIN(idx) (MEMFD_WIN_BASE + (uint64_t)(idx) * MEMFD_MAX)
+unsigned long g_memfd_grown;      /* pages mapped into memfd objects */
+unsigned long g_memfd_reclaimed;  /* pages handed back to the PMM after an object died */
+unsigned long g_memfd_leaked;     /* pages kept because a shootdown was not acknowledged */
 
-/* RETIRED BUFFERS: how a MAPPED memfd is allowed to grow at all (M2082).
- *
- * Growing means kmalloc'ing a bigger buffer and copying, and the old buffer's
- * pages are ALIASED INTO USERSPACE by every live mmap of the object. kfree()ing
- * it hands those pages back to the kernel heap while a process still has them
- * mapped read-write, so growth was simply refused whenever `mapped` was set.
- *
- * Refusing is safe and wrong. Resizing an already-mapped pool is what every
- * wl_shm client does -- libwayland-cursor's shm_pool_resize and Firefox's
- * WaylandShmPool::Resize are both posix_fallocate/ftruncate on a mapped fd,
- * followed by munmap + mmap -- and wayland.c's own M2058 comment records the
- * consequence: the client's grow fails, it sends wl_shm_pool.resize anyway, and
- * the compositor has to answer with a FATAL protocol error. Firefox's startup
- * makes this call 107 times and gets ENOSPC every time.
- *
- * So don't free the old buffer: RETIRE it. It stays allocated, so the live
- * mapping keeps pointing at memory that is still ours, and it is released when
- * the object itself dies -- which cannot happen while a mapping exists, because
- * a mapping holds a reference (see app_mmap_memfd_nl's ownership note).
- *
- * Sixteen slots is more than the number of doublings from one page to
- * MEMFD_MAX, so the array cannot be the limit in practice; if it ever is, the
- * old refusal is what happens, which is exactly as safe as before. */
-#define MEMFD_RETIRED_N 16
 static struct memfd { int used, refs; unsigned seals; unsigned long size, cap;
-                      char *buf, *raw; int mapped; char name[64];
-                      char *retired[MEMFD_RETIRED_N]; int nretired;
+                      char *buf; int mapped; char name[64];
+                      int npg;            /* frames mapped at the front of the slot */
+                      /* 1 = dead, its frames still mapped and waiting for
+                       * memfd_reclaim; 2 = being reclaimed. A draining slot is
+                       * not free: reusing it would hand a new object the old
+                       * one's frames through a TLB entry another core still
+                       * holds. */
+                      int drain;
+                      /* Serialises growth, and each size change that goes with
+                       * one. Spin-then-yield, held across frame allocation and
+                       * vmm_map but never across anything that can sleep on
+                       * I/O. Always taken BEFORE a VMA lock, never inside one. */
+                      volatile int glk;
                       /* POSIX shared memory (M2008): a memfd is anonymous, but
                        * /dev/shm/NAME is the same object to everyone who opens
                        * that name. `named` marks the ones that are reachable by
                        * name, so memfd_create's anonymous objects never collide
                        * with them. */
                       int named; } memfds[NMEMFD];
+static volatile int g_memfd_draining;   /* how many slots have drain != 0 */
+
+static void memfd_glk_take(struct memfd *m) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&m->glk, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void memfd_glk_give(struct memfd *m) { __atomic_store_n(&m->glk, 0, __ATOMIC_RELEASE); }
 
 static inline uint64_t memfd_lock_take(void);
 static inline void memfd_lock_give(uint64_t f);
@@ -10856,26 +11108,24 @@ static inline void memfd_lock_give(uint64_t f);
  * like an allocator rather than like shared state.
  *
  * The count is taken here too, under the same lock, so it cannot report a
- * half-initialised slot. */
-static int memfd_alloc(const char *name) {
+ * half-initialised slot. Caller holds g_memfd_lock. */
+static int memfd_claim_nl(const char *name, int *live_out) {
     int got = -1, live = 0;
-    char nm[32]; nm[0] = 0;
-    uint64_t f = memfd_lock_take();
-    for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used) {
+    for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used && !memfds[i].drain) {
         struct memfd *m = &memfds[i];
         m->used = 1; m->refs = 1; m->seals = 0; m->size = 0; m->cap = 0;
-        m->buf = 0; m->raw = 0; m->mapped = 0;
-        m->nretired = 0;
-        for (int k = 0; k < MEMFD_RETIRED_N; k++) m->retired[k] = 0;
+        m->buf = 0; m->mapped = 0; m->npg = 0; m->named = 0;
         int j = 0; if (name) while (name[j] && j < (int)sizeof m->name - 1) { m->name[j] = name[j]; j++; }
         m->name[j] = 0;
-        for (j = 0; m->name[j] && j < (int)sizeof nm - 1; j++) nm[j] = m->name[j];
-        nm[j] = 0;
         got = i;
         break;
     }
     if (got >= 0) for (int k = 0; k < NMEMFD; k++) if (memfds[k].used) live++;
-    memfd_lock_give(f);
+    if (live_out) *live_out = live;
+    return got;
+}
+/* What a claim has to say, printed after the lock is dropped. */
+static void memfd_claim_note(int got, int live, const char *name) {
     if (got < 0) {
         /* THE TABLE IS FULL, AND SAYING SO IS THE WHOLE POINT. Every caller
          * turns this -1 into an errno of its own and none of them can say
@@ -10886,7 +11136,7 @@ static int memfd_alloc(const char *name) {
                     "refusing to create '%s'. Something is not giving references back.\n",
                     NMEMFD, name ? name : "(anon)");
         }
-        return -1;
+        return;
     }
     /* A HIGH-WATER MARK, NOT A PER-CALL LINE (M2087). A leak of one object per
      * operation is invisible in a per-operation log -- the lines all look the
@@ -10894,13 +11144,26 @@ static int memfd_alloc(const char *name) {
      * NMEMFD and the table is then exhausted for the rest of the boot. A
      * correct create/destroy cycle never moves it at all, so a healthy boot
      * prints a handful of lines and a leaking one prints a staircase. */
-    {   static int peak;
-        if (live > peak) {
-            peak = live;
-            kprintf("[memfd] %d of %d shared-memory objects live (new peak) -- '%s'\n",
-                    live, NMEMFD, nm);
-        }
+    static int peak;
+    if (live > peak) {
+        peak = live;
+        kprintf("[memfd] %d of %d shared-memory objects live (new peak) -- '%s'\n",
+                live, NMEMFD, name ? name : "(anon)");
     }
+}
+static void memfd_reclaim(void);
+static int memfd_alloc(const char *name) {
+    int live = 0;
+    uint64_t f = memfd_lock_take();
+    int got = memfd_claim_nl(name, &live);
+    memfd_lock_give(f);
+    if (got < 0 && __atomic_load_n(&g_memfd_draining, __ATOMIC_ACQUIRE)) {
+        memfd_reclaim();                 /* dead objects are holding slots: free them now */
+        f = memfd_lock_take();
+        got = memfd_claim_nl(name, &live);
+        memfd_lock_give(f);
+    }
+    memfd_claim_note(got, live, name);
     return got;
 }
 /* THE memfd REFCOUNT IS SHARED ACROSS PROCESSES, so it needs a lock (M2043).
@@ -10909,14 +11172,8 @@ static int memfd_alloc(const char *name) {
  * designed to be shared -- inherited across fork, passed over a socket with
  * SCM_RIGHTS, opened by name under /dev/shm. Two cores dropping the last two
  * references at once can both read 2, both compute 1, and both store 1: the
- * object leaks a slot out of NMEMFD for the rest of the boot.
- *
- * The worse case is both reading 1. Then both compute 0 and both run
- * `kfree(raw)` -- a DOUBLE FREE of kernel-heap memory, which corrupts the
- * allocator's own free list. After that any unrelated kmalloc anywhere in the
- * kernel can return an overlapping block, which is a fully generic mechanism
- * for "memory that has nothing to do with this reads back wrong". That is the
- * shape of the corruption being hunted, and this is one way to produce it.
+ * object leaks a slot out of NMEMFD for the rest of the boot. If both read 1,
+ * both tear it down.
  *
  * One lock around the count and the teardown it guards. Same irq_save + spin
  * idiom the rest of this file uses. */
@@ -10956,187 +11213,99 @@ long app_memfd_size(int fd) {
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used) return -1;
     return (long)memfds[idx].size;
 }
+/* The last reference: the object is dead, but its frames stay mapped in its
+ * slot until memfd_reclaim has shot down every core's TLB. That is not done
+ * here, because this runs from munmap, exit, exec, close and the compositor,
+ * and some of those hold locks that other cores spin on with interrupts off --
+ * a shootdown from there waits out its whole timeout and then cannot free
+ * anything anyway. */
 static void memfd_unref(int idx) {
     if (idx < 0 || idx >= NMEMFD) return;
-    /* Decide who frees UNDER the lock, and take the buffer pointer with us, so
-     * exactly one caller can ever reach the kfree for a given object. (M2043) */
-    void *doomed = 0;
-    /* ...and every buffer this object OUTGREW while it was mapped (M2082).
-     * Taken under the same lock and by the same single winner, for the same
-     * reason the live buffer is: reaching refs==0 means no fd and no MAPPING
-     * holds the object any more, so nothing can still be aliasing these. */
-    void *retired[MEMFD_RETIRED_N]; int nret = 0;
     uint64_t f = memfd_lock_take();
-    if (memfds[idx].used && --memfds[idx].refs <= 0) {
-        doomed = memfds[idx].raw;
-        for (int k = 0; k < memfds[idx].nretired; k++) retired[nret++] = memfds[idx].retired[k];
-        memfds[idx].nretired = 0;
-        for (int k = 0; k < MEMFD_RETIRED_N; k++) memfds[idx].retired[k] = 0;
-        memfds[idx].used = 0; memfds[idx].buf = 0; memfds[idx].raw = 0;
-        memfds[idx].mapped = 0; memfds[idx].size = memfds[idx].cap = 0;
+    struct memfd *m = &memfds[idx];
+    if (m->used && --m->refs <= 0) {
+        m->used = 0; m->buf = 0; m->mapped = 0; m->size = m->cap = 0;
+        if (m->npg) { m->drain = 1; __atomic_fetch_add(&g_memfd_draining, 1, __ATOMIC_ACQ_REL); }
     }
     memfd_lock_give(f);
-    if (doomed) kfree(doomed);            /* outside the lock: kfree can be slow */
-    for (int k = 0; k < nret; k++) kfree(retired[k]);
 }
-/* Ensure cap >= need (doubling), preserving the first `size` bytes. 0/-1.
+/* Give dead objects' frames back: unmap them from their slots, make every core
+ * forget the translations, and only then free them -- the carve_drain rule
+ * (M2107): a frame freed before the shootdown is acknowledged is a frame
+ * another core can still write. If it is not acknowledged the frames are kept
+ * forever, which costs memory and nothing else.
  *
- * A MAPPED object can grow now (M2082). Two things make that safe, and the
- * first one is what makes it cheap:
- *
- *  - Growth WITHIN the existing capacity moves nothing. That is the
- *    `need <= m->cap` line, and it was always there -- what was missing was any
- *    reason for the capacity to be bigger than the exact first request. A pool
- *    asked for 2304 bytes got one page, so the very next resize had to
- *    reallocate. A mapped object that must move once is given room to grow
- *    several more times without moving again.
- *
- *  - When it does have to move, the old buffer is RETIRED rather than freed,
- *    so the pages a process still has mapped stay ours. See the `retired`
- *    note on struct memfd.
- *
- * The one honest divergence from Linux: there, growing a file never moves
- * anything, so a client that keeps writing through its OLD mapping keeps
- * writing to the object. Here that client would write to the retired copy and
- * the new one would not see it. Every wl_shm client resizes with
- * ftruncate-then-munmap-then-mmap and writes nothing in between, and the
- * headroom above means the realloc usually does not happen at all -- whereas
- * refusing to grow was guaranteed to break all of them. */
-static int memfd_grow(struct memfd *m, unsigned long need) {
-    if (need <= m->cap) return 0;                  /* nothing moves: mappings stay valid */
-    if (need > MEMFD_MAX) return -1;
-    /* No slot to remember the outgoing buffer in -> refuse, exactly as before. */
-    if (m->mapped && m->nretired >= MEMFD_RETIRED_N) return -1;
-    unsigned long nc = m->cap ? m->cap * 2 : PAGE_SIZE;
-    while (nc < need) nc *= 2;
-    /* HEADROOM for an object somebody has already mapped: this is the
-     * expensive, copying, divergent case, so buy several more resizes with one
-     * of them. 2304 -> 32 KiB holds a whole cursor theme; a 1.9 MiB window pool
-     * gets 8 MiB and survives two doublings. */
-    if (m->mapped) { while (nc < need * 4 && nc < MEMFD_MAX) nc *= 2; }
-    if (nc > MEMFD_MAX) nc = MEMFD_MAX;
-    nc = (nc + PAGE_SIZE - 1) & ~(unsigned long)(PAGE_SIZE - 1);   /* whole pages: see the struct comment */
-    char *nr = kmalloc(nc + PAGE_SIZE); if (!nr) return -1;
-    char *nb = (char *)(((uintptr_t)nr + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
-    for (unsigned long i = 0; i < m->size; i++) nb[i] = m->buf[i];
-    for (unsigned long i = m->size; i < nc; i++) nb[i] = 0;        /* never hand stale kernel bytes to a mapping */
-    char *retiring = 0;
-    if (m->raw) {
-        if (m->mapped) { retiring = m->raw; m->retired[m->nretired++] = m->raw; }  /* still aliased */
-        else           kfree(m->raw);
-    }
-    char *oldbuf = m->buf;
-    m->raw = nr; m->buf = nb; m->cap = nc;
-    /* RE-POINT EVERY LIVE MAPPING AT THE NEW BUFFER (M2200).
-     *
-     * Retiring the old buffer stops a use-after-free and SILENTLY BREAKS THE
-     * SHARING, which is a different kind of wrong. A memfd exists so that two
-     * processes see ONE piece of memory; after a grow the object's bytes live at
-     * `nb` while every existing mmap still aliases the retired pages, so each
-     * side has a private copy and neither is told. The comment above -- "the
-     * live mapping keeps pointing at memory that is still ours" -- is true, and
-     * is exactly the defect: safe, and wrong.
-     *
-     * The contents were copied above, so a re-pointed mapping sees its own
-     * data; what changes is that both sides are looking at one buffer again.
-     *
-     * HONEST SCOPE. This was found while hunting the 1-core blank page, and it
-     * is NOT proven to be that: the commit-time check added alongside it
-     * (kernel/wayland.c) fired on a boot that rendered the page perfectly as
-     * well as on a blank one, and the pool it fired on was 8 MiB from creation
-     * and never grew at all -- so THIS path was not even on that boot's
-     * critical path. What is proven is the defect itself, from the code: a
-     * mapped memfd that grows leaves its mappings on memory the object no
-     * longer uses.
-     *
-     * THE FRAMES MUST BE REFCOUNTED, exactly as app_mmap_memfd_nl's ownership
-     * note says: munmap and teardown call pmm_free_frame on every present user
-     * page, so a mapping that is re-pointed has to take a reference on the new
-     * frame and give up the one it held on the old. Getting that wrong is
-     * M1985 again -- a live kernel-heap page handed back to the PMM.
-     *
-     * The VMA ranges are collected under the lock and mapped after it is
-     * released: vmm_map_to allocates page tables, and holding a VMA spinlock
-     * across an allocation is the shape that hung the machine in M1988. */
-    if (m->mapped && oldbuf) {
-        int idx = (int)(m - memfds);          /* the index vma.mfd holds */
-        unsigned long fixed = 0, unshareable = 0;
-        for (int pi = 0; pi < MAX_APPS; pi++) {
-            struct app *a = &apps[pi];
-            if (!a->used || !a->cr3) continue;
-            /* ONE VMA AT A TIME, NOT A COPY OF THE TABLE (M2217).
-             *
-             * This collected the matching ranges into `r[APP_MAXVMA]` first.
-             * APP_MAXVMA is 4096 and the entry is 24 bytes, so that is a
-             * NINETY-SIX KILOBYTE local -- on a 16 KiB kernel stack in syscall
-             * context, and on the 64 KiB watcher thread once M2214 moved the
-             * page probe there. It double-faulted: "KERNEL STACK OVERFLOW: a
-             * task overran its kernel stack (its #PF escalated to a #DF)",
-             * with rbp-rsp = 0x10028. I wrote the array to avoid holding the
-             * VMA lock across vmm_map_to, and swapped one hazard for a worse
-             * one.
-             *
-             * The snapshot is unnecessary: since M1988 a VMA entry NEVER MOVES
-             * -- removal leaves a tombstone -- so an index is stable and the
-             * lock only has to cover the read of one entry. No array, no
-             * bound, and the same property that made tombstones worth having. */
-            int nmatched = 0;
-            for (int i = 0; i < a->nvma; i++) {
-                uint64_t vstart = 0, vlen = 0, vfoff = 0;
-                uint64_t fl = vma_lock(a);
-                if (a->vma[i].len && a->vma[i].mfd == idx) {
-                    vstart = a->vma[i].start; vlen = a->vma[i].len; vfoff = a->vma[i].foff;
-                }
-                vma_unlock(a, fl);
-                if (!vlen) continue;
-                nmatched++;
-                for (uint64_t off = 0; off < vlen; off += PAGE_SIZE) {
-                    uint64_t ooff = vfoff + off;           /* the OBJECT offset */
-                    if (ooff >= nc) break;                 /* past the new buffer */
-                    uint64_t ph = vmm_translate((uint64_t)(nb + ooff));
-                    if (!ph || !pmm_refcountable(ph)) { unshareable++; continue; }
-                    uint64_t oldph = vmm_translate_in(a->cr3, vstart + off);
-                    if (oldph == ph) continue;             /* already the new frame */
-                    pmm_addref(ph);                        /* THIS mapping's reference */
-                    vmm_map_to(a->cr3, vstart + off, ph,
-                               PTE_USER | PTE_WRITABLE | PTE_NX);
-                    if (oldph) pmm_free_frame(oldph);      /* give up the retired one */
-                    fixed++;
-                }
+ * Called from the reclaimer thread, and from memfd_alloc when dead objects are
+ * what fill the table. Both are plain task context holding no lock. */
+#define MEMFD_RECLAIM_BATCH 128
+static void memfd_reclaim(void) {
+    if (!__atomic_load_n(&g_memfd_draining, __ATOMIC_ACQUIRE)) return;
+    for (int idx = 0; idx < NMEMFD; idx++) {
+        struct memfd *m = &memfds[idx];
+        uint64_t f = memfd_lock_take();
+        int mine = (m->drain == 1);
+        if (mine) m->drain = 2;                   /* one reclaimer per slot */
+        int npg = m->npg;
+        memfd_lock_give(f);
+        if (!mine) continue;
+        uint64_t fr[MEMFD_RECLAIM_BATCH]; int nf = 0;
+        for (int p = 0; p < npg || nf; ) {
+            if (p < npg) {
+                uint64_t va = MEMFD_WIN(idx) + (uint64_t)p * PAGE_SIZE;
+                uint64_t ph = vmm_translate(va);
+                p++;
+                if (ph) { vmm_unmap(va); fr[nf++] = ph & ~(uint64_t)(PAGE_SIZE - 1); }
+                if (nf < MEMFD_RECLAIM_BATCH && p < npg) continue;
             }
-            if (!nmatched) continue;
-            app_tlb_sync(a);   /* another core may still cache the old frame */
+            if (!nf) break;
+            if (vmm_tlb_shootdown()) {
+                for (int k = 0; k < nf; k++) pmm_free_frame(fr[k]);
+                __atomic_fetch_add(&g_memfd_reclaimed, (unsigned long)nf, __ATOMIC_RELAXED);
+            } else {
+                __atomic_fetch_add(&g_memfd_leaked, (unsigned long)nf, __ATOMIC_RELAXED);
+                static int told;
+                if (!told) { told = 1;
+                    kprintf("[memfd] %d page(s) of a dead object KEPT rather than freed: the "
+                            "shootdown was not acknowledged, so another core may still map them\n", nf); }
+            }
+            nf = 0;
         }
-        g_memfd_remapped += fixed;
-        /* AND IF NOTHING ALIASES IT ANY MORE, GIVE IT BACK (M2226).
-         *
-         * M2082 retired the outgoing buffer because live mmaps still pointed
-         * at it. M2200 re-points them -- so once every page has been moved,
-         * the retired buffer has no aliases left and holding it is pure waste.
-         * It is not only waste: MEMFD_RETIRED_N is a small array, and
-         * memfd_grow REFUSES outright when it fills, which is what produced
-         *
-         *   [wl] shm pool 10: resize to 1048576 but the backing memfd owns
-         *        only 65536 bytes -- the client's own ftruncate must have
-         *        failed
-         *
-         * in a failing boot: a Wayland client whose pool could not grow past
-         * 64 KiB, killed by an accounting limit rather than by memory.
-         *
-         * Only when EVERY page moved. `unshareable` counts the ones that could
-         * not be refcounted and therefore still alias the old buffer; if any
-         * remain, retiring is still the only safe answer. */
-        if (!unshareable && retiring && m->nretired > 0 &&
-            m->retired[m->nretired - 1] == retiring) {
-            m->nretired--;
-            m->retired[m->nretired] = 0;
-            kfree(retiring);
-            g_memfd_unretired++;
+        f = memfd_lock_take();
+        m->npg = 0; m->drain = 0;
+        __atomic_fetch_sub(&g_memfd_draining, 1, __ATOMIC_ACQ_REL);
+        memfd_lock_give(f);
+    }
+}
+static void memfd_reclaimer(void) {
+    for (;;) { memfd_reclaim(); task_sleep_ms(200); }
+}
+void app_memfd_start_reclaimer(void) { task_create(memfd_reclaimer, 0, 0); }
+
+/* Ensure cap >= need by mapping more frames at the end of the slot. 0/-1.
+ * Caller holds m->glk. Nothing that exists moves, so a MAPPED object grows as
+ * freely as any other (M2082's whole problem is gone) and every pointer the
+ * compositor holds stays valid. New pages are zeroed: never hand a mapping
+ * stale bytes. A partial failure keeps the pages it did map, and `cap` says
+ * how many that was. */
+static int memfd_grow(struct memfd *m, unsigned long need) {
+    if (need <= m->cap) return 0;
+    if (need > MEMFD_MAX) return -1;
+    int idx = (int)(m - memfds);
+    int want = (int)((need + PAGE_SIZE - 1) / PAGE_SIZE);
+    while (m->npg < want) {
+        uint64_t ph = pmm_alloc_frame();
+        if (!ph) return -1;
+        memset(hhdm(ph), 0, PAGE_SIZE);
+        if (vmm_map(MEMFD_WIN(idx) + (uint64_t)m->npg * PAGE_SIZE, ph, PTE_WRITABLE | PTE_NX) != 0) {
+            pmm_free_frame(ph);
+            return -1;
         }
-        if (unshareable)
-            kprintf("[memfd] %lu page(s) of the grown buffer are not refcountable, so the "
-                    "mappings still alias the RETIRED pages there and the object is unshared "
-                    "across them\n", unshareable);
+        uint64_t f = memfd_lock_take();
+        m->npg++;
+        m->cap = (unsigned long)m->npg * PAGE_SIZE;
+        m->buf = (char *)MEMFD_WIN(idx);
+        memfd_lock_give(f);
+        __atomic_fetch_add(&g_memfd_grown, 1, __ATOMIC_RELAXED);
     }
     return 0;
 }
@@ -11152,27 +11321,26 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
  * The sizes are not invented. 2304 and 6912 are exactly what libwayland-cursor
  * asks for: a 24x24 ARGB cursor, and the pool after two more images are added
  * to it. Firefox's startup makes that second call 107 times and every one of
- * them returned ENOSPC.
+ * them returned ENOSPC before M2082.
  *
- * Two independent things can break, and there is an assertion for each. Put
- * back the `if (m->mapped) return -1` and the SUCCEEDS check fails. Remove it
- * without retiring the outgoing buffer and the churn check fails instead --
- * because the kernel heap hands that block straight back out, while a process
- * still has its pages mapped. That second failure is the one worth having a
- * test for: it is silent, it corrupts an unrelated allocation, and it is the
- * reason the restriction was there in the first place. */
+ * What is asserted is what the page-backed design promises: a grow of a
+ * mapped object succeeds, keeps the bytes, does NOT MOVE the object (so the
+ * compositor's pointers and every mapping stay valid), keeps the very same
+ * frames under the pages that already existed, and zeroes what it adds -- and
+ * teardown gives every frame back. Put the kmalloc-and-copy grow back and the
+ * "did not move" and "same frame" checks fail. */
 static int memfd_st_pass, memfd_st_fail;
 static void memfd_ck(int cond, const char *what) {
     if (cond) { memfd_st_pass++; kprintf("[ ok ] memfd: %s\n", what); }
     else      { memfd_st_fail++; kprintf("[FAIL] memfd: %s\n", what); }
 }
-#define MEMFD_ST_CHURN 48
 void app_memfd_selftest(void) {
     const unsigned long first = 2304, second = 6912;   /* one cursor, then three */
     const char PAT = (char)0xA5;
     int idx = memfd_alloc("memfdselftest");
     if (idx < 0) { memfd_ck(0, "a memfd object was available"); goto summary; }
     struct memfd *m = &memfds[idx];
+    memfd_glk_take(m);
 
     if (memfd_grow(m, first) != 0) { memfd_ck(0, "a fresh memfd grew to a cursor pool's size"); goto cleanup; }
     memfd_ck(1, "a fresh memfd grew to a cursor pool's size");
@@ -11180,11 +11348,12 @@ void app_memfd_selftest(void) {
     for (unsigned long i = 0; i < first; i++) m->buf[i] = PAT;
 
     unsigned long cap0 = m->cap;
-    char *old = m->buf, *oldraw = m->raw;
+    char *old = m->buf;
+    uint64_t ph0 = vmm_translate((uint64_t)(uintptr_t)old);
     /* The premise: 2304 bytes fits in one page, so the very next resize is
-     * past the capacity and cannot be served without reallocating. If this
-     * ever stops being true the test below stops testing anything. */
-    memfd_ck(second > cap0, "the second resize really is past the capacity, so it must reallocate");
+     * past the capacity and has to add a page. If this ever stops being true
+     * the test below stops testing anything. */
+    memfd_ck(second > cap0, "the second resize really is past the capacity, so it must add pages");
 
     m->mapped = 1;                      /* a client has mmap'd it; its pages are aliased */
     int grew = memfd_grow(m, second);
@@ -11195,64 +11364,32 @@ void app_memfd_selftest(void) {
     int intact = 1;
     for (unsigned long i = 0; i < first; i++) if (m->buf[i] != PAT) { intact = 0; break; }
     memfd_ck(intact, "the bytes written before the grow survived it");
+    memfd_ck(m->buf == old, "the object did not move, so every pointer into it is still valid");
+    memfd_ck(ph0 && vmm_translate((uint64_t)(uintptr_t)m->buf) == ph0,
+             "its first page is still the same frame, so a live mapping still shares it");
+    int zero = 1;
+    for (unsigned long i = cap0; i < m->cap; i++) if (m->buf[i]) { zero = 0; break; }
+    memfd_ck(zero, "the pages the grow added read as zeros");
 
-    /* Was the OUTGOING buffer retired or freed? If it was freed it is on the
-     * kernel heap's free list, and allocations of the same size class get it
-     * back -- with a live user mapping still pointing at it. */
-    /* WHAT M2226 CHANGED, AND WHY THIS ASSERTION HAD TO CHANGE WITH IT.
-     *
-     * Until M2226 this checked `nretired == 1 && retired[0] == oldraw`: the
-     * outgoing buffer must be held, because live mmaps still pointed at it.
-     * M2200 then made the grow RE-POINT every live mapping at the new buffer,
-     * and M2226 finished the thought -- once nothing aliases the old buffer,
-     * holding it is not caution, it is a leak into a four-entry array whose
-     * exhaustion makes memfd_grow refuse outright, which is what produced a
-     * Wayland pool that could not grow past 64 KiB.
-     *
-     * This test drives `m->mapped = 1` by hand and no process has a VMA for
-     * the object, so the re-pointing loop matches nothing, `unshareable` is 0,
-     * and freeing is the CORRECT outcome. The old assertion kept failing on a
-     * kernel that was right -- a stale test reporting a bug that no longer
-     * existed, which costs exactly as much as a missing one.
-     *
-     * The retain-while-aliased property is not lost: it is covered with a REAL
-     * mapping by the wl_shm pool-resize checks in the same suite ("the
-     * outgoing buffer is retired, not handed to kfree"), which is the only
-     * place it can be tested honestly, because it needs a real alias. */
-    memfd_ck(m->nretired == 0,
-             "with nothing actually aliasing it, the outgoing buffer is FREED, not retired (M2226)");
-    void *churn[MEMFD_ST_CHURN]; int nch = 0;
-    for (int k = 0; k < MEMFD_ST_CHURN; k++) {
-        churn[nch] = kmalloc(cap0 + PAGE_SIZE);      /* the same request the old buffer came from */
-        if (!churn[nch]) break;
-        for (unsigned long i = 0; i < cap0 + PAGE_SIZE; i++) ((char *)churn[nch])[i] = (char)0x5A;
-        nch++;
-    }
-    /* ...and because it was freed, the heap may hand those pages straight back
-     * out. Asserting that it DOES is what stops this becoming a test that
-     * passes whatever happens: `old` is dangling by design here, and reading
-     * it is the point -- if the block were still held out of the free list the
-     * pattern would survive, and the M2226 optimisation would not be
-     * happening. */
-    int recycled = 0;
-    for (unsigned long i = 0; i < first; i++) if (old[i] != PAT) { recycled = 1; break; }
-    for (int k = 0; k < nch; k++) kfree(churn[k]);
-    memfd_ck(recycled || nch == 0,
-             "and the freed buffer really did go back to the heap (churn reclaimed it)");
-    (void)oldraw;
-
-    /* The headroom: the point of over-allocating a mapped object is that the
-     * NEXT resize does not move anything, so a live mapping stays correct. */
     char *stable = m->buf;
     int again = memfd_grow(m, second + PAGE_SIZE);
-    memfd_ck(again == 0 && m->buf == stable,
-             "a further resize within the new capacity moves nothing at all");
+    memfd_ck(again == 0 && m->buf == stable && m->cap >= second + PAGE_SIZE,
+             "a further grow moves nothing either");
 
   cleanup:
+    memfd_glk_give(m);
     m->mapped = 0;                      /* nothing is really mapped: let teardown free it */
-    memfd_unref(idx);
-    memfd_ck(!memfds[idx].used && memfds[idx].nretired == 0,
-             "teardown released the object and every buffer it outgrew");
+    {   int npg = m->npg;
+        memfd_unref(idx);
+        memfd_ck(!memfds[idx].used && (npg == 0 || memfds[idx].drain == 1),
+                 "a dead object's slot is held until its frames are reclaimed");
+        memfd_reclaim();
+        int gone = 1;
+        for (int p = 0; p < npg; p++)
+            if (vmm_translate(MEMFD_WIN(idx) + (uint64_t)p * PAGE_SIZE)) { gone = 0; break; }
+        memfd_ck(gone && !memfds[idx].drain && !memfds[idx].npg,
+                 "teardown unmapped and freed every page the object owned");
+    }
   summary:
     kprintf("memfd self-test: %d passed, %d failed\n", memfd_st_pass, memfd_st_fail);
 }
@@ -11286,7 +11423,7 @@ static uint64_t memfd_mmap_no(const char *why, int fd, uint64_t len, uint64_t of
 }
 unsigned long app_memfd_mmap_failures(void) { return g_memfd_mmap_fail; }
 
-static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
+static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off, int prot, int priv) {
     struct app *a = cur(); if (!a || !len) return 0;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3)
         return memfd_mmap_no("that descriptor is not a memfd", fd, len, off);
@@ -11298,11 +11435,30 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
         return memfd_mmap_no("the offset is not page-aligned", fd, len, off);
     if (off + len > m->cap)
         return memfd_mmap_no("the range runs past the object's capacity", fd, len, off);
-    uint64_t base = vma_find_gap(a, len, 0);
-    if (!base)
-        return memfd_mmap_no("no free address range of that size", fd, len, off);
     if (vma_full(a))
         return memfd_mmap_no("the VMA table is full", fd, len, off);   /* see the ownership note below */
+    /* Search and claim in ONE critical section (M1988): toolkits map shm
+     * buffers from several threads at once, and a gap found and recorded as
+     * two acts could be handed to two of them. Shared from the moment it
+     * exists, so a fork() racing the page mapping below cannot treat these
+     * heap frames as private COW pages (M2200). */
+    uint64_t base = 0;
+    int vs11 = vma_reserve(a, len, 0, &base);
+    if (vs11 < 0)
+        return memfd_mmap_no(vma_full(a) ? "the VMA table is full"
+                                         : "no free address range of that size", fd, len, off);
+    a->vma[vs11].shared = priv ? 0 : 1;
+    a->vma[vs11].foff = off;
+    /* WHAT THE CALLER ASKED FOR, NOT ALWAYS READ-WRITE-SHARED. Every mapping
+     * used to be writable and shared whatever prot and flags said: a
+     * PROT_READ mapping could be written, a write-sealed object's pages were
+     * writable through any mapping made of it, and a MAP_PRIVATE mapping's
+     * writes landed in the object for every other process to see. PROT_WRITE
+     * with MAP_PRIVATE maps the pages copy-on-write -- the fault path copies
+     * them on the first write, as it does after fork -- and PROT_EXEC is the
+     * only thing that clears NX. */
+    uint64_t pflags = PTE_USER | ((prot & 4) ? 0 : PTE_NX);
+    if (prot & 2) pflags |= priv ? PTE_COW : PTE_WRITABLE;
     /* OWNERSHIP (M1985). These frames belong to the KERNEL HEAP -- they are the
      * memfd's kmalloc'd buffer, aliased into the process, not pages this
      * process allocated. Two things follow, and neither was true before:
@@ -11326,7 +11482,7 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
         uint64_t phys = vmm_translate((uint64_t)(uintptr_t)(m->buf + off + i));
         if (!phys || !pmm_refcountable(phys)) goto unwind;   /* unbacked or unshareable: map no hole */
-        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) goto unwind;
+        if (vmm_map(base + i, phys, pflags) != 0) goto unwind;
         pmm_addref(phys);
         continue;
       unwind:
@@ -11334,15 +11490,13 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
             uint64_t up = vmm_translate(base + u);
             if (up) { vmm_unmap(base + u); pmm_free_frame(up); }
         }
+        vma_release(a, vs11);
         return memfd_mmap_no("a page of the object is unbacked or not refcountable, so the "
                              "mapping would have had a hole in it", fd, len, off);
     }
     m->mapped = 1;
     memfd_ref(a->fd[fd].obj);            /* the MAPPING keeps the object alive, not the fd */
-    int vs11; VMA_NEW(a, vs11);                          /* recorded so munmap/poll/maps see it */
-    a->vma[vs11].start = base; a->vma[vs11].len = len;
-    a->vma[vs11].shared = 1;
-    a->vma[vs11].mfd = (short)a->fd[fd].obj;
+    a->vma[vs11].mfd = (short)a->fd[fd].obj;          /* recorded so munmap/poll/maps see it */
     /* AND WHERE IN THE OBJECT IT STARTS (M2203). `off` was accepted, honoured
      * when the pages were mapped, and then thrown away -- so nothing could
      * afterwards say which bytes of the memfd this mapping covers.
@@ -11352,7 +11506,7 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
      * different page by construction -- an instrument that reports a
      * difference it created itself, for the second time in two days. */
     a->vma[vs11].foff = off;
-    a->vma[vs11].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+    a->vma[vs11].prot = (uint8_t)(VMA_PROT_READ | ((prot & 2) ? VMA_PROT_WRITE : 0) | ((prot & 4) ? VMA_PROT_EXEC : 0));
     
     return base;
 }
@@ -11379,18 +11533,22 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
 static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
     struct app *a = cur(); if (!a || !len) return 0;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 17) return 0;
-    uint64_t have = drm_map_size(off);
-    if (!have) return 0;                          /* no object at that offset */
+    int node = a->fd[fd].obj;                     /* objects are named per node: see bo_of */
+    uint64_t have = drm_map_size(node, off);
+    if (!have) return 0;                          /* no object of THIS node at that offset */
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (len > have) len = have;                   /* never map past the object */
-    uint64_t base = vma_find_gap(a, len, 0);
-    if (!base || vma_full(a)) return 0;
+    if (vma_full(a)) return 0;
+    uint64_t base = 0;
+    int vs = vma_reserve(a, len, 0, &base);          /* search + claim atomically (M1988) */
+    if (vs < 0) return 0;
+    /* Shared from the moment it exists -- see the note below on why. */
+    a->vma[vs].shared = 1;
     uint64_t done = 0;
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
-        uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
-        if (!phys || !pmm_refcountable(phys)) break;
-        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) break;
-        pmm_addref(phys);
+        uint64_t phys = drm_map_frame_ref(node, off, i / PAGE_SIZE);   /* referenced for us, atomically */
+        if (!phys) break;
+        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) { pmm_free_frame(phys); break; }
         done = i + PAGE_SIZE;
     }
     if (done != len) {
@@ -11398,10 +11556,11 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
          * vertices into a range whose tail is unmapped and faults on a pointer
          * it was told was valid. */
         for (uint64_t i = 0; i < done; i += PAGE_SIZE) {
-            uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
+            uint64_t phys = vmm_translate(base + i);   /* what WE mapped, not a fresh lookup a GEM_CLOSE can empty */
             vmm_unmap(base + i);
-            if (phys) pmm_free_frame(phys);
+            if (phys) pmm_free_frame(phys & ~(uint64_t)(PAGE_SIZE - 1));
         }
+        vma_release(a, vs);
         return 0;
     }
     /* RECORDED, or munmap and teardown cannot see it. Marked `shared` because
@@ -11409,9 +11568,6 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
      * process even though no other process maps them, and a COW break on one
      * would silently give the guest a copy while the host kept gathering from
      * the original. */
-    int vs; VMA_NEW(a, vs);
-    a->vma[vs].start = base; a->vma[vs].len = len;
-    a->vma[vs].shared = 1;
     a->vma[vs].mfd = -1;
     a->vma[vs].foff = off;
     a->vma[vs].prot = VMA_PROT_READ | VMA_PROT_WRITE;
@@ -11426,10 +11582,24 @@ uint64_t app_mmap_drm(int fd, uint64_t len, uint64_t off) {
     return r_;
 }
 
-uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
+uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) { return app_mmap_memfd_ex(fd, len, off, 3, 0); }
+uint64_t app_mmap_memfd_ex(int fd, uint64_t len, uint64_t off, int prot, int priv) {
     struct app *a_ = cur();
+    /* A MAPPING PAST THE END GETS PAGES UNDER IT. The capacity used to be the
+     * doubled size of a kmalloc, so a client mapping a little more than its
+     * file happened to fit; with exact whole pages it would not. Linux maps it
+     * and faults past EOF -- here the tail is zero pages, which is what such a
+     * client then sees as the file grows into it. The lock is the object's,
+     * taken before the VMA section and never inside it. */
+    if (a_ && fd >= 0 && fd < APP_NFD && a_->fd[fd].used && a_->fd[fd].type == 3 && len &&
+        !(off & (PAGE_SIZE - 1)) && off + len <= MEMFD_MAX) {
+        struct memfd *m = &memfds[a_->fd[fd].obj];
+        memfd_glk_take(m);
+        if (m->used && m->buf) (void)memfd_grow(m, off + ((len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1)));
+        memfd_glk_give(m);
+    }
     uint64_t f_ = vma_lock(a_);
-    uint64_t r_ = app_mmap_memfd_nl(fd, len, off);
+    uint64_t r_ = app_mmap_memfd_nl(fd, len, off, prot, priv);
     vma_unlock(a_, f_);
     return r_;
 }
@@ -11522,8 +11692,8 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
  * M2082 removed the reason this used to fire constantly -- a mapped memfd can
  * be grown now, so the common case is that the client's ftruncate DID work and
  * the object really is that big. What is left is the honest remainder: a grow
- * can still fail at MEMFD_MAX, or because the object has run out of retired-
- * buffer slots, and the client is not told which. So the check stays.
+ * can still fail at MEMFD_MAX, or when the PMM runs out of frames, and the
+ * client is not told which. So the check stays.
  *
  * `cap` is the useful bound: whole pages the object already owns and has
  * zeroed, which a resize can claim without anything moving. */
@@ -11540,7 +11710,7 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
  * A memfd mapping is EAGER (app_mmap_memfd_nl maps every page up front), so the
  * invariant is total and checkable: for every VMA that names a memfd, the
  * physical frame behind each page must be the frame behind the same offset of
- * the object's buffer. Anything that breaks it -- a grow that retires the
+ * the object's buffer. Anything that breaks it -- a grow that moved the
  * buffer (M2200), a fork that copies a shared page, a fault handler that
  * demand-zeroes over one, a stale VMA -- shows up here, and none of them have
  * an instrument of their own.
@@ -11570,7 +11740,7 @@ unsigned long app_memfd_share_audit(int verbose) {
             for (int i = 0; i < a->nvma; i++) {
                 uint64_t vstart = 0, vlen = 0, vfoff = 0;
                 uint64_t fl = vma_lock(a);
-                if (a->vma[i].len && a->vma[i].mfd == mi) {
+                if (a->vma[i].len && a->vma[i].mfd == mi && a->vma[i].shared) {   /* a PRIVATE one may have copied */
                     vstart = a->vma[i].start; vlen = a->vma[i].len; vfoff = a->vma[i].foff;
                 }
                 vma_unlock(a, fl);
@@ -11720,7 +11890,10 @@ int app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsign
     if (app_scm_capacity() < 1) return -1;       /* the in-flight pool is exhausted (M2104) */
     int idx = memfd_alloc(name); if (idx < 0) return -1;
     struct memfd *m = &memfds[idx];
-    if (memfd_grow(m, len) != 0) { memfd_unref(idx); return -1; }
+    memfd_glk_take(m);
+    int grew = memfd_grow(m, len);
+    memfd_glk_give(m);
+    if (grew != 0) { memfd_unref(idx); return -1; }
     for (unsigned long i = 0; i < len; i++) m->buf[i] = ((const char *)data)[i];
     m->size = len;
     struct fdent fe;
@@ -11989,7 +12162,7 @@ static void eof_spin_watch(struct app *a, int fd, long n) {
                 a->pid, fd, a->fd[fd].used ? a->fd[fd].type : -1);
         if (a->fd[fd].used && a->fd[fd].type == 2)
             kprintf("[nettrace]   it is the file '%s' at offset %ld\n",
-                    a->fd[fd].path, (long)a->fd[fd].off);
+                    a->fd[fd].path, file_off(a, fd));
     }
 }
 /* RUN A BLOCKING NETWORK CALL WITH INTERRUPTS ON (M2068).
@@ -12026,10 +12199,52 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (n > 0) { struct app *a = cur(); if (a) epoll_note_drain(a, fd); }
     return n;
 }
+/* OPEN FILE DESCRIPTIONS (POSIX's name for what dup and fork share).
+ *
+ * A regular-file descriptor used to carry its OWN cursor, copied by value on
+ * dup2, dup and fork, and O_APPEND only chose the starting offset. So every
+ * descriptor for one opening wrote at its own position: `make >log 2>&1`,
+ * `{ ls; date; } >out` and a shell's redirected subcommands overwrote each
+ * other's output, and two `>>` appenders clobbered each other. POSIX says the
+ * cursor and the append flag belong to the OPENING, which dup/fork/SCM share.
+ *
+ * So app_open allocates one here and the descriptor names it in `obj`
+ * (index + 1; 0 = none, which keeps the old per-descriptor cursor for any
+ * file fd made some other way or when the table is full). Every copy holds
+ * a reference; an O_APPEND write goes to end-of-file every time. */
+#define APP_NOFD 1024
+static struct { int refs; long off; uint8_t append; } g_ofd[APP_NOFD];
+static volatile int g_ofd_lk;
+static int ofd_new(long off, int append) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_ofd_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    int h = 0;
+    for (int i = 0; i < APP_NOFD; i++)
+        if (!g_ofd[i].refs) { g_ofd[i].refs = 1; g_ofd[i].off = off; g_ofd[i].append = (uint8_t)append; h = i + 1; break; }
+    __atomic_store_n(&g_ofd_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return h;
+}
+static void ofd_ref(int h)   { if (h > 0 && h <= APP_NOFD) __atomic_fetch_add(&g_ofd[h - 1].refs, 1, __ATOMIC_ACQ_REL); }
+static void ofd_unref(int h) { if (h > 0 && h <= APP_NOFD && g_ofd[h - 1].refs > 0) __atomic_fetch_sub(&g_ofd[h - 1].refs, 1, __ATOMIC_ACQ_REL); }
+static long file_off(struct app *a, int fd) {
+    int h = a->fd[fd].obj;
+    return (h > 0 && h <= APP_NOFD) ? g_ofd[h - 1].off : a->fd[fd].off;
+}
+static void file_off_set(struct app *a, int fd, long v) {
+    int h = a->fd[fd].obj;
+    if (h > 0 && h <= APP_NOFD) g_ofd[h - 1].off = v; else a->fd[fd].off = v;
+}
+static int file_append(struct app *a, int fd) {
+    int h = a->fd[fd].obj;
+    return (h > 0 && h <= APP_NOFD) ? g_ofd[h - 1].append : 0;
+}
+
 static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     struct app *a = cur(); if (!a) return -1;
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned read (M1193/M1196) */
-        long off = a->fd[fd].off;
+        long off = file_off(a, fd);                  /* the OPENING's cursor, shared by dup/fork */
         if (off < 0) return -1;
         /* A DIRECTORY IS NOT AN UNREADABLE FILE (M2071). ext2_pread refuses a
          * directory with a bare -1, which the Linux layer turns into EBADF --
@@ -12043,7 +12258,7 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
           if (vfs_stat(a->fd[fd].path, &st) == 0 && (st.stx_mode & S_IFMT) == S_IFDIR)
               return APP_FD_EISDIR; }
         long n = vfs_pread(a->fd[fd].path, buf, max, (uint64_t)off);   /* native positioned read (tmpfs/ext2); uncapped */
-        if (n > 0) a->fd[fd].off = off + n;
+        if (n > 0) file_off_set(a, fd, off + n);
         /* A READ OF AN OPEN FILE THAT FAILS SAYS WHICH FILE (M2071). The Linux
          * ABI turns a bare -1 into EBADF, and "bad file descriptor" on a
          * descriptor the kernel itself reports as open and regular is the most
@@ -12068,29 +12283,62 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 4) {   /* timerfd: read the expiration count (M1217) */
         if (max < 8) return -1;
-        long exp = a->fd[fd].off;
-        if (exp != 0 && (uint64_t)timer_ms() >= (uint64_t)exp) {
-            long interval = a->fd[fd].obj;                                     /* periodic interval (ms); 0 = one-shot */
-            uint64_t count = 1;
-            if (interval > 0) {                                               /* periodic: count missed firings + re-arm */
-                count += ((uint64_t)timer_ms() - (uint64_t)exp) / (uint64_t)interval;
-                a->fd[fd].off = exp + (long)(count * (uint64_t)interval);      /* next future expiry */
-            } else {
-                a->fd[fd].off = 0;                                            /* one-shot: disarm */
+        /* NOT EXPIRED IS NOT EOF. This returned 0 before the first expiry,
+         * and 0 from read() means "there will never be more": a program that
+         * reads a timerfd to wait for it -- the whole point of a blocking one
+         * -- saw end-of-file instead of sleeping. Linux blocks until the timer
+         * fires, or answers EAGAIN on a non-blocking descriptor; never 0.
+         *
+         * The expiry is consumed under the lock settime writes it under, so a
+         * re-arm racing this read cannot be half-seen. The wait is sliced, so
+         * a settime from another thread, a kill, or a close is noticed. */
+        for (;;) {
+            uint64_t f = irq_save();
+            long exp = a->fd[fd].off;
+            uint64_t now = timer_ms();
+            if (exp != 0 && now >= (uint64_t)exp) {
+                long interval = a->fd[fd].obj;                                 /* periodic interval (ms); 0 = one-shot */
+                uint64_t count = 1;
+                if (interval > 0) {                                           /* periodic: count missed firings + re-arm */
+                    count += (now - (uint64_t)exp) / (uint64_t)interval;
+                    a->fd[fd].off = exp + (long)(count * (uint64_t)interval);  /* next future expiry */
+                } else {
+                    a->fd[fd].off = 0;                                        /* one-shot: disarm */
+                }
+                irq_restore(f);
+                for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(count >> (i * 8));   /* expiration count (LE u64) */
+                return 8;
             }
-            for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(count >> (i * 8));   /* expiration count (LE u64) */
-            return 8;
+            irq_restore(f);
+            if (app_fd_nonblock(fd)) return APP_FD_EAGAIN;
+            if (a->kill || a->exited) return -1;
+            uint64_t wait = exp ? (uint64_t)exp - now : 10;                   /* disarmed: wait for a settime */
+            if (wait > 10) wait = 10;
+            task_sleep_ms(wait ? (int)wait : 1);
+            if (!a->fd[fd].used || a->fd[fd].type != 4) return -1;           /* closed under us */
         }
-        return 0;                                                             /* not expired yet */
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 5) {   /* eventfd: read the counter (M1242) */
         if (max < 8) return -1;
-        while (a->fd[fd].off <= 0) {            /* empty: block for real unless EFD_NONBLOCK (M1579) */
+        for (;;) {                               /* empty: block for real unless non-blocking (M1579) */
             uint64_t f = irq_save();             /* M1612: pairs with app_fd_write's own lock below --
                                                     * was unsynchronized, so a writer's check of g_evfd_wait[]
                                                     * could run before this reader finishes registering */
-            if (a->fd[fd].off > 0) { irq_restore(f); break; }   /* a writer raced in since the check above */
-            if (a->fd[fd].obj) { irq_restore(f); return -1; }   /* obj doubles as the EFD_NONBLOCK flag for this type -> EAGAIN */
+            if (a->fd[fd].off > 0) {
+                /* CONSUME UNDER THE LOCK the writer adds under: read-then-store
+                 * outside it lost a post that landed in between, and a thread
+                 * pool waiting on that post (EFD_SEMAPHORE) never woke. */
+                long cnt = a->fd[fd].off;
+                uint64_t val = a->fd[fd].write_end ? 1u : (uint64_t)cnt;       /* SEMAPHORE: 1, else the whole count */
+                a->fd[fd].off = a->fd[fd].write_end ? cnt - 1 : 0;             /* SEMAPHORE: decrement, else drain */
+                irq_restore(f);
+                for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(val >> (i * 8));
+                return 8;
+            }
+            /* EFD_NONBLOCK at creation lives in `obj`; O_NONBLOCK set later by
+             * fcntl/FIONBIO lives in `.nonblock` -- honour either. And it is
+             * EAGAIN: a bare -1 reached a Linux caller as EBADF. */
+            if (a->fd[fd].obj || app_fd_nonblock(fd)) { irq_restore(f); return APP_FD_EAGAIN; }
             int slot = -1;
             for (int i = 0; i < EVFD_NWAIT; i++) if (!g_evfd_wait[i].used) { slot = i; break; }
             if (slot < 0) { irq_restore(f); return -1; }        /* too many blocked eventfd readers system-wide; fail rather than hang */
@@ -12098,12 +12346,8 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
             irq_restore(f);                      /* released BEFORE blocking (M1612) */
             task_block();                       /* woken by eventfd_write, a kill, or a signal */
             g_evfd_wait[slot].used = 0;          /* reclaim our slot on resume (idempotent w/ the WAKE below) */
+            if (a->kill || a->exited) return -1;
         }
-        long cnt = a->fd[fd].off;
-        uint64_t val = a->fd[fd].write_end ? 1u : (uint64_t)cnt;              /* SEMAPHORE: 1, else the whole count */
-        for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(val >> (i * 8));
-        a->fd[fd].off = a->fd[fd].write_end ? cnt - 1 : 0;                    /* SEMAPHORE: decrement, else drain */
-        return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 8) {   /* inotify: drain queued events (M1266) */
         /* AN EMPTY INOTIFY IS NOT EOF (M2016). Zero from read() means "there
@@ -12342,9 +12586,13 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
 static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
     struct app *a = cur(); if (!a) return -1;
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned write (M1195) */
-        long off = a->fd[fd].off;
+        long off = file_off(a, fd);
+        if (file_append(a, fd)) {                    /* O_APPEND: at end-of-file EVERY time, not just at open */
+            struct statx st;
+            if (vfs_stat(a->fd[fd].path, &st) == 0) off = (long)st.stx_size;
+        }
         long n = app_file_write_at(a, fd, buf, len, off);
-        if (n > 0) a->fd[fd].off = off + n;
+        if (n > 0) file_off_set(a, fd, off + n);
         return n;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 3) {   /* memfd: seal-checked positioned write (M1212) */
@@ -12352,12 +12600,18 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         if (m->seals & F_SEAL_WRITE) return -1;
         long off = a->fd[fd].off; if (off < 0) return -1;
         unsigned long end = (unsigned long)off + len;
+        if (end < (unsigned long)off) return -1;
         if (end > m->size) {                                  /* the write grows the file */
             if (m->seals & F_SEAL_GROW) return -1;
-            if (memfd_grow(m, end) != 0) return -1;
-            for (unsigned long i = m->size; i < (unsigned long)off; i++) m->buf[i] = 0;   /* zero a sparse gap */
-            m->size = end;
+            memfd_glk_take(m);                                /* one grower, and one size, at a time */
+            if (end > m->size) {
+                if (memfd_grow(m, end) != 0) { memfd_glk_give(m); return -1; }
+                for (unsigned long i = m->size; i < (unsigned long)off; i++) m->buf[i] = 0;   /* zero a sparse gap */
+                m->size = end;
+            }
+            memfd_glk_give(m);
         }
+        if (end > m->cap) return -1;                          /* a racing shrink cannot take pages, but be sure */
         for (unsigned long i = 0; i < len; i++) m->buf[off + i] = ((const char *)buf)[i];
         a->fd[fd].off = off + (long)len;
         return (long)len;
@@ -12367,9 +12621,9 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         uint64_t add = 0;
         for (int i = 0; i < 8; i++) add |= (uint64_t)(unsigned char)((const char *)buf)[i] << (i * 8);
         if (add == 0xFFFFFFFFFFFFFFFFull) return -1;                          /* ~0 is reserved/invalid for eventfd */
+        uint64_t f = irq_save();                /* the add is a read-modify-write: under the reader's lock */
         long nc = a->fd[fd].off + (long)add;
-        if (nc < a->fd[fd].off) return -1;                                   /* overflow -> would block; reject */
-        uint64_t f = irq_save();
+        if (nc < a->fd[fd].off) { irq_restore(f); return -1; }               /* overflow -> would block; reject */
         a->fd[fd].off = nc;
         for (int i = 0; i < EVFD_NWAIT; i++)                                  /* wake every reader blocked on THIS (app, fd) (M1579) */
             if (g_evfd_wait[i].used && g_evfd_wait[i].a == a && g_evfd_wait[i].fd == fd) {
@@ -12507,6 +12761,7 @@ long app_pwrite(int fd, const void *buf, unsigned long len, long off) {
 }
 static void epoll_ref(int idx);    /* defined with the epoll table below (M1220) */
 static void epoll_unref(int idx);
+static void epoll_forget_fd(struct app *a, int fd);
 /* O_NONBLOCK as a real per-fd property (M1965). fcntl(F_SETFL) used to be a
  * no-op that returned 0, which is the worst of both worlds: the caller
  * believes the fd is non-blocking and then a read blocks its event loop
@@ -12542,6 +12797,7 @@ int app_fd_type(int fd) {
 
 int app_fd_close(int fd) {
     struct app *a = cur(); if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used) return -1;
+    epoll_forget_fd(a, fd);                  /* leave every interest set this process put it in */
     if (a->fd[fd].type == 1) pipe_close_end(a->fd[fd].obj, a->fd[fd].write_end);
     else if (a->fd[fd].type == 3) memfd_unref(a->fd[fd].obj);   /* drop a memfd reference (M1212) */
     else if (a->fd[fd].type == 6) epoll_unref(a->fd[fd].obj);   /* drop an epoll reference (M1220) */
@@ -12553,6 +12809,7 @@ int app_fd_close(int fd) {
         net_tcp_sock_close(a->fd[fd].obj);  /* close the TCP connection (M1268) */
     }
     else if (a->fd[fd].type == 11) pty_close(a->fd[fd].obj);    /* close this pty end, waking the peer (M1274) */
+    else if (a->fd[fd].type == 2) ofd_unref(a->fd[fd].obj);     /* one fewer holder of the opening (g_ofd) */
     else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
     else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
     else if (a->fd[fd].type == 16) net_tcp_accept_close();                                  /* accepted AF_INET connection (M2020) */
@@ -12579,12 +12836,16 @@ int app_dup2(int oldfd, int newfd) {
     struct app *a = cur(); if (!a || oldfd < 0 || oldfd >= APP_NFD || !a->fd[oldfd].used) return -1;
     if (newfd < 0 || newfd >= APP_NFD) return -1;
     if (oldfd == newfd) return newfd;
+    if (a->fd[newfd].used) epoll_forget_fd(a, newfd);   /* the old file at newfd is closed */
     if (a->fd[newfd].used && a->fd[newfd].type == 1) pipe_close_end(a->fd[newfd].obj, a->fd[newfd].write_end);
     else if (a->fd[newfd].used && a->fd[newfd].type == 3) memfd_unref(a->fd[newfd].obj);   /* (M1212) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 6) epoll_unref(a->fd[newfd].obj);   /* (M1220) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 8) inotify_free(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 10) net_tcp_sock_close(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
+    else if (a->fd[newfd].used && a->fd[newfd].type == 11) pty_close(a->fd[newfd].obj);   /* pty ends are references (pty_ref) */
+    else if (a->fd[newfd].used && a->fd[newfd].type == 17) drm_close_node(a->fd[newfd].obj);   /* so are render nodes */
+    else if (a->fd[newfd].used && a->fd[newfd].type == 2) ofd_unref(a->fd[newfd].obj);        /* and file openings */
     /* CLAIM newfd BEFORE WRITING IT, NOT AFTER (M2329). dup2 installs a
      * descriptor without ever going through app_fd_claim, so between the
      * struct copy starting and the claim bit being set, an allocator on
@@ -12624,6 +12885,9 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].type == 8) inotify_ref(a->fd[newfd].obj);       /* (M1603) */
     else if (a->fd[newfd].type == 10) net_tcp_sock_ref(a->fd[newfd].obj); /* (M1603) */
     else if (a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_ref(a->fd[newfd].obj); /* AF_UNIX: a descriptor is a reference (M2002) */
+    else if (a->fd[newfd].type == 11) pty_ref(a->fd[newfd].obj);   /* and so is a pty end: a dup'd copy must not close it for everyone */
+    else if (a->fd[newfd].type == 17) drm_node_ref(a->fd[newfd].obj);   /* ...and a render node (Mesa dups it) */
+    else if (a->fd[newfd].type == 2) ofd_ref(a->fd[newfd].obj);   /* the copy SHARES the cursor: `2>&1` writes after `1`, not over it */
     return newfd;
 }
 /* mkfifo(path): create a named pipe (M1188). 0/-1. */
@@ -12738,10 +13002,12 @@ int app_open(const char *path, int flags) {
             if (*q) return -1;                                   /* trailing junk */
             if (!pty_pts_valid(n)) return -1;                    /* no such live pty */
             id = (n << 1) | 1;                                   /* slave id */
+            if (pty_ref(id) < 0) return -1;                      /* this descriptor holds the slave */
         }
         int fd = -1;
         fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
-        if (fd < 0) { if (!(id & 1)) pty_close(id); return -1; } /* no fd slot: undo the master open */
+        if (fd < 0) { pty_close(id); return -1; }               /* no fd slot: undo the open (either end) */
+        if (!(id & 1)) pty_disown(id);                           /* released with the descriptor, not the pid */
         a->fd[fd] = (struct fdent){ 1, 11, 1, id, {0}, 0 };      /* used, type=11 pty, write_end=1 (bidirectional) */
         int j = 0; while (path[j] && j < (int)sizeof a->fd[fd].path - 1) { a->fd[fd].path[j] = path[j]; j++; }
         a->fd[fd].path[j] = 0;
@@ -12766,6 +13032,7 @@ int app_open(const char *path, int flags) {
     int j = 0; while (path[j] && j < (int)sizeof a->fd[fd].path - 1) { a->fd[fd].path[j] = path[j]; j++; }
     a->fd[fd].path[j] = 0;
     a->fd[fd].off = (flags & O_APPEND) ? (long)st.stx_size : 0;   /* O_APPEND starts at EOF */
+    a->fd[fd].obj = ofd_new(a->fd[fd].off, (flags & O_APPEND) ? 1 : 0);   /* the shared opening (see g_ofd) */
     a->fd[fd].cloexec = (flags & O_CLOEXEC) ? 1 : 0;              /* close-on-exec (M1218) */
     return fd;
 }
@@ -12782,18 +13049,18 @@ long app_lseek(int fd, long off, int whence) {
             r = find_hole ? size : off;
         } else r = vfs_seek_data_hole(a->fd[fd].path, off, find_hole);
         if (r < 0) return -1;
-        a->fd[fd].off = r;                                   /* POSIX: the seek also repositions the fd */
+        if (a->fd[fd].type == 2) file_off_set(a, fd, r); else a->fd[fd].off = r;   /* POSIX: the seek also repositions the fd */
         return r;
     }
     long base = 0;
-    if (whence == 1) base = a->fd[fd].off;
+    if (whence == 1) base = (a->fd[fd].type == 2) ? file_off(a, fd) : a->fd[fd].off;
     else if (whence == 2) {                                  /* SEEK_END: file size (memfd size for type 3, M1212) */
         if (a->fd[fd].type == 3) base = (long)memfds[a->fd[fd].obj].size;
         else { struct statx st; if (vfs_stat(a->fd[fd].path, &st) != 0) return -1; base = (long)st.stx_size; }
     }
     long n = base + off;
     if (n < 0) return -1;
-    a->fd[fd].off = n;
+    if (a->fd[fd].type == 2) file_off_set(a, fd, n); else a->fd[fd].off = n;
     return n;
 }
 
@@ -12850,23 +13117,37 @@ int app_shm_fd(const char *name, int o_creat, int o_excl) {
      * would be the same object to every lookup below. Refuse instead. */
     int nlen = 0; while (name[nlen]) nlen++;
     if (nlen >= (int)sizeof memfds[0].name) return -36;   /* ENAMETOOLONG */
-    int idx = -1;
+    /* LOOK UP AND CREATE AS ONE ACT. Firefox's processes open these names
+     * concurrently with O_CREAT|O_EXCL to decide which of them owns a segment.
+     * Found and created as two steps, both could miss, both create, and both
+     * be told they own a DIFFERENT object with the same name; or a lookup
+     * could find an object whose last reference was dropped before memfd_ref
+     * ran, and take a reference on whatever reused the slot. */
+    int idx = -1, live = 0, created = 0, tried = 0;
+  again:;
+    uint64_t f = memfd_lock_take();
     for (int i = 0; i < NMEMFD; i++) {
         if (!memfds[i].used || !memfds[i].named) continue;
         int k = 0;
         while (memfds[i].name[k] && memfds[i].name[k] == name[k]) k++;
         if (!memfds[i].name[k] && !name[k]) { idx = i; break; }
     }
-    if (idx >= 0 && o_creat && o_excl) return -17;   /* EEXIST */
-    if (idx < 0) {
-        if (!o_creat) return -2;    /* ENOENT */
-        idx = memfd_alloc(name);
-        if (idx < 0) return -28;   /* ENOSPC */
-        memfds[idx].named = 1;
-        memfds[idx].refs++;        /* the NAME is a reference: see app_shm_unlink */
-    } else {
-        memfd_ref(idx);                     /* another descriptor on the same object */
+    if (idx >= 0 && o_creat && o_excl) { memfd_lock_give(f); return -17; }   /* EEXIST */
+    if (idx >= 0) memfds[idx].refs++;        /* another descriptor on the same object */
+    else if (o_creat) {
+        idx = memfd_claim_nl(name, &live);
+        if (idx >= 0) {
+            created = 1;
+            memfds[idx].named = 1;
+            memfds[idx].refs++;              /* the NAME is a reference: see app_shm_unlink */
+        }
     }
+    memfd_lock_give(f);
+    if (idx < 0 && o_creat && !tried && __atomic_load_n(&g_memfd_draining, __ATOMIC_ACQUIRE)) {
+        tried = 1; memfd_reclaim(); goto again;   /* dead objects are holding the slots */
+    }
+    if (o_creat && (created || idx < 0)) memfd_claim_note(idx, live, name);
+    if (idx < 0) return o_creat ? -28 : -2;  /* ENOSPC : ENOENT */
     int fd = -1;
     fd = app_fd_claim(a);
     if (fd < 0) { memfd_unref(idx); return -24; }   /* EMFILE */
@@ -12880,17 +13161,18 @@ int app_shm_fd(const char *name, int o_creat, int o_excl) {
  * of any process would collide with the first one's name. */
 int app_shm_unlink(const char *name) {
     if (!name || !name[0]) return -22;   /* EINVAL */
+    int idx = -1;
+    uint64_t f = memfd_lock_take();      /* two unlinks of one name drop ONE reference */
     for (int i = 0; i < NMEMFD; i++) {
         if (!memfds[i].used || !memfds[i].named) continue;
         int k = 0;
         while (memfds[i].name[k] && memfds[i].name[k] == name[k]) k++;
-        if (!memfds[i].name[k] && !name[k]) {
-            memfds[i].named = 0;
-            memfd_unref(i);         /* drop the name's reference; open fds keep it alive */
-            return 0;
-        }
+        if (!memfds[i].name[k] && !name[k]) { memfds[i].named = 0; idx = i; break; }
     }
-    return -2;    /* ENOENT */
+    memfd_lock_give(f);
+    if (idx < 0) return -2;    /* ENOENT */
+    memfd_unref(idx);          /* drop the name's reference; open fds keep it alive */
+    return 0;
 }
 
 /* Add memfd seals (one-way OR of F_SEAL_*). Returns the new seal set, or -1
@@ -12911,16 +13193,20 @@ long app_ftruncate(int fd, long len) {
     if (a->fd[fd].type != 3) return -1;                    /* otherwise it must be a memfd */
     struct memfd *m = &memfds[a->fd[fd].obj];
     unsigned long n = (unsigned long)len;
-    if (n == m->size) return 0;
-    if (n < m->size) {                                       /* shrink */
-        if (m->seals & (F_SEAL_SHRINK | F_SEAL_WRITE)) return -1;
-        m->size = n; return 0;
+    memfd_glk_take(m);                                       /* size and pages change together */
+    long r = 0;
+    if (n == m->size) goto out;
+    if (n < m->size) {                                       /* shrink: the pages stay, the length does not */
+        if (m->seals & (F_SEAL_SHRINK | F_SEAL_WRITE)) { r = -1; goto out; }
+        m->size = n; goto out;
     }
-    if (m->seals & (F_SEAL_GROW | F_SEAL_WRITE)) return -1;  /* grow */
-    if (memfd_grow(m, n) != 0) return -1;
-    for (unsigned long i = m->size; i < n; i++) m->buf[i] = 0;
+    if (m->seals & (F_SEAL_GROW | F_SEAL_WRITE)) { r = -1; goto out; }   /* grow */
+    if (memfd_grow(m, n) != 0) { r = -1; goto out; }
+    for (unsigned long i = m->size; i < n; i++) m->buf[i] = 0;   /* bytes a shrink left behind read as zeros */
     m->size = n;
-    return 0;
+  out:
+    memfd_glk_give(m);
+    return r;
 }
 /* fsync/fdatasync/sync_file_range (M1566): honestly free, not a lying stub --
  * blockdev.c's buffer cache is write-through (bcache_flush's own comment),
@@ -12973,6 +13259,19 @@ long app_timerfd_remaining_ms(int fd) {
     uint64_t now = timer_ms(), due = (uint64_t)a->fd[fd].off;
     return (due > now) ? (long)(due - now) : 0;         /* already expired reads as 0, as on Linux */
 }
+/* Which clock a TFD_TIMER_ABSTIME deadline is measured against: REALTIME is an
+ * epoch time, MONOTONIC is uptime. Kept in `write_end`, which a timerfd has no
+ * other use for. */
+void app_timerfd_set_realtime(int fd, int on) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return;
+    a->fd[fd].write_end = on ? 1 : 0;
+}
+int app_timerfd_is_realtime(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return 0;
+    return a->fd[fd].write_end;
+}
 long app_timerfd_interval_ms(int fd) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return 0;
@@ -12982,8 +13281,11 @@ long app_timerfd_interval_ms(int fd) {
 long app_timerfd_settime(int fd, long delay_ms, long interval_ms) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return -1;
+    if (interval_ms > 0x7fffffffl) interval_ms = 0x7fffffffl;                          /* `obj` is an int */
+    uint64_t f = irq_save();                                                            /* the pair changes together */
     a->fd[fd].off = (delay_ms <= 0) ? 0 : (long)(timer_ms() + (uint64_t)delay_ms);   /* absolute expiry; <=0 disarms */
     a->fd[fd].obj = (delay_ms > 0 && interval_ms > 0) ? (int)interval_ms : 0;         /* periodic interval (ms); 0 = one-shot */
+    irq_restore(f);
     return 0;
 }
 /* eventfd (M1242): a pollable u64-counter fd. The counter lives in the fd's own
@@ -13471,6 +13773,21 @@ long app_recvfrom(int fd, void *buf, int max, uint8_t srcip[4], uint16_t *srcpor
 /* fd hygiene (M1218): fcntl(F_GETFD/F_SETFD/F_DUPFD/F_DUPFD_CLOEXEC), dup3,
  * close_range — over the per-fd FD_CLOEXEC bit (honored by app_exec above; fork
  * copies the whole fdent so it survives a fork, as POSIX requires). */
+/* The lowest descriptor >= lo that is neither in use nor claimed, CLAIMED
+ * before the lock is dropped -- the same rule as app_fd_claim (M2325).
+ * F_DUPFD, and so dup(2), used to scan for !used outside fdt_lock and
+ * ignore the claim bitmap, so an open() on another thread could be handed
+ * the same slot between the scan and the install, and dup2 then overwrote
+ * that thread's new descriptor. The mark stays until close, as dup2's does. */
+static int app_fd_claim_from(struct app *a, int lo) {
+    int ai = app_slot(a), nf = -1;
+    fdt_take();
+    for (int i = lo; i < APP_NFD; i++)
+        if (!a->fd[i].used && !(ai >= 0 && g_fd_claimed[ai][i])) { nf = i; app_fd_mark(a, i, 1); break; }
+    fdt_give();
+    return nf;
+}
+
 long app_fcntl(int fd, int cmd, long arg) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD) return -1;
@@ -13486,7 +13803,7 @@ long app_fcntl(int fd, int cmd, long arg) {
         if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
             int lo = (int)arg; if (lo < APP_FD_FIRST) lo = APP_FD_FIRST;
             if (lo >= APP_NFD) return -1;
-            int nf = -1; for (int i = lo; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
+            int nf = app_fd_claim_from(a, lo);
             if (nf < 0) return -1;
             a->fd[nf] = (struct fdent){ 1, 14, 1, fd, {0}, 0, 0 };   /* obj = which stdio fd it aliases */
             a->fd[nf].cloexec = (cmd == F_DUPFD_CLOEXEC) ? 1 : 0;
@@ -13498,8 +13815,9 @@ long app_fcntl(int fd, int cmd, long arg) {
     if (cmd == F_SETFD) { a->fd[fd].cloexec = (arg & FD_CLOEXEC) ? 1 : 0; return 0; }
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         int lo = (int)arg; if (lo < APP_FD_FIRST) lo = APP_FD_FIRST;
-        int nf = -1; for (int i = lo; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
-        if (nf < 0 || app_dup2(fd, nf) != nf) return -1;
+        int nf = app_fd_claim_from(a, lo);
+        if (nf < 0) return -1;
+        if (app_dup2(fd, nf) != nf) { app_fd_mark(a, nf, 0); return -1; }
         a->fd[nf].cloexec = (cmd == F_DUPFD_CLOEXEC) ? 1 : 0;
         return nf;
     }
@@ -13512,11 +13830,19 @@ int app_dup3(int oldfd, int newfd, int flags) {
     a->fd[newfd].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
     return newfd;
 }
+/* close_range(2). CLOSE_RANGE_CLOEXEC (4) asks for the range to be MARKED
+ * close-on-exec, not closed -- the flags were ignored, so a program preparing
+ * a child's descriptors closed its own. lo > hi is EINVAL (-2 here);
+ * CLOSE_RANGE_UNSHARE (2) needs nothing, the table is never shared on exec. */
 long app_close_range(unsigned lo, unsigned hi, int flags) {
     struct app *a = cur(); if (!a) return -1;
-    (void)flags;
+    if (lo > hi) return -2;
     if (hi >= APP_NFD) hi = APP_NFD - 1;
-    for (unsigned i = lo; i <= hi && i < APP_NFD; i++) if (a->fd[i].used) app_fd_close((int)i);
+    for (unsigned i = lo; i <= hi && i < APP_NFD; i++) {
+        if (!a->fd[i].used) continue;
+        if (flags & 4) a->fd[i].cloexec = 1;
+        else app_fd_close((int)i);
+    }
     return 0;
 }
 /* sendfile (M1219): copy up to `count` bytes from in_fd to out_fd through a
@@ -13590,17 +13916,93 @@ long app_sendfile(int out_fd, int in_fd, long *off, unsigned long count) {
  * it owns in ONE instance, so 32 is an arbitrary ceiling on how much a program
  * may do at once -- and hitting it looked like a random socket failure. */
 #define EP_MAX 256
-static struct epollobj { int used, refs, n; struct { int fd, events, last_ready, disarmed; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
-static void epoll_ref(int idx)   { if (idx >= 0 && idx < NEPOLL && epolls[idx].used) epolls[idx].refs++; }
-static void epoll_unref(int idx) { if (idx >= 0 && idx < NEPOLL && epolls[idx].used && --epolls[idx].refs <= 0) epolls[idx].used = 0; }
+/* `owner` is the pid that registered an item: see epoll_forget_fd. */
+static struct epollobj { int used, refs, n; volatile int lk;
+                         struct { int fd, events, last_ready, disarmed, owner; unsigned long data; } items[EP_MAX]; } epolls[NEPOLL];
+/* TWO LOCKS, FOR TWO KINDS OF SHARING.
+ *
+ * The TABLE is shared by every process: creating an instance was a scan for a
+ * free slot and a separate claim, so two processes could be handed one
+ * instance, and the refcount was a plain ++/-- on an object fork and
+ * SCM_RIGHTS share. g_ep_lk covers the claim and the count.
+ *
+ * An instance's ITEMS are shared by every thread that holds it -- libuv's
+ * worker threads epoll_ctl while the loop thread sits in epoll_wait -- and a
+ * DEL moves the last item into the hole, so a scan running beside it could
+ * skip a live item or read one twice, and two ADDs of one fd could both pass
+ * the EEXIST check. `lk` covers every read and write of the items. It is
+ * spin-then-yield without masking interrupts, because a scan calls
+ * app_fd_ready on each item and that can poll a NIC. */
+static volatile int g_ep_lk;
+static inline uint64_t ep_tab_take(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_ep_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static inline void ep_tab_give(uint64_t f) {
+    __atomic_store_n(&g_ep_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+static void ep_lk_take(struct epollobj *e) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&e->lk, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void ep_lk_give(struct epollobj *e) { __atomic_store_n(&e->lk, 0, __ATOMIC_RELEASE); }
+static void epoll_ref(int idx) {
+    if (idx < 0 || idx >= NEPOLL) return;
+    uint64_t f = ep_tab_take();
+    if (epolls[idx].used) epolls[idx].refs++;
+    ep_tab_give(f);
+}
+static void epoll_unref(int idx) {
+    if (idx < 0 || idx >= NEPOLL) return;
+    uint64_t f = ep_tab_take();
+    if (epolls[idx].used && --epolls[idx].refs <= 0) epolls[idx].used = 0;
+    ep_tab_give(f);
+}
+/* A CLOSED DESCRIPTOR LEAVES THE INTEREST SETS IT WAS IN.
+ *
+ * Items are keyed by fd NUMBER. Close fd 7 without EPOLL_CTL_DEL -- which
+ * Linux allows, because it drops the registration when the file goes -- and
+ * the item stayed, so the next socket or pipe to be handed number 7 was
+ * reported ready under the OLD registration's data. For an event loop that
+ * data is a pointer to the watcher it freed along with the old descriptor.
+ *
+ * Only the closing process's own registrations go. A forked child closing the
+ * descriptors it inherited is the normal prelude to exec, and on Linux that
+ * does not touch the parent's registrations, because the parent's copy keeps
+ * the file open; removing by number alone would have silently deafened the
+ * parent's event loop. (Linux keys on the open file, so a registration also
+ * survives close() when a dup of the fd is still open. Keying by number here
+ * cannot express that, and dropping it is the failure that cannot corrupt
+ * anything.) */
+static void epoll_forget_fd(struct app *a, int fd) {
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].epwatch) return;
+    for (int f = 0; f < APP_NFD; f++) {
+        if (!a->fd[f].used || a->fd[f].type != 6) continue;
+        int idx = a->fd[f].obj;
+        if (idx < 0 || idx >= NEPOLL) continue;
+        struct epollobj *e = &epolls[idx];
+        ep_lk_take(e);
+        for (int i = 0; i < e->n; ) {
+            if (e->items[i].fd == fd && e->items[i].owner == a->pid) e->items[i] = e->items[--e->n];
+            else i++;
+        }
+        ep_lk_give(e);
+    }
+}
 
 int app_epoll_create(void) {
     struct app *a = cur(); if (!a) return -1;
-    int idx = -1; for (int i = 0; i < NEPOLL; i++) if (!epolls[i].used) { idx = i; break; }
+    int idx = -1;
+    uint64_t tf = ep_tab_take();
+    for (int i = 0; i < NEPOLL; i++) if (!epolls[i].used) { idx = i; break; }
+    if (idx >= 0) { epolls[idx].used = 1; epolls[idx].refs = 1; epolls[idx].n = 0; }
+    ep_tab_give(tf);
     if (idx < 0) return -1;
-    epolls[idx].used = 1; epolls[idx].refs = 1; epolls[idx].n = 0;
     int fd = -1; fd = app_fd_claim(a);   /* RLIMIT_NOFILE (M1547) */
-    if (fd < 0) { epolls[idx].used = 0; return -1; }
+    if (fd < 0) { epoll_unref(idx); return -1; }
     a->fd[fd] = (struct fdent){ 1, 6, 0, idx, {0}, 0, 0 };   /* used, type=epoll, obj=idx */
     return fd;
 }
@@ -13617,32 +14019,39 @@ int app_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned long data)
     struct app *a = cur();
     if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -9;   /* EBADF */
     if (fd < 0 || fd >= APP_NFD) return -9;                                                           /* EBADF */
+    if (op != EPOLL_CTL_DEL && !a->fd[fd].used) return -9;                  /* EBADF: nothing to watch */
+    if (fd == epfd) return -22;                                               /* EINVAL: an instance cannot watch itself */
     struct epollobj *e = &epolls[a->fd[epfd].obj];
+    int rc = -22;                                                             /* EINVAL: unknown op */
+    ep_lk_take(e);
     if (op == EPOLL_CTL_ADD) {
-        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) return -17;   /* EEXIST: already registered */
-        if (e->n >= EP_MAX) return -28;                                        /* ENOSPC: instance full */
-        e->items[e->n].fd = fd; e->items[e->n].events = (int)events; e->items[e->n].data = data;
-        e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
-        e->items[e->n].disarmed = 0;     /* EPOLLONESHOT has not fired yet (M2016) */
-        e->n++;
-        a->fd[fd].epwatch = 1;           /* this descriptor is worth a drain check (M2059) */
-        return 0;
-    }
-    if (op == EPOLL_CTL_MOD) {
+        rc = 0;
+        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { rc = -17; break; }   /* EEXIST: already registered */
+        if (!rc && e->n >= EP_MAX) rc = -28;                                   /* ENOSPC: instance full */
+        if (!rc) {
+            e->items[e->n].fd = fd; e->items[e->n].events = (int)events; e->items[e->n].data = data;
+            e->items[e->n].last_ready = 0;   /* M1545: no edge reported yet */
+            e->items[e->n].disarmed = 0;     /* EPOLLONESHOT has not fired yet (M2016) */
+            e->items[e->n].owner = a->pid;   /* whose close() removes it (epoll_forget_fd) */
+            e->n++;
+            a->fd[fd].epwatch = 1;           /* this descriptor is worth a drain check (M2059) */
+        }
+    } else if (op == EPOLL_CTL_MOD) {
+        rc = -2;                                                               /* ENOENT: not registered */
         for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) {
             e->items[i].events = (int)events; e->items[i].data = data;
             e->items[i].last_ready = 0;   /* M1545: a changed interest set re-arms the edge, same spirit as a fresh ADD */
             e->items[i].disarmed = 0;     /* ...and re-arms EPOLLONESHOT, which is what MOD is FOR (M2016) */
             a->fd[fd].epwatch = 1;
-            return 0;
+            rc = 0;
+            break;
         }
-        return -2;                                                             /* ENOENT: not registered */
+    } else if (op == EPOLL_CTL_DEL) {
+        rc = -2;                                                               /* ENOENT */
+        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { e->items[i] = e->items[--e->n]; rc = 0; break; }
     }
-    if (op == EPOLL_CTL_DEL) {
-        for (int i = 0; i < e->n; i++) if (e->items[i].fd == fd) { e->items[i] = e->items[--e->n]; return 0; }
-        return -2;                                                             /* ENOENT */
-    }
-    return -22;                                                                /* EINVAL: unknown op */
+    ep_lk_give(e);
+    return rc;
 }
 /* One non-blocking pass: fill `out` with the ready members. Returns the count,
  * or -1 for a bad epfd. The SYS_epoll_wait dispatch wraps this in the poll
@@ -13698,6 +14107,7 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
     if (!a || epfd < 0 || epfd >= APP_NFD || !a->fd[epfd].used || a->fd[epfd].type != 6) return -1;
     struct epollobj *e = &epolls[a->fd[epfd].obj];
     int k = 0;
+    ep_lk_take(e);
     for (int i = 0; i < e->n && k < maxevents; i++) {
         /* EPOLLONESHOT: already delivered, and not re-armed. Linux keeps the
          * registration but stops reporting until EPOLL_CTL_MOD sets a new
@@ -13712,6 +14122,7 @@ int app_epoll_check(int epfd, struct epoll_event *out, int maxevents) {
             if (e->items[i].events & EPOLLONESHOT) e->items[i].disarmed = 1;
         }
     }
+    ep_lk_give(e);
     return k;
 }
 
@@ -14123,7 +14534,7 @@ int app_fd_nread(int fd, long *out) {
         struct statx st;
         if (vfs_stat(a->fd[fd].path, &st) != 0) return APP_NREAD_ENOTTY;
         if ((st.stx_mode & 0xF000) == 0x4000) return APP_NREAD_ENOTTY;   /* a DIRECTORY is not a byte stream */
-        long sz = (long)st.stx_size, off = a->fd[fd].off;
+        long sz = (long)st.stx_size, off = file_off(a, fd);   /* the OPENING's cursor (g_ofd) */
         n = sz > off ? sz - off : 0;
         break;
     }
@@ -14452,7 +14863,7 @@ void app_fd_print(int fd) {
                 obj, a->fd[fd].write_end ? "write" : "read", ro, wo, q, hw, nb, cx);
         break;
     }
-    case 2: kprintf("file '%s' off=%ld nonblock=%d cloexec=%d", a->fd[fd].path, a->fd[fd].off, nb, cx); break;
+    case 2: kprintf("file '%s' off=%ld nonblock=%d cloexec=%d", a->fd[fd].path, file_off(a, fd), nb, cx); break;
     case 3: kprintf("memfd obj %d off=%ld nonblock=%d cloexec=%d", obj, a->fd[fd].off, nb, cx); break;
     case 12: kprintf("AF_UNIX ep %d rx_queued=%ld readable=%d TX_queued=%ld tx_room=%d "
                      "peer_reader_waiting=%d nonblock=%d cloexec=%d",
@@ -14839,6 +15250,9 @@ static void app_fd_fork(struct app *child, struct app *parent) {
          * how Firefox's display connection died right after it had bound every
          * global and taken its keymap. */
         else if (parent->fd[i].used && parent->fd[i].type == 12) unix_ref(parent->fd[i].obj);   /* AF_UNIX endpoint inherited (M2002) */
+        else if (parent->fd[i].used && parent->fd[i].type == 11) pty_ref(parent->fd[i].obj);    /* pty end inherited: the child's close must not hang it up */
+        else if (parent->fd[i].used && parent->fd[i].type == 17) drm_node_ref(parent->fd[i].obj);   /* render node inherited: likewise */
+        else if (parent->fd[i].used && parent->fd[i].type == 2) ofd_ref(parent->fd[i].obj);       /* file opening shared with the child (g_ofd) */
     }
 }
 /* exit/reap: close every fd the process still held. Must mirror app_fd_close's
@@ -14846,9 +15260,9 @@ static void app_fd_fork(struct app *child, struct app *parent) {
  * exited without itself calling close() on a memfd/epoll/inotify/TCP-socket
  * fd leaked that global table's slot permanently (TCPSOCK_N is just 2, so
  * two such exits exhausted socket() for the whole OS until reboot). Type 11
- * (pty) is deliberately NOT here: it's already released by pid, not by fd,
- * via pty_release_pid() a few lines up in app_reap -- adding it here would
- * double-close it. */
+ * (pty) is here now that each descriptor holds a reference to its end
+ * (pty_ref): a master opened through /dev/ptmx is disowned from the pid-based
+ * pty_release_pid, which only drops the id a NATIVE app holds. */
 static void app_fd_release(struct app *a) {
     for (int i = 0; i < APP_NFD; i++) if (a->fd[i].used) {
         if (a->fd[i].type == 1) pipe_close_end(a->fd[i].obj, a->fd[i].write_end);
@@ -14863,6 +15277,9 @@ static void app_fd_release(struct app *a) {
          * compositor's client table fills with the dead. */
         else if (a->fd[i].type == 12) { if (a->fd[i].obj >= 0) unix_close(a->fd[i].obj); }
         else if (a->fd[i].type == 13) unix_unlisten(a->fd[i].obj);
+        else if (a->fd[i].type == 11) pty_close(a->fd[i].obj);
+        else if (a->fd[i].type == 17) drm_close_node(a->fd[i].obj);   /* a GL process that exits leaked its node: 16 exits and no GPU */
+        else if (a->fd[i].type == 2) ofd_unref(a->fd[i].obj);
         a->fd[i].used = 0;
         app_fd_mark(a, i, 0);
         app_fd_unclaim_mark(a, i);
@@ -14916,12 +15333,12 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
         if (nch >= p->rlim_nproc) return -1;            /* at the limit -> EAGAIN */
     }
 
-    struct app *a = 0;
-    for (int i = 0; i < MAX_APPS; i++) if (!apps[i].used) { a = &apps[i]; break; }
+    struct app *a = app_slot_claim();
     if (!a) return -1;                                  /* process table full */
 
     memset(a, 0, sizeof(*a));
     a->used = 1;
+    app_slot_publish(a);
         /* A RECYCLED apps[] SLOT MUST NOT INHERIT ITS PREDECESSOR'S CLAIMS
          * (M2327). g_fd_claimed is indexed by slot, and teardown clears it --
          * but an exit path that skips that loop would leave bits set, and
@@ -14930,7 +15347,7 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
          * later and miles away, so the invariant is re-established HERE, where
          * it cannot depend on every exit path behaving. */
         app_fd_claims_reset(a);
-    a->pid = next_pid++;                                /* a FRESH pid (not the parent's) */
+    a->pid = app_new_pid();                             /* a FRESH pid (not the parent's) */
     /* title: the parent's, marked as a fork */
     int ti = 0; const char *pt = p->title ? p->title : "app";
     while (pt[ti] && ti < 16) { a->titlebuf[ti] = pt[ti]; ti++; }
@@ -14963,7 +15380,12 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
      * is a good trade for memory that cannot be corrupted. */
     a->cr3 = vmm_create_address_space();
     if (!a->cr3) { a->used = 0; return -1; }
-    vdso_map(a->cr3);                                   /* the RO vDSO page (shared, RO — not COW) */
+    /* NO vdso_map here: vmm_fork_cow copies the parent's vDSO PTE like any
+     * other read-only page, with its one reference. Mapping it first as well
+     * took TWO references for one mapping and released one at exit -- +1 per
+     * fork on an 8-bit count, so after ~255 forks it wrapped to zero, the next
+     * exit freed the frame, and the timer went on writing the clock into
+     * whoever was handed it next. */
     if (vmm_fork_cow(a->cr3) != 0) { vmm_destroy_address_space(a->cr3); a->used = 0; return -1; }
     /* NOW make the parent's siblings drop their WRITABLE entries (M2047).
      *
@@ -15162,14 +15584,38 @@ void app_task_forget_everywhere(void *t) {
     }
 }
 
-static int app_thr_slot(struct app *a) {
-    for (int i = 0; i < APP_MAXTHREAD; i++) if (!a->thr[i]) return i;
+/* Is there room for one more thread? A hint for failing early, before a task
+ * is built; the claim itself is app_thr_install. */
+static int app_thr_room(struct app *a) {
     for (int i = 0; i < APP_MAXTHREAD; i++) {
         task_t *t = a->thr[i];
-        if (!t || t->state != TASK_DEAD) continue;
+        if (!t || (t->state == TASK_DEAD && __atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE))) return 1;
+    }
+    return 0;
+}
+
+/* RECORD A NEW THREAD, CLAIMING ITS SLOT WITH A COMPARE-AND-SWAP (M1988's
+ * class, in the thread table). This used to return a free index and let the
+ * caller store into it later, so two concurrent pthread_creates were handed
+ * the same slot: the overwritten thread was then invisible to
+ * app_stop_siblings and the reaper and ran on after its address space was
+ * freed, and two claimers reclaiming one dead thread both task_free'd it.
+ * Swapping the real pointer in means no half-claimed slot is ever visible,
+ * and only the winner of a reclaim frees the dead task. -1 if full. */
+static int app_thr_install(struct app *a, task_t *nt) {
+    for (int i = 0; i < APP_MAXTHREAD; i++) {
+        task_t *exp = 0;
+        if (!a->thr[i] &&
+            __atomic_compare_exchange_n(&a->thr[i], &exp, nt, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return i;
+    }
+    for (int i = 0; i < APP_MAXTHREAD; i++) {
+        task_t *t = a->thr[i];
+        if (!t || t == nt || t->state != TASK_DEAD) continue;
         if (!__atomic_load_n(&t->off_cpu, __ATOMIC_ACQUIRE)) continue;
+        if (!__atomic_compare_exchange_n(&a->thr[i], &t, nt, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;                                   /* another claimer took it first */
         app_task_forget_everywhere(t);
-        a->thr[i] = 0;
         task_free(t);
         return i;
     }
@@ -15210,7 +15656,12 @@ long app_clone(struct registers *r, uint64_t fn, uint64_t stack, uint64_t arg) {
     task_t *t = task_create_stack_suspended(thread_trampoline, a->cr3, a, 256 * 1024);   /* SHARED cr3 + app. 256K (was 64K): a clone'd thread that calls sys_https runs the bignum/RSA TLS handshake on THIS kernel stack — the ring-3 browser's async fetch worker does exactly that, and 64K overflowed (corrupting the task ring -> task_wake_sleepers GPF). Matches the in-kernel browser worker's 256K. */
     if (!t) { kfree(f); return -1; }
     t->start_frame = f;
-    { int sl = app_thr_slot(a); if (sl >= 0) a->thr[sl] = t; }   /* track for join/reap (M1139); reclaims finished slots (M2009) */
+    if (app_thr_install(a, t) < 0) {   /* track for join/reap (M1139); reclaims finished slots (M2009) */
+        /* No slot: an untracked thread outlives its address space. Start it
+         * with no frame, so thread_trampoline ends it at once (M2014). */
+        t->start_frame = 0; kfree(f); task_cont(t);
+        return -1;
+    }
     task_cont(t);                      /* the start frame is stored: NOW it may run (M2014) */
     return t->id;
 }
@@ -15238,9 +15689,8 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
     struct app *a = cur();
     if (!a || !r || !stack) return -1;
     /* Refuse when the thread table is full rather than creating a task nothing
-     * can join or reap. */
-    int slot = app_thr_slot(a);
-    if (slot < 0) return -1;
+     * can join or reap. (A hint: the slot is claimed by app_thr_install below.) */
+    if (!app_thr_room(a)) return -1;
 
     struct registers *f = kmalloc(sizeof *f);
     if (!f) return -1;
@@ -15264,8 +15714,15 @@ long app_clone_linux(struct registers *r, unsigned long flags, uint64_t stack,
     /* PARENT_SETTID is written HERE, in the parent, before we return -- the
      * caller may read it the instant clone() returns, and the child may not
      * have run yet. */
+    if (app_thr_install(a, t) < 0) {
+        /* The table filled between the check above and now. Never run a
+         * thread nothing tracks: start it with no frame so it ends at once --
+         * and without a clear_child_tid, which would be written into a stack
+         * the caller frees when this clone fails. */
+        t->clear_child_tid = 0; t->start_frame = 0; kfree(f); task_cont(t);
+        return -1;
+    }
     if ((flags & LXC_PARENT_SETTID) && vmm_user_ok(ptid, 4)) *(volatile int *)ptid = t->id;
-    a->thr[slot] = t;
     task_cont(t);                      /* TLS + tid pointers are set: now it may run */
     return t->id;
 }
@@ -15415,7 +15872,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
                                                * image (not the new, not-yet-populated one) is still live */
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    __asm__ volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");   /* become the new space */
+    uint64_t exec_prev_cr3 = task_cr3_borrow(new_cr3);   /* become the new space (preemption-safe) */
 
     elf_lazy_range_t lazy[4]; int nlazy = 0;
     /* A mapped load registers VMAs as it goes, so a->nvma has to be reset
@@ -15423,6 +15880,17 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * segments it just mapped. Snapshotted so the fail path, which leaves the
      * caller running in its OLD address space, restores its VMA list. */
     int saved_nvma = a->nvma;
+    /* THE OLD IMAGE'S memfd MAPPINGS EACH HOLD A REFERENCE (M1985), and the
+     * reset below discards the VMA table -- the mapped load even overwrites
+     * the old entries with the new image's. Nothing ever dropped those
+     * references, so every exec from a process with memfd mappings (every
+     * fork+exec Firefox makes) leaked the objects until NMEMFD ran out.
+     * Collected now, released only once the exec has committed. */
+    short old_mfd[64]; int n_old_mfd = 0, lost_mfd = 0;
+    for (int vi = 0; vi < a->nvma; vi++)
+        if (a->vma[vi].len && a->vma[vi].mfd >= 0) {
+            if (n_old_mfd < 64) old_mfd[n_old_mfd++] = a->vma[vi].mfd; else lost_mfd++;
+        }
     uint64_t entry;
     if (exec_mappath[0]) {
         a->nvma = 0;
@@ -15459,6 +15927,38 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
         
     }
 
+    /* EXEC ENDS EVERY OTHER THREAD FIRST, as on Linux. The old address space
+     * is destroyed just below, and the siblings were never stopped: they
+     * went on running on its freed page tables. Stop them, wait (bounded)
+     * until none is still executing on a core, and release them as the
+     * reaper would. If a non-main thread is the one exec'ing, it becomes the
+     * main task -- the old main is just another sibling now. */
+    {   task_t *me = task_self();
+        for (int i = 0; i < APP_MAXTHREAD; i++) {
+            task_t *t = a->thr[i];
+            if (t && t != me) { app_futex_forget(t); task_stop(t); }
+        }
+        if (a->task && a->task != me) { app_futex_forget(a->task); task_stop(a->task); }
+        for (int spin = 0; spin < 2000; spin++) {
+            int on = (a->task && a->task != me && task_is_on_cpu(a->task));
+            for (int i = 0; i < APP_MAXTHREAD && !on; i++)
+                if (a->thr[i] && a->thr[i] != me && task_is_on_cpu(a->thr[i])) on = 1;
+            if (!on) break;
+            task_sleep_ms(1);
+        }
+        if (a->task != me) {                         /* adopt: the exec'ing thread is the process now */
+            for (int i = 0; i < APP_MAXTHREAD; i++)
+                if (a->thr[i] == me) { a->thr[i] = a->task; break; }
+            a->task = me;
+        }
+        for (int i = 0; i < APP_MAXTHREAD; i++) {
+            task_t *t = a->thr[i];
+            if (!t || t == me || !app_task_reapable(t)) continue;
+            app_task_forget_everywhere(t);
+            app_task_release(t);
+            a->thr[i] = 0;
+        }
+    }
     /* committed: we are now the new program. Free the OLD space (non-active now). */
     /* A vfork CHILD's old address space is its PARENT's -- destroying it here
      * would take the parent down with it. exec is also the moment the parent
@@ -15466,6 +15966,8 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * (M2006) */
     int was_borrowed = a->cr3_borrowed;
     a->cr3_borrowed = 0;
+    for (int k = 0; k < n_old_mfd; k++) memfd_unref(old_mfd[k]);   /* the old image's mappings are gone */
+    if (lost_mfd) kprintf("[exec] %d memfd mapping reference(s) beyond 64 could not be released\n", lost_mfd);
     if (!was_borrowed) vmm_destroy_address_space(old_cr3);
     a->cr3 = new_cr3; a->task->cr3 = new_cr3;
     /* RELEASE THE vfork PARENT ONLY NOW, with the switch completely done
@@ -15495,7 +15997,15 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
          * page, so the new image entered ring 3 with an unmapped RSP and took
          * an immediate page fault at CR2=0x50081000. Silently entering a
          * program at a bad stack is far worse than refusing the exec. */
-        if (!rsp) { kprintf("[linuxabi] execve: could not build the initial stack\n"); goto fail; }
+        if (!rsp) {
+            /* PAST THE COMMIT POINT there is nothing to go back to: the old
+             * address space was destroyed above. `goto fail` reloaded that
+             * dead CR3 and freed the live one. The process exits instead,
+             * as Linux kills a process whose exec fails this late. */
+            kprintf("[linuxabi] execve: could not build the initial stack -- the old image is gone, exiting\n");
+            __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+            app_sys_exit(127);
+        }
         a->ustack = rsp;
     }
 
@@ -15547,7 +16057,7 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
     return 0;                                               /* frame rewritten; iretq enters the new program */
 
 fail:
-    __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");   /* restore the old space */
+    task_cr3_return(exec_prev_cr3);                          /* restore the old space */
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
     vmm_destroy_address_space(new_cr3);
     return -1;
