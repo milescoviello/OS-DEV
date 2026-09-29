@@ -14663,7 +14663,12 @@ static long app_fork_common(struct registers *r, uint64_t child_rsp, int share_v
      * is a good trade for memory that cannot be corrupted. */
     a->cr3 = vmm_create_address_space();
     if (!a->cr3) { a->used = 0; return -1; }
-    vdso_map(a->cr3);                                   /* the RO vDSO page (shared, RO — not COW) */
+    /* NO vdso_map here: vmm_fork_cow copies the parent's vDSO PTE like any
+     * other read-only page, with its one reference. Mapping it first as well
+     * took TWO references for one mapping and released one at exit -- +1 per
+     * fork on an 8-bit count, so after ~255 forks it wrapped to zero, the next
+     * exit freed the frame, and the timer went on writing the clock into
+     * whoever was handed it next. */
     if (vmm_fork_cow(a->cr3) != 0) { vmm_destroy_address_space(a->cr3); a->used = 0; return -1; }
     /* NOW make the parent's siblings drop their WRITABLE entries (M2047).
      *
