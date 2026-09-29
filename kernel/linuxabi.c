@@ -4110,7 +4110,7 @@ static void lx_dispatch_body(struct registers *r) {
             uint64_t base = app_heap_base();
             if (lo < base) lo = base;
             app_set_break(lo);
-            r->rax = lo;
+            r->rax = app_sbrk(0);            /* the break actually set (page-rounded, >= lo) */
         }
         break;
     }

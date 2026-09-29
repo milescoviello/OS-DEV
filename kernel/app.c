@@ -5009,12 +5009,39 @@ int app_sys_read(char *buf, unsigned max) {
  * LXS_brk case for what looping on that costs. The pages stay mapped; only the
  * bookkeeping moves, which is all the caller can observe. */
 uint64_t app_heap_base(void) { return UHEAP_BASE; }
+static int app_tlb_sync(struct app *a);
+/* LOWERING THE BREAK FREES WHAT IT UNCOVERS. This only moved heap_end, so the
+ * pages above the new break stayed mapped; the next grow mapped fresh frames
+ * over them and the old ones were orphaned for good (glibc's malloc trim does
+ * exactly this, repeatedly). It also broke the brk contract glibc's calloc
+ * relies on -- memory newly obtained from brk is zero -- whenever a grow
+ * re-exposed a page that was still mapped. The break is kept page-aligned
+ * (brk returns the break actually set, which may round up), and the freed
+ * pages go back only after a shootdown every core acknowledged, as munmap's
+ * do. Only ever lowers, never grows. */
 void app_set_break(uint64_t addr) {
     struct app *a = cur();
     if (!a) return;
     if (!a->heap_end) a->heap_end = UHEAP_BASE;
     if (addr < UHEAP_BASE) addr = UHEAP_BASE;
-    if (addr <= a->heap_end) a->heap_end = addr;      /* only ever lowers, never grows */
+    addr = (addr + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    if (addr >= a->heap_end) return;
+    uint64_t top = (a->heap_end + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    a->heap_end = addr;
+    uint64_t fr[64]; int n = 0, leaked = 0;
+    for (uint64_t v = addr; v < top; v += PAGE_SIZE) {
+        uint64_t ph = vmm_translate(v);
+        if (!ph) continue;
+        vmm_unmap(v);
+        fr[n++] = ph & ~(uint64_t)(PAGE_SIZE - 1);
+        if (n == 64 || v + PAGE_SIZE >= top) {
+            if (app_tlb_sync(a)) { for (int k = 0; k < n; k++) pmm_free_frame(fr[k]); }
+            else leaked += n;
+            n = 0;
+        }
+    }
+    if (n) { if (app_tlb_sync(a)) { for (int k = 0; k < n; k++) pmm_free_frame(fr[k]); } else leaked += n; }
+    if (leaked) kprintf("[app] brk shrink leaked %d frame(s): the shootdown did not complete\n", leaked);
 }
 
 uint64_t app_sbrk(long inc) {
@@ -15398,6 +15425,17 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * segments it just mapped. Snapshotted so the fail path, which leaves the
      * caller running in its OLD address space, restores its VMA list. */
     int saved_nvma = a->nvma;
+    /* THE OLD IMAGE'S memfd MAPPINGS EACH HOLD A REFERENCE (M1985), and the
+     * reset below discards the VMA table -- the mapped load even overwrites
+     * the old entries with the new image's. Nothing ever dropped those
+     * references, so every exec from a process with memfd mappings (every
+     * fork+exec Firefox makes) leaked the objects until NMEMFD ran out.
+     * Collected now, released only once the exec has committed. */
+    short old_mfd[64]; int n_old_mfd = 0, lost_mfd = 0;
+    for (int vi = 0; vi < a->nvma; vi++)
+        if (a->vma[vi].len && a->vma[vi].mfd >= 0) {
+            if (n_old_mfd < 64) old_mfd[n_old_mfd++] = a->vma[vi].mfd; else lost_mfd++;
+        }
     uint64_t entry;
     if (exec_mappath[0]) {
         a->nvma = 0;
@@ -15473,6 +15511,8 @@ long app_exec(struct registers *r, const char *name, const char *arg) {
      * (M2006) */
     int was_borrowed = a->cr3_borrowed;
     a->cr3_borrowed = 0;
+    for (int k = 0; k < n_old_mfd; k++) memfd_unref(old_mfd[k]);   /* the old image's mappings are gone */
+    if (lost_mfd) kprintf("[exec] %d memfd mapping reference(s) beyond 64 could not be released\n", lost_mfd);
     if (!was_borrowed) vmm_destroy_address_space(old_cr3);
     a->cr3 = new_cr3; a->task->cr3 = new_cr3;
     /* RELEASE THE vfork PARENT ONLY NOW, with the switch completely done
