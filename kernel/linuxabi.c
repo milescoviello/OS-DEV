@@ -550,16 +550,23 @@ static const char *lx_fd_prefix_rewrite(const char *p, char *out, int max) {
  * different files. */
 static unsigned long g_path_trunc;
 unsigned long lx_path_truncations(void) { return g_path_trunc; }
-static void lx_path_truncated(const char *want, const char *got, int max) {
+/* What a translation that did not fit resolves to: a name under /proc, which
+ * procfs owns and which nothing can create, write, rename or delete. So the
+ * call FAILS instead of acting on whatever the cut-off prefix names -- the
+ * diagnostic below used to be all there was, and the open, unlink or rename
+ * went ahead on a different file. */
+static const char g_lx_toolong[] = "/proc/.path-too-long";
+static const char *lx_path_truncated(const char *want, const char *got, int max) {
     g_path_trunc++;
-    if (g_path_trunc > 8) return;
+    if (g_path_trunc > 8) return g_lx_toolong;
     int n = 0; while (want && want[n]) n++;
     app_t *a = app_current();
     kprintf("[linuxabi] path TRUNCATED #%lu by pid %d: %d chars asked for, %d is the limit "
-            "(+%d for the mount prefix) -- this NAMES A DIFFERENT FILE.\n"
-            "           wanted \"%s\"\n           opened \"%s\"\n",
+            "(+%d for the mount prefix) -- REFUSED, since the cut-off name is a different file.\n"
+            "           wanted \"%s\"\n           cut to \"%s\"\n",
             g_path_trunc, a ? app_pid_of(a) : -1, n, max - 1, LX_ROOT_LEN,
             want ? want : "(null)", got ? got : "(null)");
+    return g_lx_toolong;
 }
 
 static const char *lx_xlate(const char *p, char *out, int max) {
@@ -614,7 +621,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
          * chain against a 16 KB kernel stack -- so it is its own milestone.
          * Until then, say so: a wrong answer that announces itself can be
          * found, and this one could not. */
-        if (p[pi]) lx_path_truncated(p, out, max);
+        if (p[pi]) return lx_path_truncated(p, out, max);
         /* A TRAILING SLASH IS NOT A CHARACTER THE PATH WALKER FORGIVES, and
          * "/" is the path a program is most likely to hand us: the root itself
          * became "/disk2/", which resolved to nothing. Claude Code checks its
@@ -645,7 +652,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
     if (n && out[n - 1] != '/' && n < max - 1) out[n++] = '/';
     int ri; for (ri = 0; p[ri] && n < max - 1; ri++) out[n++] = p[ri];
     out[n] = 0;
-    if (cwd[ci] || p[ri]) lx_path_truncated(p, out, max);   /* M2197: this branch had no diagnostic */
+    if (cwd[ci] || p[ri]) return lx_path_truncated(p, out, max);   /* M2197: this branch had no diagnostic */
     while (n > 1 && out[n - 1] == '/') out[--n] = 0;      /* same rule for a relative path */
     return out;
 }
@@ -786,7 +793,7 @@ static const char *lx_xlate_at(long dirfd, const char *up, char *out, int max) {
     while (u[0] == '.' && u[1] == '/') u += 2;
     int k; for (k = 0; u[k] && p < max - 1; k++) out[p++] = u[k];
     out[p] = 0;
-    if (btrunc || u[k]) lx_path_truncated(up, out, max);    /* M2197: this join had no diagnostic */
+    if (btrunc || u[k]) return lx_path_truncated(up, out, max);    /* M2197: this join had no diagnostic */
     return out;
 }
 
