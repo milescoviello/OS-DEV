@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 int main(int argc, char **argv) {
     const char *dir  = argc > 1 ? argv[1] : "/";   /* the Linux root IS the ext2 volume (M1954) */
@@ -41,5 +42,39 @@ int main(int argc, char **argv) {
     printf("LXIO: wrote+read %d lines / %ld bytes, stat size=%ld, dir entries=%d\n",
            lines, bytes, (long)st.st_size, nents);
     fflush(stdout);
-    return (lines == 200 && st.st_size == bytes && nents > 0) ? 0 : 2;
+    /* ONE OPENING, SHARED OFFSET. dup'd and forked descriptors share the file
+     * position (POSIX's open file description): `cmd >log 2>&1` depends on it.
+     * Each descriptor used to keep its own cursor, so the second writer
+     * overwrote the first. And O_APPEND writes at end-of-file EVERY time. */
+    int shared_ok = 0;
+    {
+        const char *sp = "/root/lxio-shared.txt";
+        unlink(sp);
+        int a = open(sp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int b = (a >= 0) ? dup(a) : -1;
+        if (a >= 0 && b >= 0 && write(a, "AAAA", 4) == 4 && write(b, "BBBB", 4) == 4) {
+            pid_t pid = fork();
+            if (pid == 0) { ssize_t w = write(a, "CCCC", 4); _exit(w == 4 ? 0 : 1); }
+            int stt = 0; waitpid(pid, &stt, 0);
+            if (write(b, "DDDD", 4) == 4) {
+                int x = open(sp, O_WRONLY | O_APPEND), y = open(sp, O_WRONLY | O_APPEND);
+                if (x >= 0 && y >= 0 && write(x, "EE", 2) == 2 && write(y, "FF", 2) == 2) {
+                    char got[64] = {0};
+                    int r = open(sp, O_RDONLY);
+                    ssize_t n = (r >= 0) ? read(r, got, sizeof got - 1) : -1;
+                    if (n == 20 && memcmp(got, "AAAABBBBCCCCDDDDEEFF", 20) == 0) shared_ok = 1;
+                    else printf("LXIO: shared-offset file reads \"%.*s\" (%zd bytes), want AAAABBBBCCCCDDDDEEFF\n",
+                                (int)(n > 0 ? n : 0), got, n);
+                    if (r >= 0) close(r);
+                }
+                if (x >= 0) close(x);
+                if (y >= 0) close(y);
+            }
+        }
+        if (a >= 0) close(a);
+        if (b >= 0) close(b);
+        unlink(sp);
+    }
+    if (shared_ok) printf("LXIO: dup'd and forked descriptors share one offset, O_APPEND appends every write\n");
+    return (lines == 200 && st.st_size == bytes && nents > 0 && shared_ok) ? 0 : 2;
 }

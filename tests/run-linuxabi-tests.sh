@@ -321,6 +321,11 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: glibc file I/O wrong:"; grep -a "LXIO:" "$SLOG3" | head -1; f3=1
     fi
+    if grep -aq "LXIO: dup'd and forked descriptors share one offset" "$SLOG3"; then
+        echo "  ok: dup'd and forked descriptors share one file offset, and O_APPEND appends every write"
+    else
+        echo "  FAIL: shared file offsets:"; grep -a "LXIO: shared" "$SLOG3" | head -2; f3=1
+    fi
     # Phase 3's deliverable: a REAL PIPELINE between two processes. lxbox forks,
     # re-execs ITSELF twice with different argv, wires the halves with a pipe
     # and wait4s both. The COUNT is the assertion -- "pipeline done" alone

@@ -524,6 +524,9 @@ unsigned long g_readahead_pages;   /* pages filled by readahead rather than by a
 int g_net_trace;
 static unsigned long g_net_calls;   /* socket reads+writes, to notice a connection going quiet (M2016) */
 static struct app apps[MAX_APPS];
+static long file_off(struct app *a, int fd);   /* a file fd's cursor, shared by dup/fork (see g_ofd) */
+static void ofd_ref(int h);                    /* one more descriptor for a file opening */
+static void ofd_unref(int h);
 void app_cow_quarantine_flush(struct app *a);   /* drain the batched COW frees (M2102) */
 
 /* SELF-AUDIT (-append vmaaudit, M1988). Two VMAs must never describe the same
@@ -1232,7 +1235,7 @@ int app_format_fds(app_t *a, char *b, int max) {
             p = maps_str(b, p, max, "file ");
             p = maps_str(b, p, max, a->fd[i].path);
             p = maps_str(b, p, max, " @");
-            p = maps_dec(b, p, max, (uint64_t)a->fd[i].off);
+            p = maps_dec(b, p, max, (uint64_t)file_off(a, i));
         } else {
             p = maps_str(b, p, max, "?");
         }
@@ -1471,6 +1474,7 @@ int app_scm_send(int ep, int fd) {
     case 12: if (g_scmpool[e].fe.obj >= 0) unix_ref(g_scmpool[e].fe.obj); break;
     case 11: pty_ref(g_scmpool[e].fe.obj); break;   /* a pty end is a reference too (pty_ref) */
     case 17: drm_node_ref(g_scmpool[e].fe.obj); break;   /* and a render node (drm_node_ref) */
+    case 2:  ofd_ref(g_scmpool[e].fe.obj); break;        /* a passed file shares its opening */
     default: break;                      /* files and console aliases carry no count */
     }
     /* FIFO append, because the protocol matches descriptors to messages by
@@ -1575,6 +1579,7 @@ void app_scm_drop_conn(int ci) {
         case 12: if (doomed[i].obj >= 0) unix_close(doomed[i].obj); break;
         case 11: pty_close(doomed[i].obj); break;
         case 17: drm_close_node(doomed[i].obj); break;
+        case 2:  ofd_unref(doomed[i].obj); break;
         default: break;
         }
     }
@@ -11822,10 +11827,52 @@ long app_fd_read(int fd, void *buf, unsigned long max) {
     if (n > 0) { struct app *a = cur(); if (a) epoll_note_drain(a, fd); }
     return n;
 }
+/* OPEN FILE DESCRIPTIONS (POSIX's name for what dup and fork share).
+ *
+ * A regular-file descriptor used to carry its OWN cursor, copied by value on
+ * dup2, dup and fork, and O_APPEND only chose the starting offset. So every
+ * descriptor for one opening wrote at its own position: `make >log 2>&1`,
+ * `{ ls; date; } >out` and a shell's redirected subcommands overwrote each
+ * other's output, and two `>>` appenders clobbered each other. POSIX says the
+ * cursor and the append flag belong to the OPENING, which dup/fork/SCM share.
+ *
+ * So app_open allocates one here and the descriptor names it in `obj`
+ * (index + 1; 0 = none, which keeps the old per-descriptor cursor for any
+ * file fd made some other way or when the table is full). Every copy holds
+ * a reference; an O_APPEND write goes to end-of-file every time. */
+#define APP_NOFD 1024
+static struct { int refs; long off; uint8_t append; } g_ofd[APP_NOFD];
+static volatile int g_ofd_lk;
+static int ofd_new(long off, int append) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_ofd_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    int h = 0;
+    for (int i = 0; i < APP_NOFD; i++)
+        if (!g_ofd[i].refs) { g_ofd[i].refs = 1; g_ofd[i].off = off; g_ofd[i].append = (uint8_t)append; h = i + 1; break; }
+    __atomic_store_n(&g_ofd_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+    return h;
+}
+static void ofd_ref(int h)   { if (h > 0 && h <= APP_NOFD) __atomic_fetch_add(&g_ofd[h - 1].refs, 1, __ATOMIC_ACQ_REL); }
+static void ofd_unref(int h) { if (h > 0 && h <= APP_NOFD && g_ofd[h - 1].refs > 0) __atomic_fetch_sub(&g_ofd[h - 1].refs, 1, __ATOMIC_ACQ_REL); }
+static long file_off(struct app *a, int fd) {
+    int h = a->fd[fd].obj;
+    return (h > 0 && h <= APP_NOFD) ? g_ofd[h - 1].off : a->fd[fd].off;
+}
+static void file_off_set(struct app *a, int fd, long v) {
+    int h = a->fd[fd].obj;
+    if (h > 0 && h <= APP_NOFD) g_ofd[h - 1].off = v; else a->fd[fd].off = v;
+}
+static int file_append(struct app *a, int fd) {
+    int h = a->fd[fd].obj;
+    return (h > 0 && h <= APP_NOFD) ? g_ofd[h - 1].append : 0;
+}
+
 static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     struct app *a = cur(); if (!a) return -1;
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned read (M1193/M1196) */
-        long off = a->fd[fd].off;
+        long off = file_off(a, fd);                  /* the OPENING's cursor, shared by dup/fork */
         if (off < 0) return -1;
         /* A DIRECTORY IS NOT AN UNREADABLE FILE (M2071). ext2_pread refuses a
          * directory with a bare -1, which the Linux layer turns into EBADF --
@@ -11839,7 +11886,7 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
           if (vfs_stat(a->fd[fd].path, &st) == 0 && (st.stx_mode & S_IFMT) == S_IFDIR)
               return APP_FD_EISDIR; }
         long n = vfs_pread(a->fd[fd].path, buf, max, (uint64_t)off);   /* native positioned read (tmpfs/ext2); uncapped */
-        if (n > 0) a->fd[fd].off = off + n;
+        if (n > 0) file_off_set(a, fd, off + n);
         /* A READ OF AN OPEN FILE THAT FAILS SAYS WHICH FILE (M2071). The Linux
          * ABI turns a bare -1 into EBADF, and "bad file descriptor" on a
          * descriptor the kernel itself reports as open and regular is the most
@@ -12138,9 +12185,13 @@ long app_fd_write(int fd, const void *buf, unsigned long len) {
 static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
     struct app *a = cur(); if (!a) return -1;
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 2) {   /* FILE fd: positioned write (M1195) */
-        long off = a->fd[fd].off;
+        long off = file_off(a, fd);
+        if (file_append(a, fd)) {                    /* O_APPEND: at end-of-file EVERY time, not just at open */
+            struct statx st;
+            if (vfs_stat(a->fd[fd].path, &st) == 0) off = (long)st.stx_size;
+        }
         long n = app_file_write_at(a, fd, buf, len, off);
-        if (n > 0) a->fd[fd].off = off + n;
+        if (n > 0) file_off_set(a, fd, off + n);
         return n;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 3) {   /* memfd: seal-checked positioned write (M1212) */
@@ -12349,6 +12400,7 @@ int app_fd_close(int fd) {
         net_tcp_sock_close(a->fd[fd].obj);  /* close the TCP connection (M1268) */
     }
     else if (a->fd[fd].type == 11) pty_close(a->fd[fd].obj);    /* close this pty end, waking the peer (M1274) */
+    else if (a->fd[fd].type == 2) ofd_unref(a->fd[fd].obj);     /* one fewer holder of the opening (g_ofd) */
     else if (a->fd[fd].type == 12) { if (a->fd[fd].obj >= 0) unix_close(a->fd[fd].obj); }   /* AF_UNIX endpoint: wake the peer with EOF (M1965) */
     else if (a->fd[fd].type == 13) unix_unlisten(a->fd[fd].obj);                            /* AF_UNIX listener: release the name (M1965) */
     else if (a->fd[fd].type == 16) net_tcp_accept_close();                                  /* accepted AF_INET connection (M2020) */
@@ -12383,6 +12435,7 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].used && a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_close(a->fd[newfd].obj); /* (M2002) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 11) pty_close(a->fd[newfd].obj);   /* pty ends are references (pty_ref) */
     else if (a->fd[newfd].used && a->fd[newfd].type == 17) drm_close_node(a->fd[newfd].obj);   /* so are render nodes */
+    else if (a->fd[newfd].used && a->fd[newfd].type == 2) ofd_unref(a->fd[newfd].obj);        /* and file openings */
     /* CLAIM newfd BEFORE WRITING IT, NOT AFTER (M2329). dup2 installs a
      * descriptor without ever going through app_fd_claim, so between the
      * struct copy starting and the claim bit being set, an allocator on
@@ -12424,6 +12477,7 @@ int app_dup2(int oldfd, int newfd) {
     else if (a->fd[newfd].type == 12 && a->fd[newfd].obj >= 0) unix_ref(a->fd[newfd].obj); /* AF_UNIX: a descriptor is a reference (M2002) */
     else if (a->fd[newfd].type == 11) pty_ref(a->fd[newfd].obj);   /* and so is a pty end: a dup'd copy must not close it for everyone */
     else if (a->fd[newfd].type == 17) drm_node_ref(a->fd[newfd].obj);   /* ...and a render node (Mesa dups it) */
+    else if (a->fd[newfd].type == 2) ofd_ref(a->fd[newfd].obj);   /* the copy SHARES the cursor: `2>&1` writes after `1`, not over it */
     return newfd;
 }
 /* mkfifo(path): create a named pipe (M1188). 0/-1. */
@@ -12568,6 +12622,7 @@ int app_open(const char *path, int flags) {
     int j = 0; while (path[j] && j < (int)sizeof a->fd[fd].path - 1) { a->fd[fd].path[j] = path[j]; j++; }
     a->fd[fd].path[j] = 0;
     a->fd[fd].off = (flags & O_APPEND) ? (long)st.stx_size : 0;   /* O_APPEND starts at EOF */
+    a->fd[fd].obj = ofd_new(a->fd[fd].off, (flags & O_APPEND) ? 1 : 0);   /* the shared opening (see g_ofd) */
     a->fd[fd].cloexec = (flags & O_CLOEXEC) ? 1 : 0;              /* close-on-exec (M1218) */
     return fd;
 }
@@ -12584,18 +12639,18 @@ long app_lseek(int fd, long off, int whence) {
             r = find_hole ? size : off;
         } else r = vfs_seek_data_hole(a->fd[fd].path, off, find_hole);
         if (r < 0) return -1;
-        a->fd[fd].off = r;                                   /* POSIX: the seek also repositions the fd */
+        if (a->fd[fd].type == 2) file_off_set(a, fd, r); else a->fd[fd].off = r;   /* POSIX: the seek also repositions the fd */
         return r;
     }
     long base = 0;
-    if (whence == 1) base = a->fd[fd].off;
+    if (whence == 1) base = (a->fd[fd].type == 2) ? file_off(a, fd) : a->fd[fd].off;
     else if (whence == 2) {                                  /* SEEK_END: file size (memfd size for type 3, M1212) */
         if (a->fd[fd].type == 3) base = (long)memfds[a->fd[fd].obj].size;
         else { struct statx st; if (vfs_stat(a->fd[fd].path, &st) != 0) return -1; base = (long)st.stx_size; }
     }
     long n = base + off;
     if (n < 0) return -1;
-    a->fd[fd].off = n;
+    if (a->fd[fd].type == 2) file_off_set(a, fd, n); else a->fd[fd].off = n;
     return n;
 }
 
@@ -14667,6 +14722,7 @@ static void app_fd_fork(struct app *child, struct app *parent) {
         else if (parent->fd[i].used && parent->fd[i].type == 12) unix_ref(parent->fd[i].obj);   /* AF_UNIX endpoint inherited (M2002) */
         else if (parent->fd[i].used && parent->fd[i].type == 11) pty_ref(parent->fd[i].obj);    /* pty end inherited: the child's close must not hang it up */
         else if (parent->fd[i].used && parent->fd[i].type == 17) drm_node_ref(parent->fd[i].obj);   /* render node inherited: likewise */
+        else if (parent->fd[i].used && parent->fd[i].type == 2) ofd_ref(parent->fd[i].obj);       /* file opening shared with the child (g_ofd) */
     }
 }
 /* exit/reap: close every fd the process still held. Must mirror app_fd_close's
@@ -14693,6 +14749,7 @@ static void app_fd_release(struct app *a) {
         else if (a->fd[i].type == 13) unix_unlisten(a->fd[i].obj);
         else if (a->fd[i].type == 11) pty_close(a->fd[i].obj);
         else if (a->fd[i].type == 17) drm_close_node(a->fd[i].obj);   /* a GL process that exits leaked its node: 16 exits and no GPU */
+        else if (a->fd[i].type == 2) ofd_unref(a->fd[i].obj);
         a->fd[i].used = 0;
         app_fd_mark(a, i, 0);
         app_fd_unclaim_mark(a, i);
