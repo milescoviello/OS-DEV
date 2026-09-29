@@ -1,5 +1,98 @@
 # What's next
 
+> **(M2399) A WHOLE-SYSTEM REVIEW, AND `make check` GREEN WITH NO SUITE
+> EXCUSED.**
+>
+> ```
+> make check on the node: 105 parallel-pool suites + 6 serial suites PASS.
+> Only xkbtest (no libxkbcommon headers there) and gdbstubtest (no gdb) skip,
+> for missing HOST tools.
+> ```
+>
+> This milestone adds no feature. The request was "review the OS and get it
+> into a good state", so the kernel was reviewed subsystem by subsystem and
+> every finding was fixed or written down below. The work is 70 commits,
+> each covering one defect or one class of defect (or a doc), each with its
+> own message. Most are races and lifetime bugs of the find-then-fill kind. The
+> ones worth knowing about:
+>
+> - **Every suite that was not green had a real cause.**
+>   - **waylandtest** was red because its harness aimed at the wrong screen.
+>     It scaled absolute-pointer moves for 1280x960, but the desktop is
+>     2560x1440, so every aim landed on another window. Separately, pointer
+>     events went only to the focused window. They now go to the window under
+>     the cursor.
+>   - **httpdtest** failed one run in three or four, on the baseline too,
+>     always on its 404 request. The in-guest server dropped a second
+>     client's SYN while it was busy. QEMU's proxy kept redialling, so dropped
+>     SYNs turned into connections that were served seconds late, ahead of the
+>     live request. A busy listener now keeps those SYNs for its next
+>     `accept`.
+>   - **boottest** failed once during this work. The console-lock self-test
+>     faked a foreign lock holder while the network self-test was printing,
+>     then "restored" a lock that its real holder had already released. Every
+>     later print then waited out the full spin limit. The test now holds the
+>     real lock while it fakes the owner.
+> - **The `rip=0x3` panic from M2390 has a mechanism.** `current` was read in
+>   two loads: the LAPIC id, then `cur[]` for that core. A preemption between
+>   them read another core's slot. `thread_trampoline` then called that task's
+>   NULL `entry`, which runs the IVT bytes at physical 0 and faults with #UD at
+>   3. `current` is now read as one interrupt-masked observation, and the
+>   trampoline copies `entry` before enabling interrupts. This follows from
+>   the code and matches the crash; it has not been re-run on the GT 1030. Six
+>   more places in the scheduler could hand a task's state or stack to two
+>   owners.
+> - **memfd objects never move.** A grow used to reallocate the buffer and then
+>   re-point every mapping by rewriting *other processes'* page tables, under
+>   no lock their munmap, exec or exit takes. It also freed buffers the
+>   compositor was still blitting from. Each object now owns a fixed 16 MiB
+>   slot of kernel VA backed by PMM frames. Growing maps more frames at the
+>   end, and a dead object's frames are freed only after a TLB shootdown.
+> - **Isolation.** DRM buffer handles were global, so any process with a render
+>   fd could map another process's GPU buffers. Because CR0.WP is off, a
+>   syscall writing to a COW-shared frame wrote into the other process's
+>   copy. SMEP and UMIP were enabled on the BSP only.
+> - **Data loss.** Several bugs could lose or corrupt data:
+>   - ext2 freed a fast symlink's target text as if it were block numbers.
+>   - A write through a symlink rewrote the link itself.
+>   - FAT32 had no writer lock, and a second writer's sectors were staged into
+>     the first writer's journal transaction.
+>   - msync grew files to a page boundary and missed writes made on other
+>     cores.
+>   - Over-long paths were cut short and then acted on, which is a *different*
+>     file.
+> - **Wrong Linux ABI answers that real programs act on.**
+>   - `fstat()` of a pipe said "directory", because glibc implements it with
+>     AT_EMPTY_PATH.
+>   - `futimens` returned EFAULT.
+>   - A timerfd read before expiry returned EOF.
+>   - A dup'd fd had its own file offset.
+>   - A closed fd stayed in epoll sets under its old `data`.
+>   - `kill(0)` and `kill(-pgid)` signalled the caller instead of the group,
+>     and a fatal signal sent to another process did not end it.
+>
+> **How it was checked.** Every suite ran on the node. A suite that fails
+> intermittently was counted against the baseline kernel (cb732ef0) before any
+> failure was blamed on a change. The counts are in the commit messages.
+>
+> **What is known and not fixed:**
+> - **CR0.WP is still off.** The COW fix breaks sharing in the syscall's own
+>   validation path. Turning WP on needs exception fixups for kernel access to
+>   user memory, and there are none.
+> - **VFS_PATH_MAX is 256.** Over-long paths now fail instead of naming another
+>   file, but raising the limit is its own job: about seventy stack buffers
+>   are sized by it.
+> - **The lxfaulttest boot overran its budget once in five linuxabitest runs.**
+>   It printed 990 lines and never reached its end marker. Eight standalone
+>   boots did not reproduce it. The suite now keeps that boot's log when it
+>   fails.
+> - **A USB transfer that times out is abandoned, not cancelled.** This is
+>   true for both xHCI and EHCI. The block drivers are handled: AHCI recovers
+>   its port, virtio-blk resets the device, and NVMe matches completions to
+>   command ids and takes a controller offline after a real timeout.
+> - **memfd and DRM mmap cannot place a mapping at a fixed address.** MAP_FIXED
+>   is now refused instead of ignored. A DRM mapping is always read-write.
+
 > **(M2390) MESA'S NVC0 DRIVER RUNS AGAINST OS-DEV'S OWN NOUVEAU RENDER NODE,
 > UP TO THE ONE THING IT CANNOT HAVE YET.**
 >
