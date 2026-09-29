@@ -372,6 +372,9 @@ static inline uint64_t lx_sigset_out(uint64_t mine) { return mine >> 1; }
 #define LXO_APPEND 02000
 #define LXO_NONBLOCK 04000        /* Linux O_NONBLOCK (M2009) */
 #define LXO_CLOEXEC 02000000      /* Linux O_CLOEXEC */
+#define LXO_EXCL       0200
+#define LXO_DIRECTORY  0200000
+#define LXO_NOFOLLOW   0400000
 
 /* Linux's x86-64 `struct stat` -- 144 bytes, and the field OFFSETS are the ABI.
  * Writing our own struct layout here would compile fine and hand glibc
@@ -2444,7 +2447,10 @@ static void lx_dispatch_body(struct registers *r) {
             int af = app_inet_accept((int)a1);
             __asm__ volatile("cli");
             if (af < 0) { r->rax = (uint64_t)lx_fd_err(af); break; }
-            if (is4) app_fd_set_nonblock(af, (r->r10 & 0x800) ? 1 : 0);
+            /* SOCK_NONBLOCK / SOCK_CLOEXEC for accept4; plain accept inherits
+             * NEITHER from the listener on Linux (the new fd is blocking). */
+            app_fd_set_nonblock(af, (is4 && (r->r10 & 0x800)) ? 1 : 0);
+            if (is4 && (r->r10 & LXO_CLOEXEC)) app_fd_set_cloexec(af, 1);
             if (r->rsi && vmm_user_ok(r->rsi, 16)) {   /* fill in a plausible peer address */
                 uint8_t *o = (uint8_t *)r->rsi;
                 for (int i = 0; i < 16; i++) o[i] = 0;
@@ -2463,7 +2469,8 @@ static void lx_dispatch_body(struct registers *r) {
          * a loop that retries on EAGAIN would spin on it forever. */
         if (nf < 0) { r->rax = (uint64_t)lx_fd_err(nf); break; }
         /* accept4's SOCK_NONBLOCK applies to the ACCEPTED fd, not the listener. */
-        if (is4) app_fd_set_nonblock(nf, (r->r10 & 0x800) ? 1 : 0);
+        app_fd_set_nonblock(nf, (is4 && (r->r10 & 0x800)) ? 1 : 0);   /* see the AF_INET branch */
+        if (is4 && (r->r10 & LXO_CLOEXEC)) app_fd_set_cloexec(nf, 1);
         if (r->rdx && vmm_user_ok(r->rdx, 4)) *(uint32_t *)r->rdx = 2;   /* addrlen: just the family */
         r->rax = (uint64_t)nf;
         break;
@@ -3407,6 +3414,7 @@ static void lx_dispatch_body(struct registers *r) {
         break;
     case LXS_epoll_create1_: {              /* (flags) */
         int efd = app_epoll_create();
+        if (efd >= 0 && (a1 & LXO_CLOEXEC)) app_fd_set_cloexec(efd, 1);   /* EPOLL_CLOEXEC: it was dropped */
         r->rax = (efd < 0) ? (uint64_t)-(long)LX_EMFILE : (uint64_t)efd;
         break;
     }
@@ -4354,8 +4362,14 @@ static void lx_dispatch_body(struct registers *r) {
         break;
     case LXS_inotify_init1_:
         /* inotify EXISTS here (M1266) -- only the flags-taking entry point was
-         * missing, which is the only one glib uses. */
-        { int ifd = app_inotify_init(); r->rax = ifd < 0 ? (uint64_t)-(long)LX_EMFILE : (uint64_t)ifd; }
+         * missing, which is the only one glib uses.
+         * IN_NONBLOCK (= O_NONBLOCK) and IN_CLOEXEC (= O_CLOEXEC) were then
+         * dropped: libuv drains inotify until EAGAIN, so without IN_NONBLOCK
+         * Node's fs.watch thread parked in the read instead of its loop. */
+        { int ifd = app_inotify_init();
+          if (ifd >= 0 && (a1 & LXO_NONBLOCK)) app_fd_set_nonblock(ifd, 1);
+          if (ifd >= 0 && (a1 & LXO_CLOEXEC))  app_fd_set_cloexec(ifd, 1);
+          r->rax = ifd < 0 ? (uint64_t)-(long)LX_EMFILE : (uint64_t)ifd; }
         break;
     case LXS_prlimit64:
         /* (pid, resource, new, old). Report "unlimited" for a get and accept a
@@ -4742,12 +4756,31 @@ static void lx_dispatch_body(struct registers *r) {
             }
         }
         long lf = (long)r->rdx, nf = 0;
+        /* THE FLAGS THAT CHANGE THE ANSWER, which only write/create/trunc/
+         * append used to survive. O_CREAT|O_EXCL on an existing name succeeded,
+         * so a lock file (git's index.lock) excluded nobody; O_DIRECTORY and
+         * O_NOFOLLOW were no-ops; O_CLOEXEC and O_NONBLOCK were lost, so every
+         * file leaked into exec'd children. Checked against the name itself
+         * (lstat), as Linux does: a symlink "exists" for O_EXCL. */
+        {   struct statx osx;
+            int ex = (vfs_lstat(path, &osx) == 0);
+            int islnk = ex && (osx.stx_mode & 0170000u) == 0120000u;
+            if (ex && (lf & LXO_CREAT) && (lf & LXO_EXCL)) { r->rax = (uint64_t)-(long)LX_EEXIST; break; }
+            if (islnk && (lf & LXO_NOFOLLOW)) { r->rax = (uint64_t)-(long)LX_ELOOP; break; }
+            if (lf & LXO_DIRECTORY) {
+                struct statx dsx;
+                if (vfs_stat(path, &dsx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+                if ((dsx.stx_mode & 0170000u) != 0040000u) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+            }
+        }
         if (lf & (LXO_WRONLY | LXO_RDWR)) nf |= O_WRONLY;   /* we have no separate RDWR */
         if (lf & LXO_CREAT)  nf |= O_CREAT;
         if (lf & LXO_TRUNC)  nf |= O_TRUNC;
         if (lf & LXO_APPEND) nf |= O_APPEND;
         int fd = app_open(path, (int)nf);
         if (fd >= 0) {
+            if (lf & LXO_CLOEXEC)  app_fd_set_cloexec(fd, 1);
+            if (lf & LXO_NONBLOCK) app_fd_set_nonblock(fd, 1);
             /* DID THE BROWSER EVER ASK FOR THE PAGE? (M2107)
              *
              * Only FAILED opens are logged here, which is right for a dynamic
