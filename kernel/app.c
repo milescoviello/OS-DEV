@@ -2492,6 +2492,22 @@ int app_reap(app_t *a) {
      * process stayed un-reaped and un-zombified for ever and its parent hung in
      * wait4(). See task_off_stack for why STOPPED needs its own proof. */
     if (a->used && a->exited && (!a->task || app_task_reapable(a->task))) {
+        /* EVERY THREAD OFF ITS CORE BEFORE ANYTHING IT USES IS FREED. The
+         * teardown below stopped a live thread and destroyed the address
+         * space a few lines later -- but a task_stop only takes effect at that
+         * thread's next switch, up to a tick away on another core, so it went
+         * on running user code and syscalls on freed page tables. Stop them
+         * all first, and if any is still on a core, report "not reaped yet":
+         * every caller retries. A thread blocked off-CPU does not hold this up. */
+        {   int on_core = 0;
+            for (int i = 0; i < APP_MAXTHREAD; i++) {
+                task_t *t = a->thr[i];
+                if (!t || app_task_reapable(t)) continue;
+                task_stop(t);
+                if (task_is_on_cpu(t)) on_core = 1;
+            }
+            if (on_core) return 0;
+        }
         /* ONE REAPER, ATOMICALLY (M2072).
          *
          * This function frees the address space, every memfd mapping, the

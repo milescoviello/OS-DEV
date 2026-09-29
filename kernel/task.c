@@ -1076,6 +1076,16 @@ static int task_on_a_cpu(task_t *t) {
     return 0;
 }
 
+/* For a reaper: is `t` still executing (or mid-switch) on some core? */
+int task_is_on_cpu(task_t *t) {
+    uint64_t f = irq_save();
+    rq_lock_take();
+    int on = t ? task_on_a_cpu(t) : 0;
+    rq_lock_give();
+    irq_restore(f);
+    return on;
+}
+
 void task_wake(task_t *t) {
     uint64_t f = irq_save();
     rq_lock_take();
