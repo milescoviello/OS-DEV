@@ -127,7 +127,14 @@ else
     # "wedged", and the one time it fired the boot had merely been slow.
     echo "  FAIL: the boot did not reach its end marker within the budget ($(wc -l < "$SLOG2") log lines; a full boot is ~306)"; f2=1
 fi
-[ $f2 -eq 0 ] || { echo "FAIL: console-lock/fault-reporting regression"; exit 1; }
+if [ $f2 -ne 0 ]; then
+    # KEEP THE EVIDENCE. This boot's log was deleted with the rest, so the one
+    # time it overran its budget there was nothing to say what it was doing.
+    cp "$SLOG2" /tmp/osdev-linuxabi-FAULT-FAIL.log 2>/dev/null && {
+        echo "  (the failing boot's serial log is at /tmp/osdev-linuxabi-FAULT-FAIL.log; its tail:)"
+        tail -15 "$SLOG2" | sed 's/^/      /'; }
+    echo "FAIL: console-lock/fault-reporting regression"; exit 1
+fi
 echo "PASS: a ring-3 fault mid-print is reported and never deadlocks the console"
 
 # --- M1942: AVX via XSAVE ---------------------------------------------------
