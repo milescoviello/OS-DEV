@@ -2302,17 +2302,44 @@ static void lx_dispatch_body(struct registers *r) {
          * UTIME_NOW is 0x3fffffff and UTIME_OMIT is 0x3ffffffe, in the
          * NANOSECONDS field -- a value that is not a time at all, which is why
          * they have to be recognised before the seconds are used. */
-        if (!r->rsi || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* A NULL PATH IS THE DESCRIPTOR ITSELF: that is futimens(), which
+         * glibc implements as utimensat(fd, NULL, times, 0) and which cp -p,
+         * tar and rsync use on the file they just wrote. It was EFAULT. The
+         * dirfd was ignored too, so a relative name resolved against the
+         * working directory instead of the directory it was given. */
+        if (r->r10 & ~(uint64_t)(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
         char xu[VFS_PATH_MAX];
-        const char *up2 = lx_xlate((const char *)r->rsi, xu, sizeof xu);
+        const char *up2 = 0;
+        int of_fd = !r->rsi;
+        if (!of_fd) {
+            if (!vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+            if (!((const char *)r->rsi)[0]) {
+                if (!(r->r10 & LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+                of_fd = 1;
+            }
+        }
+        if (of_fd) {
+            if ((long)a1 == LX_AT_FDCWD) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }   /* Linux: no file named */
+            if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
+            up2 = app_fd_path((int)a1);
+        } else {
+            up2 = lx_xlate_at((long)a1, (const char *)r->rsi, xu, sizeof xu);
+        }
+        /* "Now" is the clock clock_gettime reports, not a fresh RTC read that
+         * can differ from it by up to a second -- make compares the two. */
         long at = -1, mt = -1;                       /* -1 = leave alone */
-        if (!r->rdx) { at = (long)(rtc_unix()); mt = at; }
+        long now = (long)lx_realtime_sec();
+        if (!r->rdx) { at = now; mt = now; }
         else if (vmm_user_ok(r->rdx, 32)) {
             const int64_t *ts = (const int64_t *)r->rdx;
-            long now = (long)rtc_unix();
+            int bad = 0;
+            for (int k = 1; k <= 3; k += 2)
+                if (ts[k] != 0x3fffffff && ts[k] != 0x3ffffffe && (ts[k] < 0 || ts[k] >= 1000000000)) bad = 1;
+            if (bad) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
             at = (ts[1] == 0x3fffffff) ? now : (ts[1] == 0x3ffffffe ? -1 : (long)ts[0]);
             mt = (ts[3] == 0x3fffffff) ? now : (ts[3] == 0x3ffffffe ? -1 : (long)ts[2]);
         } else { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up2) { r->rax = 0; break; }             /* a pipe or socket: no file time to keep */
         r->rax = (uint64_t)(vfs_utimes(up2, at, mt) == 0 ? 0 : -(long)LX_ENOENT);
         break;
     }
