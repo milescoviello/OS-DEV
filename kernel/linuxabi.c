@@ -2274,8 +2274,11 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t un = (r->rax == LXS_link_) ? r->rsi : r->r10;
         if (!uo || !un || !vmm_user_str_ok(uo, LX_STRMAX) || !vmm_user_str_ok(un, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xo[VFS_PATH_MAX], xn[VFS_PATH_MAX];
-        const char *op = lx_xlate((const char *)uo, xo, sizeof xo);
-        const char *np = lx_xlate((const char *)un, xn, sizeof xn);
+        /* Each name relative to its own dirfd, as linkat defines. */
+        long odir = (r->rax == LXS_link_) ? LX_AT_FDCWD : (long)r->rdi;
+        long ndir = (r->rax == LXS_link_) ? LX_AT_FDCWD : (long)r->rdx;
+        const char *op = lx_xlate_at(odir, (const char *)uo, xo, sizeof xo);
+        const char *np = lx_xlate_at(ndir, (const char *)un, xn, sizeof xn);
         r->rax = (uint64_t)(vfs_link(op, np) == 0 ? 0 : -(long)LX_EPERM);
         break;
     }
@@ -2291,7 +2294,8 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t ul = (r->rax == LXS_symlink_) ? r->rsi : r->rdx;
         if (!ut || !ul || !vmm_user_str_ok(ut, LX_STRMAX) || !vmm_user_str_ok(ul, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xl[VFS_PATH_MAX];
-        const char *lp = lx_xlate((const char *)ul, xl, sizeof xl);
+        long ldir = (r->rax == LXS_symlink_) ? LX_AT_FDCWD : (long)r->rsi;   /* symlinkat's newdirfd */
+        const char *lp = lx_xlate_at(ldir, (const char *)ul, xl, sizeof xl);
         /* The TARGET is not translated: it is the link's contents, a string
          * interpreted later in the process's own view of the filesystem, and
          * rewriting it into /disk2/... would bake our mount point into a file
@@ -5940,7 +5944,10 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t pa = (r->rax == LXS_access_) ? r->rdi : r->rsi;
         const char *up = (const char *)pa;
         if (!up || !vmm_user_str_ok(pa, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
+        /* faccessat's name is relative to ITS dirfd, not the cwd (M2032's
+         * rule, which this handler predated). */
+        long adir = (r->rax == LXS_access_) ? LX_AT_FDCWD : (long)r->rdi;
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at(adir, up, xp, sizeof xp);
         struct statx sx;
         /* Existence only. Everything runs as root here and there are no mode
          * bits on the boot volume, so reporting a permission failure would be
