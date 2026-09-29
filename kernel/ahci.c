@@ -108,13 +108,15 @@ struct hba_prdt_entry {
     uint32_t dbc_i;            /* bits 21..0 = byte count - 1; bit 31 = IRQ    */
 } __attribute__((packed));
 
-/* The command table a header points at: the command FIS, then the PRDT. We use
- * a single PRDT entry, which is all a contiguous DMA buffer needs. */
+/* The command table a header points at: the command FIS, then the PRDT. One
+ * entry per physically contiguous piece of the buffer (see ahci_xfer_chunk).
+ * 64 entries is 128 + 1024 bytes, well inside the table's own 4 KiB frame. */
+#define AHCI_PRDT_MAX 64
 struct hba_cmd_table {
     uint8_t  cfis[64];         /* command FIS (we write a Register H2D here)   */
     uint8_t  acmd[16];         /* ATAPI command (unused)                       */
     uint8_t  rsv[48];
-    struct hba_prdt_entry prdt[1];
+    struct hba_prdt_entry prdt[AHCI_PRDT_MAX];
 } __attribute__((packed));
 
 /* A Register Host-to-Device FIS — the SATA-level command packet. */
@@ -151,6 +153,7 @@ struct ahci_disk {
 static uint64_t ahci_identify(int disk);   /* fwd: IDENTIFY DEVICE -> sector count */
 
 static volatile uint8_t   *abar;       /* HBA register block (mapped BAR5)     */
+static int                 hba_s64a;   /* CAP.S64A: the HBA can DMA above 4 GiB */
 static struct ahci_disk    disks[AHCI_MAX_PORTS];
 static int                 ndisks;
 
@@ -266,6 +269,7 @@ int ahci_init(void) {
 
     /* Take ownership: put the HBA in AHCI mode. */
     hba_write(HBA_GHC, hba_read(HBA_GHC) | GHC_AE);
+    hba_s64a = (hba_read(HBA_CAP) >> 31) & 1;   /* CAP.S64A: 64-bit DMA addresses (see ahci_xfer_chunk) */
 
     /* Walk the implemented-ports bitmap; bring up each port that has a SATA
      * disk. CAP[4:0]+1 caps the port count, but PI is authoritative. */
@@ -298,14 +302,41 @@ static int find_cmd_slot(volatile uint8_t *p) {
  * PRDT for one DMA transfer, issue it on a free slot, and poll to completion.
  * `write` picks WRITE DMA EXT and sets the header's W bit; the buffer's physical
  * address is taken from `buf`. Returns 0 on success, -1 on bad arg / error. */
+/* A command that failed or timed out may still be running, and the next one
+ * would rewrite the command table it is reading. Clearing PxCMD.ST stops the
+ * engine and clears PxCI (AHCI 1.3 s3.3.7), so the port is clean again. */
+static void port_recover(volatile uint8_t *p) {
+    port_stop(p);
+    port_write(p, PxSERR, 0xFFFFFFFF);
+    port_write(p, PxIS,   0xFFFFFFFF);
+    port_start(p);
+}
+
+static int ahci_xfer_chunk(int disk, uint64_t lba, uint32_t count, void *buf, int write);
+
+/* The buffer is split into PHYSICALLY contiguous pieces, one PRD entry each.
+ * This used to hand the HBA phys_of(buf) and count*512 bytes in ONE entry,
+ * which assumes the whole buffer is contiguous in physical memory. It is not:
+ * ext2 reads into 4 KiB kernel-stack buffers, stacks are separately mapped
+ * frames (kstack_alloc), and the block layer sends 128-sector batches into
+ * whatever buffer the caller has -- so the tail of a transfer landed in
+ * whichever physical page happened to follow. virtio-blk had the same bug
+ * (M2144). A chunk of 8*(AHCI_PRDT_MAX-1) sectors spans at most
+ * AHCI_PRDT_MAX pages however it is aligned, so it always fits. */
 static int ahci_xfer(int disk, uint64_t lba, uint32_t count, void *buf, int write) {
     if (disk < 0 || disk >= ndisks || count == 0 || !buf)
         return -1;
-    /* One PRDT entry carries up to 4 MiB (its byte count is 22 bits, value-1),
-     * i.e. 8192 sectors. Keep the whole transfer in that single entry. */
-    if (count > 8192)
-        return -1;
+    const uint32_t per = 8u * (AHCI_PRDT_MAX - 1);
+    uint8_t *b = (uint8_t *)buf;
+    while (count) {
+        uint32_t n = count < per ? count : per;
+        if (ahci_xfer_chunk(disk, lba, n, b, write) != 0) return -1;
+        lba += n; count -= n; b += (uint64_t)n * AHCI_SECTOR_SIZE;
+    }
+    return 0;
+}
 
+static int ahci_xfer_chunk(int disk, uint64_t lba, uint32_t count, void *buf, int write) {
     volatile uint8_t *p = disks[disk].port;
 
     /* Wait for the port to be idle (not busy / no data-request pending). */
@@ -321,18 +352,43 @@ static int ahci_xfer(int disk, uint64_t lba, uint32_t count, void *buf, int writ
     struct hba_cmd_table  *tbl = disks[disk].cmd_table;
     uint64_t tbl_phys = phys_of(tbl);
 
+    memset(tbl, 0, sizeof(*tbl));
+    int nprd = 0;
+    uint64_t run_end = 0;                              /* physical end of the last entry */
+    uint8_t *b = (uint8_t *)buf;
+    for (uint32_t left = count * AHCI_SECTOR_SIZE; left; ) {
+        uint32_t in_page = PAGE_SIZE - (uint32_t)((uintptr_t)b & (PAGE_SIZE - 1));
+        uint32_t len = left < in_page ? left : in_page;
+        uint64_t ph = phys_of(b);
+        if (!ph) return -1;                            /* not mapped: nothing to DMA into */
+        if (!hba_s64a && ph + len > 0x100000000ull) {
+            /* The HBA only has 32 address bits: the high half would be
+             * dropped and the DMA would land somewhere else entirely. */
+            static int told;
+            if (!told) { told = 1;
+                kprintf("[ahci] buffer above 4 GiB on an HBA without 64-bit DMA -- refusing the transfer\n"); }
+            return -1;
+        }
+        if (nprd && ph == run_end && ((tbl->prdt[nprd - 1].dbc_i & 0x3FFFFF) + 1 + len) <= (4u << 20)) {
+            tbl->prdt[nprd - 1].dbc_i += len;          /* physically adjacent: extend the entry */
+        } else {
+            if (nprd == AHCI_PRDT_MAX) return -1;      /* cannot happen for a chunk: see ahci_xfer */
+            tbl->prdt[nprd].dba   = (uint32_t)ph;
+            tbl->prdt[nprd].dbau  = (uint32_t)(ph >> 32);
+            tbl->prdt[nprd].dbc_i = len - 1;           /* byte count - 1 */
+            nprd++;
+        }
+        run_end = ph + len;
+        b += len; left -= len;
+    }
+    tbl->prdt[nprd - 1].dbc_i |= (1u << 31);           /* IOC on the last entry */
+
     memset(hdr, 0, sizeof(*hdr));
     hdr->cfl   = sizeof(struct fis_reg_h2d) / sizeof(uint32_t);  /* = 5 DWORDs */
     hdr->w     = write ? 1 : 0;
-    hdr->prdtl = 1;
+    hdr->prdtl = (uint16_t)nprd;
     hdr->ctba  = (uint32_t)tbl_phys;
     hdr->ctbau = (uint32_t)(tbl_phys >> 32);
-
-    memset(tbl, 0, sizeof(*tbl));
-    uint64_t buf_phys = phys_of(buf);
-    tbl->prdt[0].dba   = (uint32_t)buf_phys;
-    tbl->prdt[0].dbau  = (uint32_t)(buf_phys >> 32);
-    tbl->prdt[0].dbc_i = ((count * AHCI_SECTOR_SIZE) - 1) | (1u << 31);  /* byte count-1 + IOC */
 
     struct fis_reg_h2d *fis = (struct fis_reg_h2d *)tbl->cfis;
     fis->fis_type = FIS_TYPE_REG_H2D;
@@ -356,17 +412,21 @@ static int ahci_xfer(int disk, uint64_t lba, uint32_t count, void *buf, int writ
     for (int i = 0; i < 5000000; i++) {
         if (!(port_read(p, PxCI) & (1u << slot)))
             break;
-        if (port_read(p, PxIS) & PxIS_TFES)
-            return -1;                       /* device flagged an error */
-        if (i == 4999999)
-            return -1;                       /* timeout */
+        if (port_read(p, PxIS) & PxIS_TFES) {
+            port_recover(p);                 /* device flagged an error: stop it using the table */
+            return -1;
+        }
+        if (i == 4999999) {
+            port_recover(p);                 /* timeout: the command may still be running */
+            return -1;
+        }
     }
 
     /* Final error check: task-file ERR bit, or an interrupt-status error. */
-    if (port_read(p, PxTFD) & PxTFD_ERR)
+    if ((port_read(p, PxTFD) & PxTFD_ERR) || (port_read(p, PxIS) & PxIS_TFES)) {
+        port_recover(p);
         return -1;
-    if (port_read(p, PxIS) & PxIS_TFES)
-        return -1;
+    }
     return 0;
 }
 
