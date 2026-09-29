@@ -1,5 +1,69 @@
 # What's next
 
+> **(M2391-M2396) A HOTSPOT JVM RUNS IN OS-DEV. THIS IS LINK 1 OF THE ROUTE TO
+> MINECRAFT (MINECRAFT.md).**
+>
+> ```
+> openjdk version "25.0.4" 2026-07-21 LTS                    (Temurin, exit 0)
+> LXSIGCTX: RESULT PASS (0 check(s) failed)                  27/27, 2.57 us per caught fault
+> LXJAVA: RESULT PASS (0 check(s) failed) in 2279 ms         -XX:+UseSerialGC
+> LXJAVA: RESULT PASS (0 check(s) failed) in 2137 ms         G1 (real Linux: 1004 ms)
+> ```
+>
+> **The route to Minecraft.** Minecraft 26.3 is Java 25 + LWJGL 3.4 + SDL3 +
+> OpenGL 3.3 core. SDL3 ends up on Wayland when there is no X server, and
+> 26.1/26.2 force X11, so 26.3 is the version to target. MINECRAFT.md covers
+> it link by link, with the gaps named: the GL window (Mesa has no software
+> rasterizer, and no EGL client has ever shown a window here), held keys and
+> mouse-look in the compositor, and no audio device for Linux programs.
+>
+> **What the JVM needed (M2392): the Linux signal frame.** HotSpot lets the
+> hardware fault for every null check, zero divide and safepoint poll, then
+> has its handler move the PC in the ucontext. Here:
+> - the frame was OS-DEV's own layout;
+> - `rt_sigreturn` threw the edit away;
+> - no FP state was saved;
+> - every exception was SIGSEGV;
+> - fault info was per process;
+> - fork dropped `sa_flags`;
+> - `sigaltstack` was a stub;
+> - `getcpu` was ENOSYS.
+>
+> Linux processes now get the real `rt_sigframe` with its XSAVE image, and
+> sigreturn restores from it. `tools/lx/lxsigctx.c` passes 27/27 on real
+> Linux; on the M2391 kernel it read `si_addr 0` and `REG_RIP 0x23` and then
+> died.
+>
+> **The JVM itself (M2393):** JDK 25 staged at `/opt/jdk` (204 MB), and
+> `-append lxjava`.
+>
+> Found on the way:
+> - **The fault report was unbounded (M2392).** It cost 580 s of serial output
+>   for one 288 ms test.
+> - **`noprobes` never worked (M2394).** It contains `probes`.
+> - **`build-mesa-virgl.sh` built mesa-demos (M2391),** and left the host's
+>   libEGL stub in the image.
+> - **Firefox 156 crashed every content process (M2395).** Firefox 156 was
+>   the laptop's package since 2026-09-26. Its content processes died on
+>   "Shared memory PlatformHandle is not safe to map", which the M2391
+>   kernel does identically.
+>   - The cause: `open("/proc/self/fd/N")` opened a procfs file instead of
+>     re-opening the memfd, and Firefox builds every read-only shm handle
+>     that way.
+>   - Now: PAGE ON SCREEN at 29.3 s.
+>
+> - **`pve-run.sh` waited out every Claude boot (M2396).** Its `lxask`
+>   marker never matched the line the kernel prints.
+>
+> The new frame changes signals for every Linux process, so the heavy users
+> were re-run:
+> - Firefox renders;
+> - `claude -p` answers "OS-DEV" (exit 0);
+> - the other 30 suite probes pass on both kernels.
+>
+> Next: a headless `server.jar` world, then a GL 3.3 core context in a Wayland
+> window.
+
 > **(M2390) MESA'S NVC0 DRIVER RUNS AGAINST OS-DEV'S OWN NOUVEAU RENDER NODE,
 > UP TO THE ONE THING IT CANNOT HAVE YET.**
 >
