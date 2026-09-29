@@ -537,10 +537,12 @@ int g_vma_audit;
  * is opt-in and effectively never on. This asks it for ONE slot -- the one just
  * published -- which is O(n) and cheap enough to leave on always. It exists
  * because an overlap is the signature of the find-then-fill race that M2329
- * fixed in the MAP_FIXED path and that six `vma_find_gap` sites still have:
- * two threads are handed the same address, the later carve removes one of the
- * twins, and the survivor can be a PROT_NONE reservation that the victim then
- * faults on -- which is precisely how Firefox died on its own thread stack.
+ * fixed in the MAP_FIXED path: two threads are handed the same address, the
+ * later carve removes one of the twins, and the survivor can be a PROT_NONE
+ * reservation that the victim then faults on -- which is precisely how Firefox
+ * died on its own thread stack. Every gap search now goes through
+ * vma_reserve, which searches and claims under one lock, so this should stay
+ * silent; it is kept because it is cheap and names the racing pair if not.
  *
  * Silent when correct. Fires only on the defect, and names both slots and the
  * line that created each, so the report identifies the racing pair rather than
@@ -5123,7 +5125,8 @@ static uint64_t vma_find_gap(struct app *a, uint64_t len, uint64_t align);
  * Returns the claimed slot, with start/len already set, and writes the address
  * to *out. -1 if there is no gap or no slot. The caller fills in the rest of
  * the entry; `len` is already non-zero, so no other allocator can take it. */
-static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *out) {
+#define vma_reserve(a, len, align, out) vma_reserve_line((a), (len), (align), (out), __LINE__)
+static int vma_reserve_line(struct app *a, uint64_t len, uint64_t align, uint64_t *out, unsigned line) {
     uint64_t f = vma_alloc_lock(a);
     uint64_t addr = vma_find_gap(a, len, align);
     int slot = -1;
@@ -5131,6 +5134,7 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
         slot = vma_pick_slot(a);
         if (slot >= 0) {
             for (unsigned b = 0; b < sizeof a->vma[0]; b++) ((char *)&a->vma[slot])[b] = 0;
+            a->vma[slot].oline = (unsigned short)line;   /* WHO MADE THIS MAPPING, as VMA_NEW records it (M2207) */
             a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
             a->vma[slot].prot = VMA_PROT_READ | VMA_PROT_WRITE;
             a->vma[slot].start = addr;
@@ -5141,6 +5145,57 @@ static int vma_reserve(struct app *a, uint64_t len, uint64_t align, uint64_t *ou
     vma_alloc_unlock(a, f);
     if (slot >= 0) vma_published(a, slot);   /* M2333 */
     if (slot >= 0 && out) *out = addr;
+    return slot;
+}
+
+/* GIVE A RESERVATION BACK, for a caller that fails after vma_reserve or
+ * VMA_NEW. The same tombstone app_munmap writes, in the same order: every
+ * field but len first, len LAST, because len == 0 is what hands the slot to
+ * the next allocator -- clear it earlier and that allocator's fields can be
+ * overwritten by ours. Under the claim lock so vma_pick_slot cannot see the
+ * slot half-released. */
+static void vma_release(struct app *a, int slot) {
+    uint64_t f = vma_alloc_lock(a);
+    a->vma[slot].start = 0;
+    a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
+    a->vma[slot].file_backed = 0; a->vma[slot].shared = 0;
+    a->vma[slot].huge = 0; a->vma[slot].sealed = 0; a->vma[slot].uffd = 0;
+    a->vma[slot].locked = 0; a->vma[slot].prot = 0;
+    a->vma[slot].len = 0;                         /* LAST: this frees the slot */
+    vma_alloc_unlock(a, f);
+}
+
+/* RESERVE A RANGE THE CALLER CHOSE (M2329's shape, shared). Publishes
+ * [addr, addr+len) as a live anonymous RW VMA under the claim lock, so from
+ * that instant every other allocator's search and carve sees it. With
+ * `refuse_overlap` the overlap test happens inside the same critical section
+ * (an mmap hint must never land on an existing mapping); without it the caller
+ * carves the old mappings out afterwards with app_vma_carve_ex(.., slot).
+ * Returns the slot, or -1 (no slot, or an overlap was refused). */
+#define vma_reserve_at(a, addr, len, refuse) vma_reserve_at_line((a), (addr), (len), (refuse), __LINE__)
+static int vma_reserve_at_line(struct app *a, uint64_t addr, uint64_t len, int refuse_overlap,
+                               unsigned line) {
+    uint64_t f = vma_alloc_lock(a);
+    int slot = -1;
+    int clash = 0;
+    if (refuse_overlap)
+        for (int i = 0; i < a->nvma; i++) {
+            if (!a->vma[i].len) continue;
+            uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
+            if (addr < e && s < addr + len) { clash = 1; break; }
+        }
+    if (!clash) slot = vma_pick_slot(a);
+    if (slot >= 0) {
+        for (unsigned b = 0; b < sizeof a->vma[0]; b++) ((char *)&a->vma[slot])[b] = 0;
+        a->vma[slot].oline = (unsigned short)line;
+        a->vma[slot].fidx = -1; a->vma[slot].mfd = -1;
+        a->vma[slot].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+        a->vma[slot].start = addr;
+        a->vma[slot].len   = len;             /* THE RESERVATION: a range, not a slot */
+        if (slot >= a->nvma) a->nvma = slot + 1;
+    }
+    vma_alloc_unlock(a, f);
+    if (slot >= 0) vma_published(a, slot);
     return slot;
 }
 
@@ -5211,13 +5266,14 @@ static int gap_is_clear(uint64_t addr, uint64_t len) {
     for (uint64_t p = addr; p < end; p += HUGE_SIZE) {
         if (vmm_pte_raw(p) & PTE_PRESENT) {
             g_gap_collisions++;
-            if (g_gap_collisions <= 8)
+            if (g_gap_collisions <= 8) {
                 kprintf("[vma] ** the gap chosen at %lx+%lx is NOT EMPTY: %lx is already mapped "
                         "(pte %lx) with no VMA covering it. Two allocations would have shared "
                         "pages. Refusing this range. **\n",
                         (unsigned long)addr, (unsigned long)len, (unsigned long)p,
                         (unsigned long)vmm_pte_raw(p));
-                { struct app *ca = cur(); if (ca) gap_report_neighbours(ca, p); }
+                struct app *ca = cur(); if (ca) gap_report_neighbours(ca, p);
+            }
             return 0;
         }
     }
@@ -5346,26 +5402,10 @@ static uint64_t app_mmap_fixed_nl(uint64_t addr, uint64_t len) {
      * Ninth instance of this session's one bug class -- find, then fill, with
      * the table unlocked in between.
      */
-    int vs0 = -1;
-    {   uint64_t rf = vma_alloc_lock(a);
-        vs0 = vma_pick_slot(a);
-        if (vs0 >= 0) {
-            for (unsigned _b = 0; _b < sizeof a->vma[0]; _b++) ((char *)&a->vma[vs0])[_b] = 0;
-            a->vma[vs0].oline = (unsigned short)__LINE__;
-            a->vma[vs0].fidx = -1; a->vma[vs0].mfd = -1;
-            a->vma[vs0].prot = VMA_PROT_READ | VMA_PROT_WRITE;
-            a->vma[vs0].start = addr;
-            a->vma[vs0].len   = len;          /* THE RESERVATION: a range, not a slot */
-            if (vs0 >= a->nvma) a->nvma = vs0 + 1;
-        }
-        vma_alloc_unlock(a, rf);
-    }
+    int vs0 = vma_reserve_at(a, addr, len, 0);
     if (vs0 < 0) return 0;
     if (app_vma_carve_ex(a, addr, len, vs0) != 0) {
-        uint64_t rf = vma_alloc_lock(a);      /* give the reservation back */
-        a->vma[vs0].start = 0; a->vma[vs0].len = 0;
-        a->vma[vs0].fidx = -1; a->vma[vs0].mfd = -1; a->vma[vs0].prot = 0;
-        vma_alloc_unlock(a, rf);
+        vma_release(a, vs0);                  /* give the reservation back */
         return 0;
     }
     a->vma[vs0].sealed = 0;
@@ -5401,22 +5441,12 @@ static uint64_t app_mmap_hint_nl(uint64_t addr, uint64_t len) {
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;
     if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-    for (int i = 0; i < a->nvma; i++) {
-        if (!a->vma[i].len) continue;
-        uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
-        if (addr < e && s < addr + len) return 0;      /* occupied: the caller chooses instead */
-    }
-    int vs0; VMA_NEW(a, vs0);
-    a->vma[vs0].start = addr;
-    a->vma[vs0].len   = len;
-    a->vma[vs0].sealed = 0;
-    a->vma[vs0].uffd  = 0;
-    a->vma[vs0].file_backed = 0;
+    /* The overlap test and the claim are one critical section: tested and then
+     * recorded separately, two threads hinting the same free address both
+     * passed the test and both got it. Occupied -> 0, the caller picks. */
+    int vs0 = vma_reserve_at(a, addr, len, 1);
+    if (vs0 < 0) return 0;
     a->vma[vs0].locked = a->mlock_future;
-    a->vma[vs0].huge = 0;
-    a->vma[vs0].shared = 0;
-    a->vma[vs0].foff = 0;
-    a->vma[vs0].fidx = -1;
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
 }
@@ -5466,7 +5496,7 @@ static uint64_t app_mmap_nl(uint64_t len) {
     uint64_t addr = 0;
     int vs1 = vma_reserve(a, len, len >= HUGE_SIZE ? HUGE_SIZE : 0, &addr);
     if (vs1 < 0) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) { a->vma[vs1].start = 0; a->vma[vs1].len = 0; return 0; }
+    if (addr + len > MMAP_TOP || addr + len < addr) { vma_release(a, vs1); return 0; }
     a->vma[vs1].locked = a->mlock_future;       /* MCL_FUTURE: born locked if mlockall(MCL_FUTURE) is in effect (M1283) */
     
     a->mmap_next = addr + len + PAGE_SIZE;          /* leave an unmapped guard gap */
@@ -5492,17 +5522,13 @@ static uint64_t app_mmap_huge_nl(uint64_t len) {
     len = (len + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);          /* whole 2 MiB pages */
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    uint64_t addr = vma_find_gap(a, len, HUGE_SIZE);   /* 2 MiB-aligned base */
-    if (!addr) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    int vs2; VMA_NEW(a, vs2);
-    a->vma[vs2].start = addr;
-    a->vma[vs2].len   = len;
-    vma_published(a, vs2);   /* M2333 */
-    a->vma[vs2].sealed = 0;
-    a->vma[vs2].uffd  = 0;
-    a->vma[vs2].file_backed = 0;
-    a->vma[vs2].locked = 0;
+    /* Search and claim in ONE critical section, as app_mmap does (M1988):
+     * finding the gap and recording it as two acts let two threads be handed
+     * the same range. */
+    uint64_t addr = 0;
+    int vs2 = vma_reserve(a, len, HUGE_SIZE, &addr);   /* 2 MiB-aligned base */
+    if (vs2 < 0) return 0;
+    if (addr + len > MMAP_TOP || addr + len < addr) { vma_release(a, vs2); return 0; }
     a->vma[vs2].huge = 1;
     
     a->mmap_next = addr + len + HUGE_SIZE;          /* guard gap, preserving 2 MiB alignment */
@@ -5554,15 +5580,18 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
         vs3 = vma_reserve(a, len, 0, &addr);
         if (vs3 < 0) return 0;
         if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) {
-            a->vma[vs3].start = 0; a->vma[vs3].len = 0; return 0;
+            vma_release(a, vs3); return 0;
         }
     } else {
-        if (app_vma_carve(a, addr, len) != 0) return 0;     /* MAP_FIXED: replace what is there */
+        /* MAP_FIXED: replace what is there. Reserve the range FIRST and carve
+         * around the reservation, as app_mmap_fixed does (M2329): carving and
+         * then recording left the range unclaimed in between, so another
+         * thread's mmap could be handed it -- in the path ld.so maps every
+         * library through. */
         if (addr < MMAP_BASE || addr + len > MMAP_TOP || addr + len < addr) return 0;
-        if (vma_full(a)) return 0;               /* re-check: the carve may have split */
-        VMA_NEW(a, vs3);
-        a->vma[vs3].start = addr;
-        a->vma[vs3].len   = len;
+        vs3 = vma_reserve_at(a, addr, len, 0);
+        if (vs3 < 0) return 0;
+        if (app_vma_carve_ex(a, addr, len, vs3) != 0) { vma_release(a, vs3); return 0; }
     }
     a->vma[vs3].sealed = 0;
     a->vma[vs3].uffd  = 0;
@@ -5579,7 +5608,7 @@ uint64_t app_mmap_file_at(const char *path, uint64_t addr, uint64_t len,
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[vs3].fidx < 0) { a->vma[vs3].start = 0; a->vma[vs3].len = 0; return 0; }   /* release the slot */
+    if (a->vma[vs3].fidx < 0) { vma_release(a, vs3); return 0; }   /* release the slot */
     
     if (addr + len + PAGE_SIZE > a->mmap_next) a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -5591,18 +5620,11 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (vma_full(a)) return 0;
     if (a->rlim_as && app_vma_total(a) + len > a->rlim_as) return 0;   /* RLIMIT_AS (M1164) */
-    uint64_t addr = vma_find_gap(a, len, 0);
-    if (!addr) return 0;
-    if (addr + len > MMAP_TOP || addr + len < addr) return 0;
-    int vs4; VMA_NEW(a, vs4);
-    a->vma[vs4].start = addr;
-    a->vma[vs4].len   = len;
-    vma_published(a, vs4);   /* M2333 */
-    a->vma[vs4].sealed = 0;
-    a->vma[vs4].uffd  = 0;
+    uint64_t addr = 0;
+    int vs4 = vma_reserve(a, len, 0, &addr);         /* search + claim atomically (M1988) */
+    if (vs4 < 0) return 0;
+    if (addr + len > MMAP_TOP || addr + len < addr) { vma_release(a, vs4); return 0; }
     a->vma[vs4].file_backed = 1;
-    a->vma[vs4].locked = 0;
-    a->vma[vs4].huge = 0;
     a->vma[vs4].shared = shared ? 1 : 0;
     a->vma[vs4].foff = 0;
     a->vma[vs4].fidx = vma_intern_path(path);
@@ -5613,7 +5635,7 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
      * dynamic section was NULL. It surfaced as a page fault at CR2=0x8 deep
      * inside _dl_check_map_versions, with nothing pointing at the cause.
      * A short path is now an error, which is a diagnosable failure. */
-    if (a->vma[vs4].fidx < 0) return 0;   /* nvma not yet incremented: nothing to undo */
+    if (a->vma[vs4].fidx < 0) { vma_release(a, vs4); return 0; }   /* the slot IS claimed: give it back */
     
     a->mmap_next = addr + len + PAGE_SIZE;
     return addr;
@@ -6154,25 +6176,34 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
     /* GROW: extend in place if the tail [old_end,new_end) is free + in-window */
     uint64_t old_end = old_addr + old_len, new_end = old_addr + new_len;
     if (new_end <= MMAP_TOP && new_end > old_addr) {
+        if (a->rlim_as && app_vma_total(a) - old_len + new_len > a->rlim_as) return (uint64_t)-1;
+        /* The check and the extension are ONE claim, under the same lock
+         * vma_reserve searches under: checked and then written separately,
+         * another thread's mmap could be handed the tail in between (M1988's
+         * find-then-fill race, in the one path that grows a range rather than
+         * finding one). */
         int overlap = 0;
+        uint64_t gf = vma_alloc_lock(a);
         for (int i = 0; i < a->nvma; i++) if (i != vi) {
             uint64_t s = a->vma[i].start, e = s + a->vma[i].len;
             if (old_end < e && new_end > s) { overlap = 1; break; }
         }
-        if (!overlap) {
-            if (a->rlim_as && app_vma_total(a) - old_len + new_len > a->rlim_as) return (uint64_t)-1;
-            a->vma[vi].len = new_len;                     /* new pages demand-fault in lazily */
-            return old_addr;
-        }
+        if (!overlap) a->vma[vi].len = new_len;           /* new pages demand-fault in lazily */
+        vma_alloc_unlock(a, gf);
+        if (!overlap) return old_addr;
     }
     if (!(flags & MREMAP_MAYMOVE)) return (uint64_t)-1;   /* blocked, and not allowed to move */
 
     /* MOVE: reserve a fresh region (bump allocator, like app_mmap), copy, free old */
     if (vma_full(a)) return (uint64_t)-1;
-    uint64_t nbase = vma_find_gap(a, new_len, 0);
-    if (!nbase) return (uint64_t)-1;
-    if (nbase + new_len > MMAP_TOP || nbase + new_len < nbase) return (uint64_t)-1;
     if (a->rlim_as && app_vma_total(a) + new_len > a->rlim_as) return (uint64_t)-1;
+    /* Claim the destination BEFORE copying into it: pages are mapped there
+     * below, and an unclaimed range can be handed to another thread's mmap
+     * while that happens (M1988). */
+    uint64_t nbase = 0;
+    int vs5 = vma_reserve(a, new_len, 0, &nbase);
+    if (vs5 < 0) return (uint64_t)-1;
+    if (nbase + new_len > MMAP_TOP || nbase + new_len < nbase) { vma_release(a, vs5); return (uint64_t)-1; }
     uint64_t copy_len = old_len < new_len ? old_len : new_len;
     for (uint64_t off = 0; off < copy_len; off += PAGE_SIZE) {
         uint64_t ph = vmm_translate(old_addr + off);
@@ -6180,17 +6211,13 @@ static uint64_t app_mremap_nl(uint64_t old_addr, uint64_t old_len, uint64_t new_
         uint64_t nf = pmm_alloc_frame();
         if (!nf) {                                         /* OOM mid-move: undo the new pages, bail (old untouched) */
             for (uint64_t u = 0; u < off; u += PAGE_SIZE) { uint64_t q = vmm_translate(nbase + u); if (q) { vmm_unmap(nbase + u); pmm_free_frame(q); } }
+            vma_release(a, vs5);
             return (uint64_t)-1;
         }
         uint8_t *s = (uint8_t *)hhdm(ph), *d = (uint8_t *)hhdm(nf);
         memcpy(d, s, PAGE_SIZE);   /* word-at-a-time (M2094) */
         vmm_map(nbase + off, nf, PTE_WRITABLE | PTE_USER | PTE_NX);
     }
-    int vs5; VMA_NEW(a, vs5);
-    a->vma[vs5].start = nbase; a->vma[vs5].len = new_len;
-    vma_published(a, vs5);   /* M2333 */
-    a->vma[vs5].sealed = a->vma[vs5].uffd = a->vma[vs5].file_backed = a->vma[vs5].locked = a->vma[vs5].huge = 0;
-    
     a->mmap_next = nbase + new_len + PAGE_SIZE;
     app_munmap_nl(old_addr, old_len);                     /* free the old region's frames + VMA (the lock is already held) */
     return nbase;
@@ -7005,9 +7032,10 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
     uint64_t total = len * 2;
     if (total < len) return 0;                       /* overflow */
     if (vma_full(a)) return 0;
-    uint64_t base = vma_find_gap(a, total, 0);
-    if (!base) return 0;
-    if (base + total > MMAP_TOP || base + total < base) return 0;
+    uint64_t base = 0;
+    int vs6 = vma_reserve(a, total, 0, &base);       /* claim before mapping into it (M1988) */
+    if (vs6 < 0) return 0;
+    if (base + total > MMAP_TOP || base + total < base) { vma_release(a, vs6); return 0; }
     uint64_t mapped = 0;
     for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
         uint64_t frame = pmm_alloc_frame();
@@ -7017,6 +7045,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
                 vmm_unmap(base + len + u); vmm_unmap(base + u);
                 if (ph) pmm_free_frame(ph);          /* drops the addref, then frees */
             }
+            vma_release(a, vs6);
             return 0;
         }
         uint8_t *z = (uint8_t *)hhdm(frame);
@@ -7031,6 +7060,7 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
                 vmm_unmap(base + len + u); vmm_unmap(base + u);
                 if (ph) pmm_free_frame(ph);
             }
+            vma_release(a, vs6);
             return 0;
         }
         vmm_map(base + off, frame, PTE_WRITABLE | PTE_USER | PTE_NX);          /* primary */
@@ -7040,16 +7070,6 @@ static uint64_t app_ringbuf_nl(uint64_t len) {
         __asm__ volatile("invlpg (%0)" : : "r"(base + len + off) : "memory");
         mapped += PAGE_SIZE;
     }
-    int vs6; VMA_NEW(a, vs6);
-    a->vma[vs6].start = base;
-    a->vma[vs6].len   = total;
-    vma_published(a, vs6);   /* M2333 */
-    a->vma[vs6].sealed = 0;
-    a->vma[vs6].uffd  = 0;
-    a->vma[vs6].file_backed = 0;
-    a->vma[vs6].locked = 0;
-    a->vma[vs6].huge = 0;
-    
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -7074,21 +7094,20 @@ uint64_t app_shm_open(const char *name, uint64_t size) {
     if (shm_get(name, size, &frames, &np) < 0) return 0;
     if (vma_full(a)) return 0;
     uint64_t total = (uint64_t)np * PAGE_SIZE;
-    uint64_t base = vma_find_gap(a, total, 0);
-    if (!base) return 0;
-    if (base + total > MMAP_TOP || base + total < base) return 0;
+    uint64_t base = 0;
+    int vs7 = vma_reserve(a, total, 0, &base);       /* claim before mapping into it (M1988) */
+    if (vs7 < 0) return 0;
+    if (base + total > MMAP_TOP || base + total < base) { vma_release(a, vs7); return 0; }
     /* Above PMM_MAXREFS pmm_addref SILENTLY DOES NOTHING, so the mapping below
      * would not hold the reference it claims to and the first unmap would free
      * a frame the SHM object still owns. Refuse instead: an honest failure to
      * share beats a mapping that outlives its own memory. (M1985) */
-    for (int p = 0; p < np; p++) if (!pmm_refcountable(frames[p])) return 0;
+    for (int p = 0; p < np; p++) if (!pmm_refcountable(frames[p])) { vma_release(a, vs7); return 0; }
     for (int p = 0; p < np; p++) {
         vmm_map(base + (uint64_t)p * PAGE_SIZE, frames[p], PTE_WRITABLE | PTE_USER | PTE_NX);
         pmm_addref(frames[p]);                       /* this mapping holds a ref on the shared frame */
         __asm__ volatile("invlpg (%0)" : : "r"(base + (uint64_t)p * PAGE_SIZE) : "memory");
     }
-    int vs7; VMA_NEW(a, vs7);
-    a->vma[vs7].start = base; a->vma[vs7].len = total; vma_published(a, vs7); a->vma[vs7].sealed = 0; a->vma[vs7].uffd = 0; a->vma[vs7].file_backed = 0; a->vma[vs7].locked = 0; a->vma[vs7].huge = 0; 
     a->mmap_next = base + total + PAGE_SIZE;
     return base;
 }
@@ -10970,11 +10989,20 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
         return memfd_mmap_no("the offset is not page-aligned", fd, len, off);
     if (off + len > m->cap)
         return memfd_mmap_no("the range runs past the object's capacity", fd, len, off);
-    uint64_t base = vma_find_gap(a, len, 0);
-    if (!base)
-        return memfd_mmap_no("no free address range of that size", fd, len, off);
     if (vma_full(a))
         return memfd_mmap_no("the VMA table is full", fd, len, off);   /* see the ownership note below */
+    /* Search and claim in ONE critical section (M1988): toolkits map shm
+     * buffers from several threads at once, and a gap found and recorded as
+     * two acts could be handed to two of them. Shared from the moment it
+     * exists, so a fork() racing the page mapping below cannot treat these
+     * heap frames as private COW pages (M2200). */
+    uint64_t base = 0;
+    int vs11 = vma_reserve(a, len, 0, &base);
+    if (vs11 < 0)
+        return memfd_mmap_no(vma_full(a) ? "the VMA table is full"
+                                         : "no free address range of that size", fd, len, off);
+    a->vma[vs11].shared = 1;
+    a->vma[vs11].foff = off;
     /* OWNERSHIP (M1985). These frames belong to the KERNEL HEAP -- they are the
      * memfd's kmalloc'd buffer, aliased into the process, not pages this
      * process allocated. Two things follow, and neither was true before:
@@ -11006,15 +11034,13 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
             uint64_t up = vmm_translate(base + u);
             if (up) { vmm_unmap(base + u); pmm_free_frame(up); }
         }
+        vma_release(a, vs11);
         return memfd_mmap_no("a page of the object is unbacked or not refcountable, so the "
                              "mapping would have had a hole in it", fd, len, off);
     }
     m->mapped = 1;
     memfd_ref(a->fd[fd].obj);            /* the MAPPING keeps the object alive, not the fd */
-    int vs11; VMA_NEW(a, vs11);                          /* recorded so munmap/poll/maps see it */
-    a->vma[vs11].start = base; a->vma[vs11].len = len;
-    a->vma[vs11].shared = 1;
-    a->vma[vs11].mfd = (short)a->fd[fd].obj;
+    a->vma[vs11].mfd = (short)a->fd[fd].obj;          /* recorded so munmap/poll/maps see it */
     /* AND WHERE IN THE OBJECT IT STARTS (M2203). `off` was accepted, honoured
      * when the pages were mapped, and then thrown away -- so nothing could
      * afterwards say which bytes of the memfd this mapping covers.
@@ -11055,8 +11081,12 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
     if (!have) return 0;                          /* no object at that offset */
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (len > have) len = have;                   /* never map past the object */
-    uint64_t base = vma_find_gap(a, len, 0);
-    if (!base || vma_full(a)) return 0;
+    if (vma_full(a)) return 0;
+    uint64_t base = 0;
+    int vs = vma_reserve(a, len, 0, &base);          /* search + claim atomically (M1988) */
+    if (vs < 0) return 0;
+    /* Shared from the moment it exists -- see the note below on why. */
+    a->vma[vs].shared = 1;
     uint64_t done = 0;
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
         uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
@@ -11074,6 +11104,7 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
             vmm_unmap(base + i);
             if (phys) pmm_free_frame(phys);
         }
+        vma_release(a, vs);
         return 0;
     }
     /* RECORDED, or munmap and teardown cannot see it. Marked `shared` because
@@ -11081,9 +11112,6 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
      * process even though no other process maps them, and a COW break on one
      * would silently give the guest a copy while the host kept gathering from
      * the original. */
-    int vs; VMA_NEW(a, vs);
-    a->vma[vs].start = base; a->vma[vs].len = len;
-    a->vma[vs].shared = 1;
     a->vma[vs].mfd = -1;
     a->vma[vs].foff = off;
     a->vma[vs].prot = VMA_PROT_READ | VMA_PROT_WRITE;
