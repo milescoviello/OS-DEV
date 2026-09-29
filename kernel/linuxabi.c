@@ -1947,25 +1947,43 @@ static void lx_dispatch_body(struct registers *r) {
                 break;
             }
         }
+        __attribute__((fallthrough));
     case LXS_unlinkat_: {                   /* (dirfd, path, flags) */
-        /* unlinkat shifts its arguments one right, exactly like faccessat. */
-        uint64_t up = (r->rax == LXS_unlink_) ? r->rdi : r->rsi;
+        /* unlinkat shifts its arguments one right, exactly like faccessat --
+         * and plain unlink has NO dirfd: it used to pass rdi, the path
+         * pointer itself, as one, so a relative unlink resolved against a
+         * garbage descriptor. */
+        int is_at = (r->rax == LXS_unlinkat_);
+        uint64_t up = is_at ? r->rsi : r->rdi;
         const char *upath = (const char *)up;
         if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        char xp[VFS_PATH_MAX];
+        const char *path = lx_xlate_at(is_at ? (long)r->rdi : LX_AT_FDCWD, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        /* AT_REMOVEDIR (0x200) is rmdir; without it a directory is EISDIR.
+         * And say WHY a removal failed: everything used to be ENOENT, so
+         * `rm -r` could not tell a non-empty directory from a missing one. */
+        struct statx rsx;
+        if (vfs_lstat(path, &rsx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        int isdir = (rsx.stx_mode & 0170000u) == 0040000u;
+        int rmdir = is_at && (r->rdx & 0x200);
+        if (isdir && !rmdir) { r->rax = (uint64_t)-(long)LX_EISDIR; break; }
+        if (!isdir && rmdir) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
         /* gcc writes its intermediate .s to a mkstemp'd name and unlinks it
          * when done; without this the driver reported
          * "gcc: error: ./ccXXXXXX.s: Function not implemented" and stopped
          * before it ever ran the assembler. (M1960) */
-        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
+        if (vfs_remove(path) == 0) { r->rax = 0; break; }
+        r->rax = (uint64_t)-(long)(isdir ? LX_ENOTEMPTY : LX_EIO);   /* it exists, so not ENOENT */
         break;
     }
     case LXS_mkdir_:                        /* (path, mode) */
     case LXS_mkdirat_: {                    /* (dirfd, path, mode) */
-        uint64_t up = (r->rax == LXS_mkdir_) ? r->rdi : r->rsi;   /* mkdirat shifts right */
+        int mk_at = (r->rax == LXS_mkdirat_);
+        uint64_t up = mk_at ? r->rsi : r->rdi;   /* mkdirat shifts right */
         const char *upath = (const char *)up;
         if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
+        char xp[VFS_PATH_MAX];
+        const char *path = lx_xlate_at(mk_at ? (long)r->rdi : LX_AT_FDCWD, upath, xp, sizeof xp);   /* dirfd (M2032); mkdir has none */
         /* A TRAILING SLASH is legal in mkdir(2) -- `mkdir -p o/kernel/` passes
          * one straight through -- and our VFS path walker treats it as an
          * extra empty component and fails. Strip it here rather than in
@@ -2102,7 +2120,12 @@ static void lx_dispatch_body(struct registers *r) {
         const char *upath = (const char *)r->rdi;
         if (!upath || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
-        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
+        /* The real reason, as unlinkat does: a non-empty directory is
+         * ENOTEMPTY (what rm -r and git clean act on), not ENOENT. */
+        struct statx dsx;
+        if (vfs_lstat(path, &dsx) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+        if ((dsx.stx_mode & 0170000u) != 0040000u) { r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+        r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOTEMPTY);
         break;
     }
     case LXS_fchdir_: {                     /* (fd) */
@@ -4262,8 +4285,8 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_statfs_: case LXS_fstatfs_: {
         /* struct statfs is 120 bytes: f_type, f_bsize, f_blocks, f_bfree,
-         * f_bavail, f_files, f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags,
-         * f_spare[4] -- all 8-byte except the fsid pair. glib uses it to decide
+         * f_bavail, f_files, f_ffree, f_fsid (int[2], 8 bytes), f_namelen,
+         * f_frsize, f_flags, f_spare[4] -- fifteen 8-byte slots. glib uses it to decide
          * whether a directory is on a remote filesystem before it will watch
          * it; ENOSYS made every path look unwatchable. The numbers are the
          * ext2 volume's shape, rounded: honest enough for that decision and
@@ -4279,8 +4302,11 @@ static void lx_dispatch_body(struct registers *r) {
         f[4] = 280000;                       /* f_bavail */
         f[5] = 65536;                        /* f_files */
         f[6] = 60000;                        /* f_ffree */
-        f[9] = 255;                          /* f_namelen */
-        f[10] = 4096;                        /* f_frsize */
+        /* f[7] is f_fsid: fsid_t is int[2], ONE 8-byte slot, not two. This
+         * wrote f_namelen into f_frsize's slot and f_frsize into f_flags, so
+         * df scaled every size by 255 and pathconf(_PC_NAME_MAX) said 0. */
+        f[8] = 255;                          /* f_namelen */
+        f[9] = 4096;                         /* f_frsize */
         r->rax = 0;
         break;
     }
@@ -4625,7 +4651,15 @@ static void lx_dispatch_body(struct registers *r) {
             const char *xp = lx_xlate(upath, lbuf, (int)sizeof lbuf);
             char tgt[VFS_PATH_MAX];
             long tn = vfs_readlink(xp, tgt, sizeof tgt - 1);
-            if (tn < 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }
+            if (tn < 0) {
+                /* EINVAL means "it exists and is not a symlink". For a name
+                 * that does not exist at all it is ENOENT: glibc's realpath()
+                 * reads EINVAL as "a real file, keep going", so it used to
+                 * succeed on paths that were not there. */
+                struct statx lsx;
+                r->rax = (uint64_t)-(long)(vfs_lstat(xp, &lsx) == 0 ? LX_EINVAL : LX_ENOENT);
+                break;
+            }
             if (tn > (long)sizeof tgt - 1) tn = (long)sizeof tgt - 1;
             tgt[tn] = 0;
             for (long k = 0; k <= tn; k++) lbuf[k] = tgt[k];
@@ -5774,6 +5808,13 @@ static void lx_dispatch_body(struct registers *r) {
          * manager's schedule, while POSIX requires the fds to close at EXIT. */
         app_sys_exit((int)a1);
         break;
+    /* 312 IS kcmp ON x86-64; 179 IS quotactl. M2193 implemented kcmp under
+     * 179 because that was the number Firefox's ENOSYS log showed -- those
+     * were quotactl calls, and real kcmp callers (Mesa's fd-sharing check)
+     * still got ENOSYS. Both land here now: kcmp is answered for real, and a
+     * quotactl, whose arguments can never name two equal pids, gets EPERM --
+     * the refusal it has been getting, and a plausible one without quotas. */
+    case 312:
     case 179: {   /* kcmp(pid1, pid2, type, idx1, idx2) -- M2193 */
         /* THE ONLY UNIMPLEMENTED SYSCALL FIREFOX STILL MAKES.
          *
