@@ -57,6 +57,7 @@ require() {
 }
 require "ATA LBA48: drive"                            "a >128 GiB ATA disk was detected (LBA48 candidate)"
 require "wrote + read back, data matches (LBA48 OK)"  "high-LBA write+read-back past the 128 GiB boundary (LBA48 works)"
+require "original restored"                           "the sector's original contents were put back (the test destroys nothing)"
 require "mounted FAT32 volume"                        "boot FAT32 still mounted on the LBA28 path (boot intact)"
 require "launching the desktop environment"           "reached desktop launch (no fault on the ATA path)"
 

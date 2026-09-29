@@ -1693,12 +1693,27 @@ void ata_lba48_selftest(void) {
 
     uint64_t hi = (1ull << 28) + 100000;             /* ~49 MiB past the 128 GiB boundary -> needs LBA48 */
     if (hi >= info->sectors) hi = info->sectors - 1;
+    /* SAVE AND RESTORE THE SECTOR. This ran by default on any non-boot ATA
+     * disk over 128 GiB and overwrote a sector of it with a test pattern --
+     * harmless on the harness's blank scratch disk, one sector of somebody's
+     * data on real hardware. Every other disk self-test puts the original
+     * back; this one does too now, and does not write at all unless it could
+     * read the original first. */
+    static uint8_t saved[SECTOR_SIZE];
+    if (ata_read_drive(big, (uint32_t)hi, 1, saved) != 0) {
+        kprintf("[ !! ] ATA LBA48: could not read sector %lu to save it; not writing\n\n", hi);
+        return;
+    }
     for (int i = 0; i < SECTOR_SIZE; i++) dma_scratch[i] = (uint8_t)(i * 3 + 0x2D);
     memset(dma_readback, 0, sizeof(dma_readback));
     int ok = (ata_write_drive(big, (uint32_t)hi, 1, dma_scratch) == 0);
     ok = ok && (ata_read_drive(big, (uint32_t)hi, 1, dma_readback) == 0);
     ok = ok && (memcmp(dma_readback, dma_scratch, SECTOR_SIZE) == 0);
+    int restored = (ata_write_drive(big, (uint32_t)hi, 1, saved) == 0) &&
+                   (ata_read_drive(big, (uint32_t)hi, 1, dma_readback) == 0) &&
+                   (memcmp(dma_readback, saved, SECTOR_SIZE) == 0);
     kprintf("[ %s ] ATA LBA48 high-LBA round-trip at sector %lu (past the 128 GiB "
-            "boundary): %s\n\n", ok ? "ok" : "!!", hi,
-            ok ? "wrote + read back, data matches (LBA48 OK)" : "MISMATCH/FAIL");
+            "boundary): %s; original %s\n\n", ok && restored ? "ok" : "!!", hi,
+            ok ? "wrote + read back, data matches (LBA48 OK)" : "MISMATCH/FAIL",
+            restored ? "restored" : "NOT RESTORED");
 }
