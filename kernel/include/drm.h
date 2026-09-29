@@ -21,7 +21,8 @@
 int  drm_is_node_path(const char *path);   /* 1 for /dev/dri/renderD128 (and card0) */
 long drm_ioctl(int fd, unsigned long req, void *uarg);
 int  drm_open_node(void);                  /* returns a node id, or -1 */
-void drm_close_node(int id);
+void drm_close_node(int id);             /* drops one descriptor's reference; the last one frees the node */
+void drm_node_ref(int id);               /* one more descriptor (dup/fork/SCM) holds the node */
 
 /* For app.c's mmap of a render-node descriptor: which physical frame backs
  * page `page` of the object named by VIRTGPU_MAP offset `off`, and how large

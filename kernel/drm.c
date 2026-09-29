@@ -135,6 +135,7 @@ static struct {
     int used;
     int ctx;            /* has this node's virgl context been created? */
     int nv;             /* a nouveau node, served by nvdrm.c (M2390) */
+    int refs;           /* descriptors holding it: see drm_node_ref */
 } g_node[DRM_NODES];
 
 /* GEM OBJECTS.
@@ -262,11 +263,20 @@ int drm_open_node(void) {
         nv = 1;
     }
     for (int i = 0; i < DRM_NODES; i++)
-        if (!g_node[i].used) { g_node[i].used = 1; g_node[i].nv = nv; return i; }
+        if (!g_node[i].used) { g_node[i].used = 1; g_node[i].nv = nv; g_node[i].refs = 1; return i; }
     return -1;
 }
+/* A NODE IS HELD BY EVERY DESCRIPTOR FOR IT. Mesa's pipe loader dups the
+ * render fd, and a forked child closes what it inherited: the first close of
+ * any copy used to tear the whole node down -- every buffer and the host GL
+ * context -- under the copy still in use. The node now goes with its last
+ * descriptor. */
+void drm_node_ref(int id) {
+    if (id >= 0 && id < DRM_NODES && g_node[id].used) __atomic_fetch_add(&g_node[id].refs, 1, __ATOMIC_ACQ_REL);
+}
 void drm_close_node(int id) {
-    if (id < 0 || id >= DRM_NODES) return;
+    if (id < 0 || id >= DRM_NODES || !g_node[id].used) return;
+    if (__atomic_sub_fetch(&g_node[id].refs, 1, __ATOMIC_ACQ_REL) > 0) return;   /* another descriptor still holds it */
     /* EVERY OBJECT THIS NODE MADE GOES WITH IT. A GL process that exits
      * without calling GEM_CLOSE on each buffer -- which is every process that
      * crashes, and most that do not -- would otherwise leak both guest frames
