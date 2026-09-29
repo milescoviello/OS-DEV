@@ -528,6 +528,7 @@ static long file_off(struct app *a, int fd);   /* a file fd's cursor, shared by 
 static void ofd_ref(int h);                    /* one more descriptor for a file opening */
 static void ofd_unref(int h);
 void app_cow_quarantine_flush(struct app *a);   /* drain the batched COW frees (M2102) */
+static int app_msync_of(struct app *a, uint64_t addr, uint64_t len);   /* write back a's dirty MAP_SHARED pages */
 
 /* SELF-AUDIT (-append vmaaudit, M1988). Two VMAs must never describe the same
  * address: that is the invariant every "no VMA" fault suggests is broken, and
@@ -2593,7 +2594,7 @@ int app_reap(app_t *a) {
             uint64_t flags2;
             __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags2) :: "memory");
             uint64_t old_cr3_reap = task_cr3_borrow(a->cr3);   /* msync can sleep on disk: see task_cr3_borrow */
-            app_msync(0, (uint64_t)-1);
+            app_msync_of(a, 0, (uint64_t)-1);                  /* THIS process's mappings, not the reaper's */
             task_cr3_return(old_cr3_reap);
             __asm__ volatile("push %0; popfq" : : "r"(flags2) : "memory", "cc");
         }
@@ -5738,10 +5739,32 @@ uint64_t app_mmap_file(const char *path, uint64_t len, int shared) {
  * fd write (M1195) -- read the whole file via vfs_read, patch the dirty
  * page(s) in memory, write it back via vfs_write. One RMW per VMA (not per
  * page), and skipped entirely when nothing in range is actually dirty. */
-int app_msync(uint64_t addr, uint64_t len) {
-    struct app *a = cur();
-    if (!a) return -1;
+/* WHAT CHANGED, AND WHY (the M1544 design above, three corrections).
+ *
+ *  - THE DIRTY BIT WAS CLEARED ON ONE CORE. A core that already caches the
+ *    page's translation with D=1 never writes the PTE again, so after a local
+ *    invlpg its writes left the page looking clean and the NEXT msync skipped
+ *    them. Now the bit is cleared, every core is made to drop the translation,
+ *    and only THEN is the page copied: a write after that either landed before
+ *    the copy (and is in it) or re-dirties the page for the next sync.
+ *  - THE WHOLE FILE WAS REWRITTEN, AND GROWN. It was read, patched and written
+ *    back at max(size, the mapping's page-rounded span), so msync of a mapped
+ *    100-byte file made it 4096 bytes, and any write() another process made
+ *    between the read and the write-back was undone. Each dirty page is now
+ *    written in place with vfs_pwrite, clipped at end-of-file (Linux does not
+ *    extend a file from a mapping either). The read-patch-write path remains
+ *    only for a filesystem with no positioned write, still clipped.
+ *  - THE PAGE WAS READ THROUGH ITS USER ADDRESS, which needed the process's
+ *    address space loaded and was not protected from a munmap on another core.
+ *    It is read through the HHDM from a frame this function holds a reference
+ *    on, so it works for any process -- which reap needs: it runs in the window
+ *    manager's context, and app_msync used to walk cur()'s VMAs there, which
+ *    are not the dying process's. */
+#define MSYNC_BATCH 64
+static int app_msync_of(struct app *a, uint64_t addr, uint64_t len) {
+    if (!a || !a->cr3) return -1;
     uint64_t end = addr + len;
+    if (end < addr) end = ~(uint64_t)0;
     for (int i = 0; i < a->nvma; i++) {
         if (!a->vma[i].file_backed || !a->vma[i].shared) continue;
         uint64_t vstart = a->vma[i].start, vend = vstart + a->vma[i].len;
@@ -5753,64 +5776,68 @@ int app_msync(uint64_t addr, uint64_t len) {
             if (vmm_pte_in(a->cr3, page) & PTE_DIRTY) { any_dirty = 1; break; }
         if (!any_dirty) continue;
 
-        /* SNAPSHOT THE MAPPING BEFORE BLOCKING ON THE DISK (M2161).
-         *
-         * THE PANIC THIS FIXES. `vfs_read` below goes to the disk and this
-         * function deliberately holds no VMA lock across it (see the comment on
-         * vma_lock). It then went back to `a->vma[i]` for `foff` -- after
-         * another thread could have carved, moved or replaced that entry. A
-         * larger `foff` makes `fileoff` exceed `need`, and then
-         *
-         *     uint64_t n = PAGE_SIZE; if (fileoff + n > need) n = need - fileoff;
-         *
-         * UNDERFLOWS: `need - fileoff` is unsigned, so `n` becomes ~2^64 and
-         * the copy runs off the end of both the heap buffer and the mapped
-         * page. That is a supervisor READ of an absent page with no handler:
-         *
-         *     *** KERNEL PANIC *** Page Fault err=0x0 rip=app_msync
-         *
-         * reachable by any process that calls msync() while another of its
-         * threads touches the same address space -- which is Firefox with
-         * SQLite on eight cores, every run.
-         *
-         * Three fixes, because each is independently necessary: take the
-         * fields ONCE, before the I/O; clamp with a comparison that cannot
-         * underflow; and do the page copy under the VMA lock, which is safe
-         * here precisely because the copy does no I/O -- the reads and writes
-         * are outside it. */
-        uint64_t v_foff = a->vma[i].foff, v_len = a->vma[i].len, v_start = a->vma[i].start;
+        /* SNAPSHOT THE MAPPING BEFORE BLOCKING ON THE DISK (M2161): another
+         * thread can carve, move or replace this entry while the writes below
+         * sleep, so its fields are taken once, here. */
+        uint64_t v_foff = a->vma[i].foff, v_start = a->vma[i].start;
         char vpath[VFS_PATH_MAX];
         {   const char *sp = vma_path(a, i); unsigned k = 0;
             for (; sp && sp[k] && k < sizeof(vpath) - 1; k++) vpath[k] = sp[k];
             vpath[k] = 0; }
-        struct statx st; long sz = (vfs_stat(vpath, &st) == 0) ? (long)st.stx_size : 0;
-        uint64_t need = v_foff + v_len;                      /* the mapping's own span sets the ceiling */
-        if ((uint64_t)sz > need) need = (uint64_t)sz;        /* preserve any bytes past the mapping */
-        if (need == 0 || need > (16u << 20)) continue;       /* refuse to RMW something absurd (16 MiB cap) */
-        char *tmp = kmalloc((size_t)need);
-        if (!tmp) continue;
-        long got = vfs_read(vpath, tmp, need);
-        if (got < 0) got = 0;
-        for (long b = got; b < (long)need; b++) tmp[b] = 0;  /* zero-fill any gap, mirrors app_fd_write */
+        struct statx st;
+        if (vfs_stat(vpath, &st) != 0) continue;
+        uint64_t fsz = (uint64_t)st.stx_size;
 
-        uint64_t mfl = vma_lock(a);
-        for (uint64_t page = lo & ~(uint64_t)(PAGE_SIZE - 1); page < hi; page += PAGE_SIZE) {
-            uint64_t pte = vmm_pte_in(a->cr3, page);
-            if (!(pte & PTE_PRESENT) || !(pte & PTE_DIRTY)) continue;
-            if (page < v_start) continue;
-            uint64_t fileoff = v_foff + (page - v_start);
-            if (fileoff >= need) continue;                   /* never underflow the clamp */
-            uint64_t n = need - fileoff; if (n > PAGE_SIZE) n = PAGE_SIZE;
-            for (uint64_t b = 0; b < n; b++) tmp[fileoff + b] = ((const char *)page)[b];
-            vmm_set_pte_in(a->cr3, page, pte & ~PTE_DIRTY);
-            __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+        uint64_t page = lo & ~(uint64_t)(PAGE_SIZE - 1);
+        while (page < hi) {
+            struct { uint64_t off, phys; uint32_t n; } w[MSYNC_BATCH];
+            int nw = 0;
+            uint64_t mfl = vma_lock(a);
+            for (; page < hi && nw < MSYNC_BATCH; page += PAGE_SIZE) {
+                uint64_t pte = vmm_pte_in(a->cr3, page);
+                if (!(pte & PTE_PRESENT) || !(pte & PTE_DIRTY)) continue;
+                if (page < v_start) continue;
+                uint64_t fileoff = v_foff + (page - v_start);
+                uint64_t phys = pte & PTE_ADDR_MASK;
+                if (fileoff < fsz && !pmm_refcountable(phys)) continue;   /* cannot hold it: leave it dirty */
+                vmm_set_pte_in(a->cr3, page, pte & ~PTE_DIRTY);
+                __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+                if (fileoff >= fsz) continue;          /* past end-of-file: Linux drops it too */
+                pmm_addref(phys);                      /* the copy below reads THIS frame, whatever munmap does */
+                uint64_t n = fsz - fileoff; if (n > PAGE_SIZE) n = PAGE_SIZE;
+                w[nw].off = fileoff; w[nw].phys = phys; w[nw].n = (uint32_t)n; nw++;
+            }
+            vma_unlock(a, mfl);
+            if (!nw) continue;
+            app_tlb_sync(a);                           /* no core keeps a D=1 translation past here */
+            int unsupported = 0;
+            for (int k = 0; k < nw; k++) {
+                long wr = unsupported ? VFS_PWRITE_UNSUPPORTED
+                                      : vfs_pwrite(vpath, hhdm(w[k].phys), w[k].n, w[k].off);
+                if (wr == VFS_PWRITE_UNSUPPORTED) unsupported = 1;
+            }
+            if (unsupported && fsz && fsz <= (16u << 20)) {
+                /* No positioned write here (tmpfs, FAT): patch the file as a
+                 * whole, as before -- but never past its end. */
+                char *tmp = kmalloc((size_t)fsz);
+                if (tmp) {
+                    long got = vfs_read(vpath, tmp, fsz);
+                    if (got < 0) got = 0;
+                    for (uint64_t b = (uint64_t)got; b < fsz; b++) tmp[b] = 0;
+                    for (int k = 0; k < nw; k++) {
+                        const char *src = (const char *)hhdm(w[k].phys);
+                        for (uint32_t b = 0; b < w[k].n; b++) tmp[w[k].off + b] = src[b];
+                    }
+                    vfs_write(vpath, tmp, fsz);
+                    kfree(tmp);
+                }
+            }
+            for (int k = 0; k < nw; k++) pmm_free_frame(w[k].phys);   /* our hold, not the mapping's */
         }
-        vma_unlock(a, mfl);
-        vfs_write(vpath, tmp, need);
-        kfree(tmp);
     }
     return 0;
 }
+int app_msync(uint64_t addr, uint64_t len) { return app_msync_of(cur(), addr, len); }
 
 /* Split the VMA containing `addr` so that `addr` becomes a boundary. No-op if
  * nothing contains it, or if it is already a start/end. Returns 0, or -1 if
