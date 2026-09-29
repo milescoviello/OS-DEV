@@ -232,7 +232,9 @@ else
 # WHICH LINE ENDS THE WAIT. Overridable (M2393): a run of several programs
 # in a row must not stop at the first one's crash marker -- `lxjava` runs three
 # JVMs, and "CRASHED with signal" from the first would cut off the other two.
-MARKERS=${MARKERS:-'PAGE ON SCREEN|OSDEV-BASH-OK|lxask] exit|FFSHOT-PNGEND|FFSHOT: no PNG|no Wayland client left|the process is GONE|CRASHED with signal|KERNEL PANIC|the watcher has finished its window|lxjava\] DONE'}
+# `lxask\] claude -p ->` is the line kmain.c:3445 actually prints; `lxask] exit`
+# never matched it, so every Claude boot waited out its whole CAP (M2396).
+MARKERS=${MARKERS:-'PAGE ON SCREEN|OSDEV-BASH-OK|lxask] exit|lxask\] claude -p ->|FFSHOT-PNGEND|FFSHOT: no PNG|no Wayland client left|the process is GONE|CRASHED with signal|KERNEL PANIC|the watcher has finished its window|lxjava\] DONE'}
 echo "==> waiting for a marker (not for a duration)..."
 i=0
 while [ $i -lt "$CAP" ]; do
