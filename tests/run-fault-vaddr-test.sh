@@ -23,7 +23,11 @@ QEMU=${QEMU:-qemu-system-x86_64}
 KERNEL=build/kernel32.elf
 DISK=build/fat.img
 EXT2=build/ext2.img
-LIB=/usr/lib64/firefox/libxul.so
+# The oracle must be the file the GUEST loads, which is the copy staged into
+# the image -- not whatever the machine running this script has installed.
+# The host path is only a fallback for a tree whose lxroot is elsewhere.
+LIB=build/lxroot/usr/lib64/firefox/libxul.so
+[ -f "$LIB" ] || LIB=/usr/lib64/firefox/libxul.so
 FILEOFF=0x8cbc3a0          # the real offset from the 8-core hunt
 
 command -v "$QEMU" >/dev/null 2>&1 || { echo "SKIP: fault-vaddr test ($QEMU not found)"; exit 0; }
@@ -33,12 +37,17 @@ command -v readelf >/dev/null 2>&1 || { echo "SKIP: fault-vaddr test (no readelf
 
 # THE ORACLE: binutils' own view of the same file. p_vaddr + (fileoff - p_offset)
 # for the PT_LOAD containing the offset.
-WANT=$(readelf -lW "$LIB" | awk -v off="$FILEOFF" '
-    BEGIN { want = strtonum(off) }
-    $1 == "LOAD" {
-        po = strtonum($2); pv = strtonum($3); fs = strtonum($5);
-        if (want >= po && want < po + fs) { printf "%x\n", pv + (want - po); exit }
-    }')
+# Shell arithmetic, not awk: strtonum() is a gawk extension, and on a host
+# whose awk is mawk the script died with "function strtonum never defined".
+WANT=
+while read -r typ po pv pa fs rest; do
+    [ "$typ" = LOAD ] || continue
+    if [ $((FILEOFF)) -ge $((po)) ] && [ $((FILEOFF)) -lt $((po + fs)) ]; then
+        WANT=$(printf '%x' $((pv + FILEOFF - po))); break
+    fi
+done <<EOF_PH
+$(readelf -lW "$LIB")
+EOF_PH
 [ -n "$WANT" ] || { echo "SKIP: fault-vaddr test (no LOAD segment of $LIB covers $FILEOFF)"; exit 0; }
 echo "host readelf says $LIB file offset $FILEOFF is library vaddr 0x$WANT"
 

@@ -2141,10 +2141,22 @@ lxinettest: $(KERNEL) $(DISK) $(EXT2IMG)
 # which costs a couple of minutes and keeps them meaningful.
 CHECKJOBS ?= 6
 CHECK_SERIAL := gfxtest browsertest layoutrendertest desktoptest httpdtest usbkbdtest
+# A SKIP IS NOT A PASS, so do not let it read as one. A suite whose
+# prerequisite is missing on this host (QEMU, a staged library, the network)
+# prints "SKIP:" and exits 0, and the run still ends in ALL TESTS PASSED. That
+# is right for a host that genuinely cannot run it, and it is how waylandtest
+# and faultvaddrtest silently stopped being tested on the machine that ran
+# them. So the output is kept, and every SKIP is repeated at the end.
 check:
-	@$(MAKE) --no-print-directory -j$(CHECKJOBS) -Otarget check-all
-	@$(MAKE) --no-print-directory $(CHECK_SERIAL)
+	@mkdir -p $(BUILD)
+	@{ $(MAKE) --no-print-directory -j$(CHECKJOBS) -Otarget check-all 2>&1; echo $$? > $(BUILD)/check.rc; } | tee $(BUILD)/check.log
+	@test "$$(cat $(BUILD)/check.rc)" = 0
+	@{ $(MAKE) --no-print-directory $(CHECK_SERIAL) 2>&1; echo $$? > $(BUILD)/check.rc; } | tee -a $(BUILD)/check.log
+	@test "$$(cat $(BUILD)/check.rc)" = 0
 	@echo "ALL TESTS PASSED (parallel pool + $(CHECK_SERIAL) serially)"
+	@n=$$(grep -c '^SKIP' $(BUILD)/check.log || true); if [ "$$n" -gt 0 ]; then \
+	    echo "BUT $$n suite(s) SKIPPED -- these were NOT tested on this host:"; \
+	    grep '^SKIP' $(BUILD)/check.log | sed 's/^/    /'; fi
 
 # NO TASK'S DEEPEST CALL CHAIN MAY OUTGROW ITS KERNEL STACK (M2198). Pure
 # host analysis -- one compile of every kernel translation unit with
@@ -2153,7 +2165,7 @@ stackusagetest:
 	@tools/check-stack-usage.py
 
 check-all: stackusagetest waylandtest xkbtest lxinettest jstest imgtest x509test tlsfuzztest nettest tcpreliabletest fstest ext2test xattrtest iso9660test kattest bignumfuzztest barrettfuzztest stringtest svgtest deflatetest pngenctest ziptest tartest heaptest journaltest wavtest acpiamltest webptest elftest httptest kheaptest jsonfuzztest regexfuzztest jssrcfuzztest htmlentfuzztest htmlattrtest urltest colortest csstest csseltest readertest shgreptest shsedtest shmathtest shsplittest shbracetest shexpandtest shquotetest shtesttest lsfmttest shsorttest shtxttest wsframetest wsclienttest usbbottest layouttest sha1test calctest sheettest plottest jsoncoretest difftest mdtest editortest arctest hashtest normpathtest completetest lxargsplittest boottest kstacktest ustacktest wxtest smeptest smpthreadtest smpschedtest journalguesttest fatjournaltest netcontest gdbstubtest rtl8139test virtionettest virtioblktest virtiorngtest virtioconsoletest nvmetest floppytest parttest blockdevtest raidtest ahcitest atapitest atalba48test idedmatest virtiogputest svgatest usbstoragetest ehcitest xhcitest hdatest ipctest faultvaddrtest ext2racetest bcachetest linuxabitest
-	@echo "ALL TESTS PASSED (jstest + imgtest + x509test + tlsfuzztest + nettest + tcpreliabletest + fstest + ext2test + xattrtest + iso9660test + kattest + bignumfuzztest + barrettfuzztest + stringtest + svgtest + deflatetest + pngenctest + ziptest + tartest + heaptest + journaltest + wavtest + acpiamltest + webptest + elftest + httptest + kheaptest + jsonfuzztest + regexfuzztest + jssrcfuzztest + htmlentfuzztest + htmlattrtest + urltest + colortest + csstest + csseltest + readertest + shgreptest + shsedtest + shmathtest + shsplittest + shbracetest + shexpandtest + shquotetest + shtesttest + lsfmttest + shsorttest + shtxttest + wsframetest + wsclienttest + usbbottest + layouttest + sha1test + calctest + sheettest + plottest + jsoncoretest + difftest + mdtest + editortest + arctest + hashtest + normpathtest + xkbtest + completetest + lxargsplittest + boottest + kstacktest + ustacktest + wxtest + smeptest + smpthreadtest + smpschedtest + journalguesttest + fatjournaltest + netcontest + gdbstubtest + rtl8139test + virtionettest + virtioblktest + virtiorngtest + virtioconsoletest + nvmetest + floppytest + parttest + blockdevtest + raidtest + ahcitest + atapitest + atalba48test + idedmatest + virtiogputest + svgatest + usbstoragetest + usbkbdtest + ehcitest + xhcitest + hdatest + httpdtest + gfxtest + browsertest + layoutrendertest + ipctest + faultvaddrtest + ext2racetest + bcachetest + linuxabitest)"
+	@echo "ALL TESTS PASSED ($(words $^) suites in the parallel pool: $^)"
 
 clean:
 	rm -rf $(BUILD)
