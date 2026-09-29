@@ -22,7 +22,13 @@ Sequence, in order, because each step tests something the previous one cannot:
 """
 import json, os, re, socket, sys, time
 
-SCREEN_W, SCREEN_H = 1280, 960
+# THE SCREEN SIZE IS READ, NOT ASSUMED. This was a constant 1280x960, and the
+# absolute axis is scaled by it: when the desktop's framebuffer became
+# 2560x1440 every aim landed 2x right and 1.5x down -- on some other window --
+# and the suite reported "the client received no wl_pointer.motion at all"
+# for a compositor that was never pointed at. The screendump that finds the
+# surface carries the real size, so the scale comes from there.
+SCREEN_W, SCREEN_H = 1280, 960     # replaced by the first screendump's size
 WANT = (0x33, 0x66, 0xCC)          # the client's fill colour
 EXP_W, EXP_H = 64, 32
 # AIM WHERE ONLY THE PARENT IS (M2332).
@@ -71,12 +77,15 @@ class Qmp:
         self._cmd({"execute": "screendump", "arguments": {"filename": path}})
 
 def find_surface(path):
-    """Return the top-left of the client's surface on screen, or None."""
+    """Return the top-left of the client's surface on screen, or None.
+    Also records the screen size the dump was taken at (see SCREEN_W)."""
+    global SCREEN_W, SCREEN_H
     try: d = open(path, 'rb').read()
     except OSError: return None
     parts = d.split(b'\n', 3)
     if len(parts) < 4 or parts[0] != b'P6': return None
     w, h = map(int, parts[1].split()); px = parts[3]
+    SCREEN_W, SCREEN_H = w, h
     xs, ys = [], []
     for y in range(h):
         base = y * w * 3
@@ -115,7 +124,8 @@ def main():
     if not origin:
         print("  FAIL: could not locate the client's surface on screen to aim at"); return 1
     ox, oy = origin
-    print("  ok: located the client's surface on screen at (%d,%d) -- aiming input at it" % (ox, oy))
+    print("  ok: located the client's surface on screen at (%d,%d) of %dx%d -- aiming input at it"
+          % (ox, oy, SCREEN_W, SCREEN_H))
 
     fail = 0
     q.move(ox + OFF_X, oy + OFF_Y); time.sleep(1.5)
