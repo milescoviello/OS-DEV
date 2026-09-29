@@ -389,11 +389,29 @@ static void console_selftest_peer(void) {
 void console_panic_selftest(void) {
     int fails = 0, checks = 0;
     unsigned before = panic_lock_attempts;
-    int save_lock = con_lock, save_owner = con_owner;
 
-    /* Stage a holder that is definitely not us. */
+    /* HOLD THE LOCK FOR REAL, THEN MAKE IT LOOK FOREIGN.
+     *
+     * This saved con_lock/con_owner, staged a fake holder over them, and
+     * "put it back exactly as it was" afterwards. Exactly as it was is wrong
+     * whenever another task was printing at that moment -- the boot's network
+     * self-test runs concurrently -- because that task then releases the lock
+     * in the middle of the test ("the bypass DISTURBED the foreign holder's
+     * lock (lock=0 owner=-1)"), and the restore re-locks it on behalf of a
+     * task that has already let go. Every later kprintf then waits out the
+     * full CON_SPIN_LIMIT, and the boot crawls to a halt a few lines on.
+     *
+     * Acquired first, the lock cannot have another printer inside it. The
+     * results are recorded while it is staged and printed after it is
+     * released, so no line has to spin against the fake holder either. */
+    uint64_t lf; int held = con_take(&lf);
+    if (!held) {
+        kprintf("[conlock] could not take the console lock to stage a foreign holder -- skipped\n");
+        kprintf("[conlock] CONLOCKSELFTEST PASSED (0 checks, skipped)\n");
+        return;
+    }
+    int mine = con_owner;
     con_owner = 0x7FFFFFFF;
-    __atomic_store_n(&con_lock, 1, __ATOMIC_RELEASE);
     panic_mode = 1;
 
     /* This print must come straight back. On the reverted code con_take spins
@@ -401,31 +419,30 @@ void console_panic_selftest(void) {
      * iterations per line, which under TCG is the difference between a report
      * and a wedge. */
     kprintf("[conlock] a report-mode print issued with a FOREIGN lock holder\n");
+    int refused   = panic_lock_attempts > before;
+    int lk = con_lock, ow = con_owner;
+    int untouched = lk && ow == 0x7FFFFFFF;
+
+    panic_mode = 0;
+    con_owner = mine;                       /* ours again, and released the normal way */
+    con_give(held, lf);
+    panic_lock_attempts = before;
 
     checks++;
-    if (panic_lock_attempts <= before) {
-        panic_mode = 0;
+    if (!refused) {
         kprintf("[conlock] FAIL report mode did not REFUSE the console lock -- "
                 "the fault reporter is waiting for a lock a stopped core still holds\n");
         fails++;
-    } else {
-        panic_mode = 0;
+    } else
         kprintf("[conlock] ok   a report-mode print refuses the lock instead of spinning for it\n");
-    }
 
     checks++;
-    if (!con_lock || con_owner != 0x7FFFFFFF) {
+    if (!untouched) {
         kprintf("[conlock] FAIL the bypass DISTURBED the foreign holder's lock "
-                "(lock=%d owner=%d)\n", con_lock, con_owner);
+                "(lock=%d owner=%d)\n", lk, ow);
         fails++;
     } else
         kprintf("[conlock] ok   ...and left the foreign holder's lock untouched\n");
-
-    /* Put it back exactly as it was. */
-    con_owner = save_owner;
-    __atomic_store_n(&con_lock, save_lock, __ATOMIC_RELEASE);
-    panic_lock_attempts = before;
-    panic_mode = 0;
 
     /* The tag deliberately avoids the word the boot suite forbids: a crash
      * guard that greps the log for it must not be weakened so a test can name
