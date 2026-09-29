@@ -683,6 +683,57 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * checks page by page up to the NUL (faulting demand pages in, so a valid
  * string in not-yet-touched memory is still accepted). */
 #define LX_STRMAX     4096u          /* PATH_MAX */
+
+/* A DIRECTORY READ IS A SNAPSHOT (getdents64). The descriptor's offset used
+ * to be an index into a listing rebuilt on every call, so when a caller
+ * deleted what it had just read -- `rm -r`, `git clean` -- the remaining
+ * entries shifted down past the index and were never returned: files were
+ * left behind and the final rmdir failed. The listing taken at offset 0 is
+ * kept, per (pid, fd, path), until the read reaches its end. */
+#define LX_DSNAP_N 8
+static struct { int pid, fd; char path[128]; vfs_dirent *ents; int n; unsigned long used; } g_dsnap[LX_DSNAP_N];
+static volatile int g_dsnap_lk;
+static unsigned long g_dsnap_clk;
+static uint64_t dsnap_lock(void) {
+    uint64_t f; __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    while (__atomic_exchange_n(&g_dsnap_lk, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+    return f;
+}
+static void dsnap_unlock(uint64_t f) {
+    __atomic_store_n(&g_dsnap_lk, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("push %0; popfq" : : "r"(f) : "memory", "cc");
+}
+static int dsnap_key(int i, int pid, int fd, const char *path) {
+    if (!g_dsnap[i].ents || g_dsnap[i].pid != pid || g_dsnap[i].fd != fd) return 0;
+    int k = 0; while (path[k] && g_dsnap[i].path[k] == path[k]) k++;
+    return path[k] == 0 && g_dsnap[i].path[k] == 0;
+}
+/* Detach (pid, fd)'s snapshot, if any; the caller frees what comes back. */
+static vfs_dirent *dsnap_take(int pid, int fd, const char *path, int *n) {
+    uint64_t f = dsnap_lock();
+    vfs_dirent *e = 0;
+    for (int i = 0; i < LX_DSNAP_N; i++)
+        if (dsnap_key(i, pid, fd, path)) { e = g_dsnap[i].ents; *n = g_dsnap[i].n; g_dsnap[i].ents = 0; break; }
+    dsnap_unlock(f);
+    return e;
+}
+/* Keep `e` for (pid, fd); returns whatever it displaced, for the caller to free. */
+static vfs_dirent *dsnap_put(int pid, int fd, const char *path, vfs_dirent *e, int n) {
+    int pl = 0; while (path[pl]) pl++;
+    if (pl >= (int)sizeof g_dsnap[0].path) return e;          /* cannot key it: do not keep it */
+    uint64_t f = dsnap_lock();
+    int slot = -1; unsigned long oldest = ~0ul;
+    for (int i = 0; i < LX_DSNAP_N; i++) {
+        if (!g_dsnap[i].ents) { slot = i; break; }
+        if (g_dsnap[i].used < oldest) { oldest = g_dsnap[i].used; slot = i; }
+    }
+    vfs_dirent *old = g_dsnap[slot].ents;
+    g_dsnap[slot].ents = e; g_dsnap[slot].n = n; g_dsnap[slot].pid = pid; g_dsnap[slot].fd = fd;
+    for (int k = 0; k <= pl; k++) g_dsnap[slot].path[k] = path[k];
+    g_dsnap[slot].used = ++g_dsnap_clk;
+    dsnap_unlock(f);
+    return old;
+}
 #define LX_ARGSTRMAX  131072u        /* MAX_ARG_STRLEN: one argv/envp string */
 /* WHICH RESOLVER FILES DID GLIBC ACTUALLY LOOK AT (M2128).
  *
@@ -5002,18 +5053,27 @@ static void lx_dispatch_body(struct registers *r) {
          * call has to find. Fall back to 256 rather than fail the readdir
          * outright when the heap cannot spare it; a truncated listing is
          * reported below, which is more than a lost directory would be. */
-        int ecap = 1024;                    /* NB: `cap` is already the user buffer size */
-        vfs_dirent *ents = kmalloc((unsigned long)ecap * sizeof *ents);
-        if (!ents) { ecap = 256; ents = kmalloc((unsigned long)ecap * sizeof *ents); }
-        if (!ents) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
-        int n = vfs_list_path(dp, ents, ecap);
-        if (n < 0) { kfree(ents); r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
-        if (n == ecap)
-            kprintf("[linuxabi] getdents64(%s): at least %d entries -- listing TRUNCATED\n", dp, ecap);
         /* The offset is carried in the fd's own cursor, so a second call
          * returns 0 and readdir() terminates instead of looping forever. */
         long start = app_lseek((int)a1, 0, 1 /*SEEK_CUR*/);
         if (start < 0) start = 0;
+        int dpid = app_current_pid(), n = 0;
+        vfs_dirent *ents = (start > 0) ? dsnap_take(dpid, (int)a1, dp, &n) : 0;   /* a read already under way: see g_dsnap */
+        if (!ents) {
+            int ecap = 1024;                /* NB: `cap` is already the user buffer size */
+            vfs_dirent *tmp = kmalloc((unsigned long)ecap * sizeof *tmp);
+            if (!tmp) { ecap = 256; tmp = kmalloc((unsigned long)ecap * sizeof *tmp); }
+            if (!tmp) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
+            n = vfs_list_path(dp, tmp, ecap);
+            if (n < 0) { kfree(tmp); r->rax = (uint64_t)-(long)LX_ENOTDIR; break; }
+            if (n == ecap)
+                kprintf("[linuxabi] getdents64(%s): at least %d entries -- listing TRUNCATED\n", dp, ecap);
+            /* Keep an exact-size copy as the snapshot (the scratch array is
+             * 1024 x 264 bytes); if even that fails, serve from the scratch. */
+            ents = n ? kmalloc((unsigned long)n * sizeof *ents) : 0;
+            if (ents) { for (int i = 0; i < n; i++) ents[i] = tmp[i]; kfree(tmp); }
+            else ents = tmp;
+        }
         uint8_t *out = (uint8_t *)r->rsi;
         long used = 0; int emitted = 0;
         for (int i = (int)start; i < n; i++) {
@@ -5033,7 +5093,10 @@ static void lx_dispatch_body(struct registers *r) {
             used += rec; emitted++;
         }
         app_lseek((int)a1, start + emitted, 0 /*SEEK_SET*/);
-        kfree(ents);
+        if (emitted && start + emitted < n) {           /* more to come: keep the snapshot */
+            vfs_dirent *old = dsnap_put(dpid, (int)a1, dp, ents, n);
+            if (old) kfree(old);
+        } else if (ents) kfree(ents);                   /* the end: nothing to keep */
         r->rax = (uint64_t)used;            /* 0 = end of directory */
         break;
     }
