@@ -56,6 +56,13 @@ static int g_fj_txn;            /* a filesystem-op transaction is open */
  * than corrupting the shared transaction buffer — no yielding lock (which would
  * deadlock against ata_lock's own yield). */
 static volatile int g_fj_busy;
+/* The task whose op opened the transaction. Only ITS writes are staged and
+ * only its reads peek the staged blocks: anyone else sees the disk. */
+struct task;
+extern struct task *task_self(void);
+extern void task_yield(void);
+static struct task *volatile g_fj_owner;
+static int fat_in_txn(void) { return g_fj_txn && g_fj_owner == task_self(); }
 static int g_fj_overflow;        /* a staged write didn't fit the open txn -> force abort, never tear (M1885) */
 
 static uint16_t rd16(const uint8_t *p) { return p[0] | p[1] << 8; }
@@ -80,7 +87,7 @@ static int ata_read_retry(uint32_t lba, uint8_t count, void *buf) {
     /* Inside a journaled op, a single-sector read must see any block this op has
      * already STAGED (not the stale on-disk copy) — else e.g. a chain-link
      * fat_set would re-read a FAT sector and undo the just-allocated entry. */
-    if (g_fj_txn && count == 1 && journal_peek(&g_fj, lba, buf)) return 0;
+    if (fat_in_txn() && count == 1 && journal_peek(&g_fj, lba, buf)) return 0;
     int r = -1;
     for (int attempt = 0; attempt < 3 && r < 0; attempt++) r = ata_read(lba, count, buf);
     return r;
@@ -96,7 +103,7 @@ static void jf_bflush(void *c)                                { (void)c; ata_cac
  * is atomic), else write straight through. If staging ever fails (txn full — the
  * caller's size guard prevents this), fall back to a direct write. */
 static void fat_wr(uint32_t lba, const void *buf) {
-    if (g_fj_txn) {
+    if (fat_in_txn()) {
         /* In a journaled op: stage it. If it somehow doesn't fit the transaction
          * (the cluster-cap guard below should make this impossible), do NOT fall
          * back to a direct write — that tears the op (some blocks staged, this one
@@ -130,6 +137,7 @@ static int fat_txn_begin_op(void) {
     if (!g_fj_ready || g_fj_txn) return 0;
     if (__atomic_exchange_n(&g_fj_busy, 1, __ATOMIC_ACQUIRE) != 0) return 0;
     if (journal_begin(&g_fj) != 0) { __atomic_store_n(&g_fj_busy, 0, __ATOMIC_RELEASE); return 0; }
+    g_fj_owner = task_self();
     g_fj_txn = 1;
     g_fj_overflow = 0;
     return 1;
@@ -140,6 +148,7 @@ static void fat_txn_end(int commit) {
     if (g_fj_overflow) commit = 0;      /* a staged write overflowed the txn -> abort, don't tear (M1885) */
     if (commit) journal_commit(&g_fj); else journal_abort(&g_fj);
     g_fj_overflow = 0;
+    g_fj_owner = 0;
     __atomic_store_n(&g_fj_busy, 0, __ATOMIC_RELEASE);
 }
 
@@ -612,9 +621,9 @@ static void free_chain(uint32_t cl) {
     }
 }
 
-static long fat32_delete(const char *name);          /* forward decl */
+static long fat32_delete_nl(const char *name);       /* forward decl */
 
-static long fat32_write(const char *name, const void *data, unsigned long len) {
+static long fat32_write_nl(const char *name, const void *data, unsigned long len) {
     uint32_t dir; const char *leaf;
     if (resolve(name, &dir, &leaf) < 0 || !leaf[0]) return -1;
     int exists = 0; uint32_t oldsz = 0;
@@ -644,7 +653,7 @@ static long fat32_write(const char *name, const void *data, unsigned long len) {
     (void)oldsz;
     int owns = (!exists && nclus <= jrnl_cluster_cap()) ? fat_txn_begin_op() : 0;
 
-    fat32_delete(name);            /* no-op for a new file; for an overwrite it self-journals the rm (direct path) */
+    fat32_delete_nl(name);         /* no-op for a new file; for an overwrite it self-journals the rm (direct path) */
 
     /* allocate a cluster chain and write the data into it */
     uint32_t first = 0, prev = 0;
@@ -677,7 +686,7 @@ static long fat32_write(const char *name, const void *data, unsigned long len) {
 }
 
 /* Create a new (empty) subdirectory at `path`. */
-static long fat32_mkdir(const char *path) {
+static long fat32_mkdir_nl(const char *path) {
     uint32_t dir; const char *leaf;
     if (resolve(path, &dir, &leaf) < 0 || !leaf[0]) return -1;
     if (dir_find(dir, leaf, 0, 0, 0)) return -1;          /* already exists */
@@ -812,7 +821,7 @@ static int dir_nonempty_visit(const uint8_t *e, const char *name, void *ctx) {
     return 1;                                  /* a real entry — stop the walk */
 }
 
-static long fat32_delete(const char *name) {
+static long fat32_delete_nl(const char *name) {
     uint32_t dir; const char *leaf;
     if (resolve(name, &dir, &leaf) < 0 || !leaf[0]) return -1;
     uint8_t want[11];
@@ -878,7 +887,7 @@ static int name_fits_83(const char *name) {
  * [0..10] (the name) in the in-memory sector buffer and writes back ONLY that
  * one sector — every other byte of that entry and every other entry in the
  * sector is preserved exactly. */
-static long fat32_rename(const char *path, const char *newname) {
+static long fat32_rename_nl(const char *path, const char *newname) {
     if (!name_fits_83(newname)) return -1;            /* 8.3-write only: reject empty / over-long */
     uint8_t new83[11];
     to_83(newname, new83);
@@ -937,6 +946,45 @@ static void fat32_df(uint64_t *freeb, uint64_t *totalb) {
     uint64_t cs = (uint64_t)sec_per_clus * SECSZ;
     *freeb  = (uint64_t)freecl * cs;
     *totalb = (uint64_t)total_clusters * cs;
+}
+
+/* ONE WRITER AT A TIME.
+ *
+ * Every mutation here is a read-modify-write of shared sectors -- a FAT
+ * sector holds 128 cluster links, a directory sector 16 entries -- plus a
+ * free-cluster search from a shared hint, and nothing serialised them. Two
+ * cores creating files could read the same FAT sector, each set its own link,
+ * and write back: one chain loses its link, or both claim the same free
+ * cluster and two files share their data.
+ *
+ * The journal made it worse rather than better. Its "one op at a time" claim
+ * (g_fj_busy) sent the loser down the direct path -- but the transaction flag
+ * is global, so the loser's fat_wr saw it set and STAGED its sectors into the
+ * winner's transaction, to be committed, or discarded on abort, with an op
+ * that knew nothing about them. The transaction now belongs to the task that
+ * opened it (g_fj_owner), and this lock makes the fallback unreachable.
+ *
+ * Spin-then-yield, like ext2's fsw_take: it is held across disk I/O, and the
+ * ATA lock taken inside it yields the same way, so neither can starve the
+ * other's holder. */
+static volatile int fat_wlk;
+static void fat_w_take(void) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&fat_wlk, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void fat_w_give(void) { __atomic_store_n(&fat_wlk, 0, __ATOMIC_RELEASE); }
+static long fat32_write(const char *name, const void *data, unsigned long len) {
+    fat_w_take(); long r = fat32_write_nl(name, data, len); fat_w_give(); return r;
+}
+static long fat32_mkdir(const char *path) {
+    fat_w_take(); long r = fat32_mkdir_nl(path); fat_w_give(); return r;
+}
+static long fat32_delete(const char *name) {
+    fat_w_take(); long r = fat32_delete_nl(name); fat_w_give(); return r;
+}
+static long fat32_rename(const char *path, const char *newname) {
+    fat_w_take(); long r = fat32_rename_nl(path, newname); fat_w_give(); return r;
 }
 
 static struct vfs_ops fat32_ops = { fat32_list, fat32_read, fat32_write,
