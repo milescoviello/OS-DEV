@@ -37,6 +37,7 @@
 #include "pmm.h"
 #include "kheap.h"
 #include "app.h"
+#include "task.h"   /* task_yield, for the DRM lock */
 
 #define DRM_IOCTL_VERSION                    0xc0406400ul
 #define DRM_IOCTL_GET_CAP                    0xc010640cul
@@ -174,11 +175,33 @@ static uint32_t g_next_res = 64;        /* clear of RESOURCE_ID 1 */
  * handle by division, with no second table to keep in step with this one. */
 #define DRM_MAP_STRIDE (16ull * 1024 * 1024)
 
-static struct drm_bo *bo_of(uint32_t handle) {
-    if (!handle || handle > DRM_BO_N) return 0;
+/* A HANDLE IS ONLY A NAME WITHIN ITS NODE. Handles are small integers, so
+ * any process holding a render fd could guess another's -- and bo_of did not
+ * ask which node was asking. GEM_CLOSE freed another process's buffer out
+ * from under its GPU work; MAP followed by mmap put another process's frames
+ * into the caller's address space, which is cross-process memory access
+ * through a GPU ioctl. Every lookup now names the node it is made for. */
+static struct drm_bo *bo_of(uint32_t handle, int node) {
+    if (!handle || handle > DRM_BO_N || node < 0) return 0;
     struct drm_bo *b = &g_bo[handle - 1];
-    return b->used ? b : 0;
+    return (b->used && b->node == node) ? b : 0;
 }
+
+/* ONE LOCK FOR THE NODE TABLE, THE OBJECT TABLE AND THE 3D COMMAND PATH.
+ * Nothing serialised them: two threads creating resources could both pick a
+ * free slot, a GEM_CLOSE could free an object's frames while an mmap of it
+ * was reading them, and virtio_gpu.c builds each 3D request in a static
+ * struct BEFORE its queue lock is taken, so two submitters could overwrite
+ * each other's request -- that file's only caller is this one, so holding
+ * this lock across every call into it closes that too. Spin-then-yield: it is
+ * held across device round-trips that sleep. */
+static volatile int g_drm_lk;
+static void drm_lk_take(void) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&g_drm_lk, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void drm_lk_give(void) { __atomic_store_n(&g_drm_lk, 0, __ATOMIC_RELEASE); }
 
 static void bo_free(struct drm_bo *b) {
     if (!b || !b->used) return;
@@ -240,14 +263,24 @@ static uint32_t node_ctx(int node) {
 /* For app.c's mmap: which frame backs page `page` of the object named by map
  * offset `off`, and how big is it. Kept here so the handle namespace has
  * exactly one owner. */
-uint64_t drm_map_frame(uint64_t off, uint64_t page) {
-    struct drm_bo *b = bo_of((uint32_t)(off / DRM_MAP_STRIDE));
-    if (!b || page >= b->nframes) return 0;
-    return b->frames[page];
+/* The frame comes back with a REFERENCE the caller's mapping now owns, taken
+ * under the lock a GEM_CLOSE frees under -- so the frame cannot be freed
+ * between being looked up and being mapped. 0 if there is no such page, or
+ * it cannot be refcounted (and so must not be mapped). */
+uint64_t drm_map_frame_ref(int node, uint64_t off, uint64_t page) {
+    drm_lk_take();
+    struct drm_bo *b = bo_of((uint32_t)(off / DRM_MAP_STRIDE), node);
+    uint64_t phys = (b && page < b->nframes) ? b->frames[page] : 0;
+    if (phys && pmm_refcountable(phys)) pmm_addref(phys); else phys = 0;
+    drm_lk_give();
+    return phys;
 }
-uint64_t drm_map_size(uint64_t off) {
-    struct drm_bo *b = bo_of((uint32_t)(off / DRM_MAP_STRIDE));
-    return b ? (uint64_t)b->nframes * PAGE_SIZE : 0;
+uint64_t drm_map_size(int node, uint64_t off) {
+    drm_lk_take();
+    struct drm_bo *b = bo_of((uint32_t)(off / DRM_MAP_STRIDE), node);
+    uint64_t n = b ? (uint64_t)b->nframes * PAGE_SIZE : 0;
+    drm_lk_give();
+    return n;
 }
 
 /* WHICH GPU A NODE IS (M2390). virtio-gpu's 3D device when the VM has one;
@@ -262,9 +295,12 @@ int drm_open_node(void) {
         if (!nvgpu_drm_ok()) return -1;
         nv = 1;
     }
+    int got = -1;
+    drm_lk_take();                         /* find and claim as one act */
     for (int i = 0; i < DRM_NODES; i++)
-        if (!g_node[i].used) { g_node[i].used = 1; g_node[i].nv = nv; g_node[i].refs = 1; return i; }
-    return -1;
+        if (!g_node[i].used) { g_node[i].used = 1; g_node[i].nv = nv; g_node[i].refs = 1; got = i; break; }
+    drm_lk_give();
+    return got;
 }
 /* A NODE IS HELD BY EVERY DESCRIPTOR FOR IT. Mesa's pipe loader dups the
  * render fd, and a forked child closes what it inherited: the first close of
@@ -277,6 +313,7 @@ void drm_node_ref(int id) {
 void drm_close_node(int id) {
     if (id < 0 || id >= DRM_NODES || !g_node[id].used) return;
     if (__atomic_sub_fetch(&g_node[id].refs, 1, __ATOMIC_ACQ_REL) > 0) return;   /* another descriptor still holds it */
+    drm_lk_take();
     /* EVERY OBJECT THIS NODE MADE GOES WITH IT. A GL process that exits
      * without calling GEM_CLOSE on each buffer -- which is every process that
      * crashes, and most that do not -- would otherwise leak both guest frames
@@ -285,6 +322,7 @@ void drm_close_node(int id) {
         if (g_bo[i].used && g_bo[i].node == id) bo_free(&g_bo[i]);
     if (g_node[id].ctx && !g_node[id].nv) { virtio_gpu_ctx_destroy((uint32_t)id + 1); g_node[id].ctx = 0; }
     g_node[id].used = 0; g_node[id].nv = 0;
+    drm_lk_give();
 }
 
 /* WHICH PATHS ARE THIS DEVICE.
@@ -317,12 +355,18 @@ static int drm_node_of_fd(int fd) {
     return (n >= 0 && n < DRM_NODES && g_node[n].used) ? n : -1;
 }
 
+static long drm_ioctl_nl(int fd, int node, unsigned long req, void *uarg);
 long drm_ioctl(int fd, unsigned long req, void *uarg) {
-    {   int nd = drm_node_of_fd(fd);
-        if (nd >= 0 && g_node[nd].nv) return nvdrm_ioctl(req, uarg);
-    }
+    int node = drm_node_of_fd(fd);
+    if (node >= 0 && g_node[node].nv) return nvdrm_ioctl(req, uarg);
     if (!virtio_gpu_has_3d()) { drm_seen(req, "any ioctl with no 3D device", E_NODEV); return E_NODEV; }
-
+    drm_lk_take();
+    long r = drm_ioctl_nl(fd, node, req, uarg);
+    drm_lk_give();
+    return r;
+}
+static long drm_ioctl_nl(int fd, int node, unsigned long req, void *uarg) {
+    (void)fd;
     switch (req) {
 
     /* ---- who are you ----------------------------------------------------- */
@@ -504,7 +548,6 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_virtgpu_resource_create rc;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof rc)) return E_FAULT;
         memcpy(&rc, uarg, sizeof rc);
-        int node = drm_node_of_fd(fd);
         uint32_t ctx = node_ctx(node);
         if (!ctx) { drm_seen(req, "RESOURCE_CREATE but no virgl context", E_NODEV); return E_NODEV; }
 
@@ -554,7 +597,7 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_virtgpu_resource_info ri;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof ri)) return E_FAULT;
         memcpy(&ri, uarg, sizeof ri);
-        struct drm_bo *b = bo_of(ri.bo_handle);
+        struct drm_bo *b = bo_of(ri.bo_handle, node);
         if (!b) return E_INVAL;
         ri.res_handle = b->res_id;
         ri.size       = (uint32_t)b->nframes * PAGE_SIZE;
@@ -568,7 +611,7 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_virtgpu_map mp;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof mp)) return E_FAULT;
         memcpy(&mp, uarg, sizeof mp);
-        struct drm_bo *b = bo_of(mp.handle);
+        struct drm_bo *b = bo_of(mp.handle, node);
         if (!b) return E_INVAL;
         if (!b->nframes) {
             /* A HOST-ONLY RESOURCE CANNOT BE MAPPED, and saying so is the
@@ -587,7 +630,7 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_gem_close gc;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof gc)) return E_FAULT;
         memcpy(&gc, uarg, sizeof gc);
-        struct drm_bo *b = bo_of(gc.handle);
+        struct drm_bo *b = bo_of(gc.handle, node);
         if (!b) return E_INVAL;
         bo_free(b);
         drm_seen(req, "GEM_CLOSE", 0);
@@ -613,7 +656,7 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_prime_handle ph;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof ph)) return E_FAULT;
         memcpy(&ph, uarg, sizeof ph);
-        struct drm_bo *b = bo_of(ph.handle);
+        struct drm_bo *b = bo_of(ph.handle, node);
         if (!b) { drm_seen(req, "PRIME_HANDLE_TO_FD on an unknown handle", E_INVAL); return E_INVAL; }
         int fd = app_drm_prime_fd(ph.handle);
         if (fd < 0) { drm_seen(req, "PRIME_HANDLE_TO_FD: no descriptor available", E_MFILE); return E_MFILE; }
@@ -628,7 +671,7 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof ph)) return E_FAULT;
         memcpy(&ph, uarg, sizeof ph);
         int h = app_drm_prime_handle_of(ph.fd);
-        if (h <= 0 || !bo_of((uint32_t)h)) {
+        if (h <= 0 || !bo_of((uint32_t)h, node)) {
             drm_seen(req, "PRIME_FD_TO_HANDLE: that descriptor names no object", E_INVAL);
             return E_INVAL;
         }
@@ -643,7 +686,6 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_virtgpu_execbuffer eb;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof eb)) return E_FAULT;
         memcpy(&eb, uarg, sizeof eb);
-        int node = drm_node_of_fd(fd);
         uint32_t ctx = node_ctx(node);
         if (!ctx) return E_NODEV;
         if (!eb.command || !eb.size) return E_INVAL;
@@ -670,9 +712,8 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_virtgpu_3d_transfer tr;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof tr)) return E_FAULT;
         memcpy(&tr, uarg, sizeof tr);
-        struct drm_bo *b = bo_of(tr.bo_handle);
+        struct drm_bo *b = bo_of(tr.bo_handle, node);
         if (!b) return E_INVAL;
-        int node = drm_node_of_fd(fd);
         uint32_t ctx = node_ctx(node);
         if (!ctx) return E_NODEV;
         int to_host = (req == DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST);
@@ -692,7 +733,7 @@ long drm_ioctl(int fd, unsigned long req, void *uarg) {
         struct drm_virtgpu_3d_wait wt;
         if (!uarg || !vmm_user_ok((uint64_t)(uintptr_t)uarg, sizeof wt)) return E_FAULT;
         memcpy(&wt, uarg, sizeof wt);
-        if (!bo_of(wt.handle)) return E_INVAL;
+        if (!bo_of(wt.handle, node)) return E_INVAL;
         /* NOTHING TO WAIT FOR, HONESTLY. Every command this node issues is
          * complete before its ioctl returns, so an object is never busy. This
          * is a true answer today and a lie the instant submission goes

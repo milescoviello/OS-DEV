@@ -11191,8 +11191,9 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
 static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
     struct app *a = cur(); if (!a || !len) return 0;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 17) return 0;
-    uint64_t have = drm_map_size(off);
-    if (!have) return 0;                          /* no object at that offset */
+    int node = a->fd[fd].obj;                     /* objects are named per node: see bo_of */
+    uint64_t have = drm_map_size(node, off);
+    if (!have) return 0;                          /* no object of THIS node at that offset */
     len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     if (len > have) len = have;                   /* never map past the object */
     if (vma_full(a)) return 0;
@@ -11203,10 +11204,9 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
     a->vma[vs].shared = 1;
     uint64_t done = 0;
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
-        uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
-        if (!phys || !pmm_refcountable(phys)) break;
-        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) break;
-        pmm_addref(phys);
+        uint64_t phys = drm_map_frame_ref(node, off, i / PAGE_SIZE);   /* referenced for us, atomically */
+        if (!phys) break;
+        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) { pmm_free_frame(phys); break; }
         done = i + PAGE_SIZE;
     }
     if (done != len) {
@@ -11214,9 +11214,9 @@ static uint64_t app_mmap_drm_nl(int fd, uint64_t len, uint64_t off) {
          * vertices into a range whose tail is unmapped and faults on a pointer
          * it was told was valid. */
         for (uint64_t i = 0; i < done; i += PAGE_SIZE) {
-            uint64_t phys = drm_map_frame(off, i / PAGE_SIZE);
+            uint64_t phys = vmm_translate(base + i);   /* what WE mapped, not a fresh lookup a GEM_CLOSE can empty */
             vmm_unmap(base + i);
-            if (phys) pmm_free_frame(phys);
+            if (phys) pmm_free_frame(phys & ~(uint64_t)(PAGE_SIZE - 1));
         }
         vma_release(a, vs);
         return 0;
