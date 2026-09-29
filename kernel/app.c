@@ -11913,20 +11913,40 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 4) {   /* timerfd: read the expiration count (M1217) */
         if (max < 8) return -1;
-        long exp = a->fd[fd].off;
-        if (exp != 0 && (uint64_t)timer_ms() >= (uint64_t)exp) {
-            long interval = a->fd[fd].obj;                                     /* periodic interval (ms); 0 = one-shot */
-            uint64_t count = 1;
-            if (interval > 0) {                                               /* periodic: count missed firings + re-arm */
-                count += ((uint64_t)timer_ms() - (uint64_t)exp) / (uint64_t)interval;
-                a->fd[fd].off = exp + (long)(count * (uint64_t)interval);      /* next future expiry */
-            } else {
-                a->fd[fd].off = 0;                                            /* one-shot: disarm */
+        /* NOT EXPIRED IS NOT EOF. This returned 0 before the first expiry,
+         * and 0 from read() means "there will never be more": a program that
+         * reads a timerfd to wait for it -- the whole point of a blocking one
+         * -- saw end-of-file instead of sleeping. Linux blocks until the timer
+         * fires, or answers EAGAIN on a non-blocking descriptor; never 0.
+         *
+         * The expiry is consumed under the lock settime writes it under, so a
+         * re-arm racing this read cannot be half-seen. The wait is sliced, so
+         * a settime from another thread, a kill, or a close is noticed. */
+        for (;;) {
+            uint64_t f = irq_save();
+            long exp = a->fd[fd].off;
+            uint64_t now = timer_ms();
+            if (exp != 0 && now >= (uint64_t)exp) {
+                long interval = a->fd[fd].obj;                                 /* periodic interval (ms); 0 = one-shot */
+                uint64_t count = 1;
+                if (interval > 0) {                                           /* periodic: count missed firings + re-arm */
+                    count += (now - (uint64_t)exp) / (uint64_t)interval;
+                    a->fd[fd].off = exp + (long)(count * (uint64_t)interval);  /* next future expiry */
+                } else {
+                    a->fd[fd].off = 0;                                        /* one-shot: disarm */
+                }
+                irq_restore(f);
+                for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(count >> (i * 8));   /* expiration count (LE u64) */
+                return 8;
             }
-            for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(count >> (i * 8));   /* expiration count (LE u64) */
-            return 8;
+            irq_restore(f);
+            if (app_fd_nonblock(fd)) return APP_FD_EAGAIN;
+            if (a->kill || a->exited) return -1;
+            uint64_t wait = exp ? (uint64_t)exp - now : 10;                   /* disarmed: wait for a settime */
+            if (wait > 10) wait = 10;
+            task_sleep_ms(wait ? (int)wait : 1);
+            if (!a->fd[fd].used || a->fd[fd].type != 4) return -1;           /* closed under us */
         }
-        return 0;                                                             /* not expired yet */
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 5) {   /* eventfd: read the counter (M1242) */
         if (max < 8) return -1;
@@ -12869,6 +12889,19 @@ long app_timerfd_remaining_ms(int fd) {
     uint64_t now = timer_ms(), due = (uint64_t)a->fd[fd].off;
     return (due > now) ? (long)(due - now) : 0;         /* already expired reads as 0, as on Linux */
 }
+/* Which clock a TFD_TIMER_ABSTIME deadline is measured against: REALTIME is an
+ * epoch time, MONOTONIC is uptime. Kept in `write_end`, which a timerfd has no
+ * other use for. */
+void app_timerfd_set_realtime(int fd, int on) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return;
+    a->fd[fd].write_end = on ? 1 : 0;
+}
+int app_timerfd_is_realtime(int fd) {
+    struct app *a = cur();
+    if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return 0;
+    return a->fd[fd].write_end;
+}
 long app_timerfd_interval_ms(int fd) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return 0;
@@ -12878,8 +12911,11 @@ long app_timerfd_interval_ms(int fd) {
 long app_timerfd_settime(int fd, long delay_ms, long interval_ms) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 4) return -1;
+    if (interval_ms > 0x7fffffffl) interval_ms = 0x7fffffffl;                          /* `obj` is an int */
+    uint64_t f = irq_save();                                                            /* the pair changes together */
     a->fd[fd].off = (delay_ms <= 0) ? 0 : (long)(timer_ms() + (uint64_t)delay_ms);   /* absolute expiry; <=0 disarms */
     a->fd[fd].obj = (delay_ms > 0 && interval_ms > 0) ? (int)interval_ms : 0;         /* periodic interval (ms); 0 = one-shot */
+    irq_restore(f);
     return 0;
 }
 /* eventfd (M1242): a pollable u64-counter fd. The counter lives in the fd's own

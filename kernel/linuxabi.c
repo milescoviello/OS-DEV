@@ -3412,8 +3412,17 @@ static void lx_dispatch_body(struct registers *r) {
      * matters: reading an absolute deadline as a relative one is the same
      * mistake M2010 fixed in FUTEX_WAIT_BITSET. */
     case LXS_timerfd_create_: {             /* (clockid, flags) */
+        /* REALTIME(0), MONOTONIC(1), BOOTTIME(7) and their _ALARM forms
+         * (8, 9) are what Linux accepts; anything else, and any flag but
+         * NONBLOCK|CLOEXEC, is EINVAL. The clock matters for TFD_TIMER_ABSTIME:
+         * a REALTIME deadline is an epoch time, and measuring it against
+         * uptime put it decades away. */
+        if (!(a1 == 0 || a1 == 1 || a1 == 7 || a1 == 8 || a1 == 9) || (r->rsi & ~(uint64_t)0x80800)) {
+            r->rax = (uint64_t)-(long)LX_EINVAL; break;
+        }
         int tfd = app_timerfd_create();
         if (tfd < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
+        app_timerfd_set_realtime(tfd, a1 == 0 || a1 == 8);
         if (r->rsi & 0x800)   app_fd_set_nonblock(tfd, 1);   /* TFD_NONBLOCK */
         if (r->rsi & 0x80000) app_fd_set_cloexec(tfd, 1);    /* TFD_CLOEXEC  */
         r->rax = (uint64_t)tfd;
@@ -3423,14 +3432,26 @@ static void lx_dispatch_body(struct registers *r) {
         if (!r->rdx) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(r->rdx, 32)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         const int64_t *it = (const int64_t *)r->rdx;      /* {interval.sec,nsec, value.sec,nsec} */
+        /* What Linux refuses, refused: a negative time or a nanosecond field
+         * outside [0, 1e9). And seconds are capped (~31 years) so the
+         * conversion below cannot overflow into a negative delay, which would
+         * read as "disarm". */
+        if (it[0] < 0 || it[2] < 0 || it[1] < 0 || it[1] >= 1000000000 || it[3] < 0 || it[3] >= 1000000000) {
+            r->rax = (uint64_t)-(long)LX_EINVAL; break;
+        }
+        if ((r->rsi & ~(uint64_t)3) != 0) { r->rax = (uint64_t)-(long)LX_EINVAL; break; }   /* ABSTIME | CANCEL_ON_SET only */
+        int64_t isec = it[0] > 1000000000ll ? 1000000000ll : it[0];
+        int64_t vsec = it[2] > 1000000000ll ? 1000000000ll : it[2];
         /* Round the nanoseconds UP, for the same reason the futex path does:
          * a sub-millisecond timer must not become a zero-millisecond one,
          * which reads as "disarm" and stops the loop it was driving. */
-        int64_t ival = it[0] * 1000 + (it[1] + 999999) / 1000000;
-        int64_t want = it[2] * 1000 + (it[3] + 999999) / 1000000;
+        int64_t ival = isec * 1000 + (it[1] + 999999) / 1000000;
+        int64_t want = vsec * 1000 + (it[3] + 999999) / 1000000;
         int64_t delay = want;
         if ((it[2] || it[3]) && (r->rsi & 1)) {           /* TFD_TIMER_ABSTIME */
-            int64_t now = (int64_t)timer_ms();
+            int64_t now = app_timerfd_is_realtime((int)a1)   /* the clock the deadline was read from */
+                ? (int64_t)lx_realtime_sec() * 1000 + (int64_t)(timer_ms() % 1000)
+                : (int64_t)timer_ms();
             delay = want - now;
             if (delay <= 0) delay = 1;                    /* already due: fire at once, not never */
         }

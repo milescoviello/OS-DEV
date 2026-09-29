@@ -343,6 +343,8 @@ void app_sync(void);                                        /* whole-system flus
 int  app_timerfd_create(void);                             /* a pollable one-shot timer fd (>=3); -1 (M1217) */
 long app_timerfd_settime(int fd, long delay_ms, long interval_ms);
 long app_timerfd_remaining_ms(int fd);                     /* ms until it fires, 0 = disarmed/expired, -1 = not a timerfd (M2073) */
+void app_timerfd_set_realtime(int fd, int on);             /* its TFD_TIMER_ABSTIME deadlines are epoch times (CLOCK_REALTIME) */
+int  app_timerfd_is_realtime(int fd);
 long app_timerfd_interval_ms(int fd);                      /* its periodic interval in ms, 0 = one-shot (M2073) */  /* arm a timerfd: initial delay + periodic interval (ms; interval 0 = one-shot, delay <=0 disarms); 0/-1 (M1217, periodic M1302) */
 long app_fcntl(int fd, int cmd, long arg);                 /* F_GETFD/SETFD/DUPFD/DUPFD_CLOEXEC (M1218) */
 int  app_dup3(int oldfd, int newfd, int flags);            /* dup w/ O_CLOEXEC; -1 if old==new (M1218) */
