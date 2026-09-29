@@ -2392,6 +2392,7 @@ static int tcp_recv_seg(uint8_t *buf, int max, const uint8_t *dip,
 /* ---------------- reusable TCP stream (for HTTP and, later, TLS) ----------- */
 
 static int ooo_claim(void);       /* claim a fresh reassembly+FIN slot (defined below, M1606) */
+static int ooo_slots(void);       /* how many there are, for the refusal message */
 static void tcp_snd_open(int idx, uint32_t isn, uint32_t peer_wnd);  /* arm the reliable-send state on connect (M1886) */
 
 /* Open a connection to ip:port (routed via the gateway). 0 on success, -1 on
@@ -2453,9 +2454,28 @@ int tcp_connect(tcp_conn *c, const uint8_t ip[4], uint16_t port) {
             if ((fl & TCP_SYN) && (fl & TCP_ACK) && get32(tcp + 8) == c->myseq + 1) {
                 c->theirseq = get32(tcp + 4) + 1;
                 c->myseq += 1;
+                c->ooo_idx = ooo_claim();     /* fresh reassembly + FIN state for this conn, now that we know we need it (M1606) */
+                /* NO RELIABILITY STATE, NO CONNECTION. The slot holds the
+                 * retransmit queue, the reassembly buffer and the FIN, so a
+                 * connection made without one -- the old "graceful degrade"
+                 * when OOO_N ran out -- sent every byte exactly once with no
+                 * retransmission, dropped anything out of order, and never
+                 * saw the peer's FIN, so its reader waited for ever. A
+                 * browser holding dozens of connections can run the table
+                 * out. Refuse instead: reset the half-open connection the
+                 * peer thinks it has, and fail with ENOBUFS. */
+                if (c->ooo_idx < 0) {
+                    tcp_send_seg(c->gw, c->ip, c->sport, port, c->myseq, c->theirseq, TCP_RST | TCP_ACK, 0, 0);
+                    static int told;
+                    if (told++ < 4)
+                        kprintf("[tcp] connect %u.%u.%u.%u:%u REFUSED locally: all %d connection slots "
+                                "are in use, and a connection without one would not be reliable\n",
+                                c->ip[0], c->ip[1], c->ip[2], c->ip[3], port, ooo_slots());
+                    c->errno_hint = ENOBUFS;
+                    return -1;
+                }
                 tcp_send_seg(c->gw, c->ip, c->sport, port, c->myseq, c->theirseq, TCP_ACK, 0, 0);
                 c->up = 1;
-                c->ooo_idx = ooo_claim();     /* fresh reassembly + FIN state for this conn, now that we know we need it (M1606) */
                 tcp_snd_open(c->ooo_idx, c->myseq, get16(tcp + 14));  /* arm reliable send: ISN + peer's advertised window (M1886) */
                 return 0;
             }
@@ -2980,6 +3000,7 @@ struct ooo_state {
     int      in_fastrec;      /* 1 while in fast recovery (inflated cwnd until a new ACK) */
 };
 static struct ooo_state ooo_tab[OOO_N];
+static int ooo_slots(void) { return OOO_N; }
 static volatile int ooo_lock;
 static inline uint64_t ooo_irq_save(void) {
     uint64_t fl;
