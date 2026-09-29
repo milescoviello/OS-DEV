@@ -635,7 +635,20 @@ static int ata_write_drive_impl(int drive, uint32_t lba, uint32_t count, const v
         return ata_write_drive_impl_lba48(drive, lba, count, buf);
     if (g_ata_dma_writes && count <= ATA_DMA_BOUNCE_SECTORS && ata_dma_setup()) {
         int dr = ata_dma_xfer_impl(drive, lba, count, (void *)buf, 1);
-        if (dr >= 0) { io_dma_cmds++; return 0; }
+        if (dr >= 0) {
+            io_dma_cmds++;
+            /* THE SAME FLUSH THE PIO LOOP DOES. DMA is the default write path,
+             * and it returned before ever reaching the FLUSH CACHE below, so
+             * almost no write was flushed -- while the journal's crash
+             * consistency is argued on writes reaching the medium, and the
+             * diskbench "no flush" arm was measuring nothing. */
+            if (g_ata_write_flush) {
+                uint16_t fio = ATA_DRIVES[drive].io;
+                outb(fio + REG_COMMAND, CMD_FLUSH);
+                wait_busy_clear(fio);
+            }
+            return 0;
+        }
         /* Fall through to PIO: a controller that misbehaves costs speed, not
          * correctness -- the same rule the read path states. */
     }
