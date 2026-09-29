@@ -2643,11 +2643,19 @@ static void lx_dispatch_body(struct registers *r) {
             if (!vmm_user_ok(upoff, 8)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
             off = *(long *)upoff;
         }
-        static char sfbuf[4096];            /* the syscall path is serialized; see lx_emit */
+        /* A buffer PER CALL. This was one static 4 KiB buffer, commented as
+         * safe because "the syscall path is serialized" -- it is not: every
+         * core runs syscalls, and app_fd_write to a full pipe BLOCKS mid-copy
+         * with the buffer still in use, so even on one core a second process's
+         * sendfile refilled it. busybox cat uses sendfile by default, and
+         * `cat big | cat > out` came out corrupted. */
+        enum { SFBUF = 4096 };
+        char *sfbuf = (char *)kmalloc(SFBUF);
+        if (!sfbuf) { r->rax = (uint64_t)-(long)LX_ENOMEM; break; }
         long total = 0;
         while ((unsigned long)total < count) {
             unsigned long want = count - (unsigned long)total;
-            if (want > sizeof sfbuf) want = sizeof sfbuf;
+            if (want > SFBUF) want = SFBUF;
             long got = (off >= 0) ? app_pread(ifd, sfbuf, want, off + total)
                                   : app_fd_read(ifd, sfbuf, want);
             if (got <= 0) { if (total == 0 && got < 0) total = got; break; }
@@ -2656,7 +2664,11 @@ static void lx_dispatch_body(struct registers *r) {
             total += put;
             if (put < got) break;           /* short write: stop, report what landed */
         }
+        kfree(sfbuf);
         if (total >= 0 && off >= 0) *(long *)upoff = off + total;
+        /* A native -1 is not an errno: returned raw it read as EPERM. */
+        if (total < 0)
+            total = -(long)((app_fd_is_open(ifd) && app_fd_is_open(ofd)) ? LX_EIO : LX_EBADF);
         r->rax = (uint64_t)total;
         break;
     }
