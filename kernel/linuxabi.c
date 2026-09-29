@@ -673,6 +673,14 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * (/disk2/...), so it must not be translated a second time. */
 #define LX_AT_FDCWD (-100)
 #define LX_AT_SYMLINK_NOFOLLOW 0x100   /* fstatat/statx: stat the name, not a symlink's target */
+/* A STRING ARGUMENT IS VALIDATED TO ITS TERMINATOR, NOT ITS FIRST BYTE. Paths,
+ * socket names and argv/envp were checked with vmm_user_ok(p, 1) and then read
+ * until NUL, so a string running into an unmapped page faulted IN RING 0 --
+ * which panics the machine -- where Linux returns EFAULT. vmm_user_str_ok
+ * checks page by page up to the NUL (faulting demand pages in, so a valid
+ * string in not-yet-touched memory is still accepted). */
+#define LX_STRMAX     4096u          /* PATH_MAX */
+#define LX_ARGSTRMAX  131072u        /* MAX_ARG_STRLEN: one argv/envp string */
 /* WHICH RESOLVER FILES DID GLIBC ACTUALLY LOOK AT (M2128).
  *
  * `getaddrinfo` fails inside OS-DEV while `lxinet`, which builds its own DNS
@@ -1742,7 +1750,7 @@ static void lx_dispatch_body(struct registers *r) {
         int pa = lx_path_arg(re->nr);
         if (pa) {
             uint64_t up = (pa == 1) ? r->rdi : r->rsi;
-            if (up && vmm_user_ok(up, 1)) {
+            if (up && vmm_user_str_ok(up, LX_STRMAX)) {
                 const char *sp = (const char *)up;
                 int ci = 0;
                 while (ci < (int)sizeof re->path - 1 && sp[ci]) { re->path[ci] = sp[ci]; ci++; }
@@ -1929,7 +1937,7 @@ static void lx_dispatch_body(struct registers *r) {
         /* shm_unlink(3) is unlink("/dev/shm/NAME"). Firefox creates its segment
          * with O_EXCL and unlinks it immediately, so without this the next
          * process to want that name collides with a ghost. (M2008) */
-        if (r->rdi && vmm_user_ok(r->rdi, 1)) {
+        if (r->rdi && vmm_user_str_ok(r->rdi, LX_STRMAX)) {
             const char *up_ = (const char *)r->rdi;
             const char *t_ = "/dev/shm/";
             int k_ = 0; while (t_[k_] && up_[k_] == t_[k_]) k_++;
@@ -1943,7 +1951,7 @@ static void lx_dispatch_body(struct registers *r) {
         /* unlinkat shifts its arguments one right, exactly like faccessat. */
         uint64_t up = (r->rax == LXS_unlink_) ? r->rdi : r->rsi;
         const char *upath = (const char *)up;
-        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         /* gcc writes its intermediate .s to a mkstemp'd name and unlinks it
          * when done; without this the driver reported
@@ -1956,7 +1964,7 @@ static void lx_dispatch_body(struct registers *r) {
     case LXS_mkdirat_: {                    /* (dirfd, path, mode) */
         uint64_t up = (r->rax == LXS_mkdir_) ? r->rdi : r->rsi;   /* mkdirat shifts right */
         const char *upath = (const char *)up;
-        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         /* A TRAILING SLASH is legal in mkdir(2) -- `mkdir -p o/kernel/` passes
          * one straight through -- and our VFS path walker treats it as an
@@ -2031,7 +2039,7 @@ static void lx_dispatch_body(struct registers *r) {
          * copy-and-rename or gives up. (M1999) */
         uint64_t uo = (r->rax == LXS_link_) ? r->rdi : r->rsi;
         uint64_t un = (r->rax == LXS_link_) ? r->rsi : r->r10;
-        if (!uo || !un || !vmm_user_ok(uo, 1) || !vmm_user_ok(un, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!uo || !un || !vmm_user_str_ok(uo, LX_STRMAX) || !vmm_user_str_ok(un, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xo[VFS_PATH_MAX], xn[VFS_PATH_MAX];
         const char *op = lx_xlate((const char *)uo, xo, sizeof xo);
         const char *np = lx_xlate((const char *)un, xn, sizeof xn);
@@ -2048,7 +2056,7 @@ static void lx_dispatch_body(struct registers *r) {
          * Getting it backwards produces links that point at themselves. */
         uint64_t ut = r->rdi;
         uint64_t ul = (r->rax == LXS_symlink_) ? r->rsi : r->rdx;
-        if (!ut || !ul || !vmm_user_ok(ut, 1) || !vmm_user_ok(ul, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!ut || !ul || !vmm_user_str_ok(ut, LX_STRMAX) || !vmm_user_str_ok(ul, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xl[VFS_PATH_MAX];
         const char *lp = lx_xlate((const char *)ul, xl, sizeof xl);
         /* The TARGET is not translated: it is the link's contents, a string
@@ -2068,7 +2076,7 @@ static void lx_dispatch_body(struct registers *r) {
          * UTIME_NOW is 0x3fffffff and UTIME_OMIT is 0x3ffffffe, in the
          * NANOSECONDS field -- a value that is not a time at all, which is why
          * they have to be recognised before the seconds are used. */
-        if (!r->rsi || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!r->rsi || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xu[VFS_PATH_MAX];
         const char *up2 = lx_xlate((const char *)r->rsi, xu, sizeof xu);
         long at = -1, mt = -1;                       /* -1 = leave alone */
@@ -2092,7 +2100,7 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_rmdir_: {                      /* (path) */
         const char *upath = (const char *)r->rdi;
-        if (!upath || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(upath, xp, sizeof xp);
         r->rax = (uint64_t)(vfs_remove(path) == 0 ? 0 : -(long)LX_ENOENT);
         break;
@@ -2113,7 +2121,7 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_chdir_: {                      /* (path) */
         const char *up = (const char *)r->rdi;
-        if (!up || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
         if (vfs_chdir(path) != 0) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
         app_chdir_track(path);              /* keep getcwd's answer in step */
@@ -2212,7 +2220,7 @@ static void lx_dispatch_body(struct registers *r) {
          * unlike struct stat. Node stats constantly, and an ENOSYS here makes
          * libuv fall back -- but reporting the size correctly is cheap. */
         const char *up = (const char *)r->rsi;
-        if (!up || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
         struct statx sx;
@@ -2695,7 +2703,7 @@ static void lx_dispatch_body(struct registers *r) {
          * app_memfd_create has existed since M1212; it simply had no Linux
          * number. (M1977) */
         const char *nm = (const char *)r->rdi;
-        if (nm && !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (nm && !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         int mf = app_memfd_create(nm ? nm : "memfd", 0);
         if (mf < 0) { r->rax = (uint64_t)-(long)LX_EMFILE; break; }
         if (r->rsi & 1) app_fd_set_cloexec(mf, 1);      /* MFD_CLOEXEC */
@@ -3257,7 +3265,7 @@ static void lx_dispatch_body(struct registers *r) {
          * "which thread" is the whole question, and every one of them announces
          * its own answer -- "IPC I/O Parent", "Compositor", "JS Helper". Keep
          * it and print it in the thread dump. PR_SET_VMA really is advisory. */
-        if (a1 == 15 /*PR_SET_NAME*/ && r->rsi && vmm_user_ok(r->rsi, 1))
+        if (a1 == 15 /*PR_SET_NAME*/ && r->rsi && vmm_user_str_ok(r->rsi, LX_STRMAX))
             task_set_name((const char *)r->rsi);
         r->rax = 0;
         break;
@@ -4299,7 +4307,7 @@ static void lx_dispatch_body(struct registers *r) {
          * (add_watch, add_watch, ppoll) burning a core with its window never
          * opening, and the ring is what showed it. The native watch mechanism
          * has existed since M1266; only the ABI spelling was missing. */
-        if (!r->rsi || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!r->rsi || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate((const char *)r->rsi, xp, sizeof xp);
         int wd = app_inotify_add((int)a1, path, (unsigned)r->rdx);
         r->rax = (wd < 0) ? (uint64_t)-(long)LX_ENOENT : (uint64_t)wd;
@@ -4570,7 +4578,7 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t ub  = (r->rax == LXS_readlinkat) ? r->rdx : r->rsi;
         uint64_t usz = (r->rax == LXS_readlinkat) ? r->r10 : r->rdx;
         const char *upath = (const char *)up;
-        if (!upath || !vmm_user_ok(up, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(up, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
 
         const char *vis = 0;                 /* the answer, in the process's own view */
         char lbuf[VFS_PATH_MAX];             /* ...when it has to be read off disk */
@@ -4657,7 +4665,7 @@ static void lx_dispatch_body(struct registers *r) {
             r->rsi = p_; r->rdx = f_;
         }
         const char *upath = (const char *)r->rsi;
-        if (!upath || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* honour dirfd (M2032) */
         /* /dev/tty IS THE CONTROLLING TERMINAL (M2004), and we had no such
          * file at all. A TUI does not settle for stdin: Ink -- which is what
@@ -4824,7 +4832,7 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t upath_u = by_path ? r->rdi : r->rsi;
         uint64_t ubuf_u  = by_path ? r->rsi : r->rdx;
         const char *upath = (const char *)upath_u;
-        if (!upath || !vmm_user_ok(upath_u, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!upath || !vmm_user_str_ok(upath_u, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         if (!vmm_user_ok(ubuf_u, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         r->rdx = ubuf_u;                    /* the writes below all go through rdx */
@@ -4876,7 +4884,7 @@ static void lx_dispatch_body(struct registers *r) {
         r->rax = app_fd_is_open((int)a1) ? 0 : (uint64_t)-(long)LX_EBADF;
         break;
     case LXS_rename_: {                     /* (oldpath, newpath) */
-        if (!vmm_user_ok(r->rdi, 1) || !vmm_user_ok(r->rsi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!vmm_user_str_ok(r->rdi, LX_STRMAX) || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char op[VFS_PATH_MAX], np[VFS_PATH_MAX];
         char ox[VFS_PATH_MAX], nx[VFS_PATH_MAX];
         const char *o = lx_xlate((const char *)r->rdi, ox, sizeof ox);
@@ -5094,7 +5102,7 @@ static void lx_dispatch_body(struct registers *r) {
         break;
     case LXS_execve_: {                     /* (path, argv[], envp[]) */
         const char *path = (const char *)r->rdi;
-        if (!path || !vmm_user_ok(r->rdi, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!path || !vmm_user_str_ok(r->rdi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         /* Copy argv/envp into KERNEL memory before exec'ing. The vectors live
          * in the OLD address space, which app_execve_linux tears down partway
          * through -- reading them afterwards would be a use-after-free of an
@@ -5166,7 +5174,7 @@ static void lx_dispatch_body(struct registers *r) {
             unsigned long ao = 0; int atoobig = 0;
             for (; na < LX_EXEC_ARGS && uav[na]; na++) {
                 const char *sp = uav[na];
-                if (!vmm_user_ok((uint64_t)sp, 1)) break;
+                if (!vmm_user_str_ok((uint64_t)sp, LX_ARGSTRMAX)) break;
                 unsigned long len = 0;
                 while (sp[len] && ao + len + 1 < LX_EXEC_POOL) len++;
                 if (sp[len]) { atoobig = 1; break; }     /* pool exhausted, not a short arg */
@@ -5226,7 +5234,7 @@ static void lx_dispatch_body(struct registers *r) {
             unsigned long eo = 0; int etoobig = 0;
             for (; ne < LX_EXEC_ARGS && uev[ne]; ne++) {
                 const char *sp = uev[ne];
-                if (!vmm_user_ok((uint64_t)sp, 1)) break;
+                if (!vmm_user_str_ok((uint64_t)sp, LX_ARGSTRMAX)) break;
                 unsigned long len = 0;
                 while (sp[len] && eo + len + 1 < LX_EXEC_POOL) len++;
                 if (sp[len]) { etoobig = 1; break; }
@@ -5285,8 +5293,8 @@ static void lx_dispatch_body(struct registers *r) {
              * the path, was the one thing never written down. Six children in a
              * row died this way and the log named none of them. */
             kprintf("[linuxabi] execve(\"%s\") -> ENOENT (raw=\"%s\" ptr=%lx readable=%d argv0=\"%s\" na=%d) (child exits 127)\n",
-                    pbuf, (path && vmm_user_ok(r->rdi, 1)) ? path : "<unreadable>",
-                    (unsigned long)r->rdi, (path && vmm_user_ok(r->rdi, 1)) ? 1 : 0,
+                    pbuf, (path && vmm_user_str_ok(r->rdi, LX_STRMAX)) ? path : "<unreadable>",
+                    (unsigned long)r->rdi, (path && vmm_user_str_ok(r->rdi, LX_STRMAX)) ? 1 : 0,
                     a0buf, na);
             r->rax = (uint64_t)-(long)LX_ENOENT;   /* only reached on failure */
         }
@@ -5701,7 +5709,7 @@ static void lx_dispatch_body(struct registers *r) {
     case LXS_faccessat_: {                  /* (path, mode) / (dirfd, path, mode, flags) */
         uint64_t pa = (r->rax == LXS_access_) ? r->rdi : r->rsi;
         const char *up = (const char *)pa;
-        if (!up || !vmm_user_ok(pa, 1)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        if (!up || !vmm_user_str_ok(pa, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate(up, xp, sizeof xp);
         struct statx sx;
         /* Existence only. Everything runs as root here and there are no mode
