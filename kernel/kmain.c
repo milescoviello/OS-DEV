@@ -150,6 +150,21 @@ static int cmdline_has(const char *hay, const char *needle) {
     return 0;
 }
 
+/* ...and as a WHOLE WORD (M2394). `probes` is a substring of `noprobes`, so
+ * the substring match turned `noprobes` into "force the probes", and the line
+ * that lets `probes` beat every skip then cancelled the skip: since M2283
+ * `noprobes` has run the whole suite. A word here ends at a space, the end of
+ * the line, or an `=`. */
+static int cmdline_has_word(const char *hay, const char *needle) {
+    for (const char *p = hay; *p; p++) {
+        if (p != hay && p[-1] != ' ') continue;
+        const char *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b && (!*a || *a == ' ' || *a == '=')) return 1;
+    }
+    return 0;
+}
+
 /* CPU security hardening (M1269): enable SMEP (CR4 bit 20 — the kernel #PFs if it
  * ever tries to EXECUTE a ring-3 page) and UMIP (CR4 bit 11 — ring-3
  * SGDT/SIDT/SLDT/STR/SMSW #GP, closing those kernel-address info leaks), each
@@ -967,7 +982,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * with the probes alone -- so debugging it needs the combination the
          * switch now forbids. `probes` forces them back on; it is parsed
          * AFTER every flag that sets g_noprobes so it always wins. */
-        if (cmdline_has(cl, "probes"))     g_force_probes = 1;
+        if (cmdline_has_word(cl, "probes")) g_force_probes = 1;
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
