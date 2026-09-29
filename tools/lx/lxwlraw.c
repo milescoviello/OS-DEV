@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/uio.h>
+#include <poll.h>
 
 static void put32(unsigned char *p, unsigned v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
 static unsigned get32(const unsigned char *p) { return p[0]|(p[1]<<8)|(p[2]<<16)|((unsigned)p[3]<<24); }
@@ -42,8 +43,30 @@ int main(void) {
         printf("LXWLRAW: write failed\n"); fflush(stdout); return 3;
     }
 
+    /* READ UNTIL THE ROUNDTRIP COMPLETES, as a real client does. The reply is
+     * a byte STREAM: one read() returns whatever had arrived when this thread
+     * woke, which on a multi-core box can be the first global and nothing
+     * else. wl_display.sync's callback (object 3) is sent last, so its
+     * arrival -- not the first read -- is what "the whole handshake" means.
+     * Bounded by poll() timeouts, so a server that never answers fails the
+     * check instead of hanging it. */
     unsigned char buf[1024];
-    ssize_t n = read(fd, buf, sizeof buf);
+    ssize_t n = 0;
+    for (int tries = 0; tries < 50 && n < (ssize_t)sizeof buf; tries++) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        if (poll(&pfd, 1, 200) <= 0) continue;
+        ssize_t got = read(fd, buf + n, sizeof buf - (size_t)n);
+        if (got <= 0) break;
+        n += got;
+        int done = 0;                                  /* has object 3's event arrived whole? */
+        for (int off = 0; off + 8 <= n; ) {
+            unsigned size = get32(buf + off + 4) >> 16;
+            if (size < 8 || off + (int)size > n) break;
+            if (get32(buf + off) == 3) done = 1;
+            off += (int)size;
+        }
+        if (done) break;
+    }
     printf("LXWLRAW: read %zd bytes\n", n);
     if (n <= 0) { fflush(stdout); return 4; }
 
