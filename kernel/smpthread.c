@@ -26,6 +26,7 @@ struct smp_thread {
     smp_thread_fn fn;
     void *arg;
     volatile st_state state;
+    volatile int gone;          /* off its stack for good: join may free it */
     struct smp_thread *next;    /* ring, scoped to ONE core */
 };
 
@@ -37,6 +38,16 @@ struct smp_thread {
 static struct smp_thread *core_ring[ST_MAXCPUS];      /* one thread's "next" pointer per ring */
 static struct smp_thread *core_current[ST_MAXCPUS];   /* who's running on that core right now */
 static uint64_t core_base_rsp[ST_MAXCPUS];            /* that core's ap_main call site, to return to */
+/* A finished thread is still ON ITS STACK after it marks itself ST_DONE: its
+ * final context_switch pushes registers there. So "done" cannot mean "free
+ * it" -- join used to free the stack at ST_DONE, under a thread still
+ * switching off it. Whatever runs next on the core is proof it has left, and
+ * publishes `gone`, the same shape as task.c's core_dying. */
+static struct smp_thread *core_dead[ST_MAXCPUS];
+static void st_reap_prev(int core) {
+    struct smp_thread *d = core_dead[core];
+    if (d) { core_dead[core] = 0; __atomic_store_n(&d->gone, 1, __ATOMIC_RELEASE); }
+}
 static volatile int st_lock;
 static int rr_next = 1;                               /* round-robin spawn target, skip 0 (the BSP) */
 
@@ -48,6 +59,7 @@ static int this_core(void) { return smp_current_cpu() & (ST_MAXCPUS - 1); }
 /* Where a freshly spawned thread begins; `core_current[this_core()]` is
  * already this thread (set under the lock before the first switch-in). */
 static void st_trampoline(void) {
+    st_reap_prev(this_core());           /* before interrupts: we are the next context here */
     interrupts_enable();
     int core = this_core();
     struct smp_thread *me = core_current[core];
@@ -71,6 +83,7 @@ static void st_trampoline(void) {
     }
     core_current[core] = next;
     if (next) next->state = ST_RUNNING;
+    core_dead[core] = me;                /* the next context on this core marks us gone */
     stunlock();
 
     uint64_t discard;
@@ -122,11 +135,12 @@ void smp_thread_yield(void) {
     core_current[core] = next;
     stunlock();
     context_switch(&me->rsp, next->rsp);       /* resumes here once picked again */
+    st_reap_prev(core);
 }
 
 void smp_thread_join(smp_thread_t *t) {
     if (!t) return;
-    while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != ST_DONE)
+    while (!__atomic_load_n(&t->gone, __ATOMIC_ACQUIRE))   /* not ST_DONE: see core_dead */
         __asm__ volatile("pause");
     kstack_free(t->stack_base, ST_STACK);
     kfree(t);
@@ -146,4 +160,5 @@ void smpthread_ap_tick(void) {
     core_current[core] = first;
     stunlock();
     context_switch(&core_base_rsp[core], first->rsp);   /* returns once this core's ring drains */
+    st_reap_prev(core);
 }
