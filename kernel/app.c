@@ -444,6 +444,7 @@ struct app {
                                             * 0 = none. Deliberately NOT inherited on fork/exec, matching real Linux
                                             * (a child must opt in for itself each time) (M1562) */
     int      exit_code;                  /* exit status, captured at SYS_exit */
+    int      kill_sig;                   /* terminated BY this signal (0 = exited): wait reports WIFSIGNALED */
     int      zombie;                     /* exited + resources freed, slot retained until a parent collects it */
     volatile int waiting;                /* this process is blocked in waitpid() */
     int      ns_id;                      /* mount-namespace id (0 = the shared/global namespace); unshare() detaches (M1122) */
@@ -2327,7 +2328,14 @@ static int app_reap_children_of(struct app *me) {
  * exist but none is ready, which is what Linux does and what an event loop
  * polling its subprocesses depends on -- see the LXS_wait4_ case, which until
  * M2025 discarded the options argument and so blocked forever on WNOHANG. */
-long app_wait4(int pid, int *status, int nohang) {
+/* The caller is about to exit because of `sig` (a fatal self-signal). */
+void app_note_kill_sig(int sig) { struct app *a = cur(); if (a) a->kill_sig = sig; }
+
+long app_wait4_sig(int pid, int *status, int *killsig, int nohang);
+long app_wait4(int pid, int *status, int nohang) { return app_wait4_sig(pid, status, 0, nohang); }
+/* As app_wait4, and also reports the signal that killed the child (0 if it
+ * exited), which the Linux wait status encodes separately (WIFSIGNALED). */
+long app_wait4_sig(int pid, int *status, int *killsig, int nohang) {
     struct app *me = cur();
     if (!me) return -1;
     for (;;) {
@@ -2348,10 +2356,11 @@ long app_wait4(int pid, int *status, int nohang) {
             if (c->exited) finishing = 1;
         }
         if (z) {
-            int code = z->exit_code, cpid = z->pid;
+            int code = z->exit_code, cpid = z->pid, ks = z->kill_sig;
             z->used = 0; z->zombie = 0;            /* collect the zombie slot */
             irq_restore(f);
             if (status) *status = code;
+            if (killsig) *killsig = ks;
             return cpid;
         }
         if (!have) { irq_restore(f); return -1; }  /* no matching children to wait for */
@@ -2388,7 +2397,7 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
             if (c->zombie) { z = c; break; }
         }
         if (z) {
-            int code = z->exit_code, cpid = z->pid;
+            int code = z->exit_code, cpid = z->pid, ks = z->kill_sig;
             /* WNOWAIT MEANS LOOK, DO NOT TAKE (M2106).
              *
              * Chromium's process watcher -- which is Firefox's -- peeks at a
@@ -2404,8 +2413,8 @@ long app_waitid(int idtype, int id, struct siginfo *si, int options) {
              * about. */
             if (!(options & WNOWAIT)) { z->used = 0; z->zombie = 0; }   /* collect the zombie slot */
             irq_restore(f);
-            if (si) { si->si_signo = SIGCHLD; si->si_errno = 0; si->si_code = CLD_EXITED;
-                      si->si_pid = cpid; si->si_uid = 0; si->si_status = code; }
+            if (si) { si->si_signo = SIGCHLD; si->si_errno = 0; si->si_code = ks ? CLD_KILLED : CLD_EXITED;
+                      si->si_pid = cpid; si->si_uid = 0; si->si_status = ks ? ks : code; }
             return 0;
         }
         if (!have) { irq_restore(f); return -1; }  /* no matching children */
@@ -8892,11 +8901,37 @@ int app_signal_deliver(struct registers *r, int signo) {
  * Kept in app.c because the decision needs struct app: whether a handler is
  * installed, whether it is SIG_IGN, and what the default action is. The ABI
  * layer should not be reaching into any of that. */
+static int app_raise_one(struct app *me, struct app *t, int signo);
+/* kill(2)'s pid argument names a TARGET SET, not just a process: > 0 is that
+ * process, 0 the caller's process group, -1 every process but init and the
+ * caller, < -1 the group -pid. This used to map every pid <= 0 to the caller,
+ * so a supervisor that signalled its child's group -- `kill(-pgid, SIGTERM)`,
+ * which is how make, timeout and every job-control shell stop a pipeline --
+ * signalled ITSELF, and the group was never touched. For a set: 1 if the
+ * caller was a member and must now terminate, else 0; -1 if nothing matched. */
 int app_raise_signal_to(int pid, int signo) {
     struct app *me = cur();
     if (signo <= 0 || signo >= APP_NSIG) return -1;
-    struct app *t = (pid <= 0 || (me && pid == me->pid)) ? me : app_by_pid(pid);
-    if (!t) return -1;
+    if (pid > 0) {
+        struct app *t = (me && pid == me->pid) ? me : app_by_pid(pid);
+        return t ? app_raise_one(me, t, signo) : -1;
+    }
+    int grp = pid == 0 ? (me ? me->pgid : 0) : -pid;
+    int found = 0, self_dies = 0;
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app *t = &apps[i];
+        if (!t->used || t->exited || t->zombie) continue;
+        if (pid == -1) { if (t == me || t->pid == 1) continue; }
+        else if (t->pgid != grp) continue;
+        found = 1;
+        if (t == me) continue;                               /* the caller last: it may have to die */
+        app_raise_one(me, t, signo);
+    }
+    if (me && !me->exited && pid != -1 && me->pgid == grp)
+        self_dies = (app_raise_one(me, me, signo) == 1);
+    return found ? self_dies : -1;
+}
+static int app_raise_one(struct app *me, struct app *t, int signo) {
     if (t->sig_handler[signo] == APP_SIG_IGN) return 0;      /* explicitly ignored: discard */
     if (t->sig_handler[signo]) { app_request_signal((app_t *)t, signo); return 0; }
     /* SIG_DFL. The signals whose default action is to terminate -- everything
@@ -8906,7 +8941,13 @@ int app_raise_signal_to(int pid, int signo) {
     case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
     case 9: case 11: case 13: case 14: case 15: case 24: case 25: case 31:
         if (t == me) return 1;
-        t->kill = 1;                                         /* cooperative terminate, as the OOM killer does */
+        /* kill_sig makes this a SIGNAL death: app_deliver_pending ends the
+         * process on its next return to ring 3. `kill` alone is only read by
+         * the native syscalls' cooperative checks, so a Linux process -- a
+         * hung Firefox, a child a parent timed out -- got 0 back from kill
+         * and kept running. */
+        t->kill_sig = signo;
+        t->kill = 1;
         if (t->task) task_wake((task_t *)t->task);
         return 2;
     default:
@@ -9032,6 +9073,7 @@ int app_raise_signal_to_thread(int pid, int tid, int signo) {
     case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
     case 9: case 11: case 13: case 14: case 15: case 24: case 25: case 31:
         if (th == task_self()) return 1;
+        t->kill_sig = signo;                             /* see app_raise_one */
         t->kill = 1;
         if (t->task) task_wake((task_t *)t->task);
         return 2;
@@ -9383,6 +9425,16 @@ int app_deliver_pending(struct registers *r) {
                                               * sched_init (current==NULL) and on kernel tasks -> guard */
     if (!t || !t->proc) return 0;
     struct app *a = (struct app *)t->proc;
+    /* KILLED BY A SIGNAL: die here, on the way back to user code. This runs
+     * on every interrupt and syscall return, so it catches a process spinning
+     * in ring 3 as well as one woken from a blocking call. Only for a signal
+     * kill: the WM's close request (kill without kill_sig) stays cooperative. */
+    if (a->kill && a->kill_sig && (r->cs & 3) == 3) {
+        if (!a->exit_code) a->exit_code = 128 + a->kill_sig;
+        a->exited = 1;
+        app_stop_siblings(a);
+        task_exit();
+    }
     task_t *th = task_self();
     uint64_t thp = th ? th->sig_pending : 0;
     uint64_t thb = th ? th->sig_blocked : 0;
@@ -9883,6 +9935,7 @@ void app_fault_current(struct registers *r) {
          * a fault reported SUCCESS to anything that waited on it -- which is
          * how a crashed `as` came back as "as --version -> 0". (M1956) */
         a->exit_code = 139;
+        a->kill_sig = 11;                    /* and wait says so: WIFSIGNALED, WTERMSIG == SIGSEGV */
         /* ...and its threads die with it (M1999). A process killed by SIGSEGV
          * has to end its siblings for exactly the reason a process that exits
          * cleanly does: app_reap is about to free the address space they are
@@ -9919,7 +9972,8 @@ int app_oom_kill(void) {
         if (s > best) { best = s; victim = a; }
     }
     if (!victim) return -1;
-    victim->kill = 1;                                     /* cooperative terminate */
+    victim->kill_sig = 9;                                 /* a SIGKILL death: ends even a Linux process (see app_raise_one) */
+    victim->kill = 1;
     if (victim->task) task_wake((task_t *)victim->task);  /* unblock it so it notices + exits */
     kprintf("[oom] reclaiming memory: killed pid %d (score %ld pages)\n", victim->pid, best);
     return victim->pid;

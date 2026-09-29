@@ -2172,6 +2172,7 @@ static void lx_dispatch_body(struct registers *r) {
             lx_fatal_record(app_sys_getpid(), sig);
             lx_trace_dump(sig == 6 ? "abort()" : "the fatal signal");
             lx_user_backtrace(r);
+            app_note_kill_sig(sig);             /* a signal death, for the parent's wait status */
             app_sys_exit(128 + sig);
             break;
         }
@@ -5286,7 +5287,8 @@ static void lx_dispatch_body(struct registers *r) {
          * (M2012) and eventfd2's (M2017). WNOHANG means "look, do not block",
          * and an event loop that polls its children with it was instead parked
          * forever on the first call. */
-        long got = app_wait4((int)a1, &st, ((int)a3 & LX_WNOHANG) != 0);
+        int ks = 0;
+        long got = app_wait4_sig((int)a1, &st, &ks, ((int)a3 & LX_WNOHANG) != 0);
         if (got < 0) { r->rax = (uint64_t)-(long)LX_ECHILD; break; }
         if (got == 0) { r->rax = 0; break; }   /* WNOHANG: children exist, none ready */
         if (r->rsi) {
@@ -5295,8 +5297,15 @@ static void lx_dispatch_body(struct registers *r) {
              * for the terminating signal, which is what WEXITSTATUS/WIFEXITED
              * decode. Handing back the raw code would make WIFEXITED false and
              * WEXITSTATUS read as 0 -- a silently wrong status, not an error. */
-            *(int *)r->rsi = (st & 0xFF) << 8;
+            /* ...and a child KILLED by a signal has just that signal in the
+             * low 7 bits (WIFSIGNALED / WTERMSIG); reporting 128+sig as an
+             * exit code made every such death look like a normal exit. */
+            *(int *)r->rsi = ks ? (ks & 0x7F) : ((st & 0xFF) << 8);
         }
+        /* struct rusage (144 bytes): not tracked per child, so report zeros
+         * rather than leave the caller's uninitialised stack in it. */
+        if (r->r10 && vmm_user_ok(r->r10, 144))
+            for (int i = 0; i < 144; i++) ((uint8_t *)r->r10)[i] = 0;
         r->rax = (uint64_t)got;
         break;
     }
@@ -5340,7 +5349,7 @@ static void lx_dispatch_body(struct registers *r) {
             if (si.si_pid) {
                 *(int *)(o + 0)  = 17;            /* si_signo = SIGCHLD */
                 *(int *)(o + 4)  = 0;             /* si_errno */
-                *(int *)(o + 8)  = 1;             /* si_code = CLD_EXITED */
+                *(int *)(o + 8)  = si.si_code;    /* CLD_EXITED, or CLD_KILLED with si_status = the signal */
                 *(int *)(o + 16) = si.si_pid;     /* si_pid */
                 *(int *)(o + 20) = 0;             /* si_uid */
                 *(int *)(o + 24) = si.si_status;  /* si_status */

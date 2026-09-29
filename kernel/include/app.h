@@ -403,6 +403,8 @@ void   app_setcolor(int idx);           /* set the calling app's text colour (pa
 void   app_sys_exit(int code);          /* records the exit status; does not return */
 long   app_waitpid(int pid, int *status);   /* block until a child (pid, or -1=any) exits; returns its pid + *status (M1117) */
 long   app_wait4(int pid, int *status, int nohang);   /* wait4, honouring WNOHANG (M2025) */
+long   app_wait4_sig(int pid, int *status, int *killsig, int nohang);   /* ...and the signal that killed it (0 = exited) */
+void   app_note_kill_sig(int sig);                    /* the caller exits BY this signal (wait: WIFSIGNALED) */
 void   app_fault_current(struct registers *r);  /* a ring-3 task faulted: dump a core, kill it, keep the kernel alive; no return */
 void   app_core_dump(struct registers *r);      /* write an ET_CORE ELF of the faulting app to /tmp/core (M1104) */
 
