@@ -434,6 +434,11 @@ static struct { uint8_t buf[ORING_MAX]; int len; uint64_t at; } g_oring[ORING_N]
     }
 RXQ_LOCK(udpq)
 RXQ_LOCK(oring)
+/* ...and the TCP park ring, which every core and net_rx_service use as well
+ * and which had no lock: two park_puts could claim one slot (a lost segment,
+ * or one frame's header over another's payload) and an eviction could
+ * overwrite a slot while park_take was copying it out. */
+RXQ_LOCK(park)
 
 static void oring_put_u(const uint8_t *f, int len) {
     if (len <= 0 || len > ORING_MAX) return;
@@ -2215,8 +2220,13 @@ static int park_matches(const uint8_t *f, int len, const uint8_t *dip,
 uint64_t g_park_evicted;                  /* frames thrown away because the ring was full (M2022) */
 static void park_put(const uint8_t *f, int len) {
     if (len <= 0 || len > PARK_MAX) return;
+    uint64_t pfl = park_take_lk();
+    /* The clock is read UNDER the lock: every parked frame's `at` was set
+     * under it too, so at <= now always. Read before, another core's newer
+     * frame made `now - at` wrap, and the freshest segment expired at once
+     * (the M2124 bug class). */
     uint64_t now = timer_ticks();
-    int slot = -1;
+    int slot = -1, evicted = 0;
     for (int i = 0; i < PARK_N; i++) {
         if (g_park[i].len && now - g_park[i].at > PARK_TTL) g_park[i].len = 0;  /* expire */
         if (!g_park[i].len && slot < 0) slot = i;
@@ -2226,6 +2236,7 @@ static void park_put(const uint8_t *f, int len) {
                                            * lost TCP segment, which is the most
                                            * expensive kind of quiet. (M2022) */
         g_park_evicted++;
+        evicted = 1;
         /* SAY SO WHERE SOMEONE WILL SEE IT (M2336). M2022 wrote "a silent
          * eviction here is a silently lost TCP segment, which is the most
          * expensive kind of quiet" -- and then incremented a counter that
@@ -2238,12 +2249,7 @@ static void park_put(const uint8_t *f, int len) {
          * card, a new connection's handshake reply can be thrown away before
          * tcp_connect's park_take reaches it -- so connect() times out and a
          * tab opened after startup can never load anything. */
-        if (g_park_evicted == 1 || g_park_evicted == 10 ||
-            g_park_evicted == 100 || g_park_evicted == 1000 ||
-            (g_park_evicted % 5000) == 0)
-            kprintf("[park] ** the TCP park ring is FULL: %lu segment(s) evicted "
-                    "(%d slots). An evicted SYN-ACK is a connection that cannot "
-                    "be opened. **\n", (unsigned long)g_park_evicted, PARK_N);
+        /* (printed below, once the lock is released) */
         /* EVICT SOMETHING RE-SENDABLE. A data segment that goes missing is
          * retransmitted by the peer; a SYN-ACK that goes missing costs the
          * whole connection, because tcp_connect gives up after four SYNs. So
@@ -2272,13 +2278,20 @@ static void park_put(const uint8_t *f, int len) {
     memcpy(g_park[slot].buf, f, (size_t)len);
     g_park[slot].len = len;
     g_park[slot].at  = now;
+    uint64_t ev = g_park_evicted;
+    park_give_lk(pfl);
+    if (evicted && (ev == 1 || ev == 10 || ev == 100 || ev == 1000 || (ev % 5000) == 0))
+        kprintf("[park] ** the TCP park ring is FULL: %lu segment(s) evicted "
+                "(%d slots). An evicted SYN-ACK is a connection that cannot "
+                "be opened. **\n", (unsigned long)ev, PARK_N);
 }
 
 /* Take a parked frame for this connection, if one is waiting. Returns its length
  * (copied into `buf`) or 0. */
 static int park_take(uint8_t *buf, int max, const uint8_t *dip,
                      uint16_t sport, uint16_t dport) {
-    uint64_t now = timer_ticks();
+    uint64_t pfl = park_take_lk();
+    uint64_t now = timer_ticks();                /* under the lock: see park_put */
     for (int i = 0; i < PARK_N; i++) {
         if (!g_park[i].len) continue;
         if (now - g_park[i].at > PARK_TTL) { g_park[i].len = 0; continue; }
@@ -2286,9 +2299,11 @@ static int park_take(uint8_t *buf, int max, const uint8_t *dip,
         int n = g_park[i].len; if (n > max) n = max;
         memcpy(buf, g_park[i].buf, (size_t)n);
         g_park[i].len = 0;
+        park_give_lk(pfl);
         synack_trace(SA_TAKE, buf, n);
         return n;
     }
+    park_give_lk(pfl);
     return 0;
 }
 
