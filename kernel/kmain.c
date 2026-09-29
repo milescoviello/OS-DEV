@@ -4040,6 +4040,9 @@ void kmain(uint64_t mb_info, uint64_t magic) {
      * nothing else in the tree would notice. Asserted by
      * tests/run-ipc-tests.sh, which already boots headless and greps COM1. */
     app_memfd_selftest();
+    /* ...and only then the thread that frees dead memfds' frames, so the
+     * self-test's own reclaim step is the only one that can touch its object. */
+    { extern void app_memfd_start_reclaimer(void); app_memfd_start_reclaimer(); }
     /* UNCONDITIONAL: three page-table walks, and the invariant it guards is a
      * kernel panic under memory pressure (M2159). */
     { extern void vmm_hhdm_selftest(void); vmm_hhdm_selftest(); }

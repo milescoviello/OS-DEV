@@ -6006,6 +6006,11 @@ void app_cow_quarantine_flush(struct app *a) {
 }
 
 unsigned long g_tlb_sync_fail;   /* shootdowns that did NOT get every ack (M2107) */
+/* `a` must be the CURRENT process, or one with no thread on any core: the
+ * "no worker threads, so this core's invlpg was enough" shortcut below is only
+ * true when the one thread is running HERE. Rewriting another live process's
+ * page tables and syncing it through this is wrong -- its main task can be on
+ * another core -- which is one of the reasons memfd growth stopped doing so. */
 static int app_tlb_sync(struct app *a) {
     if (!a) return 1;
     for (int i = 0; i < APP_MAXTHREAD; i++)
@@ -10658,59 +10663,79 @@ static int fd_pipe_idx(struct app *a, int fd, int want_write) {   /* validate + 
 }
 
 /* ---- memfd: anonymous, sealable memory-backed file objects (M1212) ------------
- * A small global table of growable kheap-backed buffers, referenced by the fd
+ * A small global table of growable page-backed objects, referenced by the fd
  * table as type 3 (obj = memfd index). Distinct from mseal (M1153, which seals
  * virtual-ADDRESS ranges): these are FILE objects carrying one-way F_SEAL_* flags
  * (WRITE/SHRINK/GROW/SEAL). Refcounted across fork/dup2 exactly like a pipe. */
 #define NMEMFD 256      /* Firefox wants one /dev/shm object per content process, plus GTK's pools (M2008) */
-#define MEMFD_MAX (16ul * 1024 * 1024)   /* 16 MiB per object (kheap-bounded) */
-/* `raw` is the allocation; `buf` is the PAGE-ALIGNED view inside it, and the
- * capacity is a whole number of pages. Both are needed to mmap a memfd
- * (M1977): mapping it into a process means aliasing its pages, which requires
- * the region to start on a page boundary AND to own every page it spans --
- * otherwise the last page could be shared with an unrelated kernel allocation
- * and get handed to userspace along with it.
+#define MEMFD_MAX (16ul * 1024 * 1024)   /* 16 MiB per object: the stride of its window, below */
+/* A MEMFD NEVER MOVES.
  *
- * `mapped` freezes the size once a process has mapped it. Growing would
- * kmalloc a new buffer and copy, leaving every existing mapping pointing at
- * freed memory. wl_shm sizes a pool once and then maps it, so refusing is
- * both correct and sufficient. */
-unsigned long g_memfd_remapped;   /* pages re-pointed after a mapped memfd grew (M2200) */
-unsigned long g_memfd_unretired;  /* retired buffers freed again because nothing aliased them (M2226) */
+ * Every object owns a fixed 16 MiB slot of kernel virtual address space, and
+ * its contents are whole PMM frames mapped into the front of that slot, one
+ * page per frame. Growing maps more frames at the end, and nothing that
+ * already exists changes: not the address, not a single frame.
+ *
+ * It used to be one kmalloc'd buffer, and every property of the object
+ * followed from that choice, badly. A grow had to allocate a bigger buffer and
+ * copy, and every pointer into the old one then had to be chased down:
+ *
+ *  - a process's mmap aliased the old pages, so the old buffer was RETIRED
+ *    rather than freed (M2082), then each mapping was RE-POINTED at the new
+ *    buffer (M2200), then the retired buffer was freed once all were moved
+ *    (M2226). The re-pointing rewrote OTHER processes' page tables, under no
+ *    lock that their munmap, exec or exit takes, so it could map a frame into
+ *    an address space being destroyed, or back into a range just unmapped.
+ *    Its TLB sync also skipped processes with no worker threads, so their
+ *    main thread kept writing the retired buffer from another core.
+ *  - the COMPOSITOR keeps plain pointers into the object (a wl_shm pool, each
+ *    buffer cut from it, each surface's committed frame). A grow of an object
+ *    no process had mapped -- or the M2226 free -- handed that memory back to
+ *    the heap while the window manager was still blitting from it.
+ *  - two concurrent grows each copied, each retired or freed `raw`: a double
+ *    kfree.
+ *
+ * With a fixed address all three are impossible by construction. The frames
+ * come from the PMM, so they are refcounted the same way every other user page
+ * is, and a mapping takes one reference per page as before (M1985).
+ *
+ * `cap` is npg whole pages. `size` is the file length and never exceeds it.
+ * `buf` is the slot's address once it has a page, and 0 before, which is what
+ * "the object has no buffer" has always meant to the callers that test it. */
+#define MEMFD_WIN_BASE 0xFFFF903000000000ull   /* 4 GiB in the shared PML4[288], between the kheap and kstack windows */
+#define MEMFD_WIN(idx) (MEMFD_WIN_BASE + (uint64_t)(idx) * MEMFD_MAX)
+unsigned long g_memfd_grown;      /* pages mapped into memfd objects */
+unsigned long g_memfd_reclaimed;  /* pages handed back to the PMM after an object died */
+unsigned long g_memfd_leaked;     /* pages kept because a shootdown was not acknowledged */
 
-/* RETIRED BUFFERS: how a MAPPED memfd is allowed to grow at all (M2082).
- *
- * Growing means kmalloc'ing a bigger buffer and copying, and the old buffer's
- * pages are ALIASED INTO USERSPACE by every live mmap of the object. kfree()ing
- * it hands those pages back to the kernel heap while a process still has them
- * mapped read-write, so growth was simply refused whenever `mapped` was set.
- *
- * Refusing is safe and wrong. Resizing an already-mapped pool is what every
- * wl_shm client does -- libwayland-cursor's shm_pool_resize and Firefox's
- * WaylandShmPool::Resize are both posix_fallocate/ftruncate on a mapped fd,
- * followed by munmap + mmap -- and wayland.c's own M2058 comment records the
- * consequence: the client's grow fails, it sends wl_shm_pool.resize anyway, and
- * the compositor has to answer with a FATAL protocol error. Firefox's startup
- * makes this call 107 times and gets ENOSPC every time.
- *
- * So don't free the old buffer: RETIRE it. It stays allocated, so the live
- * mapping keeps pointing at memory that is still ours, and it is released when
- * the object itself dies -- which cannot happen while a mapping exists, because
- * a mapping holds a reference (see app_mmap_memfd_nl's ownership note).
- *
- * Sixteen slots is more than the number of doublings from one page to
- * MEMFD_MAX, so the array cannot be the limit in practice; if it ever is, the
- * old refusal is what happens, which is exactly as safe as before. */
-#define MEMFD_RETIRED_N 16
 static struct memfd { int used, refs; unsigned seals; unsigned long size, cap;
-                      char *buf, *raw; int mapped; char name[64];
-                      char *retired[MEMFD_RETIRED_N]; int nretired;
+                      char *buf; int mapped; char name[64];
+                      int npg;            /* frames mapped at the front of the slot */
+                      /* 1 = dead, its frames still mapped and waiting for
+                       * memfd_reclaim; 2 = being reclaimed. A draining slot is
+                       * not free: reusing it would hand a new object the old
+                       * one's frames through a TLB entry another core still
+                       * holds. */
+                      int drain;
+                      /* Serialises growth, and each size change that goes with
+                       * one. Spin-then-yield, held across frame allocation and
+                       * vmm_map but never across anything that can sleep on
+                       * I/O. Always taken BEFORE a VMA lock, never inside one. */
+                      volatile int glk;
                       /* POSIX shared memory (M2008): a memfd is anonymous, but
                        * /dev/shm/NAME is the same object to everyone who opens
                        * that name. `named` marks the ones that are reachable by
                        * name, so memfd_create's anonymous objects never collide
                        * with them. */
                       int named; } memfds[NMEMFD];
+static volatile int g_memfd_draining;   /* how many slots have drain != 0 */
+
+static void memfd_glk_take(struct memfd *m) {
+    uint32_t spins = 0;
+    while (__atomic_exchange_n(&m->glk, 1, __ATOMIC_ACQUIRE))
+        if (++spins >= 1000) { spins = 0; task_yield(); }
+}
+static void memfd_glk_give(struct memfd *m) { __atomic_store_n(&m->glk, 0, __ATOMIC_RELEASE); }
 
 static inline uint64_t memfd_lock_take(void);
 static inline void memfd_lock_give(uint64_t f);
@@ -10724,26 +10749,24 @@ static inline void memfd_lock_give(uint64_t f);
  * like an allocator rather than like shared state.
  *
  * The count is taken here too, under the same lock, so it cannot report a
- * half-initialised slot. */
-static int memfd_alloc(const char *name) {
+ * half-initialised slot. Caller holds g_memfd_lock. */
+static int memfd_claim_nl(const char *name, int *live_out) {
     int got = -1, live = 0;
-    char nm[32]; nm[0] = 0;
-    uint64_t f = memfd_lock_take();
-    for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used) {
+    for (int i = 0; i < NMEMFD; i++) if (!memfds[i].used && !memfds[i].drain) {
         struct memfd *m = &memfds[i];
         m->used = 1; m->refs = 1; m->seals = 0; m->size = 0; m->cap = 0;
-        m->buf = 0; m->raw = 0; m->mapped = 0;
-        m->nretired = 0;
-        for (int k = 0; k < MEMFD_RETIRED_N; k++) m->retired[k] = 0;
+        m->buf = 0; m->mapped = 0; m->npg = 0; m->named = 0;
         int j = 0; if (name) while (name[j] && j < (int)sizeof m->name - 1) { m->name[j] = name[j]; j++; }
         m->name[j] = 0;
-        for (j = 0; m->name[j] && j < (int)sizeof nm - 1; j++) nm[j] = m->name[j];
-        nm[j] = 0;
         got = i;
         break;
     }
     if (got >= 0) for (int k = 0; k < NMEMFD; k++) if (memfds[k].used) live++;
-    memfd_lock_give(f);
+    if (live_out) *live_out = live;
+    return got;
+}
+/* What a claim has to say, printed after the lock is dropped. */
+static void memfd_claim_note(int got, int live, const char *name) {
     if (got < 0) {
         /* THE TABLE IS FULL, AND SAYING SO IS THE WHOLE POINT. Every caller
          * turns this -1 into an errno of its own and none of them can say
@@ -10754,7 +10777,7 @@ static int memfd_alloc(const char *name) {
                     "refusing to create '%s'. Something is not giving references back.\n",
                     NMEMFD, name ? name : "(anon)");
         }
-        return -1;
+        return;
     }
     /* A HIGH-WATER MARK, NOT A PER-CALL LINE (M2087). A leak of one object per
      * operation is invisible in a per-operation log -- the lines all look the
@@ -10762,13 +10785,26 @@ static int memfd_alloc(const char *name) {
      * NMEMFD and the table is then exhausted for the rest of the boot. A
      * correct create/destroy cycle never moves it at all, so a healthy boot
      * prints a handful of lines and a leaking one prints a staircase. */
-    {   static int peak;
-        if (live > peak) {
-            peak = live;
-            kprintf("[memfd] %d of %d shared-memory objects live (new peak) -- '%s'\n",
-                    live, NMEMFD, nm);
-        }
+    static int peak;
+    if (live > peak) {
+        peak = live;
+        kprintf("[memfd] %d of %d shared-memory objects live (new peak) -- '%s'\n",
+                live, NMEMFD, name ? name : "(anon)");
     }
+}
+static void memfd_reclaim(void);
+static int memfd_alloc(const char *name) {
+    int live = 0;
+    uint64_t f = memfd_lock_take();
+    int got = memfd_claim_nl(name, &live);
+    memfd_lock_give(f);
+    if (got < 0 && __atomic_load_n(&g_memfd_draining, __ATOMIC_ACQUIRE)) {
+        memfd_reclaim();                 /* dead objects are holding slots: free them now */
+        f = memfd_lock_take();
+        got = memfd_claim_nl(name, &live);
+        memfd_lock_give(f);
+    }
+    memfd_claim_note(got, live, name);
     return got;
 }
 /* THE memfd REFCOUNT IS SHARED ACROSS PROCESSES, so it needs a lock (M2043).
@@ -10777,14 +10813,8 @@ static int memfd_alloc(const char *name) {
  * designed to be shared -- inherited across fork, passed over a socket with
  * SCM_RIGHTS, opened by name under /dev/shm. Two cores dropping the last two
  * references at once can both read 2, both compute 1, and both store 1: the
- * object leaks a slot out of NMEMFD for the rest of the boot.
- *
- * The worse case is both reading 1. Then both compute 0 and both run
- * `kfree(raw)` -- a DOUBLE FREE of kernel-heap memory, which corrupts the
- * allocator's own free list. After that any unrelated kmalloc anywhere in the
- * kernel can return an overlapping block, which is a fully generic mechanism
- * for "memory that has nothing to do with this reads back wrong". That is the
- * shape of the corruption being hunted, and this is one way to produce it.
+ * object leaks a slot out of NMEMFD for the rest of the boot. If both read 1,
+ * both tear it down.
  *
  * One lock around the count and the teardown it guards. Same irq_save + spin
  * idiom the rest of this file uses. */
@@ -10824,187 +10854,99 @@ long app_memfd_size(int fd) {
     if (idx < 0 || idx >= NMEMFD || !memfds[idx].used) return -1;
     return (long)memfds[idx].size;
 }
+/* The last reference: the object is dead, but its frames stay mapped in its
+ * slot until memfd_reclaim has shot down every core's TLB. That is not done
+ * here, because this runs from munmap, exit, exec, close and the compositor,
+ * and some of those hold locks that other cores spin on with interrupts off --
+ * a shootdown from there waits out its whole timeout and then cannot free
+ * anything anyway. */
 static void memfd_unref(int idx) {
     if (idx < 0 || idx >= NMEMFD) return;
-    /* Decide who frees UNDER the lock, and take the buffer pointer with us, so
-     * exactly one caller can ever reach the kfree for a given object. (M2043) */
-    void *doomed = 0;
-    /* ...and every buffer this object OUTGREW while it was mapped (M2082).
-     * Taken under the same lock and by the same single winner, for the same
-     * reason the live buffer is: reaching refs==0 means no fd and no MAPPING
-     * holds the object any more, so nothing can still be aliasing these. */
-    void *retired[MEMFD_RETIRED_N]; int nret = 0;
     uint64_t f = memfd_lock_take();
-    if (memfds[idx].used && --memfds[idx].refs <= 0) {
-        doomed = memfds[idx].raw;
-        for (int k = 0; k < memfds[idx].nretired; k++) retired[nret++] = memfds[idx].retired[k];
-        memfds[idx].nretired = 0;
-        for (int k = 0; k < MEMFD_RETIRED_N; k++) memfds[idx].retired[k] = 0;
-        memfds[idx].used = 0; memfds[idx].buf = 0; memfds[idx].raw = 0;
-        memfds[idx].mapped = 0; memfds[idx].size = memfds[idx].cap = 0;
+    struct memfd *m = &memfds[idx];
+    if (m->used && --m->refs <= 0) {
+        m->used = 0; m->buf = 0; m->mapped = 0; m->size = m->cap = 0;
+        if (m->npg) { m->drain = 1; __atomic_fetch_add(&g_memfd_draining, 1, __ATOMIC_ACQ_REL); }
     }
     memfd_lock_give(f);
-    if (doomed) kfree(doomed);            /* outside the lock: kfree can be slow */
-    for (int k = 0; k < nret; k++) kfree(retired[k]);
 }
-/* Ensure cap >= need (doubling), preserving the first `size` bytes. 0/-1.
+/* Give dead objects' frames back: unmap them from their slots, make every core
+ * forget the translations, and only then free them -- the carve_drain rule
+ * (M2107): a frame freed before the shootdown is acknowledged is a frame
+ * another core can still write. If it is not acknowledged the frames are kept
+ * forever, which costs memory and nothing else.
  *
- * A MAPPED object can grow now (M2082). Two things make that safe, and the
- * first one is what makes it cheap:
- *
- *  - Growth WITHIN the existing capacity moves nothing. That is the
- *    `need <= m->cap` line, and it was always there -- what was missing was any
- *    reason for the capacity to be bigger than the exact first request. A pool
- *    asked for 2304 bytes got one page, so the very next resize had to
- *    reallocate. A mapped object that must move once is given room to grow
- *    several more times without moving again.
- *
- *  - When it does have to move, the old buffer is RETIRED rather than freed,
- *    so the pages a process still has mapped stay ours. See the `retired`
- *    note on struct memfd.
- *
- * The one honest divergence from Linux: there, growing a file never moves
- * anything, so a client that keeps writing through its OLD mapping keeps
- * writing to the object. Here that client would write to the retired copy and
- * the new one would not see it. Every wl_shm client resizes with
- * ftruncate-then-munmap-then-mmap and writes nothing in between, and the
- * headroom above means the realloc usually does not happen at all -- whereas
- * refusing to grow was guaranteed to break all of them. */
-static int memfd_grow(struct memfd *m, unsigned long need) {
-    if (need <= m->cap) return 0;                  /* nothing moves: mappings stay valid */
-    if (need > MEMFD_MAX) return -1;
-    /* No slot to remember the outgoing buffer in -> refuse, exactly as before. */
-    if (m->mapped && m->nretired >= MEMFD_RETIRED_N) return -1;
-    unsigned long nc = m->cap ? m->cap * 2 : PAGE_SIZE;
-    while (nc < need) nc *= 2;
-    /* HEADROOM for an object somebody has already mapped: this is the
-     * expensive, copying, divergent case, so buy several more resizes with one
-     * of them. 2304 -> 32 KiB holds a whole cursor theme; a 1.9 MiB window pool
-     * gets 8 MiB and survives two doublings. */
-    if (m->mapped) { while (nc < need * 4 && nc < MEMFD_MAX) nc *= 2; }
-    if (nc > MEMFD_MAX) nc = MEMFD_MAX;
-    nc = (nc + PAGE_SIZE - 1) & ~(unsigned long)(PAGE_SIZE - 1);   /* whole pages: see the struct comment */
-    char *nr = kmalloc(nc + PAGE_SIZE); if (!nr) return -1;
-    char *nb = (char *)(((uintptr_t)nr + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1));
-    for (unsigned long i = 0; i < m->size; i++) nb[i] = m->buf[i];
-    for (unsigned long i = m->size; i < nc; i++) nb[i] = 0;        /* never hand stale kernel bytes to a mapping */
-    char *retiring = 0;
-    if (m->raw) {
-        if (m->mapped) { retiring = m->raw; m->retired[m->nretired++] = m->raw; }  /* still aliased */
-        else           kfree(m->raw);
-    }
-    char *oldbuf = m->buf;
-    m->raw = nr; m->buf = nb; m->cap = nc;
-    /* RE-POINT EVERY LIVE MAPPING AT THE NEW BUFFER (M2200).
-     *
-     * Retiring the old buffer stops a use-after-free and SILENTLY BREAKS THE
-     * SHARING, which is a different kind of wrong. A memfd exists so that two
-     * processes see ONE piece of memory; after a grow the object's bytes live at
-     * `nb` while every existing mmap still aliases the retired pages, so each
-     * side has a private copy and neither is told. The comment above -- "the
-     * live mapping keeps pointing at memory that is still ours" -- is true, and
-     * is exactly the defect: safe, and wrong.
-     *
-     * The contents were copied above, so a re-pointed mapping sees its own
-     * data; what changes is that both sides are looking at one buffer again.
-     *
-     * HONEST SCOPE. This was found while hunting the 1-core blank page, and it
-     * is NOT proven to be that: the commit-time check added alongside it
-     * (kernel/wayland.c) fired on a boot that rendered the page perfectly as
-     * well as on a blank one, and the pool it fired on was 8 MiB from creation
-     * and never grew at all -- so THIS path was not even on that boot's
-     * critical path. What is proven is the defect itself, from the code: a
-     * mapped memfd that grows leaves its mappings on memory the object no
-     * longer uses.
-     *
-     * THE FRAMES MUST BE REFCOUNTED, exactly as app_mmap_memfd_nl's ownership
-     * note says: munmap and teardown call pmm_free_frame on every present user
-     * page, so a mapping that is re-pointed has to take a reference on the new
-     * frame and give up the one it held on the old. Getting that wrong is
-     * M1985 again -- a live kernel-heap page handed back to the PMM.
-     *
-     * The VMA ranges are collected under the lock and mapped after it is
-     * released: vmm_map_to allocates page tables, and holding a VMA spinlock
-     * across an allocation is the shape that hung the machine in M1988. */
-    if (m->mapped && oldbuf) {
-        int idx = (int)(m - memfds);          /* the index vma.mfd holds */
-        unsigned long fixed = 0, unshareable = 0;
-        for (int pi = 0; pi < MAX_APPS; pi++) {
-            struct app *a = &apps[pi];
-            if (!a->used || !a->cr3) continue;
-            /* ONE VMA AT A TIME, NOT A COPY OF THE TABLE (M2217).
-             *
-             * This collected the matching ranges into `r[APP_MAXVMA]` first.
-             * APP_MAXVMA is 4096 and the entry is 24 bytes, so that is a
-             * NINETY-SIX KILOBYTE local -- on a 16 KiB kernel stack in syscall
-             * context, and on the 64 KiB watcher thread once M2214 moved the
-             * page probe there. It double-faulted: "KERNEL STACK OVERFLOW: a
-             * task overran its kernel stack (its #PF escalated to a #DF)",
-             * with rbp-rsp = 0x10028. I wrote the array to avoid holding the
-             * VMA lock across vmm_map_to, and swapped one hazard for a worse
-             * one.
-             *
-             * The snapshot is unnecessary: since M1988 a VMA entry NEVER MOVES
-             * -- removal leaves a tombstone -- so an index is stable and the
-             * lock only has to cover the read of one entry. No array, no
-             * bound, and the same property that made tombstones worth having. */
-            int nmatched = 0;
-            for (int i = 0; i < a->nvma; i++) {
-                uint64_t vstart = 0, vlen = 0, vfoff = 0;
-                uint64_t fl = vma_lock(a);
-                if (a->vma[i].len && a->vma[i].mfd == idx) {
-                    vstart = a->vma[i].start; vlen = a->vma[i].len; vfoff = a->vma[i].foff;
-                }
-                vma_unlock(a, fl);
-                if (!vlen) continue;
-                nmatched++;
-                for (uint64_t off = 0; off < vlen; off += PAGE_SIZE) {
-                    uint64_t ooff = vfoff + off;           /* the OBJECT offset */
-                    if (ooff >= nc) break;                 /* past the new buffer */
-                    uint64_t ph = vmm_translate((uint64_t)(nb + ooff));
-                    if (!ph || !pmm_refcountable(ph)) { unshareable++; continue; }
-                    uint64_t oldph = vmm_translate_in(a->cr3, vstart + off);
-                    if (oldph == ph) continue;             /* already the new frame */
-                    pmm_addref(ph);                        /* THIS mapping's reference */
-                    vmm_map_to(a->cr3, vstart + off, ph,
-                               PTE_USER | PTE_WRITABLE | PTE_NX);
-                    if (oldph) pmm_free_frame(oldph);      /* give up the retired one */
-                    fixed++;
-                }
+ * Called from the reclaimer thread, and from memfd_alloc when dead objects are
+ * what fill the table. Both are plain task context holding no lock. */
+#define MEMFD_RECLAIM_BATCH 128
+static void memfd_reclaim(void) {
+    if (!__atomic_load_n(&g_memfd_draining, __ATOMIC_ACQUIRE)) return;
+    for (int idx = 0; idx < NMEMFD; idx++) {
+        struct memfd *m = &memfds[idx];
+        uint64_t f = memfd_lock_take();
+        int mine = (m->drain == 1);
+        if (mine) m->drain = 2;                   /* one reclaimer per slot */
+        int npg = m->npg;
+        memfd_lock_give(f);
+        if (!mine) continue;
+        uint64_t fr[MEMFD_RECLAIM_BATCH]; int nf = 0;
+        for (int p = 0; p < npg || nf; ) {
+            if (p < npg) {
+                uint64_t va = MEMFD_WIN(idx) + (uint64_t)p * PAGE_SIZE;
+                uint64_t ph = vmm_translate(va);
+                p++;
+                if (ph) { vmm_unmap(va); fr[nf++] = ph & ~(uint64_t)(PAGE_SIZE - 1); }
+                if (nf < MEMFD_RECLAIM_BATCH && p < npg) continue;
             }
-            if (!nmatched) continue;
-            app_tlb_sync(a);   /* another core may still cache the old frame */
+            if (!nf) break;
+            if (vmm_tlb_shootdown()) {
+                for (int k = 0; k < nf; k++) pmm_free_frame(fr[k]);
+                __atomic_fetch_add(&g_memfd_reclaimed, (unsigned long)nf, __ATOMIC_RELAXED);
+            } else {
+                __atomic_fetch_add(&g_memfd_leaked, (unsigned long)nf, __ATOMIC_RELAXED);
+                static int told;
+                if (!told) { told = 1;
+                    kprintf("[memfd] %d page(s) of a dead object KEPT rather than freed: the "
+                            "shootdown was not acknowledged, so another core may still map them\n", nf); }
+            }
+            nf = 0;
         }
-        g_memfd_remapped += fixed;
-        /* AND IF NOTHING ALIASES IT ANY MORE, GIVE IT BACK (M2226).
-         *
-         * M2082 retired the outgoing buffer because live mmaps still pointed
-         * at it. M2200 re-points them -- so once every page has been moved,
-         * the retired buffer has no aliases left and holding it is pure waste.
-         * It is not only waste: MEMFD_RETIRED_N is a small array, and
-         * memfd_grow REFUSES outright when it fills, which is what produced
-         *
-         *   [wl] shm pool 10: resize to 1048576 but the backing memfd owns
-         *        only 65536 bytes -- the client's own ftruncate must have
-         *        failed
-         *
-         * in a failing boot: a Wayland client whose pool could not grow past
-         * 64 KiB, killed by an accounting limit rather than by memory.
-         *
-         * Only when EVERY page moved. `unshareable` counts the ones that could
-         * not be refcounted and therefore still alias the old buffer; if any
-         * remain, retiring is still the only safe answer. */
-        if (!unshareable && retiring && m->nretired > 0 &&
-            m->retired[m->nretired - 1] == retiring) {
-            m->nretired--;
-            m->retired[m->nretired] = 0;
-            kfree(retiring);
-            g_memfd_unretired++;
+        f = memfd_lock_take();
+        m->npg = 0; m->drain = 0;
+        __atomic_fetch_sub(&g_memfd_draining, 1, __ATOMIC_ACQ_REL);
+        memfd_lock_give(f);
+    }
+}
+static void memfd_reclaimer(void) {
+    for (;;) { memfd_reclaim(); task_sleep_ms(200); }
+}
+void app_memfd_start_reclaimer(void) { task_create(memfd_reclaimer, 0, 0); }
+
+/* Ensure cap >= need by mapping more frames at the end of the slot. 0/-1.
+ * Caller holds m->glk. Nothing that exists moves, so a MAPPED object grows as
+ * freely as any other (M2082's whole problem is gone) and every pointer the
+ * compositor holds stays valid. New pages are zeroed: never hand a mapping
+ * stale bytes. A partial failure keeps the pages it did map, and `cap` says
+ * how many that was. */
+static int memfd_grow(struct memfd *m, unsigned long need) {
+    if (need <= m->cap) return 0;
+    if (need > MEMFD_MAX) return -1;
+    int idx = (int)(m - memfds);
+    int want = (int)((need + PAGE_SIZE - 1) / PAGE_SIZE);
+    while (m->npg < want) {
+        uint64_t ph = pmm_alloc_frame();
+        if (!ph) return -1;
+        memset(hhdm(ph), 0, PAGE_SIZE);
+        if (vmm_map(MEMFD_WIN(idx) + (uint64_t)m->npg * PAGE_SIZE, ph, PTE_WRITABLE | PTE_NX) != 0) {
+            pmm_free_frame(ph);
+            return -1;
         }
-        if (unshareable)
-            kprintf("[memfd] %lu page(s) of the grown buffer are not refcountable, so the "
-                    "mappings still alias the RETIRED pages there and the object is unshared "
-                    "across them\n", unshareable);
+        uint64_t f = memfd_lock_take();
+        m->npg++;
+        m->cap = (unsigned long)m->npg * PAGE_SIZE;
+        m->buf = (char *)MEMFD_WIN(idx);
+        memfd_lock_give(f);
+        __atomic_fetch_add(&g_memfd_grown, 1, __ATOMIC_RELAXED);
     }
     return 0;
 }
@@ -11020,27 +10962,26 @@ static int memfd_grow(struct memfd *m, unsigned long need) {
  * The sizes are not invented. 2304 and 6912 are exactly what libwayland-cursor
  * asks for: a 24x24 ARGB cursor, and the pool after two more images are added
  * to it. Firefox's startup makes that second call 107 times and every one of
- * them returned ENOSPC.
+ * them returned ENOSPC before M2082.
  *
- * Two independent things can break, and there is an assertion for each. Put
- * back the `if (m->mapped) return -1` and the SUCCEEDS check fails. Remove it
- * without retiring the outgoing buffer and the churn check fails instead --
- * because the kernel heap hands that block straight back out, while a process
- * still has its pages mapped. That second failure is the one worth having a
- * test for: it is silent, it corrupts an unrelated allocation, and it is the
- * reason the restriction was there in the first place. */
+ * What is asserted is what the page-backed design promises: a grow of a
+ * mapped object succeeds, keeps the bytes, does NOT MOVE the object (so the
+ * compositor's pointers and every mapping stay valid), keeps the very same
+ * frames under the pages that already existed, and zeroes what it adds -- and
+ * teardown gives every frame back. Put the kmalloc-and-copy grow back and the
+ * "did not move" and "same frame" checks fail. */
 static int memfd_st_pass, memfd_st_fail;
 static void memfd_ck(int cond, const char *what) {
     if (cond) { memfd_st_pass++; kprintf("[ ok ] memfd: %s\n", what); }
     else      { memfd_st_fail++; kprintf("[FAIL] memfd: %s\n", what); }
 }
-#define MEMFD_ST_CHURN 48
 void app_memfd_selftest(void) {
     const unsigned long first = 2304, second = 6912;   /* one cursor, then three */
     const char PAT = (char)0xA5;
     int idx = memfd_alloc("memfdselftest");
     if (idx < 0) { memfd_ck(0, "a memfd object was available"); goto summary; }
     struct memfd *m = &memfds[idx];
+    memfd_glk_take(m);
 
     if (memfd_grow(m, first) != 0) { memfd_ck(0, "a fresh memfd grew to a cursor pool's size"); goto cleanup; }
     memfd_ck(1, "a fresh memfd grew to a cursor pool's size");
@@ -11048,11 +10989,12 @@ void app_memfd_selftest(void) {
     for (unsigned long i = 0; i < first; i++) m->buf[i] = PAT;
 
     unsigned long cap0 = m->cap;
-    char *old = m->buf, *oldraw = m->raw;
+    char *old = m->buf;
+    uint64_t ph0 = vmm_translate((uint64_t)(uintptr_t)old);
     /* The premise: 2304 bytes fits in one page, so the very next resize is
-     * past the capacity and cannot be served without reallocating. If this
-     * ever stops being true the test below stops testing anything. */
-    memfd_ck(second > cap0, "the second resize really is past the capacity, so it must reallocate");
+     * past the capacity and has to add a page. If this ever stops being true
+     * the test below stops testing anything. */
+    memfd_ck(second > cap0, "the second resize really is past the capacity, so it must add pages");
 
     m->mapped = 1;                      /* a client has mmap'd it; its pages are aliased */
     int grew = memfd_grow(m, second);
@@ -11063,64 +11005,32 @@ void app_memfd_selftest(void) {
     int intact = 1;
     for (unsigned long i = 0; i < first; i++) if (m->buf[i] != PAT) { intact = 0; break; }
     memfd_ck(intact, "the bytes written before the grow survived it");
+    memfd_ck(m->buf == old, "the object did not move, so every pointer into it is still valid");
+    memfd_ck(ph0 && vmm_translate((uint64_t)(uintptr_t)m->buf) == ph0,
+             "its first page is still the same frame, so a live mapping still shares it");
+    int zero = 1;
+    for (unsigned long i = cap0; i < m->cap; i++) if (m->buf[i]) { zero = 0; break; }
+    memfd_ck(zero, "the pages the grow added read as zeros");
 
-    /* Was the OUTGOING buffer retired or freed? If it was freed it is on the
-     * kernel heap's free list, and allocations of the same size class get it
-     * back -- with a live user mapping still pointing at it. */
-    /* WHAT M2226 CHANGED, AND WHY THIS ASSERTION HAD TO CHANGE WITH IT.
-     *
-     * Until M2226 this checked `nretired == 1 && retired[0] == oldraw`: the
-     * outgoing buffer must be held, because live mmaps still pointed at it.
-     * M2200 then made the grow RE-POINT every live mapping at the new buffer,
-     * and M2226 finished the thought -- once nothing aliases the old buffer,
-     * holding it is not caution, it is a leak into a four-entry array whose
-     * exhaustion makes memfd_grow refuse outright, which is what produced a
-     * Wayland pool that could not grow past 64 KiB.
-     *
-     * This test drives `m->mapped = 1` by hand and no process has a VMA for
-     * the object, so the re-pointing loop matches nothing, `unshareable` is 0,
-     * and freeing is the CORRECT outcome. The old assertion kept failing on a
-     * kernel that was right -- a stale test reporting a bug that no longer
-     * existed, which costs exactly as much as a missing one.
-     *
-     * The retain-while-aliased property is not lost: it is covered with a REAL
-     * mapping by the wl_shm pool-resize checks in the same suite ("the
-     * outgoing buffer is retired, not handed to kfree"), which is the only
-     * place it can be tested honestly, because it needs a real alias. */
-    memfd_ck(m->nretired == 0,
-             "with nothing actually aliasing it, the outgoing buffer is FREED, not retired (M2226)");
-    void *churn[MEMFD_ST_CHURN]; int nch = 0;
-    for (int k = 0; k < MEMFD_ST_CHURN; k++) {
-        churn[nch] = kmalloc(cap0 + PAGE_SIZE);      /* the same request the old buffer came from */
-        if (!churn[nch]) break;
-        for (unsigned long i = 0; i < cap0 + PAGE_SIZE; i++) ((char *)churn[nch])[i] = (char)0x5A;
-        nch++;
-    }
-    /* ...and because it was freed, the heap may hand those pages straight back
-     * out. Asserting that it DOES is what stops this becoming a test that
-     * passes whatever happens: `old` is dangling by design here, and reading
-     * it is the point -- if the block were still held out of the free list the
-     * pattern would survive, and the M2226 optimisation would not be
-     * happening. */
-    int recycled = 0;
-    for (unsigned long i = 0; i < first; i++) if (old[i] != PAT) { recycled = 1; break; }
-    for (int k = 0; k < nch; k++) kfree(churn[k]);
-    memfd_ck(recycled || nch == 0,
-             "and the freed buffer really did go back to the heap (churn reclaimed it)");
-    (void)oldraw;
-
-    /* The headroom: the point of over-allocating a mapped object is that the
-     * NEXT resize does not move anything, so a live mapping stays correct. */
     char *stable = m->buf;
     int again = memfd_grow(m, second + PAGE_SIZE);
-    memfd_ck(again == 0 && m->buf == stable,
-             "a further resize within the new capacity moves nothing at all");
+    memfd_ck(again == 0 && m->buf == stable && m->cap >= second + PAGE_SIZE,
+             "a further grow moves nothing either");
 
   cleanup:
+    memfd_glk_give(m);
     m->mapped = 0;                      /* nothing is really mapped: let teardown free it */
-    memfd_unref(idx);
-    memfd_ck(!memfds[idx].used && memfds[idx].nretired == 0,
-             "teardown released the object and every buffer it outgrew");
+    {   int npg = m->npg;
+        memfd_unref(idx);
+        memfd_ck(!memfds[idx].used && (npg == 0 || memfds[idx].drain == 1),
+                 "a dead object's slot is held until its frames are reclaimed");
+        memfd_reclaim();
+        int gone = 1;
+        for (int p = 0; p < npg; p++)
+            if (vmm_translate(MEMFD_WIN(idx) + (uint64_t)p * PAGE_SIZE)) { gone = 0; break; }
+        memfd_ck(gone && !memfds[idx].drain && !memfds[idx].npg,
+                 "teardown unmapped and freed every page the object owned");
+    }
   summary:
     kprintf("memfd self-test: %d passed, %d failed\n", memfd_st_pass, memfd_st_fail);
 }
@@ -11305,6 +11215,19 @@ uint64_t app_mmap_drm(int fd, uint64_t len, uint64_t off) {
 
 uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
     struct app *a_ = cur();
+    /* A MAPPING PAST THE END GETS PAGES UNDER IT. The capacity used to be the
+     * doubled size of a kmalloc, so a client mapping a little more than its
+     * file happened to fit; with exact whole pages it would not. Linux maps it
+     * and faults past EOF -- here the tail is zero pages, which is what such a
+     * client then sees as the file grows into it. The lock is the object's,
+     * taken before the VMA section and never inside it. */
+    if (a_ && fd >= 0 && fd < APP_NFD && a_->fd[fd].used && a_->fd[fd].type == 3 && len &&
+        !(off & (PAGE_SIZE - 1)) && off + len <= MEMFD_MAX) {
+        struct memfd *m = &memfds[a_->fd[fd].obj];
+        memfd_glk_take(m);
+        if (m->used && m->buf) (void)memfd_grow(m, off + ((len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1)));
+        memfd_glk_give(m);
+    }
     uint64_t f_ = vma_lock(a_);
     uint64_t r_ = app_mmap_memfd_nl(fd, len, off);
     vma_unlock(a_, f_);
@@ -11399,8 +11322,8 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
  * M2082 removed the reason this used to fire constantly -- a mapped memfd can
  * be grown now, so the common case is that the client's ftruncate DID work and
  * the object really is that big. What is left is the honest remainder: a grow
- * can still fail at MEMFD_MAX, or because the object has run out of retired-
- * buffer slots, and the client is not told which. So the check stays.
+ * can still fail at MEMFD_MAX, or when the PMM runs out of frames, and the
+ * client is not told which. So the check stays.
  *
  * `cap` is the useful bound: whole pages the object already owns and has
  * zeroed, which a resize can claim without anything moving. */
@@ -11417,7 +11340,7 @@ int app_scm_take_memfd(int ep, void **base, unsigned long *size) {
  * A memfd mapping is EAGER (app_mmap_memfd_nl maps every page up front), so the
  * invariant is total and checkable: for every VMA that names a memfd, the
  * physical frame behind each page must be the frame behind the same offset of
- * the object's buffer. Anything that breaks it -- a grow that retires the
+ * the object's buffer. Anything that breaks it -- a grow that moved the
  * buffer (M2200), a fork that copies a shared page, a fault handler that
  * demand-zeroes over one, a stale VMA -- shows up here, and none of them have
  * an instrument of their own.
@@ -11597,7 +11520,10 @@ int app_scm_give_kernel_memfd(int ep, const char *name, const void *data, unsign
     if (app_scm_capacity() < 1) return -1;       /* the in-flight pool is exhausted (M2104) */
     int idx = memfd_alloc(name); if (idx < 0) return -1;
     struct memfd *m = &memfds[idx];
-    if (memfd_grow(m, len) != 0) { memfd_unref(idx); return -1; }
+    memfd_glk_take(m);
+    int grew = memfd_grow(m, len);
+    memfd_glk_give(m);
+    if (grew != 0) { memfd_unref(idx); return -1; }
     for (unsigned long i = 0; i < len; i++) m->buf[i] = ((const char *)data)[i];
     m->size = len;
     struct fdent fe;
@@ -12284,12 +12210,18 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         if (m->seals & F_SEAL_WRITE) return -1;
         long off = a->fd[fd].off; if (off < 0) return -1;
         unsigned long end = (unsigned long)off + len;
+        if (end < (unsigned long)off) return -1;
         if (end > m->size) {                                  /* the write grows the file */
             if (m->seals & F_SEAL_GROW) return -1;
-            if (memfd_grow(m, end) != 0) return -1;
-            for (unsigned long i = m->size; i < (unsigned long)off; i++) m->buf[i] = 0;   /* zero a sparse gap */
-            m->size = end;
+            memfd_glk_take(m);                                /* one grower, and one size, at a time */
+            if (end > m->size) {
+                if (memfd_grow(m, end) != 0) { memfd_glk_give(m); return -1; }
+                for (unsigned long i = m->size; i < (unsigned long)off; i++) m->buf[i] = 0;   /* zero a sparse gap */
+                m->size = end;
+            }
+            memfd_glk_give(m);
         }
+        if (end > m->cap) return -1;                          /* a racing shrink cannot take pages, but be sure */
         for (unsigned long i = 0; i < len; i++) m->buf[off + i] = ((const char *)buf)[i];
         a->fd[fd].off = off + (long)len;
         return (long)len;
@@ -12792,23 +12724,37 @@ int app_shm_fd(const char *name, int o_creat, int o_excl) {
      * would be the same object to every lookup below. Refuse instead. */
     int nlen = 0; while (name[nlen]) nlen++;
     if (nlen >= (int)sizeof memfds[0].name) return -36;   /* ENAMETOOLONG */
-    int idx = -1;
+    /* LOOK UP AND CREATE AS ONE ACT. Firefox's processes open these names
+     * concurrently with O_CREAT|O_EXCL to decide which of them owns a segment.
+     * Found and created as two steps, both could miss, both create, and both
+     * be told they own a DIFFERENT object with the same name; or a lookup
+     * could find an object whose last reference was dropped before memfd_ref
+     * ran, and take a reference on whatever reused the slot. */
+    int idx = -1, live = 0, created = 0, tried = 0;
+  again:;
+    uint64_t f = memfd_lock_take();
     for (int i = 0; i < NMEMFD; i++) {
         if (!memfds[i].used || !memfds[i].named) continue;
         int k = 0;
         while (memfds[i].name[k] && memfds[i].name[k] == name[k]) k++;
         if (!memfds[i].name[k] && !name[k]) { idx = i; break; }
     }
-    if (idx >= 0 && o_creat && o_excl) return -17;   /* EEXIST */
-    if (idx < 0) {
-        if (!o_creat) return -2;    /* ENOENT */
-        idx = memfd_alloc(name);
-        if (idx < 0) return -28;   /* ENOSPC */
-        memfds[idx].named = 1;
-        memfds[idx].refs++;        /* the NAME is a reference: see app_shm_unlink */
-    } else {
-        memfd_ref(idx);                     /* another descriptor on the same object */
+    if (idx >= 0 && o_creat && o_excl) { memfd_lock_give(f); return -17; }   /* EEXIST */
+    if (idx >= 0) memfds[idx].refs++;        /* another descriptor on the same object */
+    else if (o_creat) {
+        idx = memfd_claim_nl(name, &live);
+        if (idx >= 0) {
+            created = 1;
+            memfds[idx].named = 1;
+            memfds[idx].refs++;              /* the NAME is a reference: see app_shm_unlink */
+        }
     }
+    memfd_lock_give(f);
+    if (idx < 0 && o_creat && !tried && __atomic_load_n(&g_memfd_draining, __ATOMIC_ACQUIRE)) {
+        tried = 1; memfd_reclaim(); goto again;   /* dead objects are holding the slots */
+    }
+    if (o_creat && (created || idx < 0)) memfd_claim_note(idx, live, name);
+    if (idx < 0) return o_creat ? -28 : -2;  /* ENOSPC : ENOENT */
     int fd = -1;
     fd = app_fd_claim(a);
     if (fd < 0) { memfd_unref(idx); return -24; }   /* EMFILE */
@@ -12822,17 +12768,18 @@ int app_shm_fd(const char *name, int o_creat, int o_excl) {
  * of any process would collide with the first one's name. */
 int app_shm_unlink(const char *name) {
     if (!name || !name[0]) return -22;   /* EINVAL */
+    int idx = -1;
+    uint64_t f = memfd_lock_take();      /* two unlinks of one name drop ONE reference */
     for (int i = 0; i < NMEMFD; i++) {
         if (!memfds[i].used || !memfds[i].named) continue;
         int k = 0;
         while (memfds[i].name[k] && memfds[i].name[k] == name[k]) k++;
-        if (!memfds[i].name[k] && !name[k]) {
-            memfds[i].named = 0;
-            memfd_unref(i);         /* drop the name's reference; open fds keep it alive */
-            return 0;
-        }
+        if (!memfds[i].name[k] && !name[k]) { memfds[i].named = 0; idx = i; break; }
     }
-    return -2;    /* ENOENT */
+    memfd_lock_give(f);
+    if (idx < 0) return -2;    /* ENOENT */
+    memfd_unref(idx);          /* drop the name's reference; open fds keep it alive */
+    return 0;
 }
 
 /* Add memfd seals (one-way OR of F_SEAL_*). Returns the new seal set, or -1
@@ -12853,16 +12800,20 @@ long app_ftruncate(int fd, long len) {
     if (a->fd[fd].type != 3) return -1;                    /* otherwise it must be a memfd */
     struct memfd *m = &memfds[a->fd[fd].obj];
     unsigned long n = (unsigned long)len;
-    if (n == m->size) return 0;
-    if (n < m->size) {                                       /* shrink */
-        if (m->seals & (F_SEAL_SHRINK | F_SEAL_WRITE)) return -1;
-        m->size = n; return 0;
+    memfd_glk_take(m);                                       /* size and pages change together */
+    long r = 0;
+    if (n == m->size) goto out;
+    if (n < m->size) {                                       /* shrink: the pages stay, the length does not */
+        if (m->seals & (F_SEAL_SHRINK | F_SEAL_WRITE)) { r = -1; goto out; }
+        m->size = n; goto out;
     }
-    if (m->seals & (F_SEAL_GROW | F_SEAL_WRITE)) return -1;  /* grow */
-    if (memfd_grow(m, n) != 0) return -1;
-    for (unsigned long i = m->size; i < n; i++) m->buf[i] = 0;
+    if (m->seals & (F_SEAL_GROW | F_SEAL_WRITE)) { r = -1; goto out; }   /* grow */
+    if (memfd_grow(m, n) != 0) { r = -1; goto out; }
+    for (unsigned long i = m->size; i < n; i++) m->buf[i] = 0;   /* bytes a shrink left behind read as zeros */
     m->size = n;
-    return 0;
+  out:
+    memfd_glk_give(m);
+    return r;
 }
 /* fsync/fdatasync/sync_file_range (M1566): honestly free, not a lying stub --
  * blockdev.c's buffer cache is write-through (bcache_flush's own comment),

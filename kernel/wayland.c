@@ -2803,7 +2803,7 @@ void wl_fs_health_line(void) {
         extern unsigned char g_e2_itable_saw[8];
         extern unsigned long g_fill_exec_refused, g_fill_exec_hole, g_fill_distrust;
         extern unsigned long g_fill_cachedrop, g_fill_cachedrop_ok;
-        extern unsigned long g_memfd_remapped, g_memfd_unretired;
+        extern unsigned long g_memfd_grown, g_memfd_reclaimed, g_memfd_leaked;
         extern unsigned long g_bd_fail_n[9];
         extern int g_bd_badidx, g_bd_badndev;
         extern unsigned long g_bd_init_calls, g_bd_reg_skipped;
@@ -2900,7 +2900,7 @@ void wl_fs_health_line(void) {
                 "bytes %02x %02x %02x %02x %02x %02x %02x %02x) %lu badptr "
                 "%lu hole(s) | distrust %lu | refused: "
                 "%lu exec %lu exec-hole %lu device | cache-drop retries %lu, %lu RECOVERED | "
-                "ata: %lu retr %lu FAIL %lu dma-short | memfd: %lu remap %lu unretired | "
+                "ata: %lu retr %lu FAIL %lu dma-short | memfd pages: %lu grown %lu reclaimed %lu KEPT | "
                 "blockdev refusals by reason: idx %lu nohook %lu zerocount %lu LBA>=cap %lu "
                 "ovf %lu past-cap %lu driver %lu BADIDX %lu (last cap-refusal: lba %lu vs cap %lu; "
                 "last bad index %d against g_ndev %d) | blockdev_init x%lu, %lu re-reg skipped | "
@@ -2926,7 +2926,7 @@ void wl_fs_health_line(void) {
                 g_fill_cachedrop, g_fill_cachedrop_ok,
                 (unsigned long)atretr, (unsigned long)atfail,
                 (unsigned long)ata_dma_short_count(),
-                g_memfd_remapped, g_memfd_unretired,
+                g_memfd_grown, g_memfd_reclaimed, g_memfd_leaked,
                 g_bd_fail_n[1], g_bd_fail_n[2], g_bd_fail_n[3], g_bd_fail_n[4],
                 g_bd_fail_n[5], g_bd_fail_n[6], g_bd_fail_n[7], g_bd_fail_n[8],
                 (unsigned long)g_bd_fail_lba4, (unsigned long)g_bd_fail_cap4,
@@ -3108,10 +3108,10 @@ int wl_page_probe(uint32_t want) {
      * "is the compositor reading the client's own memory" could only be
      * answered by a log line that fires when the answer is no -- and a
      * counter with no report cannot say that the answer was YES. */
-    {   extern unsigned long g_memfd_remapped;
+    {   extern unsigned long g_memfd_grown;
         kprintf("[page]   shm: %lu commit(s) blitted the client's OWN frame, %lu did not; "
-                "%lu page(s) re-pointed after a mapped memfd grew\n",
-                g_wl_shm_ok, g_wl_shm_mismatch, g_memfd_remapped); }
+                "%lu memfd page(s) added by growth (a grow never moves an object)\n",
+                g_wl_shm_ok, g_wl_shm_mismatch, g_memfd_grown); }
     /* AND THE SAME QUESTION ABOUT EVERY OTHER SHARED MAPPING (M2203). The
      * commit check above covers the wl_shm pool the compositor is blitting; the
      * content process ships its rendering to the parent through memfds of its
