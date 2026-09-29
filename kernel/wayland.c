@@ -3413,6 +3413,20 @@ static uint32_t wl_surface_at(struct wl_client *c, int x, int y, int *ox, int *o
  * fallback for input that arrives before any window has been focused. */
 static int g_focus_ci = -1;
 void wl_set_focus_client(int ci) { g_focus_ci = ci; }
+/* POINTER FOCUS IS NOT KEYBOARD FOCUS. In Wayland the pointer belongs to the
+ * surface under the cursor and the keyboard to the focused one; they differ
+ * whenever the mouse hovers a window that has not been clicked. Motion, button
+ * and axis all went to the keyboard-focused client -- and the window manager
+ * only forwarded them for the FOCUSED window -- so hovering an unfocused
+ * Wayland window delivered nothing (waylandtest's "no wl_pointer.motion at
+ * all": the harness types into the shell, which keeps focus, then points at
+ * the client). The window manager now names the hovered client here. */
+static int g_ptr_ci = -1;
+void wl_set_pointer_client(int ci) { g_ptr_ci = ci; }
+static int wl_pointer_client(void) {
+    if (g_ptr_ci >= 0 && g_ptr_ci < WL_MAXCLIENT && g_cl[g_ptr_ci].used) return g_ptr_ci;
+    return wl_focus_client();
+}
 
 static int wl_focus_client(void) {
     if (g_focus_ci >= 0 && g_focus_ci < WL_MAXCLIENT && g_cl[g_focus_ci].used)
@@ -3674,7 +3688,7 @@ void wl_post_pointer_leave(void) {
 }
 
 void wl_post_motion(int x, int y) {
-    int focus = wl_focus_client();
+    int focus = wl_pointer_client();
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
@@ -3695,7 +3709,7 @@ void wl_post_motion(int x, int y) {
 
 void wl_post_button(int x, int y, unsigned button, int pressed) {
     if (pressed) wl_inlat_start();            /* M2337 */
-    int focus = wl_focus_client();
+    int focus = wl_pointer_client();
     if (focus < 0) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
         struct wl_client *c = &g_cl[i];
@@ -3728,7 +3742,7 @@ void wl_post_button(int x, int y, unsigned button, int pressed) {
  * way. */
 void wl_post_axis(int x, int y, int ticks_down) {
     wl_inlat_start();                         /* M2337 */
-    int focus = wl_focus_client();
+    int focus = wl_pointer_client();
     if (focus < 0) return;
     if (!ticks_down) return;
     for (int i = 0; i < WL_MAXCLIENT; i++) {
