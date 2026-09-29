@@ -13263,6 +13263,21 @@ long app_recvfrom(int fd, void *buf, int max, uint8_t srcip[4], uint16_t *srcpor
 /* fd hygiene (M1218): fcntl(F_GETFD/F_SETFD/F_DUPFD/F_DUPFD_CLOEXEC), dup3,
  * close_range — over the per-fd FD_CLOEXEC bit (honored by app_exec above; fork
  * copies the whole fdent so it survives a fork, as POSIX requires). */
+/* The lowest descriptor >= lo that is neither in use nor claimed, CLAIMED
+ * before the lock is dropped -- the same rule as app_fd_claim (M2325).
+ * F_DUPFD, and so dup(2), used to scan for !used outside fdt_lock and
+ * ignore the claim bitmap, so an open() on another thread could be handed
+ * the same slot between the scan and the install, and dup2 then overwrote
+ * that thread's new descriptor. The mark stays until close, as dup2's does. */
+static int app_fd_claim_from(struct app *a, int lo) {
+    int ai = app_slot(a), nf = -1;
+    fdt_take();
+    for (int i = lo; i < APP_NFD; i++)
+        if (!a->fd[i].used && !(ai >= 0 && g_fd_claimed[ai][i])) { nf = i; app_fd_mark(a, i, 1); break; }
+    fdt_give();
+    return nf;
+}
+
 long app_fcntl(int fd, int cmd, long arg) {
     struct app *a = cur();
     if (!a || fd < 0 || fd >= APP_NFD) return -1;
@@ -13278,7 +13293,7 @@ long app_fcntl(int fd, int cmd, long arg) {
         if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
             int lo = (int)arg; if (lo < APP_FD_FIRST) lo = APP_FD_FIRST;
             if (lo >= APP_NFD) return -1;
-            int nf = -1; for (int i = lo; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
+            int nf = app_fd_claim_from(a, lo);
             if (nf < 0) return -1;
             a->fd[nf] = (struct fdent){ 1, 14, 1, fd, {0}, 0, 0 };   /* obj = which stdio fd it aliases */
             a->fd[nf].cloexec = (cmd == F_DUPFD_CLOEXEC) ? 1 : 0;
@@ -13290,8 +13305,9 @@ long app_fcntl(int fd, int cmd, long arg) {
     if (cmd == F_SETFD) { a->fd[fd].cloexec = (arg & FD_CLOEXEC) ? 1 : 0; return 0; }
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         int lo = (int)arg; if (lo < APP_FD_FIRST) lo = APP_FD_FIRST;
-        int nf = -1; for (int i = lo; i < APP_NFD; i++) if (!a->fd[i].used) { nf = i; break; }
-        if (nf < 0 || app_dup2(fd, nf) != nf) return -1;
+        int nf = app_fd_claim_from(a, lo);
+        if (nf < 0) return -1;
+        if (app_dup2(fd, nf) != nf) { app_fd_mark(a, nf, 0); return -1; }
         a->fd[nf].cloexec = (cmd == F_DUPFD_CLOEXEC) ? 1 : 0;
         return nf;
     }
@@ -13304,11 +13320,19 @@ int app_dup3(int oldfd, int newfd, int flags) {
     a->fd[newfd].cloexec = (flags & O_CLOEXEC) ? 1 : 0;
     return newfd;
 }
+/* close_range(2). CLOSE_RANGE_CLOEXEC (4) asks for the range to be MARKED
+ * close-on-exec, not closed -- the flags were ignored, so a program preparing
+ * a child's descriptors closed its own. lo > hi is EINVAL (-2 here);
+ * CLOSE_RANGE_UNSHARE (2) needs nothing, the table is never shared on exec. */
 long app_close_range(unsigned lo, unsigned hi, int flags) {
     struct app *a = cur(); if (!a) return -1;
-    (void)flags;
+    if (lo > hi) return -2;
     if (hi >= APP_NFD) hi = APP_NFD - 1;
-    for (unsigned i = lo; i <= hi && i < APP_NFD; i++) if (a->fd[i].used) app_fd_close((int)i);
+    for (unsigned i = lo; i <= hi && i < APP_NFD; i++) {
+        if (!a->fd[i].used) continue;
+        if (flags & 4) a->fd[i].cloexec = 1;
+        else app_fd_close((int)i);
+    }
     return 0;
 }
 /* sendfile (M1219): copy up to `count` bytes from in_fd to out_fd through a
