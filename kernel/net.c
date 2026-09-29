@@ -522,6 +522,30 @@ static int net_rx_file_foreign(const uint8_t *f, int len, int want_tcp) {
  * kernel was also listening. This is the "no cross-connection RX demux" the
  * stack's own comments describe, and TCP got its park ring for exactly this in
  * M2017; UDP never got the equivalent. Now it has one. */
+static int udpq_take(uint16_t sport, void *buf, int max, uint8_t srcip[4], uint16_t *srcport);
+/* A DATAGRAM ALREADY FILED FOR US, rebuilt as the frame it arrived in.
+ *
+ * The kernel's own UDP clients -- the DNS resolver, the DHCP client, TFTP --
+ * wait for their reply here, and this loop only ever read the card. But every
+ * other consumer that pulls a frame off the card files a UDP datagram into the
+ * UDP queue by destination port (tcp_recv_seg does, the socket pumps do), so a
+ * reply that happened to arrive while a TCP read or a poll() was running was
+ * put where these callers never looked, and the lookup timed out with its
+ * answer sitting in the queue. The callers parse Ethernet/IPv4/UDP headers, so
+ * the payload is handed back inside a well-formed frame: source address and
+ * port from the queue entry, destination ours. */
+static int udpq_take_frame(uint16_t port, uint8_t *buf, int max) {
+    if (max < 42 + 1) return 0;
+    uint8_t sip[4]; uint16_t sp = 0;
+    int n = udpq_take(port, buf + 42, max - 42, sip, &sp);
+    if (n <= 0) return 0;
+    for (int i = 0; i < 42; i++) buf[i] = 0;
+    put16(buf + 12, 0x0800);                        /* IPv4 */
+    buf[14] = 0x45; put16(buf + 16, (uint16_t)(20 + 8 + n)); buf[14 + 8] = 64; buf[14 + 9] = 17;
+    memcpy(buf + 26, sip, 4); memcpy(buf + 30, OUR_IP, 4);
+    put16(buf + 34, sp); put16(buf + 36, port); put16(buf + 38, (uint16_t)(8 + n));
+    return 42 + n;
+}
 static int recv_timeout(uint8_t *buf, int max, uint64_t ticks, int my_udp_port) {
     uint64_t deadline = timer_ticks() + ticks;
     /* A TICK DEADLINE IS NOT A BOUND WITH INTERRUPTS OFF (M2068).
@@ -564,6 +588,10 @@ static int recv_timeout(uint8_t *buf, int max, uint64_t ticks, int my_udp_port) 
     int once = (ticks == 0);
     while (once || (no_irq ? (--budget > 0) : (timer_ticks() <= deadline))) {
         if (once) once = 0, budget = 1;           /* this iteration, then out */
+        if (my_udp_port > 0) {                         /* our reply, filed by another consumer */
+            int u = udpq_take_frame((uint16_t)my_udp_port, buf, max);
+            if (u > 0) return u;
+        }
         int l = oring_take(buf, max);                  /* frames another consumer filed for us (M2018) */
         if (l > 0) {
             if (arp_maybe_reply(buf, l)) continue;
