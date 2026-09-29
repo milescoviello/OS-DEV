@@ -676,6 +676,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * (/disk2/...), so it must not be translated a second time. */
 #define LX_AT_FDCWD (-100)
 #define LX_AT_SYMLINK_NOFOLLOW 0x100   /* fstatat/statx: stat the name, not a symlink's target */
+#define LX_AT_EMPTY_PATH 0x1000      /* the dirfd itself: how glibc's fstat() and Rust's metadata() ask */
 /* A STRING ARGUMENT IS VALIDATED TO ITS TERMINATOR, NOT ITS FIRST BYTE. Paths,
  * socket names and argv/envp were checked with vmm_user_ok(p, 1) and then read
  * until NUL, so a string running into an unmapped page faulted IN RING 0 --
@@ -1743,6 +1744,159 @@ void linux_syscall_dispatch(struct registers *r) {
     if (sc_nr < 512) g_syscycles[sc_nr] += dd;
     task_kernel_leave();               /* may not return: see task_t::in_kernel */
 }
+/* fstat(fd) into a struct stat buffer (kernel or already-validated user
+ * memory). 0 or a negative Linux errno. Shared by fstat, by fstatat and statx
+ * with AT_EMPTY_PATH -- which is how glibc 2.33+ implements fstat() and how
+ * Rust's File::metadata() asks -- so one descriptor gets one answer. */
+static long lx_fstat_fill(long a1, uint8_t *st) {
+    for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
+    /* stdio calls this on its own fds to decide buffering. Reporting a
+     * CHARACTER DEVICE is both true (they are the console) and what makes
+     * glibc pick line buffering instead of a full 4 KiB buffer -- with a
+     * regular-file answer, output would not appear until an explicit
+     * fflush or exit. */
+    if (a1 >= 0 && a1 <= 2) {
+        *(uint32_t *)(st + LXST_O_MODE) = LX_S_IFCHR | 0620;
+        *(uint64_t *)(st + LXST_O_RDEV) = 0x0501;          /* a tty-ish rdev */
+        *(uint64_t *)(st + LXST_O_NLINK) = 1;
+        *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
+        return 0;
+    } else {
+        /* A REAL fd. opendir() fstat()s the fd it just opened to confirm it
+         * is a directory before it will call getdents64 -- so returning
+         * EBADF here made every opendir() fail silently, with the directory
+         * fd already successfully created. The fd table remembers each
+         * FILE fd's path, so stat that. */
+        const char *fp = app_fd_path((int)a1);
+        struct statx sx;
+        if (!fp) {
+            /* A non-FILE fd -- a pipe, socket, eventfd and so on. Report a
+             * FIFO rather than EBADF: stdio calls fstat() on its own fds to
+             * pick a buffering mode, and an error there leaves it guessing.
+             * S_IFIFO is also the truthful answer for the pipe case, which
+             * is the one a shell pipeline depends on. */
+            if (!app_fd_is_open((int)a1)) { return -(long)LX_EBADF; }
+            /* EXCEPT A MEMFD, which is a REGULAR FILE -- an unlinked tmpfs
+             * one -- and every Wayland client depends on that being said.
+             * glibc's posix_fallocate fstat()s first and returns ESPIPE for
+             * a FIFO without attempting anything, so the shared-memory pool
+             * libwayland-cursor sizes that way was never sized at all, the
+             * mmap after it failed, and GDK reported the entire chain as
+             * one warning: "Failed to load cursor theme Adwaita". (M2000) */
+            long mfsz = app_memfd_size((int)a1);
+            if (mfsz >= 0) {
+                *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFREG | 0600u;
+                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)mfsz;
+                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                *(int64_t  *)(st + LXST_O_BLOCKS)  = (mfsz + 511) / 512;
+                *(uint64_t *)(st + LXST_O_INO)     = 0x2000ull + (uint64_t)a1;
+                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+                return 0;
+            }
+            /* AND A PTY IS A CHARACTER DEVICE, which is not a detail:
+             * glibc's grantpt() does
+             *
+             *     if (__fstat64 (fd, &st) < 0) return -1;
+             *     if (! S_ISCHR (st.st_mode)) { __set_errno (EINVAL); ... }
+             *
+             * so a pty master reported as a FIFO makes openpty() fail with
+             * EINVAL before it has even asked for the slave number -- which
+             * is exactly what happened after M2206 added TIOCGPTN and
+             * TIOCSPTLCK: `LXPTY: openpty failed: Invalid argument`. Two
+             * missing ioctls were not the whole reason a Linux binary could
+             * not get a pty; this was the third. ptsname_r checks the same
+             * thing. (M2211)
+             *
+             * rdev carries the real /dev/pts index in the minor, because
+             * ttyname() and a few TUI programs read it to find their own
+             * terminal: major 5 minor 2 is /dev/ptmx, major 136 is a pts
+             * slave, which is what Linux reports. */
+            /* AND A DRM RENDER NODE IS A CHARACTER DEVICE TOO (M2351),
+             * for exactly the same kind of reason as the pty above, in a
+             * library that is even stricter about it. libdrm's
+             * drmGetDevice2 -- which Mesa calls before it will load any
+             * driver -- starts with
+             *
+             *     if (fstat(fd, &sbuf)) return -errno;
+             *     maj = major(sbuf.st_rdev); min = minor(sbuf.st_rdev);
+             *     if (!drmNodeIsDRM(maj, min) || !S_ISCHR(sbuf.st_mode))
+             *             return -EINVAL;
+             *
+             * so a render node reported as a regular file is rejected
+             * before anything else is looked at, and the only symptom
+             * upstream is eglInitialize returning EGL_NOT_INITIALIZED with
+             * no explanation -- which is exactly what the first lxgl run
+             * got. Linux numbers DRM major 226, with render nodes from
+             * minor 128; this is renderD128. */
+            if (app_fd_type((int)a1) == 17) {
+                *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFCHR | 0666u;
+                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+                *(uint64_t *)(st + LXST_O_RDEV)    = (226ull << 8) | 128ull;
+                *(int64_t  *)(st + LXST_O_SIZE)    = 0;
+                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+                *(int64_t  *)(st + LXST_O_BLOCKS)  = 0;
+                *(uint64_t *)(st + LXST_O_INO)     = 0x3000ull;
+                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+                return 0;
+            }
+            {   long ptsn = app_pts_number((int)a1);
+                int is_pty = app_fd_type((int)a1) == 11;
+                if (is_pty) {
+                    *(uint32_t *)(st + LXST_O_MODE)  = LX_S_IFCHR | 0620u;
+                    *(uint64_t *)(st + LXST_O_NLINK) = 1;
+                    *(uint64_t *)(st + LXST_O_RDEV)  = (ptsn >= 0)
+                                                       ? ((5ull << 8) | 2ull)      /* the master: /dev/ptmx */
+                                                       : ((136ull << 8) | 0ull);   /* a slave: /dev/pts/N */
+                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
+                    *(uint64_t *)(st + LXST_O_INO)   = 0x3000ull + (uint64_t)a1;
+                    *(uint64_t *)(st + LXST_O_DEV)   = LX_FAKE_DEV;
+                    return 0;
+                }
+            }
+            *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
+            *(uint64_t *)(st + LXST_O_NLINK)   = 1;
+            *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+            /* Per-fd, so two different pipes are not reported as the
+             * same file. The 0x1000 bias keeps these clear of the
+             * path-hash inodes vfs_stat hands out for real files. */
+            *(uint64_t *)(st + LXST_O_INO)     = 0x1000ull + (uint64_t)a1;
+            *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+            return 0;
+        }
+        if (vfs_stat(fp, &sx) != 0) { return -(long)LX_EBADF; }
+        int isdir = (sx.stx_mode & 0170000u) == 0040000u;
+        /* The REAL mode when the filesystem reported one -- ext2 does. An
+         * executable bit that is not reported is an executable that cannot be
+         * run, and a mode of 0644 on every file makes chmod look broken.
+         * (M1999) */
+        *(uint32_t *)(st + LXST_O_MODE)    = (sx.stx_mode & 07777u)
+                                             ? sx.stx_mode
+                                             : (isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u));
+        /* The REAL link count, not a constant 1 (M1998). A directory
+         * always has at least two links ("." and its entry in its parent);
+         * find(1) subtracts 2 from st_nlink to decide how many
+         * subdirectories are left to visit and walks a negative number of
+         * them. A hardlinked file reported 1 too, so nothing could tell
+         * that two names were the same file. */
+        *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);
+        *(int64_t  *)(st + LXST_O_ATIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_MTIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_CTIME)   = (int64_t)sx.stx_mtime;
+        *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
+        *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
+        *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
+        /* A REAL inode, not a constant. ld.so decides "is this object
+         * already loaded?" by comparing (st_dev, st_ino) -- reporting 1
+         * for everything made it map libbfd and then skip libz, libzstd
+         * and libc as duplicates of it, and the only symptom was
+         * `undefined symbol: free, version GLIBC_2.2.5`. (M1955) */
+        *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;
+        *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
+        return 0;
+    }
+}
+
 static void lx_dispatch_body(struct registers *r) {
     /* WHICH RING SLOT THIS CALL OWNS -- a LOCAL, not a shared cursor (M2003).
      *
@@ -2299,9 +2453,30 @@ static void lx_dispatch_body(struct registers *r) {
         const char *up = (const char *)r->rsi;
         if (!up || !vmm_user_str_ok(r->rsi, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
         struct statx sx;
-        int st_rc = (r->rdx & LX_AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &sx) : vfs_stat(path, &sx);   /* see LXS_lstat_ */
+        int st_rc = -1;
+        if (!up[0]) {                       /* AN EMPTY PATH: see LXS_newfstatat */
+            if (!(r->rdx & LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+            if ((long)r->rdi != LX_AT_FDCWD) {
+                /* The descriptor itself, answered exactly as fstat answers it
+                 * -- a pipe is a FIFO, a memfd a regular file, a pty or DRM
+                 * node a character device -- then carried over field by field. */
+                uint8_t tst[LXST_SIZE];
+                long frc = lx_fstat_fill((long)r->rdi, tst);
+                if (frc < 0) { r->rax = (uint64_t)frc; break; }
+                for (unsigned i = 0; i < sizeof sx; i++) ((char *)&sx)[i] = 0;
+                sx.stx_mode  = *(uint32_t *)(tst + LXST_O_MODE);
+                sx.stx_nlink = (unsigned)*(uint64_t *)(tst + LXST_O_NLINK);
+                sx.stx_size  = (unsigned long)*(int64_t *)(tst + LXST_O_SIZE);
+                sx.stx_ino   = (unsigned)*(uint64_t *)(tst + LXST_O_INO);
+                sx.stx_mtime = (unsigned long)*(int64_t *)(tst + LXST_O_MTIME);
+                sx.stx_rdev  = *(uint64_t *)(tst + LXST_O_RDEV);
+                st_rc = 0;
+            } else up = ".";                /* AT_FDCWD: the working directory itself */
+        }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
+        if (st_rc != 0)
+            st_rc = (r->rdx & LX_AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &sx) : vfs_stat(path, &sx);   /* see LXS_lstat_ */
         if (st_rc != 0) {
             /* Name BOTH spellings. A stat that fails on a path the program
              * believes in is nearly always a TRANSLATION problem, and the
@@ -4515,157 +4690,7 @@ static void lx_dispatch_body(struct registers *r) {
     }
     case LXS_fstat: {                       /* (fd, struct stat*) */
         if (!vmm_user_ok(r->rsi, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        uint8_t *st = (uint8_t *)r->rsi;
-        for (int i = 0; i < LXST_SIZE; i++) st[i] = 0;
-        /* stdio calls this on its own fds to decide buffering. Reporting a
-         * CHARACTER DEVICE is both true (they are the console) and what makes
-         * glibc pick line buffering instead of a full 4 KiB buffer -- with a
-         * regular-file answer, output would not appear until an explicit
-         * fflush or exit. */
-        if (a1 >= 0 && a1 <= 2) {
-            *(uint32_t *)(st + LXST_O_MODE) = LX_S_IFCHR | 0620;
-            *(uint64_t *)(st + LXST_O_RDEV) = 0x0501;          /* a tty-ish rdev */
-            *(uint64_t *)(st + LXST_O_NLINK) = 1;
-            *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
-            r->rax = 0;
-        } else {
-            /* A REAL fd. opendir() fstat()s the fd it just opened to confirm it
-             * is a directory before it will call getdents64 -- so returning
-             * EBADF here made every opendir() fail silently, with the directory
-             * fd already successfully created. The fd table remembers each
-             * FILE fd's path, so stat that. */
-            const char *fp = app_fd_path((int)a1);
-            struct statx sx;
-            if (!fp) {
-                /* A non-FILE fd -- a pipe, socket, eventfd and so on. Report a
-                 * FIFO rather than EBADF: stdio calls fstat() on its own fds to
-                 * pick a buffering mode, and an error there leaves it guessing.
-                 * S_IFIFO is also the truthful answer for the pipe case, which
-                 * is the one a shell pipeline depends on. */
-                if (!app_fd_is_open((int)a1)) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
-                /* EXCEPT A MEMFD, which is a REGULAR FILE -- an unlinked tmpfs
-                 * one -- and every Wayland client depends on that being said.
-                 * glibc's posix_fallocate fstat()s first and returns ESPIPE for
-                 * a FIFO without attempting anything, so the shared-memory pool
-                 * libwayland-cursor sizes that way was never sized at all, the
-                 * mmap after it failed, and GDK reported the entire chain as
-                 * one warning: "Failed to load cursor theme Adwaita". (M2000) */
-                long mfsz = app_memfd_size((int)a1);
-                if (mfsz >= 0) {
-                    *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFREG | 0600u;
-                    *(uint64_t *)(st + LXST_O_NLINK)   = 1;
-                    *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)mfsz;
-                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                    *(int64_t  *)(st + LXST_O_BLOCKS)  = (mfsz + 511) / 512;
-                    *(uint64_t *)(st + LXST_O_INO)     = 0x2000ull + (uint64_t)a1;
-                    *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-                    r->rax = 0;
-                    break;
-                }
-                /* AND A PTY IS A CHARACTER DEVICE, which is not a detail:
-                 * glibc's grantpt() does
-                 *
-                 *     if (__fstat64 (fd, &st) < 0) return -1;
-                 *     if (! S_ISCHR (st.st_mode)) { __set_errno (EINVAL); ... }
-                 *
-                 * so a pty master reported as a FIFO makes openpty() fail with
-                 * EINVAL before it has even asked for the slave number -- which
-                 * is exactly what happened after M2206 added TIOCGPTN and
-                 * TIOCSPTLCK: `LXPTY: openpty failed: Invalid argument`. Two
-                 * missing ioctls were not the whole reason a Linux binary could
-                 * not get a pty; this was the third. ptsname_r checks the same
-                 * thing. (M2211)
-                 *
-                 * rdev carries the real /dev/pts index in the minor, because
-                 * ttyname() and a few TUI programs read it to find their own
-                 * terminal: major 5 minor 2 is /dev/ptmx, major 136 is a pts
-                 * slave, which is what Linux reports. */
-                /* AND A DRM RENDER NODE IS A CHARACTER DEVICE TOO (M2351),
-                 * for exactly the same kind of reason as the pty above, in a
-                 * library that is even stricter about it. libdrm's
-                 * drmGetDevice2 -- which Mesa calls before it will load any
-                 * driver -- starts with
-                 *
-                 *     if (fstat(fd, &sbuf)) return -errno;
-                 *     maj = major(sbuf.st_rdev); min = minor(sbuf.st_rdev);
-                 *     if (!drmNodeIsDRM(maj, min) || !S_ISCHR(sbuf.st_mode))
-                 *             return -EINVAL;
-                 *
-                 * so a render node reported as a regular file is rejected
-                 * before anything else is looked at, and the only symptom
-                 * upstream is eglInitialize returning EGL_NOT_INITIALIZED with
-                 * no explanation -- which is exactly what the first lxgl run
-                 * got. Linux numbers DRM major 226, with render nodes from
-                 * minor 128; this is renderD128. */
-                if (app_fd_type((int)a1) == 17) {
-                    *(uint32_t *)(st + LXST_O_MODE)    = LX_S_IFCHR | 0666u;
-                    *(uint64_t *)(st + LXST_O_NLINK)   = 1;
-                    *(uint64_t *)(st + LXST_O_RDEV)    = (226ull << 8) | 128ull;
-                    *(int64_t  *)(st + LXST_O_SIZE)    = 0;
-                    *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                    *(int64_t  *)(st + LXST_O_BLOCKS)  = 0;
-                    *(uint64_t *)(st + LXST_O_INO)     = 0x3000ull;
-                    *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-                    r->rax = 0;
-                    break;
-                }
-                {   long ptsn = app_pts_number((int)a1);
-                    int is_pty = app_fd_type((int)a1) == 11;
-                    if (is_pty) {
-                        *(uint32_t *)(st + LXST_O_MODE)  = LX_S_IFCHR | 0620u;
-                        *(uint64_t *)(st + LXST_O_NLINK) = 1;
-                        *(uint64_t *)(st + LXST_O_RDEV)  = (ptsn >= 0)
-                                                           ? ((5ull << 8) | 2ull)      /* the master: /dev/ptmx */
-                                                           : ((136ull << 8) | 0ull);   /* a slave: /dev/pts/N */
-                        *(int64_t  *)(st + LXST_O_BLKSIZE) = 1024;
-                        *(uint64_t *)(st + LXST_O_INO)   = 0x3000ull + (uint64_t)a1;
-                        *(uint64_t *)(st + LXST_O_DEV)   = LX_FAKE_DEV;
-                        r->rax = 0;
-                        break;
-                    }
-                }
-                *(uint32_t *)(st + LXST_O_MODE)    = 0010000u | 0600u;   /* S_IFIFO */
-                *(uint64_t *)(st + LXST_O_NLINK)   = 1;
-                *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-                /* Per-fd, so two different pipes are not reported as the
-                 * same file. The 0x1000 bias keeps these clear of the
-                 * path-hash inodes vfs_stat hands out for real files. */
-                *(uint64_t *)(st + LXST_O_INO)     = 0x1000ull + (uint64_t)a1;
-                *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-                r->rax = 0;
-                break;
-            }
-            if (vfs_stat(fp, &sx) != 0) { r->rax = (uint64_t)-(long)LX_EBADF; break; }
-            int isdir = (sx.stx_mode & 0170000u) == 0040000u;
-            /* The REAL mode when the filesystem reported one -- ext2 does. An
-             * executable bit that is not reported is an executable that cannot be
-             * run, and a mode of 0644 on every file makes chmod look broken.
-             * (M1999) */
-            *(uint32_t *)(st + LXST_O_MODE)    = (sx.stx_mode & 07777u)
-                                                 ? sx.stx_mode
-                                                 : (isdir ? (0040000u | 0755u) : (LX_S_IFREG | 0644u));
-            /* The REAL link count, not a constant 1 (M1998). A directory
-             * always has at least two links ("." and its entry in its parent);
-             * find(1) subtracts 2 from st_nlink to decide how many
-             * subdirectories are left to visit and walks a negative number of
-             * them. A hardlinked file reported 1 too, so nothing could tell
-             * that two names were the same file. */
-            *(uint64_t *)(st + LXST_O_NLINK)   = sx.stx_nlink ? sx.stx_nlink : (isdir ? 2u : 1u);
-            *(int64_t  *)(st + LXST_O_ATIME)   = (int64_t)sx.stx_mtime;
-            *(int64_t  *)(st + LXST_O_MTIME)   = (int64_t)sx.stx_mtime;
-            *(int64_t  *)(st + LXST_O_CTIME)   = (int64_t)sx.stx_mtime;
-            *(int64_t  *)(st + LXST_O_SIZE)    = (int64_t)sx.stx_size;
-            *(int64_t  *)(st + LXST_O_BLKSIZE) = 4096;
-            *(int64_t  *)(st + LXST_O_BLOCKS)  = (int64_t)((sx.stx_size + 511) / 512);
-            /* A REAL inode, not a constant. ld.so decides "is this object
-             * already loaded?" by comparing (st_dev, st_ino) -- reporting 1
-             * for everything made it map libbfd and then skip libz, libzstd
-             * and libc as duplicates of it, and the only symptom was
-             * `undefined symbol: free, version GLIBC_2.2.5`. (M1955) */
-            *(uint64_t *)(st + LXST_O_INO)     = sx.stx_ino;
-            *(uint64_t *)(st + LXST_O_DEV)     = LX_FAKE_DEV;
-            r->rax = 0;
-        }
+        r->rax = (uint64_t)lx_fstat_fill(a1, (uint8_t *)r->rsi);
         break;
     }
     case LXS_readlinkat:
@@ -4982,8 +5007,18 @@ static void lx_dispatch_body(struct registers *r) {
         uint64_t ubuf_u  = by_path ? r->rsi : r->rdx;
         const char *upath = (const char *)upath_u;
         if (!upath || !vmm_user_str_ok(upath_u, LX_STRMAX)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
-        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         if (!vmm_user_ok(ubuf_u, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
+        /* AN EMPTY PATH. With AT_EMPTY_PATH it means the descriptor itself --
+         * this is how glibc 2.33+ implements fstat() -- and it used to be
+         * joined onto the descriptor's path or, for a pipe or socket, resolved
+         * as the current directory, so fstat() of a pipe said "directory".
+         * Without the flag it is ENOENT, as on Linux. */
+        if (!upath[0]) {
+            if (by_path || !(r->r10 & LX_AT_EMPTY_PATH)) { r->rax = (uint64_t)-(long)LX_ENOENT; break; }
+            if ((long)r->rdi != LX_AT_FDCWD) { r->rax = (uint64_t)lx_fstat_fill((long)r->rdi, (uint8_t *)ubuf_u); break; }
+            upath = ".";                    /* AT_FDCWD: the working directory itself */
+        }
+        char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, upath, xp, sizeof xp);   /* dirfd (M2032) */
         r->rdx = ubuf_u;                    /* the writes below all go through rdx */
         struct statx sx;
         if ((nofollow ? vfs_lstat(path, &sx) : vfs_stat(path, &sx)) != 0) {
