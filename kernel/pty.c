@@ -163,7 +163,7 @@ int pty_open(void) {
         struct pty *p = &ptys[i];
         for (unsigned k = 0; k < sizeof *p; k++) ((unsigned char *)p)[k] = 0;
         p->used = 1; p->m_open = 1; p->s_open = 1;
-        p->m_refs = 1; p->s_refs = 0;                        /* the opener holds the master */
+        p->m_refs = 1; p->s_refs = 1;                        /* a NATIVE opener holds both ends, by id */
         p->owner = app_sys_getpid();
         p->fg_pgid = p->owner;                               /* INTR targets the opener by default */
         p->lflag = ICANON | ECHO | ISIG;                     /* cooked, like a real new tty */
@@ -272,11 +272,17 @@ int pty_close(int id) {
     return 0;
 }
 
-/* A master held through a DESCRIPTOR is released when the descriptor is, so
- * the pid-based cleanup below must not also drop it. */
+/* Opened through /dev/ptmx: the master is held by a DESCRIPTOR, released when
+ * the descriptor is, so the pid-based cleanup below must not drop it too. And
+ * the slave is held by nobody until /dev/pts/N is opened -- a slave not yet
+ * opened is not hung up (s_open stays 1), but once every descriptor that did
+ * open it is closed, the master sees the hangup. */
 void pty_disown(int id) {
     int slave; struct pty *p = resolve(id, &slave); if (!p) return;
+    uint64_t fl = pty_irq_save();
     p->owner = 0;
+    p->s_refs = 0;
+    pty_irq_restore(fl);
 }
 
 int pty_ctl(int id, int cmd, int arg) {
@@ -332,12 +338,15 @@ long pty_nread(int id) {
 }
 
 /* A native app that opened a pty by id (not through a descriptor) has died:
- * drop the master reference it held. The slot survives while a slave is
- * still open elsewhere, which now sees the hangup instead of a freed pty. */
+ * drop the two references it held, one per end (pty_close floors a count
+ * it already dropped itself at zero). The slot survives while a descriptor
+ * elsewhere still holds an end, which then sees the hangup instead of a
+ * freed pty. */
 void pty_release_pid(int pid) {
     for (int i = 0; i < NPTY; i++)
         if (ptys[i].used && ptys[i].owner == pid) {
             ptys[i].owner = 0;
             pty_close(i << 1);
+            if (ptys[i].used) pty_close((i << 1) | 1);
         }
 }
