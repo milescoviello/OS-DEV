@@ -4372,6 +4372,14 @@ static void lx_dispatch_body(struct registers *r) {
             /* A DRM render-node object, addressed by the offset VIRTGPU_MAP
              * handed out. Like a memfd it has no path, so the file-backed
              * route below cannot serve it. (M2350) */
+            /* MAP_FIXED IS REFUSED FOR THESE, NOT IGNORED. Both paths pick
+             * their own address, so a caller that asked for a particular one
+             * used to get another -- the failure this handler's own rule
+             * above says must be an error. (MAP_FIXED_NOREPLACE is 0x100000.) */
+            int ty = (fd >= 0) ? app_fd_type(fd) : -1;
+            if ((ty == 17 || ty == 3) && (flags & (LX_MAP_FIXED | 0x100000))) {
+                r->rax = (uint64_t)-(long)LX_EINVAL; break;
+            }
             if (fd >= 0 && app_fd_type(fd) == 17) {
                 uint64_t db = app_mmap_drm(fd, (uint64_t)len, (uint64_t)r->r9);
                 if (g_lx_systrace)
@@ -4381,7 +4389,11 @@ static void lx_dispatch_body(struct registers *r) {
                 r->rax = db; break;
             }
             if (fd >= 0 && app_fd_type(fd) == 3) {
-                uint64_t mb = app_mmap_memfd(fd, (uint64_t)len, (uint64_t)r->r9);
+                int priv = !(flags & LX_MAP_SHARED);
+                /* A write-sealed object cannot be mapped shared and writable:
+                 * F_SEAL_WRITE (8) is the promise a receiver relies on. */
+                if (!priv && (prot & 2) && (app_memfd_seal(fd, 0) & 8)) { r->rax = (uint64_t)-(long)LX_EPERM; break; }
+                uint64_t mb = app_mmap_memfd_ex(fd, (uint64_t)len, (uint64_t)r->r9, (int)prot, priv);
                 if (g_lx_systrace)
                     kprintf("[lxmmap] memfd fd=%d len=%lx off=%lx -> %lx\n",
                             fd, (unsigned long)len, (unsigned long)r->r9, (unsigned long)mb);

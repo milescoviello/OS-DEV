@@ -901,6 +901,14 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: munmap of a memfd mapping freed kernel-heap pages:"; grep -a "LXMEMFD" "$SLOG3" | head -3; f3=1
     fi
+    if grep -aq "LXMEMFD-OK: a write through a MAP_PRIVATE memfd mapping stays private" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: a write-sealed memfd refuses a shared writable mapping with EPERM" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: ...and still maps read-only" "$SLOG3" && \
+       grep -aq "LXMEMFD-OK: MAP_FIXED on a memfd lands exactly where it was asked, or fails" "$SLOG3"; then
+        echo "  ok: a memfd maps as asked -- MAP_PRIVATE is private, a write seal holds, MAP_FIXED never lands elsewhere"
+    else
+        echo "  FAIL: a memfd mapping ignored its prot or flags:"; grep -a "LXMEMFD-FAIL" "$SLOG3" | head -4; f3=1
+    fi
     if grep -aq "LXMEMFD-OK: the mapping OUTLIVED the last close" "$SLOG3"; then
         echo "  ok: ...and a mapping outlives the last close() of the memfd, which is how every toolkit uses one"
     else

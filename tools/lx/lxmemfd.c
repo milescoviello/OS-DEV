@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <errno.h>
 
 #define SZ  (64 * 1024)
 #define PAT 0xA5
@@ -195,6 +196,45 @@ int main(void) {
             } else ok(0, "mmap of a memfd at a non-zero offset");
             close(o);
         } else ok(0, "a memfd for the offset-mapping case");
+    }
+
+    /* WHAT THE MAPPING WAS ASKED FOR (MM11). The kernel used to map every
+     * memfd read-write and SHARED whatever prot and flags said. Each check
+     * below is Linux behaviour, so it passes there too. */
+    {
+        int pf = memfd_create("lxmemfd-priv", MFD_ALLOW_SEALING);
+        if (pf >= 0 && ftruncate(pf, 4096) == 0) {
+            unsigned char *sh = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, pf, 0);
+            unsigned char *pv = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, pf, 0);
+            if (sh != MAP_FAILED && pv != MAP_FAILED) {
+                sh[0] = 0x11;
+                pv[0] = 0x22;                     /* a private write: copy-on-write */
+                unsigned char b = 0;
+                lseek(pf, 0, SEEK_SET);
+                if (read(pf, &b, 1) != 1) b = 0;
+                ok(sh[0] == 0x11 && pv[0] == 0x22 && b == 0x11,
+                   "a write through a MAP_PRIVATE memfd mapping stays private -- the object still reads the shared write");
+                munmap(pv, 4096);
+                munmap(sh, 4096);
+            } else ok(0, "shared and private mappings of one memfd");
+            if (fcntl(pf, F_ADD_SEALS, F_SEAL_WRITE) == 0) {
+                errno = 0;
+                void *w = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, pf, 0);
+                ok(w == MAP_FAILED && errno == EPERM,
+                   "a write-sealed memfd refuses a shared writable mapping with EPERM");
+                if (w != MAP_FAILED) munmap(w, 4096);
+                void *r = mmap(0, 4096, PROT_READ, MAP_SHARED, pf, 0);
+                ok(r != MAP_FAILED, "...and still maps read-only");
+                if (r != MAP_FAILED) munmap(r, 4096);
+            } else ok(0, "F_ADD_SEALS F_SEAL_WRITE on an unmapped memfd");
+            /* MAP_FIXED must land where it was asked or not at all. */
+            void *want = (void *)0x6f0000000000ull;
+            void *fx = mmap(want, 4096, PROT_READ, MAP_SHARED | MAP_FIXED, pf, 0);
+            ok(fx == MAP_FAILED || fx == want,
+               "MAP_FIXED on a memfd lands exactly where it was asked, or fails -- never somewhere else");
+            if (fx != MAP_FAILED) munmap(fx, 4096);
+            close(pf);
+        } else ok(0, "a sealable memfd for the prot/flags checks");
     }
 
     munmap(churn, CHURN);

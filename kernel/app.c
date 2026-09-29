@@ -11091,7 +11091,7 @@ static uint64_t memfd_mmap_no(const char *why, int fd, uint64_t len, uint64_t of
 }
 unsigned long app_memfd_mmap_failures(void) { return g_memfd_mmap_fail; }
 
-static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
+static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off, int prot, int priv) {
     struct app *a = cur(); if (!a || !len) return 0;
     if (fd < 0 || fd >= APP_NFD || !a->fd[fd].used || a->fd[fd].type != 3)
         return memfd_mmap_no("that descriptor is not a memfd", fd, len, off);
@@ -11115,8 +11115,18 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     if (vs11 < 0)
         return memfd_mmap_no(vma_full(a) ? "the VMA table is full"
                                          : "no free address range of that size", fd, len, off);
-    a->vma[vs11].shared = 1;
+    a->vma[vs11].shared = priv ? 0 : 1;
     a->vma[vs11].foff = off;
+    /* WHAT THE CALLER ASKED FOR, NOT ALWAYS READ-WRITE-SHARED. Every mapping
+     * used to be writable and shared whatever prot and flags said: a
+     * PROT_READ mapping could be written, a write-sealed object's pages were
+     * writable through any mapping made of it, and a MAP_PRIVATE mapping's
+     * writes landed in the object for every other process to see. PROT_WRITE
+     * with MAP_PRIVATE maps the pages copy-on-write -- the fault path copies
+     * them on the first write, as it does after fork -- and PROT_EXEC is the
+     * only thing that clears NX. */
+    uint64_t pflags = PTE_USER | ((prot & 4) ? 0 : PTE_NX);
+    if (prot & 2) pflags |= priv ? PTE_COW : PTE_WRITABLE;
     /* OWNERSHIP (M1985). These frames belong to the KERNEL HEAP -- they are the
      * memfd's kmalloc'd buffer, aliased into the process, not pages this
      * process allocated. Two things follow, and neither was true before:
@@ -11140,7 +11150,7 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
     for (uint64_t i = 0; i < len; i += PAGE_SIZE) {
         uint64_t phys = vmm_translate((uint64_t)(uintptr_t)(m->buf + off + i));
         if (!phys || !pmm_refcountable(phys)) goto unwind;   /* unbacked or unshareable: map no hole */
-        if (vmm_map(base + i, phys, PTE_WRITABLE | PTE_USER | PTE_NX) != 0) goto unwind;
+        if (vmm_map(base + i, phys, pflags) != 0) goto unwind;
         pmm_addref(phys);
         continue;
       unwind:
@@ -11164,7 +11174,7 @@ static uint64_t app_mmap_memfd_nl(int fd, uint64_t len, uint64_t off) {
      * different page by construction -- an instrument that reports a
      * difference it created itself, for the second time in two days. */
     a->vma[vs11].foff = off;
-    a->vma[vs11].prot = VMA_PROT_READ | VMA_PROT_WRITE;
+    a->vma[vs11].prot = (uint8_t)(VMA_PROT_READ | ((prot & 2) ? VMA_PROT_WRITE : 0) | ((prot & 4) ? VMA_PROT_EXEC : 0));
     
     return base;
 }
@@ -11240,7 +11250,8 @@ uint64_t app_mmap_drm(int fd, uint64_t len, uint64_t off) {
     return r_;
 }
 
-uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
+uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) { return app_mmap_memfd_ex(fd, len, off, 3, 0); }
+uint64_t app_mmap_memfd_ex(int fd, uint64_t len, uint64_t off, int prot, int priv) {
     struct app *a_ = cur();
     /* A MAPPING PAST THE END GETS PAGES UNDER IT. The capacity used to be the
      * doubled size of a kmalloc, so a client mapping a little more than its
@@ -11256,7 +11267,7 @@ uint64_t app_mmap_memfd(int fd, uint64_t len, uint64_t off) {
         memfd_glk_give(m);
     }
     uint64_t f_ = vma_lock(a_);
-    uint64_t r_ = app_mmap_memfd_nl(fd, len, off);
+    uint64_t r_ = app_mmap_memfd_nl(fd, len, off, prot, priv);
     vma_unlock(a_, f_);
     return r_;
 }
@@ -11397,7 +11408,7 @@ unsigned long app_memfd_share_audit(int verbose) {
             for (int i = 0; i < a->nvma; i++) {
                 uint64_t vstart = 0, vlen = 0, vfoff = 0;
                 uint64_t fl = vma_lock(a);
-                if (a->vma[i].len && a->vma[i].mfd == mi) {
+                if (a->vma[i].len && a->vma[i].mfd == mi && a->vma[i].shared) {   /* a PRIVATE one may have copied */
                     vstart = a->vma[i].start; vlen = a->vma[i].len; vfoff = a->vma[i].foff;
                 }
                 vma_unlock(a, fl);
