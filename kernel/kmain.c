@@ -150,6 +150,21 @@ static int cmdline_has(const char *hay, const char *needle) {
     return 0;
 }
 
+/* ...and as a WHOLE WORD (M2394). `probes` is a substring of `noprobes`, so
+ * the substring match turned `noprobes` into "force the probes", and the line
+ * that lets `probes` beat every skip then cancelled the skip: since M2283
+ * `noprobes` has run the whole suite. A word here ends at a space, the end of
+ * the line, or an `=`. */
+static int cmdline_has_word(const char *hay, const char *needle) {
+    for (const char *p = hay; *p; p++) {
+        if (p != hay && p[-1] != ' ') continue;
+        const char *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b && (!*a || *a == ' ' || *a == '=')) return 1;
+    }
+    return 0;
+}
+
 /* CPU security hardening (M1269): enable SMEP (CR4 bit 20 — the kernel #PFs if it
  * ever tries to EXECUTE a ring-3 page) and UMIP (CR4 bit 11 — ring-3
  * SGDT/SIDT/SLDT/STR/SMSW #GP, closing those kernel-address info leaks), each
@@ -274,6 +289,8 @@ static volatile int g_lxtool_test;            /* -append lxtooltest: drive the B
 static volatile int g_lxnode_test;            /* -append lxnodetest: PHASE 6 -- run real Node.js in-guest (M1964) */
 static volatile int g_lxinet_test;            /* -append lxinettest: AF_INET sockets (DNS + HTTP) through the ABI (M1967) */
 static volatile int g_lxport;                 /* -append lxport: are two datagram sockets ever handed one local port? (M2324) */
+static volatile int g_lxsigctx;               /* -append lxsigctx: the signal context a JVM depends on, alone (M2392) */
+static volatile int g_lxjava;                 /* -append lxjava: a real HotSpot JVM, then a Java program that faults on purpose (M2393) */
 static volatile int g_lxnvdrm;                /* -append lxnvdrm: what Mesa's nvc0 asks the GT 1030's render node (M2390) */
 static volatile int g_lxdrm;                  /* -append lxdrm: does the DRM render node answer the four questions Mesa asks? (M2347) */
 static volatile int g_lxgl;                   /* -append lxgl: eight links from a GL call to the host iGPU (M2351) */
@@ -974,7 +991,7 @@ void kmain(uint64_t mb_info, uint64_t magic) {
          * with the probes alone -- so debugging it needs the combination the
          * switch now forbids. `probes` forces them back on; it is parsed
          * AFTER every flag that sets g_noprobes so it always wins. */
-        if (cmdline_has(cl, "probes"))     g_force_probes = 1;
+        if (cmdline_has_word(cl, "probes")) g_force_probes = 1;
         if (cmdline_has(cl, "lxfulltest")) { g_lxabi_test = 1; g_lxfault_test = 1; g_lxfull_test = 1; }
         if (cmdline_has(cl, "lxtooltest")) { g_lxabi_test = 1; g_lxtool_test = 1; }   /* toolchain only: no glibc demo binaries, no fault dumps */
         if (cmdline_has(cl, "futextrace")) { extern int g_futex_trace; g_futex_trace = 1; }   /* log every futex wait/wake (M1997) */
@@ -987,6 +1004,8 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         if (cmdline_has(cl, "lxnodetest"))  { g_lxabi_test = 1; g_lxnode_test = 1; }    /* its own boot: Node is 102 MB (M1964) */
         if (cmdline_has(cl, "lxinettest")) { g_lxabi_test = 1; g_lxinet_test = 1; }    /* AF_INET sockets: needs a NIC and the real internet (M1967) */
         if (cmdline_has(cl, "lxport"))     { g_lxabi_test = 1; g_lxport = 1; }   /* the ephemeral port allocator race (M2324) */
+        if (cmdline_has(cl, "lxsigctx"))   { g_lxabi_test = 1; g_lxsigctx = 1; } /* siginfo/ucontext/sigreturn as HotSpot uses them (M2392) */
+        if (cmdline_has(cl, "lxjava"))     { g_lxabi_test = 1; g_lxjava = 1; }   /* the JVM itself (M2393) */
         /* NOT g_lxabi_test. These two run from their own site after
          * virtio_gpu_init, not from the lxabi block, so setting that flag only
          * made every boot of a GPU probe run the whole thirty-probe ABI suite
@@ -1488,6 +1507,14 @@ void kmain(uint64_t mb_info, uint64_t magic) {
         kprintf("[lxabi] launching the PROT_NONE probe...\n");
         {   int nrc = app_run_linux_sync("/disk2/lxnone", 0, 0, 120000);
             kprintf("[lxabi] LXNONE exit -> %d\n", nrc); }
+        /* ...and whether a handler can do what a JVM's does with that fault
+         * (M2392): read it out of a real siginfo_t/ucontext_t, move the
+         * program counter, and have the thread resume THERE -- with its vector
+         * registers intact. HotSpot's null checks, safepoint polls and integer
+         * division all work that way. */
+        kprintf("[lxabi] launching the signal-context probe...\n");
+        {   int scrc = app_run_linux_sync("/disk2/lxsigctx", 0, 0, 120000);
+            kprintf("[lxabi] LXSIGCTX exit -> %d\n", scrc); }
         /* ...and whether an mprotect over a COW page keeps it copy-on-write
          * (M2178). vmm_protect replaced the PTE flags wholesale, so granting
          * write dropped the bit that makes the copy happen -- two processes
@@ -3443,6 +3470,38 @@ void kmain(uint64_t mb_info, uint64_t magic) {
             kprintf("[lxabi] launching the glibc getaddrinfo probe...\n");
             int gairc = app_run_linux_sync("/disk2/lxgai", 0, 0, 60000);
             kprintf("[lxabi] lxgai exit -> %d\n", gairc);
+        }
+        if (g_lxsigctx) {
+            kprintf("[lxabi] the signal context a JVM depends on, asked directly...\n");
+            int scrc = app_run_linux_sync("/disk2/lxsigctx", 0, 0, 120000);
+            kprintf("[lxabi] lxsigctx exit -> %d\n", scrc);
+        }
+        if (g_lxjava) {
+            /* A REAL JVM (M2393). Minecraft Java Edition is a HotSpot program,
+             * so this is the first link of that chain: the VM starts, reports
+             * its version, and then runs LxJava, which does on purpose the
+             * things a JVM does through signals -- implicit null checks,
+             * division by zero, stack overflow, safepoints under a JIT and a
+             * collector -- and says which of them held. Serial GC first
+             * because it asks the kernel for the least; then the default.
+             * -Xshare:auto is the default: the CDS archive is mapped if it
+             * can be and silently skipped if not. */
+            static const char *jv_ver[] = { "-XX:-UsePerfData", "-version" };
+            static const char *jv_ser[] = { "-XX:-UsePerfData", "--enable-native-access=ALL-UNNAMED", "-XX:+UseSerialGC",
+                                            "-Xmx512m", "-cp", "/opt/lxjava", "LxJava" };
+            static const char *jv_def[] = { "-XX:-UsePerfData", "--enable-native-access=ALL-UNNAMED",
+                                            "-Xmx512m", "-cp", "/opt/lxjava", "LxJava" };
+            const char *java = "/disk2/opt/jdk/bin/java";
+            kprintf("[lxjava] java -version...\n");
+            int j1 = app_run_linux_sync(java, jv_ver, 2, 300000);
+            kprintf("[lxjava] java -version exit -> %d\n", j1);
+            kprintf("[lxjava] LxJava under the Serial collector...\n");
+            int j2 = app_run_linux_sync(java, jv_ser, 7, 600000);
+            kprintf("[lxjava] LxJava (SerialGC) exit -> %d\n", j2);
+            kprintf("[lxjava] LxJava under the default collector...\n");
+            int j3 = app_run_linux_sync(java, jv_def, 6, 600000);
+            kprintf("[lxjava] LxJava (default GC) exit -> %d\n", j3);
+            kprintf("[lxjava] DONE: version %d, serial %d, default %d\n", j1, j2, j3);
         }
         if (g_lxport) {
             /* THE PORT ALLOCATOR, ASKED DIRECTLY (M2324). The DNS symptom needs

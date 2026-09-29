@@ -49,7 +49,11 @@ LXROOT=${LXROOT:-$ROOT/build/lxroot}
 # one in place is how a stale virgl-only build would survive the change.
 GALLIUM=${GALLIUM:-virgl,nouveau}
 OUT=${OUT:-/tmp/mesa-$(echo "$GALLIUM" | tr ',' '-')}
-SRC=$(ls /var/cache/distfiles/mesa-*.tar.xz 2>/dev/null | sort -V | tail -1)
+# mesa-[0-9]*, NOT mesa-* (M2391): the distfiles also hold mesa-demos-9.0.0,
+# which `sort -V` puts AFTER mesa-26.x -- so the newest "Mesa" was the demos
+# tarball, meson rejected -Dgallium-drivers, and the half-made build dir then
+# made every later run skip configure and fail at "loading build.ninja".
+SRC=$(ls /var/cache/distfiles/mesa-[0-9]*.tar.xz 2>/dev/null | sort -V | tail -1)
 [ -n "$SRC" ] || { echo "build-mesa-virgl: no mesa tarball in /var/cache/distfiles" >&2; exit 2; }
 VER=$(basename "$SRC" .tar.xz)
 
@@ -63,7 +67,11 @@ cd "$OUT/$VER"
 # -Dllvm=disabled is the whole point. -Dglx=disabled because there is no X
 # server here and never will be -- the display path is our own Wayland
 # compositor. -Dplatforms=wayland for the same reason.
-if [ ! -d "$OUT/b" ]; then
+# A CONFIGURED build dir is one with build.ninja in it. A meson setup that
+# failed leaves meson-info/ and meson-logs/ behind, and testing for the
+# directory alone skipped configure for ever after one failure.
+if [ ! -f "$OUT/b/build.ninja" ]; then
+    rm -rf "$OUT/b"
     echo "==> configuring ($GALLIUM, no LLVM, no GLX, wayland only)"
     # --libdir=lib64 TO MATCH THE GUEST, NOT THE HOST DISTRO. The guest root is
     # staged from a Gentoo box, so its libraries are in /usr/lib64 and /lib64,

@@ -149,6 +149,18 @@ typedef struct task {
                                  * core pin for floor tasks/task 0; this is the general POSIX-style subset
                                  * a task can restrict ITSELF to). Only consulted when pin_core<0 — every
                                  * ordinary task_create_stack task starts with all bits set (any core). */
+    /* THE FAULT A SIGNAL IS ABOUT, PER THREAD (M2392). This lived in struct
+     * app, so two threads faulting at the same moment -- every thread hitting
+     * a safepoint poll page at once is the ordinary case for a JVM -- could
+     * each be handed the other's si_addr. Set by the exception handler just
+     * before it delivers; consumed by that one delivery. At the END of the
+     * struct because host suites #include kernel .c files. */
+    uint64_t      lx_fault_addr, lx_fault_err, lx_fault_trapno, lx_fault_cr2;
+    int           lx_fault_code, lx_fault_signo, lx_fault_valid;
+    /* The mask a Linux frame records for sigreturn to put back, when that is
+     * not the one in force -- sigsuspend's case (M2392). */
+    uint64_t      lx_frame_mask;
+    int           lx_frame_mask_set;
 } task_t;
 
 void    sched_init(void);                  /* adopt the current context as task 0 */
@@ -208,6 +220,13 @@ void    task_kernel_enter(void);   /* a syscall began: a stop aimed here must wa
 void    task_kernel_leave(void);   /* ...and is honoured here, where no lock is held. May not return. */
 int     task_stop_pending(void);   /* should this task bail out of a blocking wait? (M2093) */
 void    task_copy_fpu(task_t *dst, task_t *src);   /* clone src's live FP/SSE state into dst (fork) */
+/* The FP image a Linux signal frame carries (M2392): size of the area, whether
+ * it is XSAVE (else FXSAVE), the live state captured into the caller's own
+ * area, and a sanitised install of a frame's image (0 = the clean state). */
+uint32_t    task_fpu_area_size(void);
+int         task_fpu_is_xsave(void);
+const void *task_fpu_snapshot(void);
+void        task_fpu_install(const void *src, uint32_t len, int fx_only);
 struct registers *task_uframe(task_t *t);  /* the task's most recent ring-3 trap frame, or 0 (M1119) */
 void    task_stop(task_t *t);              /* suspend another task (READY/RUNNING -> STOPPED); not self */
 void    task_report_why_idle(task_t *t);   /* state+ring+affinity, for a stall dump (M2039) */
