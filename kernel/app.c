@@ -9020,7 +9020,7 @@ void app_request_signal(app_t *a, int signo) {
      * the timer for SIGALRM) is routinely a different process on a different
      * core than the one about to block. */
     uint64_t f = irq_save();
-    ap->pending_sigs |= (1ull << signo);       /* OR into the bitset, so a 2nd async signal isn't dropped */
+    __atomic_fetch_or(&ap->pending_sigs, (1ull << signo), __ATOMIC_ACQ_REL);       /* OR into the bitset, so a 2nd async signal isn't dropped */
     /* WAKE EVERY THREAD THAT COULD TAKE IT, not just the main one (M2075).
      * A process-directed signal is delivered by whichever thread does not
      * block it, and the main thread is routinely the one parked longest -- in
@@ -9069,7 +9069,7 @@ int app_raise_signal_to_thread(int pid, int tid, int signo) {
     if (t->sig_handler[signo] == APP_SIG_IGN) return 0;  /* explicitly ignored: discard */
     if (t->sig_handler[signo]) {
         uint64_t f = irq_save();
-        th->sig_pending |= (1ull << signo);
+        __atomic_fetch_or(&th->sig_pending, (1ull << signo), __ATOMIC_ACQ_REL);
         task_wake(th);
         irq_restore(f);
         return 0;
@@ -9230,7 +9230,7 @@ static int app_sigqueue_to(struct app *t, int signo, uint64_t value, int code) {
         t->sigq[t->sigq_n].value = value;
         t->sigq_n++;
     }
-    t->pending_sigs |= (1ull << signo);                     /* mark pending; the queue holds the multiplicity */
+    __atomic_fetch_or(&t->pending_sigs, (1ull << signo), __ATOMIC_ACQ_REL);                     /* mark pending; the queue holds the multiplicity */
     task_wake(t->task);
     return 0;
 }
@@ -9449,6 +9449,10 @@ int app_deliver_pending(struct registers *r) {
     if ((r->cs & 3) != 3) return 0;          /* resuming kernel code (mid-syscall) -> defer */
     /* deliver the lowest pending signal that has a handler (one per return, like
      * Linux); handler-less signals stay pending for signalfd to drain. */
+    /* The pending sets are set by senders on other cores and cleared here,
+     * so every update is one atomic operation: a plain `&= ~bit` could store
+     * back a value read before another signal's bit arrived, and that signal
+     * was lost -- a lost GC-suspend signal hangs JavaScriptCore's collector. */
     for (int sig = 1; sig < APP_NSIG; sig++) {
         /* THIS THREAD'S first, then the process-wide set: a thread-directed
          * signal names its target and a process-directed one does not. (M2075) */
@@ -9456,8 +9460,8 @@ int app_deliver_pending(struct registers *r) {
         if (!mine && !(a->pending_sigs & (1ull << sig))) continue;
         /* SIG_IGN: DISCARD it, do not leave it pending for ever (M2063). */
         if (a->sig_handler[sig] == APP_SIG_IGN) {
-            a->pending_sigs &= ~(1ull << sig);
-            if (th) th->sig_pending &= ~(1ull << sig);
+            __atomic_fetch_and(&a->pending_sigs, ~(1ull << sig), __ATOMIC_ACQ_REL);
+            if (th) __atomic_fetch_and(&th->sig_pending, ~(1ull << sig), __ATOMIC_ACQ_REL);
             continue;
         }
         if (!a->sig_handler[sig]) continue;
@@ -9470,8 +9474,8 @@ int app_deliver_pending(struct registers *r) {
         if (app_signal_deliver(r, sig)) {
             if (qi >= 0) sigq_drop(a, qi);            /* consumed one queued instance */
             if (sigq_peek(a, sig) < 0) {   /* clear only when none remain -> the next queued instance delivers on the next return to ring 3 (RT queuing) */
-                a->pending_sigs &= ~(1ull << sig);
-                if (th) th->sig_pending &= ~(1ull << sig);
+                __atomic_fetch_and(&a->pending_sigs, ~(1ull << sig), __ATOMIC_ACQ_REL);
+                if (th) __atomic_fetch_and(&th->sig_pending, ~(1ull << sig), __ATOMIC_ACQ_REL);
             }
             return 1;
         }
@@ -9499,17 +9503,20 @@ static int sigfd_pick(struct app *a) {       /* lowest pending signal routed to 
 int app_sigfd_ready(app_t *a) { return a && sigfd_pick((struct app *)a) != 0; }   /* fswait peek */
 long app_sigfd_read(app_t *a, char *buf, int max) {
     struct app *ap = (struct app *)a;
-    if (!ap || max < 3) return -1;
+    if (!ap || max < 4) return -1;            /* up to "63\n" plus its NUL: max 3 wrote one byte past */
     int s;
     for (;;) {                                /* block until a sigfd signal is pending (woken by app_request_signal) */
         uint64_t f = irq_save();              /* pairs with app_request_signal's own lock (M1612) */
         s = sigfd_pick(ap);
+        /* Consumed under the same lock senders OR bits in under: a plain
+         * read-modify-write outside it could erase a signal raised in
+         * between. */
+        if (s != 0) __atomic_fetch_and(&ap->pending_sigs, ~(1ull << s), __ATOMIC_ACQ_REL);
         irq_restore(f);
         if (s != 0) break;
         task_block();
         if (!ap->used) return -1;             /* killed while parked */
     }
-    ap->pending_sigs &= ~(1ull << s);           /* consume it */
     int p = 0; char t[6]; int n = 0; int v = s;
     if (!v) t[n++] = '0'; while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
     while (n) buf[p++] = t[--n];
