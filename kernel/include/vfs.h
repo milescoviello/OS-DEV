@@ -85,6 +85,7 @@ long vfs_chmod(const char *path, uint32_t mode);                 /* set perm bit
 long vfs_chown(const char *path, long uid, long gid);            /* set owner/group (ext2 mounts); 0/-1 (M1243) */
 struct statx;
 int  vfs_stat(const char *path, struct statx *st);      /* file metadata for statx; 0/-1 (M1173) */
+int  vfs_lstat(const char *path, struct statx *st);     /* as vfs_stat, but a symlink reports ITSELF (lstat) */
 int  vfs_fiemap(const char *path, ext2_extent_t *out, int max);  /* file physical extent map (ext2 mounts); count/-1 (M1152) */
 long vfs_punch_hole(const char *path, uint64_t offset, uint64_t len);  /* fallocate PUNCH_HOLE (ext2 mounts); blocks/-1 (M1153) */
 long vfs_setxattr(const char *path, const char *name, const void *val, unsigned long vlen);  /* set user.* xattr (ext2 mounts); vlen/-1 (M1182) */

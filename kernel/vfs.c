@@ -921,6 +921,38 @@ long vfs_symlink(const char *linkpath, const char *target) {
  * symlinks (the ones SYS_symlink creates) and now real /diskN ext2 ones too
  * -- vfs_symlink has been able to CREATE the latter since M1146, but nothing
  * could ever read one back until now. Returns bytes (un-terminated) or -1. */
+/* lstat(2): stat the NAME. For a symlink that is the link itself -- S_IFLNK,
+ * its own inode, its target's length as the size -- and for anything else it
+ * is exactly stat. Reporting the target instead is what made `rm -r` treat a
+ * symlink to a directory as a directory, descend through it and delete the
+ * target's contents. A dangling link has an lstat but no stat. */
+int vfs_lstat(const char *path, struct statx *st) {
+    char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
+    if (!p) return -1;                            /* path too long to represent (M1937) */
+    int midx; char fpath[VFS_PATH_MAX];
+    uint32_t sz = 0, ino = 0, mt = 0, nl = 0, mode = 0;
+    if (mount_path(p, &midx, fpath, sizeof fpath) &&
+        blockdev_mount_link_stat(midx, fpath, &sz, &ino, &mt, &nl, &mode) == 0) {
+        for (unsigned i = 0; i < sizeof(*st); i++) ((char *)st)[i] = 0;
+        st->stx_mode = mode ? mode : (S_IFLNK | 0777u);
+        st->stx_size = sz; st->stx_ino = ino; st->stx_nlink = nl ? nl : 1;
+        st->stx_mtime = mt; st->stx_blksize = 512;
+        return 0;
+    }
+    const char *base;
+    char tb[64];
+    if (tmp_path(p, &base)) {
+        long n = tmpfs_readlink(base, tb, sizeof tb);
+        if (n >= 0) {
+            for (unsigned i = 0; i < sizeof(*st); i++) ((char *)st)[i] = 0;
+            st->stx_mode = S_IFLNK | 0777u; st->stx_size = (uint64_t)n;
+            st->stx_ino = path_ino(p); st->stx_nlink = 1; st->stx_blksize = 512;
+            return 0;
+        }
+    }
+    return vfs_stat(path, st);
+}
+
 long vfs_readlink(const char *path, void *buf, unsigned long max) {
     char rb[VFS_PATH_MAX]; const char *p = bind_resolve(path, rb, sizeof rb);
     if (!p) return -1;                            /* path too long to represent (M1937) */

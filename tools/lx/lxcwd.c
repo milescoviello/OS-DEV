@@ -210,6 +210,26 @@ static void symlinks(void) {
         if (k > 0) printf("LXCWD: open() FOLLOWED our symlink (%zd bytes)\n", k);
         else { printf("LXCWD: open followed the link but read nothing\n"); fails++; } }
     else { printf("LXCWD: open of our own symlink FAILED errno=%d\n", errno); fails++; }
+    /* lstat must describe the LINK, stat its target. When lstat followed,
+     * `rm -r` took a symlink to a directory for the directory itself and
+     * deleted the target's contents through it. */
+    {
+        struct stat ls, ss, dls, dss, fls; struct statx sxl;
+        unlink("/root/lxcwd-dlink");
+        int lk = lstat("/root/lxcwd-link", &ls) == 0 && S_ISLNK(ls.st_mode) &&
+                 ls.st_size == (off_t)strlen("/etc/machine-id");
+        int sk = stat("/root/lxcwd-link", &ss) == 0 && S_ISREG(ss.st_mode);
+        int dk = symlink("/etc", "/root/lxcwd-dlink") == 0 &&
+                 lstat("/root/lxcwd-dlink", &dls) == 0 && S_ISLNK(dls.st_mode) &&
+                 stat("/root/lxcwd-dlink", &dss) == 0 && S_ISDIR(dss.st_mode);
+        int ak = fstatat(AT_FDCWD, "/root/lxcwd-dlink", &fls, AT_SYMLINK_NOFOLLOW) == 0 &&
+                 S_ISLNK(fls.st_mode) &&
+                 statx(AT_FDCWD, "/root/lxcwd-dlink", AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sxl) == 0 &&
+                 S_ISLNK(sxl.stx_mode);
+        if (lk && sk && dk && ak) printf("LXCWD: lstat reports the link itself, stat its target (file and dir links, fstatat/statx NOFOLLOW)\n");
+        else { printf("LXCWD: lstat/stat of a symlink WRONG: lstat-link=%d stat-follows=%d dir-link=%d nofollow-flags=%d\n", lk, sk, dk, ak); fails++; }
+        unlink("/root/lxcwd-dlink");
+    }
     unlink("/root/lxcwd-link");
 
     /* A HARD LINK, and TIMESTAMPS. Firefox links a temporary into place to make

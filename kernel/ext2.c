@@ -1946,6 +1946,38 @@ long ext2_symlink_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t
  * target -- this just returns that decoded target instead of following it.
  * Slow symlinks (target too long to fit inline) are unsupported, matching
  * walk_d's own existing limit for auto-following. */
+/* lstat's half (the name, NOT what it points at): if the final component of
+ * `path` is a symlink, report the LINK's own inode -- number, size (target
+ * length), mode, times, links -- and return 0. -1 if the name is absent or is
+ * not a symlink; the caller then answers with an ordinary stat, which is what
+ * lstat means for everything else. */
+int ext2_link_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
+                        uint32_t *out_size, uint32_t *out_ino, uint32_t *out_mtime,
+                        uint32_t *out_nlink, uint32_t *out_mode) {
+    ext2_t v;
+    if (ext2_open(read, ctx, start_lba, &v) < 0) return -1;
+    char parent[256], base[256];
+    int last = -1, n = 0;
+    for (int i = 0; path[i]; i++) { if (path[i] == '/') last = i; n = i + 1; }
+    if (last < 0) parent[0] = 0;
+    else { int j = 0; for (; j < last && j < 255; j++) parent[j] = path[j]; parent[j] = 0; }
+    { int j = 0, s = last + 1; for (; s < n && j < 255; s++, j++) base[j] = path[s]; base[j] = 0; }
+    if (base[0] == 0) return -1;
+    uint8_t pin[256]; int pdir = 0;
+    if (!walk(&v, parent, pin, &pdir) || !pdir) return -1;
+    int cd = 0;
+    uint32_t ino = dir_lookup(&v, pin, base, &cd);
+    uint8_t inode[256];
+    if (!ino || read_inode(&v, ino, inode) < 0) return -1;
+    if ((e_rd16(inode + 0) & 0xF000) != 0xA000) return -1;   /* not a link: plain stat answers */
+    if (out_size)  *out_size  = e_rd32(inode + 4);
+    if (out_ino)   *out_ino   = ino;
+    if (out_mtime) *out_mtime = e_rd32(inode + 16);
+    if (out_nlink) *out_nlink = e_rd16(inode + 26);
+    if (out_mode)  *out_mode  = e_rd16(inode + 0);
+    return 0;
+}
+
 long ext2_readlink_path(blk_read_fn read, void *ctx, uint64_t start_lba,
                         const char *path, void *buf, unsigned long max) {
     ext2_t v;

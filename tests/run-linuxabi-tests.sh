@@ -682,6 +682,11 @@ LXWAIT: reaped 40/40 children
     else
         echo "  FAIL: symlinks:"; grep -a "LXCWD: .*symlink\|LXCWD: cursor" "$SLOG3" | head -4; f3=1
     fi
+    if grep -aq "LXCWD: lstat reports the link itself" "$SLOG3"; then
+        echo "  ok: lstat/fstatat/statx NOFOLLOW report a symlink as S_IFLNK; stat follows it"
+    else
+        echo "  FAIL: lstat of a symlink:"; grep -a "LXCWD: lstat" "$SLOG3" | head -3; f3=1
+    fi
     if grep -aq "LXCWD: hard link shares the inode" "$SLOG3"; then
         echo "  ok: link(2) makes a hard link, and both names report the same inode ($(grep -ao 'shares the inode ([0-9]*)' "$SLOG3" | head -1))"
     else

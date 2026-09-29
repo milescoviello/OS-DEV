@@ -672,6 +672,7 @@ static const char *lx_xlate(const char *p, char *out, int max) {
  * old cwd-relative behaviour. The stored fd path is ALREADY kernel-side
  * (/disk2/...), so it must not be translated a second time. */
 #define LX_AT_FDCWD (-100)
+#define LX_AT_SYMLINK_NOFOLLOW 0x100   /* fstatat/statx: stat the name, not a symlink's target */
 /* WHICH RESOLVER FILES DID GLIBC ACTUALLY LOOK AT (M2128).
  *
  * `getaddrinfo` fails inside OS-DEV while `lxinet`, which builds its own DNS
@@ -2214,7 +2215,8 @@ static void lx_dispatch_body(struct registers *r) {
         if (!vmm_user_ok(r->r8, 256)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         char xp[VFS_PATH_MAX]; const char *path = lx_xlate_at((long)r->rdi, up, xp, sizeof xp);   /* dirfd (M2032) */
         struct statx sx;
-        if (vfs_stat(path, &sx) != 0) {
+        int st_rc = (r->rdx & LX_AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &sx) : vfs_stat(path, &sx);   /* see LXS_lstat_ */
+        if (st_rc != 0) {
             /* Name BOTH spellings. A stat that fails on a path the program
              * believes in is nearly always a TRANSLATION problem, and the
              * translated form is the only place that shows. (M1992) */
@@ -4796,9 +4798,16 @@ static void lx_dispatch_body(struct registers *r) {
          * (path, statbuf) rather than (dirfd, path, statbuf, flags). glibc on
          * x86-64 still emits them, and a program that gets ENOSYS for stat
          * cannot look at a file at all -- Claude Code issued twelve in a row
-         * before giving up. We have no symlinks to follow differently, so
-         * lstat is the same answer. (M1992) */
+         * before giving up. (M1992)
+         *
+         * lstat, and fstatat with AT_SYMLINK_NOFOLLOW, stat the NAME: a
+         * symlink reports itself. They used to follow it, because this was
+         * written before ext2 had symlinks -- so `rm -r` saw a link to a
+         * directory as a directory, descended through it and deleted the
+         * target's contents, and cp -a / tar copied targets. */
         int by_path = (r->rax == LXS_stat_ || r->rax == LXS_lstat_);
+        int nofollow = (r->rax == LXS_lstat_) ||
+                       (r->rax == LXS_newfstatat && (r->r10 & LX_AT_SYMLINK_NOFOLLOW));
         uint64_t upath_u = by_path ? r->rdi : r->rsi;
         uint64_t ubuf_u  = by_path ? r->rsi : r->rdx;
         const char *upath = (const char *)upath_u;
@@ -4807,7 +4816,7 @@ static void lx_dispatch_body(struct registers *r) {
         if (!vmm_user_ok(ubuf_u, LXST_SIZE)) { r->rax = (uint64_t)-(long)LX_EFAULT; break; }
         r->rdx = ubuf_u;                    /* the writes below all go through rdx */
         struct statx sx;
-        if (vfs_stat(path, &sx) != 0) {
+        if ((nofollow ? vfs_lstat(path, &sx) : vfs_stat(path, &sx)) != 0) {
             /* Name BOTH spellings. A stat that fails on a path the program
              * believes in is nearly always a TRANSLATION problem, and the
              * translated form is the only place it shows. (M1992) */

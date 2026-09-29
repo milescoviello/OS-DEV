@@ -44,7 +44,10 @@ long ext2_mkdir_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t s
 long ext2_symlink_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                        const char *path, const char *target);                 /* create a fast symlink; 0/-1 (M1146) */
 long ext2_readlink_path(blk_read_fn read, void *ctx, uint64_t start_lba,
-                        const char *path, void *buf, unsigned long max);      /* read a symlink's target, not followed; bytes/-1 (M1594) */
+                        const char *path, void *buf, unsigned long max);
+int  ext2_link_stat_path(blk_read_fn read, void *ctx, uint64_t start_lba, const char *path,
+                         uint32_t *out_size, uint32_t *out_ino, uint32_t *out_mtime,
+                         uint32_t *out_nlink, uint32_t *out_mode);   /* lstat of a symlink name: 0, else -1 */      /* read a symlink's target, not followed; bytes/-1 (M1594) */
 long ext2_link_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
                     const char *oldpath, const char *newpath);                 /* hard link: 2nd name -> same inode; 0/-1 (M1207) */
 long ext2_rename_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t start_lba,
