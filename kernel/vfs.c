@@ -16,6 +16,7 @@
 #include "mbox.h"
 #include "notify.h"
 #include "eventfd.h"
+#include "console.h"   /* kprintf: a refused over-long path says so */
 #include "pci.h"
 #include "bpf.h"
 #include "fanfs.h"
@@ -75,7 +76,7 @@ static int mount_path(const char *name, int *midx, char *path, int max);   /* fw
 int vfs_cwd_set_for(app_t *a, const char *abs) {
     if (!a || !abs) return -1;
     int midx; char sub[VFS_PATH_MAX];
-    if (!mount_path(abs, &midx, sub, sizeof sub)) return -1;
+    if (!mount_path(abs, &midx, sub, sizeof sub) || midx < 0) return -1;
     app_cwd_save(a, 4 + midx, sub[0] ? sub : "/", 0);   /* synth_cwd >= 4 means "inside mount (n-4)" */
     return 0;
 }
@@ -159,8 +160,13 @@ static const char *bind_resolve(const char *name, char *out, int max) {
     if (best < 0) return name;
     int p = 0; const char *f = t[best].from;
     while (*f && p < max - 1) out[p++] = *f++;
-    for (const char *rest = name + bestlen; *rest && p < max - 1; rest++) out[p++] = *rest;
+    const char *rest = name + bestlen;
+    for (; *rest && p < max - 1; rest++) out[p++] = *rest;
     out[p] = 0;
+    /* The REBUILT path can be longer than the one checked above (a long bind
+     * source), and a cut-off one names a different file: refuse it like any
+     * other unrepresentable path. */
+    if (*f || *rest) return 0;
     return out;
 }
 
@@ -329,25 +335,41 @@ void vfs_drop_caches_for(const char *abs) {
     blockdev_drop_mount_caches(midx);
 }
 
+/* A PATH THAT DOES NOT FIT IS NOT SHORTENED. Both branches below copied into
+ * the caller's buffer and stopped at its end without a word, so a long name
+ * reached rename, link, truncate or unlink as its own prefix -- a different
+ * file. The mount is still claimed (so no other filesystem is tried with the
+ * same name), but with index -1, which every blockdev_mount_* refuses, and a
+ * non-empty path, so the mount-ROOT special cases do not match either. */
+static int mount_path_toolong(int *midx, char *path, int max, const char *name) {
+    static int told;
+    if (told++ < 4) kprintf("[vfs] path too long for its buffer (%d bytes), refused: \"%s\"\n", max, name);
+    *midx = -1;
+    if (max >= 2) { path[0] = '?'; path[1] = 0; }
+    return 1;
+}
 static int mount_path(const char *name, int *midx, char *path, int max) {
     if (name[0] == '/') {
         char comp[12]; int c = 0; const char *p = name + 1;
         while (*p && *p != '/' && c < 11) comp[c++] = *p++;
+        if (*p && *p != '/') return 0;             /* longer than any mount name: not one (was matched on its prefix) */
         comp[c] = 0;
         int idx = blockdev_mount_index(comp);
         if (idx < 0) return 0;
-        *midx = idx;
         const char *rest = (*p == '/') ? p + 1 : p;
         int i = 0; while (rest[i] && i < max - 1) { path[i] = rest[i]; i++; } path[i] = 0;
+        if (rest[i]) return mount_path_toolong(midx, path, max, name);
+        *midx = idx;
         return 1;
     }
     if (synth_cwd >= 4) {                          /* relative name inside the cwd mount */
-        *midx = synth_cwd - 4;
-        int p = 0;
-        for (int i = 0; mount_sub[i] && p < max - 1; i++) path[p++] = mount_sub[i];
-        if (p > 0 && p < max - 1) path[p++] = '/';
-        for (int i = 0; name[i] && p < max - 1; i++) path[p++] = name[i];
+        int p = 0, cut = 0;
+        for (int i = 0; mount_sub[i]; i++) { if (p < max - 1) path[p++] = mount_sub[i]; else cut = 1; }
+        if (p > 0) { if (p < max - 1) path[p++] = '/'; else cut = 1; }
+        for (int i = 0; name[i]; i++) { if (p < max - 1) path[p++] = name[i]; else cut = 1; }
         path[p] = 0;
+        if (cut) return mount_path_toolong(midx, path, max, name);
+        *midx = synth_cwd - 4;
         return 1;
     }
     return 0;
@@ -1186,7 +1208,7 @@ int vfs_chdir(const char *path) {
         char comp[12]; int c = 0; const char *p = path + 1;
         while (*p && *p != '/' && c < 11) comp[c++] = *p++;
         comp[c] = 0;
-        int idx = blockdev_mount_index(comp);
+        int idx = (*p && *p != '/') ? -1 : blockdev_mount_index(comp);   /* too long to be a mount name */
         if (idx >= 0) {
             const char *rest = (*p == '/') ? p + 1 : p;
             char sub[128]; mount_sub_join("", rest, sub, sizeof sub);
