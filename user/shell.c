@@ -4701,7 +4701,7 @@ static int run_command(char *line, char *cwd) {
                 if (!(a1 == 8 && v == 1)) ok = 0;                                   /* returns 1, count 2->1 */
                 long a2 = sys_fdread(sfd, b, 8); v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long long)b[i] << (i * 8);
                 if (!(a2 == 8 && v == 1)) ok = 0;                                   /* returns 1, count 1->0 */
-                if (sys_fdread(sfd, b, 8) != -1) ok = 0;                            /* drained -> -1 */
+                if (sys_fdread(sfd, b, 8) >= 0) ok = 0;                             /* drained -> would block (EAGAIN) */
                 sys_fdclose(sfd);
             }
             print(ok ? "eventfd: count(5)->POLLIN->read 5->drained; +3->read 3; EFD_SEMAPHORE read 1,1 then empty -- OK\n"

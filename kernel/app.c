@@ -11977,12 +11977,25 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 5) {   /* eventfd: read the counter (M1242) */
         if (max < 8) return -1;
-        while (a->fd[fd].off <= 0) {            /* empty: block for real unless EFD_NONBLOCK (M1579) */
+        for (;;) {                               /* empty: block for real unless non-blocking (M1579) */
             uint64_t f = irq_save();             /* M1612: pairs with app_fd_write's own lock below --
                                                     * was unsynchronized, so a writer's check of g_evfd_wait[]
                                                     * could run before this reader finishes registering */
-            if (a->fd[fd].off > 0) { irq_restore(f); break; }   /* a writer raced in since the check above */
-            if (a->fd[fd].obj) { irq_restore(f); return -1; }   /* obj doubles as the EFD_NONBLOCK flag for this type -> EAGAIN */
+            if (a->fd[fd].off > 0) {
+                /* CONSUME UNDER THE LOCK the writer adds under: read-then-store
+                 * outside it lost a post that landed in between, and a thread
+                 * pool waiting on that post (EFD_SEMAPHORE) never woke. */
+                long cnt = a->fd[fd].off;
+                uint64_t val = a->fd[fd].write_end ? 1u : (uint64_t)cnt;       /* SEMAPHORE: 1, else the whole count */
+                a->fd[fd].off = a->fd[fd].write_end ? cnt - 1 : 0;             /* SEMAPHORE: decrement, else drain */
+                irq_restore(f);
+                for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(val >> (i * 8));
+                return 8;
+            }
+            /* EFD_NONBLOCK at creation lives in `obj`; O_NONBLOCK set later by
+             * fcntl/FIONBIO lives in `.nonblock` -- honour either. And it is
+             * EAGAIN: a bare -1 reached a Linux caller as EBADF. */
+            if (a->fd[fd].obj || app_fd_nonblock(fd)) { irq_restore(f); return APP_FD_EAGAIN; }
             int slot = -1;
             for (int i = 0; i < EVFD_NWAIT; i++) if (!g_evfd_wait[i].used) { slot = i; break; }
             if (slot < 0) { irq_restore(f); return -1; }        /* too many blocked eventfd readers system-wide; fail rather than hang */
@@ -11990,12 +12003,8 @@ static long app_fd_read_inner(int fd, void *buf, unsigned long max) {
             irq_restore(f);                      /* released BEFORE blocking (M1612) */
             task_block();                       /* woken by eventfd_write, a kill, or a signal */
             g_evfd_wait[slot].used = 0;          /* reclaim our slot on resume (idempotent w/ the WAKE below) */
+            if (a->kill || a->exited) return -1;
         }
-        long cnt = a->fd[fd].off;
-        uint64_t val = a->fd[fd].write_end ? 1u : (uint64_t)cnt;              /* SEMAPHORE: 1, else the whole count */
-        for (int i = 0; i < 8; i++) ((char *)buf)[i] = (char)(val >> (i * 8));
-        a->fd[fd].off = a->fd[fd].write_end ? cnt - 1 : 0;                    /* SEMAPHORE: decrement, else drain */
-        return 8;
     }
     if (fd >= 0 && fd < APP_NFD && a->fd[fd].used && a->fd[fd].type == 8) {   /* inotify: drain queued events (M1266) */
         /* AN EMPTY INOTIFY IS NOT EOF (M2016). Zero from read() means "there
@@ -12263,9 +12272,9 @@ static long app_fd_write_inner(int fd, const void *buf, unsigned long len) {
         uint64_t add = 0;
         for (int i = 0; i < 8; i++) add |= (uint64_t)(unsigned char)((const char *)buf)[i] << (i * 8);
         if (add == 0xFFFFFFFFFFFFFFFFull) return -1;                          /* ~0 is reserved/invalid for eventfd */
+        uint64_t f = irq_save();                /* the add is a read-modify-write: under the reader's lock */
         long nc = a->fd[fd].off + (long)add;
-        if (nc < a->fd[fd].off) return -1;                                   /* overflow -> would block; reject */
-        uint64_t f = irq_save();
+        if (nc < a->fd[fd].off) { irq_restore(f); return -1; }               /* overflow -> would block; reject */
         a->fd[fd].off = nc;
         for (int i = 0; i < EVFD_NWAIT; i++)                                  /* wake every reader blocked on THIS (app, fd) (M1579) */
             if (g_evfd_wait[i].used && g_evfd_wait[i].a == a && g_evfd_wait[i].fd == fd) {
