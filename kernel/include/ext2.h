@@ -82,6 +82,7 @@ long ext2_removexattr(blk_read_fn read, blk_write_fn write, void *ctx, uint64_t 
  * a WAL before every transaction and neither exists, so the NEGATIVE half
  * carries most of the win. Flushed wholesale by every write in this file. */
 void ext2_path_cache_flush(void);
+unsigned long ext2_path_cache_epoch(void);   /* bumped by every flush (see g_e2pc_epoch) */
 void ext2_path_cache_stats(unsigned long *hits, unsigned long *misses,
                            unsigned long *neg, unsigned long *flushes);
 extern int g_e2_path_cache;   /* 0 = walk every path from the root, as before M2103 */

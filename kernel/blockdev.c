@@ -1098,12 +1098,21 @@ long blockdev_mount_pread(int i, const char *path, void *buf, unsigned long max,
  * shape ata.c's lock uses (M1911), because this is held across real disk I/O
  * and a pure spinner on the holder's own core starves the task it waits for. */
 static volatile int fsw_lock;
+static unsigned long fsw_epoch0;      /* the path-cache epoch when the current writer began */
 static void fsw_take(void) {
     uint32_t spins = 0;
     while (__atomic_exchange_n(&fsw_lock, 1, __ATOMIC_ACQUIRE))
         if (++spins >= 1000) { spins = 0; task_yield(); }
+    fsw_epoch0 = ext2_path_cache_epoch();
 }
-static void fsw_give(void) { __atomic_store_n(&fsw_lock, 0, __ATOMIC_RELEASE); }
+/* A writer that changed the namespace flushed the ext2 path cache on entry;
+ * flush it AGAIN as it leaves, or a reader whose walk overlapped the write can
+ * cache the pre-write answer (see g_e2pc_epoch in ext2.c). An in-place
+ * overwrite never flushed (M2140) and still does not. */
+static void fsw_give(void) {
+    if (ext2_path_cache_epoch() != fsw_epoch0) ext2_path_cache_flush();
+    __atomic_store_n(&fsw_lock, 0, __ATOMIC_RELEASE);
+}
 
 static long blockdev_mount_write_locked(int i, const char *path, const void *buf, unsigned long len) {
     blockdev_mount_scan();
@@ -1232,12 +1241,18 @@ long blockdev_mount_rename(int i, const char *oldpath, const char *newpath) {
     return r;
 }
 
+/* Under fsw_lock like every other mutating mount op: renameat2 was the one
+ * that skipped it, reopening the read-modify-write race (M2308) on directory
+ * blocks, inodes and bitmaps for every RENAME_NOREPLACE/EXCHANGE. */
 long blockdev_mount_rename2(int i, const char *oldpath, const char *newpath, int flags) {  /* renameat2 (ext2 only); 0/-1 (M1232) */
     blockdev_mount_scan();
     if (i < 0 || i >= g_nmount) return -1;
     if (g_mount[i].fstype != FS_EXT2) return -1;
-    return ext2_rename2_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
-                             oldpath ? oldpath : "", newpath ? newpath : "", flags);
+    fsw_take();
+    long r = ext2_rename2_path(mount_rfn(i), mount_wfn(i), mount_ctx(i), g_mount[i].start,
+                               oldpath ? oldpath : "", newpath ? newpath : "", flags);
+    fsw_give();
+    return r;
 }
 static long blockdev_mount_truncate_locked(int i, const char *path, uint64_t newlen) {   /* resize (ext2 only); 0/-1 (M1228) */
     blockdev_mount_scan();

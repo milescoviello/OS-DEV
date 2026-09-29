@@ -225,6 +225,13 @@ static int ext2_open(blk_read_fn read, void *ctx, uint64_t start, ext2_t *v) {
     v->feat_incompat    = (rev >= 1) ? e_rd32(sb + 96) : 0;   /* `extent`=0x40, for extent writes (M1189) */
     if (!v->blocks_per_group || v->blocks_count <= v->first_data_block) {
         v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }
+    /* A group's block and inode bitmaps are ONE block each, so neither count
+     * can exceed 8 bits per byte of it. alloc_block, alloc_inode and
+     * free_block index a 4 KiB stack buffer by bit>>3: an image claiming
+     * more (losetup accepts any file) wrote past that buffer on the kernel
+     * stack. ext2 itself never makes one; refuse it. */
+    if (v->blocks_per_group > 8u * v->block_size || v->inodes_per_group > 8u * v->block_size) {
+        v->ioerr = 1; g_e2_sb_badfield++; g_e2_distrust++; return -1; }
     v->groups = (v->blocks_count - v->first_data_block + v->blocks_per_group - 1) / v->blocks_per_group;
     return 0;
 }
@@ -588,7 +595,11 @@ static uint32_t walk_d(ext2_t *v, uint32_t startino, const char *path,
 /* `gen` is a seqlock: ODD = published and whole, EVEN = free or mid-write. It
  * replaces the old `used` flag because a flag cannot express "being rewritten",
  * and that is the state a reader has to detect. See walk_cached. */
+/* Keyed by VOLUME as well as path: with two ext2 volumes mounted (/disk2 and
+ * a losetup image, say) "etc/passwd" on one used to answer with the other's
+ * inode number -- the wrong file, or a false ENOENT. */
 static struct { char path[128]; uint32_t ino; uint8_t isdir, negative;
+                blk_read_fn vread; void *vctx; uint64_t vstart;
                 volatile unsigned gen; volatile int claim; } g_e2pc[E2PC_N];
 static unsigned g_e2pc_clk;
 static uint8_t  g_e2pc_lru[E2PC_N];
@@ -625,7 +636,18 @@ static int e2pc_eq(const char *a, const char *b) {
 }
 /* Any write to this volume drops the whole cache. Called from every mutating
  * entry point in this file. */
+/* THE FLUSH EPOCH. A reader that was already walking when a writer flushed
+ * would insert what it saw BEFORE the write -- say "P is absent" just as P was
+ * created -- and nothing would ever retract it: app_open then took O_CREAT's
+ * create-or-overwrite path and TRUNCATED THE EXISTING FILE (a stale positive
+ * after an unlink read a freed inode instead). Every flush bumps the epoch
+ * first; a reader snapshots it before walking and retracts its own insert if
+ * it moved. Writers flush again when they finish (blockdev's fsw_give), so a
+ * walk overlapping a write always meets a later bump. */
+static volatile unsigned long g_e2pc_epoch;
+unsigned long ext2_path_cache_epoch(void) { return __atomic_load_n(&g_e2pc_epoch, __ATOMIC_ACQUIRE); }
 void ext2_path_cache_flush(void) {
+    __atomic_fetch_add(&g_e2pc_epoch, 1, __ATOMIC_ACQ_REL);   /* BEFORE the entries: see above */
     for (int i = 0; i < E2PC_N; i++) {
         unsigned g = __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE);
         if (g & 1u) __atomic_store_n(&g_e2pc[i].gen, g + 1, __ATOMIC_RELEASE);
@@ -668,6 +690,7 @@ int g_e2_read_runs  = 1;
 
 static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int *is_dir) {
     if (!g_e2_path_cache) return walk(v, path, inode_out, is_dir);
+    unsigned long epoch0 = __atomic_load_n(&g_e2pc_epoch, __ATOMIC_ACQUIRE);   /* see g_e2pc_epoch */
     int plen = 0; while (path[plen]) plen++;
     int cacheable = (plen > 0 && plen < (int)sizeof g_e2pc[0].path);
     int slot = -1;
@@ -689,6 +712,8 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
             unsigned g1 = __atomic_load_n(&g_e2pc[i].gen, __ATOMIC_ACQUIRE);
             if (!(g1 & 1u)) continue;                  /* free, or being written */
             if (!e2pc_eq(g_e2pc[i].path, path)) continue;
+            if (g_e2pc[i].vread != v->read || g_e2pc[i].vctx != v->ctx ||
+                g_e2pc[i].vstart != v->start) continue;       /* another volume's answer (validated by the gen re-read) */
             uint32_t cino = g_e2pc[i].ino;
             uint8_t  cdir = g_e2pc[i].isdir, cneg = g_e2pc[i].negative;
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -746,6 +771,7 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
             g_e2pc[slot].ino = ino;
             g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
             g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
+            g_e2pc[slot].vread = v->read; g_e2pc[slot].vctx = v->ctx; g_e2pc[slot].vstart = v->start;
             g_e2pc[slot].gen |= 1u;                  /* "published", with no ordering at all */
             g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
         } else if (v2 >= 0 && !__atomic_exchange_n(&g_e2pc[v2].claim, 1, __ATOMIC_ACQUIRE)) {
@@ -759,10 +785,15 @@ static uint32_t walk_cached(ext2_t *v, const char *path, uint8_t *inode_out, int
             g_e2pc[slot].ino = ino;
             g_e2pc[slot].isdir = (uint8_t)(isd ? 1 : 0);
             g_e2pc[slot].negative = (uint8_t)(ino ? 0 : 1);
+            g_e2pc[slot].vread = v->read; g_e2pc[slot].vctx = v->ctx; g_e2pc[slot].vstart = v->start;
             __atomic_thread_fence(__ATOMIC_RELEASE);
-            __atomic_store_n(&g_e2pc[slot].gen,
-                             (__atomic_load_n(&g_e2pc[slot].gen, __ATOMIC_RELAXED) | 1u) + 2u,
-                             __ATOMIC_RELEASE);          /* publish: odd, and different */
+            unsigned pub = (__atomic_load_n(&g_e2pc[slot].gen, __ATOMIC_RELAXED) | 1u) + 2u;
+            __atomic_store_n(&g_e2pc[slot].gen, pub, __ATOMIC_RELEASE);   /* publish: odd, and different */
+            /* A flush during our walk means what we saw may predate a write:
+             * take it back (unless a flush already retired it). */
+            if (__atomic_load_n(&g_e2pc_epoch, __ATOMIC_ACQUIRE) != epoch0)
+                __atomic_compare_exchange_n(&g_e2pc[slot].gen, &pub, pub + 1, 0,
+                                            __ATOMIC_RELEASE, __ATOMIC_RELAXED);
             g_e2pc_lru[slot] = (uint8_t)(++g_e2pc_clk);
             __atomic_store_n(&g_e2pc[v2].claim, 0, __ATOMIC_RELEASE);
         } else if (v2 >= 0) {
@@ -1458,12 +1489,20 @@ static int bslot_set(ext2_t *v, uint8_t *inode, bslot_t s, uint32_t phys) {
 /* Physical block backing logical block `fblk`, allocating it (and any indirect
  * level above it) if absent. Updates i_block[] in the caller's in-memory
  * `inode`, so the caller must write_inode() to commit. 0 on failure. */
+static uint32_t bmap_alloc_f(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged, int *fresh);
 static uint32_t bmap_alloc(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged) {
+    return bmap_alloc_f(v, inode, fblk, charged, 0);
+}
+/* As bmap_alloc; *fresh says whether the block was allocated just now, i.e.
+ * holds a previous owner's bytes rather than this file's. */
+static uint32_t bmap_alloc_f(ext2_t *v, uint8_t *inode, uint32_t fblk, uint32_t *charged, int *fresh) {
     bslot_t s;
+    if (fresh) *fresh = 0;
     if (!bmap_slot(v, inode, fblk, &s, charged)) return 0;
     uint32_t b = bslot_get(v, inode, s);
     if (b) return b;                                       /* already mapped */
     if (!(b = alloc_block(v))) return 0;
+    if (fresh) *fresh = 1;
     if (charged) (*charged)++;
     if (bslot_set(v, inode, s, b) < 0) { free_block(v, b); return 0; }
     return b;
@@ -2334,6 +2373,10 @@ long ext2_truncate_path(blk_read_fn read, blk_write_fn write, void *ctx, uint64_
     ext2_t v;
     if (!write || ext2_open(read, ctx, start_lba, &v) < 0) return -1;
     v.write = write;
+    /* i_size is 32 bits here, as in ext2_pwrite_path. `(uint32_t)newlen` used
+     * to wrap instead: ftruncate(fd, 4 GiB) became a truncate to 0 that freed
+     * the whole file, 5 GiB became 1 GiB. Refuse what cannot be represented. */
+    if (newlen > 0xFFFFFFFFull) return -1;
     uint8_t inode[256]; int isdir = 0;
     uint32_t ino = walk(&v, path, inode, &isdir);
     if (!ino || isdir) return -1;                          /* regular files only */
@@ -2581,7 +2624,8 @@ static long ext2_pwrite_path_d(blk_read_fn read, blk_write_fn write, void *ctx, 
         uint32_t lo = (off > bstart) ? (uint32_t)(off - bstart) : 0;
         uint32_t hi = ((off + len) < (uint64_t)bstart + v.block_size)
                         ? (uint32_t)(off + len - bstart) : v.block_size;
-        uint32_t db = bmap_alloc(&v, inode, fb, &charged);
+        int fresh = 0;
+        uint32_t db = bmap_alloc_f(&v, inode, fb, &charged, &fresh);
         if (!db) goto fail;
 
         if (lo == 0 && hi == v.block_size) {               /* full block: no read needed */
@@ -2589,8 +2633,10 @@ static long ext2_pwrite_path_d(blk_read_fn read, blk_write_fn write, void *ctx, 
         } else {                                           /* partial: read-modify-write */
             /* A block inside the old file must be preserved around the edit;
              * one past EOF (or a hole) has no contents to preserve and must
-             * read as zeroes, not as whatever the recycled block held. */
-            if (bstart < size) { if (rdblk(&v, db, blk) < 0) goto fail; }
+             * read as zeroes, not as whatever the recycled block held. A hole
+             * INSIDE the file is also just-allocated: testing only bstart <
+             * size read a deleted file's bytes back into it. */
+            if (bstart < size && !fresh) { if (rdblk(&v, db, blk) < 0) goto fail; }
             else               { memset(blk, 0, v.block_size); }
             const uint8_t *src = (const uint8_t *)buf + (bstart + lo - off);
             memcpy(blk + lo, src, hi - lo);
